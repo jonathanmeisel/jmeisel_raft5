@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package raft5.common;
+
+// Mirrors storage::LogEntry: a single append (or delete, when `value` is
+// unset) at a given sequence number and term.
+message LogEntry {
+  uint64 seq = 1;
+  uint64 term = 2;
+  bytes key = 3;
+  optional bytes value = 4; // unset = delete tombstone
+}

@@ -1,0 +1,85 @@
+syntax = "proto3";
+
+package raft5.client;
+
+// Node-to-client API. Served on a separate port from the peer-to-peer
+// RaftPeer service (raft.proto), since the two have different auth/network
+// exposure requirements (client access vs. mTLS between known cluster
+// members).
+service Kv {
+  // Write (or delete, if `value` is unset) a single key. Blocks until the
+  // entry is committed (and, depending on the desired consistency level,
+  // applied) by the current leader.
+  rpc Write(WriteRequest) returns (WriteResponse);
+
+  // Read the current value for a key. `linearizable = true` requires a
+  // read-index/lease-read round before answering; `false` allows a
+  // possibly-stale local read.
+  rpc Read(ReadRequest) returns (ReadResponse);
+
+  // Cluster membership changes, one server at a time (single-server
+  // change, not joint consensus -- simpler to reason about; joint
+  // consensus for atomic multi-member changes can come later if needed).
+  rpc AddServer(AddServerRequest) returns (ConfigChangeResponse);
+  rpc RemoveServer(RemoveServerRequest) returns (ConfigChangeResponse);
+}
+
+// Carried in every response so a client can find the real leader without a
+// separate discovery RPC.
+message RaftError {
+  oneof kind {
+    NotLeader not_leader = 1;
+    string unavailable = 2; // e.g. no leader elected yet
+    string timeout = 3;
+  }
+}
+
+message NotLeader {
+  // Best-known leader, if any. Client should retry there.
+  optional string leader_hint = 1;
+}
+
+message WriteRequest {
+  bytes key = 1;
+  optional bytes value = 2; // unset = delete
+}
+
+message WriteResponse {
+  oneof result {
+    uint64 seq = 1; // sequence number the write was committed at
+    RaftError error = 2;
+  }
+}
+
+message ReadRequest {
+  bytes key = 1;
+  bool linearizable = 2;
+}
+
+message ReadResponse {
+  oneof result {
+    ReadOk ok = 1;
+    RaftError error = 2;
+  }
+}
+
+message ReadOk {
+  uint64 seq = 1;
+  optional bytes value = 2; // unset = key doesn't currently exist
+}
+
+message AddServerRequest {
+  string server_id = 1;
+  string address = 2;
+}
+
+message RemoveServerRequest {
+  string server_id = 1;
+}
+
+message ConfigChangeResponse {
+  oneof result {
+    bool ok = 1;
+    RaftError error = 2;
+  }
+}
