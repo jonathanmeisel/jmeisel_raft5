@@ -43,6 +43,7 @@
 //! this to process the keyspaces in bounded chunks rather than buffering an
 //! entire range into memory before acting on it.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Mutex;
@@ -56,6 +57,8 @@ const CF_META: &str = "meta";
 const META_FLOOR_SEQ: &[u8] = b"floor_seq";
 const META_FLOOR_TERM: &[u8] = b"floor_term";
 const META_COMPACT_SEQ: &[u8] = b"compact_last_seq";
+const META_CURRENT_TERM: &[u8] = b"current_term";
+const META_VOTED_FOR: &[u8] = b"voted_for";
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"RLOGSNAP";
 const SNAPSHOT_VERSION: u32 = 1;
@@ -256,6 +259,41 @@ impl RaftLog {
         }
     }
 
+    /// The persisted `(current_term, voted_for)` pair Raft's safety
+    /// property depends on: a node must never grant two votes in the same
+    /// term, even across a restart. Defaults to `(0, None)` if never
+    /// persisted (a brand new node). Loaded once at startup by
+    /// `raft::Common::new`.
+    pub fn term_state(&self) -> Result<(u64, Option<String>)> {
+        let term = match self.meta.get(META_CURRENT_TERM)? {
+            Some(bytes) => from_be_bytes(&bytes)?,
+            None => 0,
+        };
+        let voted_for = match self.meta.get(META_VOTED_FOR)? {
+            Some(bytes) => Some(
+                String::from_utf8(bytes.to_vec())
+                    .map_err(|_| StorageError::Corrupt("voted_for is not valid utf8"))?,
+            ),
+            None => None,
+        };
+        Ok((term, voted_for))
+    }
+
+    /// Atomically persist a new `(current_term, voted_for)` pair.
+    /// `voted_for = None` clears any previously recorded vote (e.g. when
+    /// advancing to a term nothing has been voted in yet) rather than
+    /// leaving a stale vote from an earlier term on disk.
+    pub fn persist_term_state(&self, term: u64, voted_for: Option<&str>) -> Result<()> {
+        let mut batch = self.db.batch();
+        batch.insert(&self.meta, META_CURRENT_TERM, be_bytes(term));
+        match voted_for {
+            Some(candidate) => batch.insert(&self.meta, META_VOTED_FOR, candidate.as_bytes()),
+            None => batch.remove(&self.meta, META_VOTED_FOR),
+        }
+        batch.commit()?;
+        Ok(())
+    }
+
     /// Atomically assign the next sequence number and write the entry at
     /// the given Raft term. `value = None` records a delete tombstone for
     /// `key` rather than removing any row. Returns the assigned sequence
@@ -275,6 +313,74 @@ impl RaftLog {
         drop(guard);
 
         Ok(seq)
+    }
+
+    /// Delete every `log` entry with `seq >= new_tail_seq` and roll
+    /// sequencing back to resume from there. For Raft log-matching: a
+    /// follower discovering a conflicting entry truncates its divergent
+    /// suffix before accepting the leader's replacement entries at the
+    /// same seqs.
+    ///
+    /// Only ever expected to run on the *uncommitted* tail: entries below
+    /// the compact/floor watermark are already committed (Leader
+    /// Completeness) and should never be a truncation target. This isn't
+    /// enforced here -- it's on the caller (the log-matching algorithm
+    /// itself should never construct a truncation point that low).
+    ///
+    /// Unlike `compact`, this commits as a single atomic batch rather than
+    /// chunking: a truncation that only deleted part of the divergent
+    /// suffix, or fixed up `latest` for only some of the affected keys,
+    /// would leave `latest` inconsistent with `log`. A follower's
+    /// divergent suffix is expected to be small (bounded by how long since
+    /// its last successful `AppendEntries`), so buffering it all is fine.
+    pub fn truncate_from(&self, new_tail_seq: u64) -> Result<()> {
+        let mut guard = self.next_seq.lock().unwrap();
+        if new_tail_seq >= *guard {
+            return Ok(()); // nothing at or above this seq to remove
+        }
+
+        let mut batch = self.db.batch();
+        let mut affected_keys: HashSet<Vec<u8>> = HashSet::new();
+
+        for item in self.log.range(be_bytes(new_tail_seq)..) {
+            let (k, v) = item.into_inner()?;
+            let (_, key, _) = decode_log_entry(&v)?;
+            affected_keys.insert(key);
+            batch.remove(&self.log, k);
+        }
+
+        // Resolve each affected key's most recent *surviving* entry with a
+        // single reverse scan below the truncation point, rather than one
+        // scan per key -- stopping as soon as every key is resolved (or
+        // the scan runs out, meaning no surviving entry exists).
+        let mut unresolved = affected_keys.clone();
+        let mut survivors: HashMap<Vec<u8>, (u64, Option<Vec<u8>>)> = HashMap::new();
+        if new_tail_seq > 0 {
+            for item in self.log.range(..be_bytes(new_tail_seq)).rev() {
+                if unresolved.is_empty() {
+                    break;
+                }
+                let (k, v) = item.into_inner()?;
+                let seq = from_be_bytes(&k)?;
+                let (_, key, value) = decode_log_entry(&v)?;
+                if unresolved.remove(&key) {
+                    survivors.insert(key, (seq, value));
+                }
+            }
+        }
+
+        for key in &affected_keys {
+            match survivors.get(key) {
+                Some((seq, value)) => {
+                    batch.insert(&self.latest, key, encode_latest_value(*seq, value.as_deref()));
+                }
+                None => batch.remove(&self.latest, key),
+            }
+        }
+
+        batch.commit()?;
+        *guard = new_tail_seq;
+        Ok(())
     }
 
     /// The current state and the sequence number that produced it, if
@@ -786,6 +892,70 @@ mod tests {
     }
 
     #[test]
+    fn truncate_from_removes_the_suffix_and_resumes_sequencing_there() {
+        let (log, path) = open_temp();
+        log.append(1, b"a", Some(b"1")).unwrap();
+        let keep = log.append(1, b"b", Some(b"2")).unwrap();
+        log.append(1, b"c", Some(b"3")).unwrap();
+        log.append(1, b"d", Some(b"4")).unwrap();
+
+        log.truncate_from(keep + 1).unwrap();
+
+        assert!(log.entries_in_range(keep + 1, 100).unwrap().is_empty());
+        assert_eq!(log.last_entry().unwrap(), Some((keep, 1)));
+
+        // Sequencing resumes right after the truncation point.
+        let next = log.append(2, b"e", Some(b"5")).unwrap();
+        assert_eq!(next, keep + 1);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn truncate_from_reverts_latest_to_the_surviving_entry_for_each_key() {
+        let (log, path) = open_temp();
+        log.append(1, b"k", Some(b"v1")).unwrap();
+        let cut = log.append(1, b"k", Some(b"v2")).unwrap();
+        log.append(1, b"k", Some(b"v3")).unwrap(); // truncated away
+
+        log.truncate_from(cut + 1).unwrap();
+
+        // `latest` reverts to the last surviving write for "k"...
+        assert_eq!(
+            log.get_latest(b"k").unwrap(),
+            Some((cut, Some(b"v2".to_vec())))
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn truncate_from_clears_latest_when_a_key_has_no_surviving_entry() {
+        let (log, path) = open_temp();
+        let above = log.append(1, b"other", Some(b"x")).unwrap();
+        log.append(1, b"only-in-suffix", Some(b"y")).unwrap();
+
+        log.truncate_from(above + 1).unwrap();
+
+        // "only-in-suffix" was never written below the truncation point,
+        // so it must disappear from `latest` entirely, not linger.
+        assert_eq!(log.get_latest(b"only-in-suffix").unwrap(), None);
+        assert_eq!(
+            log.get_latest(b"other").unwrap(),
+            Some((above, Some(b"x".to_vec())))
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn truncate_from_at_or_above_the_tail_is_a_no_op() {
+        let (log, path) = open_temp();
+        let last = log.append(1, b"a", Some(b"1")).unwrap();
+
+        log.truncate_from(last + 1).unwrap();
+        assert_eq!(log.last_entry().unwrap(), Some((last, 1)));
+        cleanup(&path);
+    }
+
+    #[test]
     fn entries_in_range_returns_terms_in_order() {
         let (log, path) = open_temp();
         log.append(1, b"a", Some(b"1")).unwrap();
@@ -912,6 +1082,36 @@ mod tests {
 
         cleanup(&path);
         cleanup(&target_path);
+    }
+
+    #[test]
+    fn term_state_defaults_when_never_persisted() {
+        let (log, path) = open_temp();
+        assert_eq!(log.term_state().unwrap(), (0, None));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn persist_term_state_round_trips_after_reopen() {
+        let (log, path) = open_temp();
+        log.persist_term_state(5, Some("node-b")).unwrap();
+        drop(log);
+
+        let reopened = RaftLog::open(&path).unwrap();
+        assert_eq!(
+            reopened.term_state().unwrap(),
+            (5, Some("node-b".to_string()))
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn persist_term_state_clears_a_previous_vote() {
+        let (log, path) = open_temp();
+        log.persist_term_state(5, Some("node-b")).unwrap();
+        log.persist_term_state(6, None).unwrap();
+        assert_eq!(log.term_state().unwrap(), (6, None));
+        cleanup(&path);
     }
 
     #[test]

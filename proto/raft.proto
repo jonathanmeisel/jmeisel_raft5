@@ -9,17 +9,15 @@ import "common.proto";
 // members, so it's the natural place to require mutual TLS / cluster
 // membership auth instead of whatever auth the Kv service uses.
 service RaftPeer {
-  // One long-lived, fire-and-forget stream per directional link between two
-  // peers (A's outbound stream to B is independent of B's outbound stream
-  // to A). Raft messages are inherently async -- a response to
-  // AppendEntries arrives as its own independently-initiated
-  // AppendEntriesResponse message on the reverse stream, not as this RPC's
-  // return value -- so a single client-streaming RPC fits better here than
-  // unary-per-message or a request/response-paired bidi stream. This also
-  // lets the leader pipeline entries to a peer without waiting on each
-  // response. `Ack` is just a periodic "still receiving" signal, not a
-  // per-message reply.
-  rpc StepMessages(stream RaftMessage) returns (Ack);
+  // Plain request/response. A leader's per-peer replication task calls
+  // this directly and feeds the response back into its own event loop; an
+  // inbound call (from some other node's leader/candidate) is answered the
+  // same way regardless of which role this node is currently in. No
+  // stream/connection state to manage -- gRPC's own call semantics (retry,
+  // timeout, cancellation) cover what a hand-rolled stream protocol would
+  // otherwise have to reimplement.
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
 
   // Chunked snapshot transfer. Maps directly onto
   // storage::export_snapshot / install_snapshot's Read/Write-based
@@ -30,23 +28,6 @@ service RaftPeer {
   rpc InstallSnapshot(stream SnapshotChunk) returns (InstallSnapshotResponse);
 }
 
-message Ack {}
-
-// A single raft consensus message. `from`/`to` identify cluster members --
-// not strictly needed if a stream only ever carries messages for one fixed
-// peer pair, but keeping them explicit costs little and leaves room to
-// multiplex multiple raft groups over one connection later.
-message RaftMessage {
-  string from = 1;
-  string to = 2;
-  oneof payload {
-    AppendEntriesRequest append_entries_request = 3;
-    AppendEntriesResponse append_entries_response = 4;
-    RequestVoteRequest request_vote_request = 5;
-    RequestVoteResponse request_vote_response = 6;
-  }
-}
-
 message AppendEntriesRequest {
   uint64 term = 1;
   string leader_id = 2;
@@ -54,6 +35,10 @@ message AppendEntriesRequest {
   uint64 prev_log_term = 4;
   repeated raft5.common.LogEntry entries = 5; // empty = heartbeat
   uint64 leader_commit = 6; // seq
+  // Highest seq the leader knows is replicated to *every* peer (not just a
+  // majority) -- safe for any node, follower included, to compact its log
+  // below this, since nobody will ever need to be sent that entry again.
+  uint64 compact_seq = 7; // seq
 }
 
 message AppendEntriesResponse {

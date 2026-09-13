@@ -10,4 +10,7 @@ pub mod raft5 {
     pub mod raft {
         include!(concat!(env!("OUT_DIR"), "/raft5.raft.rs"));
     }
+    pub mod cluster {
+        include!(concat!(env!("OUT_DIR"), "/raft5.cluster.rs"));
+    }
 }

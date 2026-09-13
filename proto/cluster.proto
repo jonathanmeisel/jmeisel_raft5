@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package raft5.cluster;
+
+// The set of servers that make up the cluster, plus the heartbeat interval
+// the leader paces AppendEntries/RequestVote timing around. Not yet wired
+// to a specific RPC -- this is the shared shape for whatever eventually
+// reads/writes cluster membership (e.g. persisted alongside the log,
+// returned to clients, or exchanged between peers).
+message ClusterConfig {
+  repeated ClusterMember members = 1;
+  uint64 heartbeat_millis = 2;
+}
+
+// A single cluster member. `server_id` matches the id used elsewhere in the
+// protocol (AddServerRequest/RemoveServerRequest in client.proto;
+// candidate_id/leader_id/from/to in raft.proto).
+message ClusterMember {
+  string server_id = 1;
+  string address = 2;
+}

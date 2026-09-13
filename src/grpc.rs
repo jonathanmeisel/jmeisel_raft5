@@ -1,12 +1,14 @@
 //! gRPC service implementations wiring the generated proto types (`pb`)
 //! into `storage::RaftLog`.
 //!
-//! Both services are stand-ins for a real Raft node: there's no leader
-//! election, term tracking, or log replication yet, so `KvService` just
-//! appends/reads locally (as if this node were always its own sole leader
-//! at term 0) and `RaftPeerService::step_messages` is unimplemented since
-//! there's no consensus engine to route messages to. `install_snapshot` is
-//! wired up for real, since it only needs `storage::RaftLog`.
+//! `KvService` is still a stand-in for a real Raft node: there's no leader
+//! election, term tracking, or log replication in its write/read path, so
+//! it just appends/reads locally as if this node were always its own sole
+//! leader at term 0. `RaftPeerService`, on the other hand, forwards
+//! `append_entries`/`request_vote` straight into a live `raft::RaftPeerHandle`
+//! -- whichever role the state machine is currently in decides how to
+//! answer. `install_snapshot` is wired up for real too, since it only needs
+//! `storage::RaftLog`.
 
 use std::sync::Arc;
 
@@ -18,11 +20,26 @@ use crate::pb::raft5::client::{
     ReadResponse, RemoveServerRequest, WriteRequest, WriteResponse,
 };
 use crate::pb::raft5::raft::raft_peer_server::RaftPeer;
-use crate::pb::raft5::raft::{snapshot_chunk, Ack, InstallSnapshotResponse, RaftMessage, SnapshotChunk};
+use crate::pb::raft5::raft::{
+    snapshot_chunk, AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotResponse,
+    RequestVoteRequest, RequestVoteResponse, SnapshotChunk,
+};
+use crate::raft::{RaftError, RaftPeerHandle};
 use crate::storage::{RaftLog, StorageError};
 
 fn storage_err(e: StorageError) -> Status {
     Status::internal(e.to_string())
+}
+
+fn raft_err(e: RaftError) -> Status {
+    match e {
+        // Neither RaftPeerHandle method can actually produce this today --
+        // only LeaderHandle::append_log does -- but RaftError is shared, so
+        // this match has to be total.
+        RaftError::NotLeader { .. } => Status::failed_precondition("not leader"),
+        RaftError::Storage(e) => storage_err(e),
+        RaftError::Disconnected => Status::unavailable("raft event loop is not running"),
+    }
 }
 
 fn join_err(e: tokio::task::JoinError) -> Status {
@@ -103,23 +120,39 @@ impl Kv for KvService {
 
 pub struct RaftPeerService {
     log: Arc<RaftLog>,
+    peer_handle: RaftPeerHandle,
 }
 
 impl RaftPeerService {
-    pub fn new(log: Arc<RaftLog>) -> Self {
-        Self { log }
+    pub fn new(log: Arc<RaftLog>, peer_handle: RaftPeerHandle) -> Self {
+        Self { log, peer_handle }
     }
 }
 
 #[tonic::async_trait]
 impl RaftPeer for RaftPeerService {
-    async fn step_messages(
+    async fn append_entries(
         &self,
-        _request: Request<Streaming<RaftMessage>>,
-    ) -> Result<Response<Ack>, Status> {
-        Err(Status::unimplemented(
-            "raft consensus engine not yet implemented",
-        ))
+        request: Request<AppendEntriesRequest>,
+    ) -> Result<Response<AppendEntriesResponse>, Status> {
+        let resp = self
+            .peer_handle
+            .append_entries(request.into_inner())
+            .await
+            .map_err(raft_err)?;
+        Ok(Response::new(resp))
+    }
+
+    async fn request_vote(
+        &self,
+        request: Request<RequestVoteRequest>,
+    ) -> Result<Response<RequestVoteResponse>, Status> {
+        let resp = self
+            .peer_handle
+            .request_vote(request.into_inner())
+            .await
+            .map_err(raft_err)?;
+        Ok(Response::new(resp))
     }
 
     async fn install_snapshot(
@@ -169,11 +202,22 @@ impl RaftPeer for RaftPeerService {
 mod tests {
     use super::*;
     use crate::pb::raft5::client::{read_response, write_response};
+    use crate::raft;
 
     fn open_temp() -> (Arc<RaftLog>, std::path::PathBuf) {
+        // A nanosecond timestamp alone isn't a reliable unique suffix under
+        // parallel test execution -- two tests starting at nearly the same
+        // instant can land on the same value (clock resolution, scheduling)
+        // and collide on the same directory, so a process-wide counter is
+        // layered on top (as a second path segment, not combined into the
+        // same u64, since combining risks collisions of its own) to
+        // guarantee uniqueness regardless.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let mut path = std::env::temp_dir();
         path.push(format!("raft5_grpc_test_{}", std::process::id()));
-        path.push(format!("{:x}", rand_suffix()));
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        path.push(format!("{:x}_{counter:x}", rand_suffix()));
         let log = Arc::new(RaftLog::open(&path).expect("open"));
         (log, path)
     }
@@ -283,6 +327,52 @@ mod tests {
             }
             other => panic!("expected Ok, got {other:?}"),
         }
+
+        cleanup(&path);
+    }
+
+    /// End-to-end through the actual tonic service: confirms
+    /// `RaftPeerService` is wired to a *running* state machine, not just
+    /// that `raft::RaftPeerHandle` works in isolation (covered separately
+    /// in `raft`'s own unit tests).
+    #[tokio::test]
+    async fn append_entries_and_request_vote_reach_the_running_state_machine() {
+        let (log, path) = open_temp();
+        let (common, _role_rx, peer_handle, _commit_rx, _compact_rx) =
+            raft::Common::new("node-under-test".to_string(), vec![], Arc::clone(&log)).unwrap();
+        tokio::spawn(raft::run(common));
+
+        let svc = RaftPeerService::new(log, peer_handle);
+
+        let append_resp = svc
+            .append_entries(Request::new(AppendEntriesRequest {
+                term: 7,
+                leader_id: "leader-1".to_string(),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+                compact_seq: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(append_resp.term, 7);
+        assert!(append_resp.success);
+
+        // Same term, first vote request seen at it -- should be granted.
+        let vote_resp = svc
+            .request_vote(Request::new(RequestVoteRequest {
+                term: 7,
+                candidate_id: "candidate-1".to_string(),
+                last_log_index: 0,
+                last_log_term: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(vote_resp.vote_granted);
+        assert_eq!(vote_resp.term, 7);
 
         cleanup(&path);
     }
