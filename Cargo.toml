@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rocksdb = "0.25"
 tonic = "0.14"
 tonic-prost = "0.14"
 prost = "0.14"
 tokio = { version = "1", features = ["full"] }
+fjall = "3.1.10"
 
 [build-dependencies]
 tonic-prost-build = "0.14"

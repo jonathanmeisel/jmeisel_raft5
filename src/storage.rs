@@ -1,56 +1,61 @@
-//! Raft log storage backed by RocksDB.
+//! Raft log storage backed by `fjall`.
 //!
-//! Layout (four column families):
+//! Layout (three keyspaces):
 //! - `log`:    seq (u64 BE)                -> encoded (term, key, value|tombstone) entry
 //! - `latest`: key                          -> encoded (seq, value|tombstone) current state
-//! - `index`:  encoded (key_len, key, seq)  -> empty marker, for history-by-key lookups
-//! - `meta`:   small set of fixed keys, currently the snapshot watermark
-//!             (`last_included_seq`, `last_included_term`) recorded by
-//!             `install_snapshot`.
+//! - `meta`:   small set of fixed keys: the floor (`floor_seq`,
+//!   `floor_term`) — the seq/term of the highest entry no longer physically
+//!   in `log`, updated by both `install_snapshot` and `compact` — and the
+//!   compaction watermark (`compact_last_seq`) recorded by `compact` alone,
+//!   for resuming an incremental compaction.
 //!
-//! A single append writes `log`, `latest` and `index` in one `WriteBatch`, so
+//! A single append writes `log` and `latest` in one atomic `WriteBatch`, so
 //! they never diverge. Sequence numbers are assigned under a mutex held for
 //! the full duration of the write, so a failed write never leaves a gap or
 //! is double-assigned.
 //!
 //! Deletes are appended entries with no value (a tombstone), not row
 //! removal: `append(term, key, None)` records that the key was deleted at
-//! that seq, same as any other entry — it appears in `seqs_for_key` history
-//! and participates in `compact` normally. `latest` keeps a tombstone marker
-//! too, so `get_latest` can distinguish "never written" (`None`) from
-//! "deleted, most recently at seq N" (`Some((n, None))`). `export_snapshot`
-//! omits tombstoned keys, since a snapshot represents only current state.
+//! that seq, same as any other entry, and participates in `compact`
+//! normally. `latest` keeps a tombstone marker too, so `get_latest` can
+//! distinguish "never written" (`None`) from "deleted, most recently at seq
+//! N" (`Some((n, None))`) — but only until `compact` passes that seq: once
+//! a tombstone's seq drops below the compaction threshold, `compact` drops
+//! it from `latest` too, since at that point "deleted a while ago" and
+//! "never written" are indistinguishable and there's nothing to gain from
+//! keeping the marker. `export_snapshot` omits tombstoned keys, since a
+//! snapshot represents only current state.
 //!
-//! Note on compaction and term lookups: `compact` removes entries per-key,
-//! not as a full index-prefix cut, so a term_at/entries_in_range query can
-//! find gaps at seq values below a compaction threshold even when they're
-//! not below any snapshot boundary. This is safe for Raft's log-matching
-//! purposes: entries below a node's own compaction/snapshot point are
-//! already committed and can never be a source of conflict again (Leader
-//! Completeness), so callers should never need term information that far
-//! back — comparisons only ever happen in the live tail.
+//! Note on compaction and term lookups: `compact` unconditionally deletes
+//! every `log` entry below its threshold, so a term_at/entries_in_range
+//! query can find gaps there even when they're not below any snapshot
+//! boundary. This is safe for Raft's log-matching purposes: entries below a
+//! node's own compaction/snapshot point are already committed and can never
+//! be a source of conflict again (Leader Completeness), so callers should
+//! never need term information that far back — comparisons only ever happen
+//! in the live tail. Live entries in `latest` — puts, and tombstones not
+//! yet passed by compaction — are never touched.
 //!
-//! Note on memory: `compact` and `install_snapshot` operate on RocksDB
+//! Note on memory: `compact` and `install_snapshot` operate on fjall
 //! iterators, which pin a consistent point-in-time view as of iterator
 //! creation — so it's safe to interleave reading from one with issuing
-//! writes/deletes against the live `DB` from the same loop. Both use this to
-//! process the CFs in bounded chunks rather than buffering an entire range
-//! into memory before acting on it.
+//! writes/deletes against the live `Database` from the same loop. Both use
+//! this to process the keyspaces in bounded chunks rather than buffering an
+//! entire range into memory before acting on it.
 
-use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Mutex;
 
-use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Direction, IteratorMode, Options, WriteBatch, DB};
+use fjall::{Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch};
 
 const CF_LOG: &str = "log";
 const CF_LATEST: &str = "latest";
-const CF_INDEX: &str = "index";
 const CF_META: &str = "meta";
 
-const META_SNAP_SEQ: &[u8] = b"snap_last_seq";
-const META_SNAP_TERM: &[u8] = b"snap_last_term";
+const META_FLOOR_SEQ: &[u8] = b"floor_seq";
+const META_FLOOR_TERM: &[u8] = b"floor_term";
+const META_COMPACT_SEQ: &[u8] = b"compact_last_seq";
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"RLOGSNAP";
 const SNAPSHOT_VERSION: u32 = 1;
@@ -64,13 +69,13 @@ const TAG_DELETE: u8 = 1;
 
 #[derive(Debug)]
 pub enum StorageError {
-    Db(rocksdb::Error),
+    Db(fjall::Error),
     Io(std::io::Error),
     Corrupt(&'static str),
 }
 
-impl From<rocksdb::Error> for StorageError {
-    fn from(e: rocksdb::Error) -> Self {
+impl From<fjall::Error> for StorageError {
+    fn from(e: fjall::Error) -> Self {
         StorageError::Db(e)
     }
 }
@@ -84,7 +89,7 @@ impl From<std::io::Error> for StorageError {
 impl std::fmt::Display for StorageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StorageError::Db(e) => write!(f, "rocksdb error: {e}"),
+            StorageError::Db(e) => write!(f, "fjall error: {e}"),
             StorageError::Io(e) => write!(f, "io error: {e}"),
             StorageError::Corrupt(msg) => write!(f, "corrupt storage: {msg}"),
         }
@@ -110,9 +115,12 @@ pub struct LogEntry {
     pub value: Option<Vec<u8>>,
 }
 
-/// Append-only, gap-free, per-key-compactable log on top of RocksDB.
+/// Append-only, gap-free, per-key-compactable log on top of `fjall`.
 pub struct RaftLog {
-    db: DB,
+    db: Database,
+    log: Keyspace,
+    latest: Keyspace,
+    meta: Keyspace,
     next_seq: Mutex<u64>,
 }
 
@@ -129,6 +137,7 @@ fn from_be_bytes(bytes: &[u8]) -> Result<u64> {
     Ok(u64::from_be_bytes(arr))
 }
 
+// Log entry encoding: [term (8 bytes BE)][tag PUT|DELETE (1 byte)][key_len (4 bytes BE)][key][value?]
 fn encode_log_entry(term: u64, key: &[u8], value: Option<&[u8]>) -> Vec<u8> {
     let value_len = value.map_or(0, <[u8]>::len);
     let mut buf = Vec::with_capacity(8 + 1 + 4 + key.len() + value_len);
@@ -161,6 +170,7 @@ fn decode_log_entry(bytes: &[u8]) -> Result<(u64, Vec<u8>, Option<Vec<u8>>)> {
     Ok((term, key, value))
 }
 
+// Latest value encoding: [seq (8 bytes BE)][tag PUT|DELETE (1 byte)][value?]
 fn encode_latest_value(seq: u64, value: Option<&[u8]>) -> Vec<u8> {
     let value_len = value.map_or(0, <[u8]>::len);
     let mut buf = Vec::with_capacity(8 + 1 + value_len);
@@ -186,85 +196,64 @@ fn decode_latest_value(bytes: &[u8]) -> Result<(u64, Option<Vec<u8>>)> {
     Ok((seq, value))
 }
 
-/// Prefix shared by every index entry for `key`: `[key_len][key]`.
-/// Length-prefixing the key keeps this prefix unambiguous, so a scan for
-/// key "ab" can never match entries belonging to key "abc".
-fn index_key_prefix(key: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(4 + key.len());
-    buf.extend_from_slice(&(key.len() as u32).to_be_bytes());
-    buf.extend_from_slice(key);
-    buf
-}
-
-fn index_key(key: &[u8], seq: u64) -> Vec<u8> {
-    let mut buf = index_key_prefix(key);
-    buf.extend_from_slice(&seq.to_be_bytes());
-    buf
-}
-
-fn decode_index_key_seq(bytes: &[u8], prefix_len: usize) -> Result<u64> {
-    if bytes.len() != prefix_len + 8 {
-        return Err(StorageError::Corrupt("index key has unexpected length"));
-    }
-    from_be_bytes(&bytes[prefix_len..])
-}
-
 // --- implementation ---------------------------------------------------
 
 impl RaftLog {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let mut db_opts = Options::default();
-        db_opts.create_if_missing(true);
-        db_opts.create_missing_column_families(true);
-
-        let cfs = vec![
-            ColumnFamilyDescriptor::new(CF_LOG, Options::default()),
-            ColumnFamilyDescriptor::new(CF_LATEST, Options::default()),
-            ColumnFamilyDescriptor::new(CF_INDEX, Options::default()),
-            ColumnFamilyDescriptor::new(CF_META, Options::default()),
-        ];
-
-        let db = DB::open_cf_descriptors(&db_opts, path, cfs)?;
-        let next_seq = Self::recover_next_seq(&db)?;
+        let db = Database::builder(path).open()?;
+        let log = db.keyspace(CF_LOG, KeyspaceCreateOptions::default)?;
+        let latest = db.keyspace(CF_LATEST, KeyspaceCreateOptions::default)?;
+        let meta = db.keyspace(CF_META, KeyspaceCreateOptions::default)?;
+        let next_seq = Self::recover_next_seq(&log, &meta)?;
 
         Ok(Self {
             db,
+            log,
+            latest,
+            meta,
             next_seq: Mutex::new(next_seq),
         })
     }
 
-    /// `next_seq` must account for both the physical log tail and any
-    /// snapshot watermark: after `install_snapshot` with no further
-    /// appends, `log` can be empty even though sequence numbers up to
-    /// `last_included_seq` are already spoken for.
-    fn recover_next_seq(db: &DB) -> Result<u64> {
-        let cf_log = Self::cf(db, CF_LOG)?;
-        let mut iter = db.iterator_cf(cf_log, IteratorMode::End);
-        let log_tail = match iter.next() {
-            Some(Ok((k, _))) => from_be_bytes(&k)?,
-            Some(Err(e)) => return Err(e.into()),
+    /// `next_seq` must account for both the physical log tail and the
+    /// floor: after `install_snapshot`, or after `compact` empties `log`
+    /// down to its physical tail, `log` can be empty even though sequence
+    /// numbers up to the floor are already spoken for.
+    fn recover_next_seq(log: &Keyspace, meta: &Keyspace) -> Result<u64> {
+        let log_tail = match log.last_key_value() {
+            Some(guard) => from_be_bytes(&guard.key()?)?,
             None => 0,
         };
-        let (watermark_seq, _) = Self::read_watermark(db)?;
-        Ok(log_tail.max(watermark_seq) + 1)
+        let (floor_seq, _) = Self::read_floor(meta)?;
+        Ok(log_tail.max(floor_seq) + 1)
     }
 
-    fn read_watermark(db: &DB) -> Result<(u64, u64)> {
-        let cf_meta = Self::cf(db, CF_META)?;
-        let seq = match db.get_cf(cf_meta, META_SNAP_SEQ)? {
+    /// The seq/term of the highest entry known to have existed but no
+    /// longer physically present in `log`, updated by both
+    /// `install_snapshot` (to the snapshot boundary) and `compact` (to the
+    /// top of whatever range it just deleted). `last_entry`/`term_at` fall
+    /// back to this when `log` doesn't have the answer itself.
+    fn read_floor(meta: &Keyspace) -> Result<(u64, u64)> {
+        let seq = match meta.get(META_FLOOR_SEQ)? {
             Some(bytes) => from_be_bytes(&bytes)?,
             None => 0,
         };
-        let term = match db.get_cf(cf_meta, META_SNAP_TERM)? {
+        let term = match meta.get(META_FLOOR_TERM)? {
             Some(bytes) => from_be_bytes(&bytes)?,
             None => 0,
         };
         Ok((seq, term))
     }
 
-    fn cf<'a>(db: &'a DB, name: &str) -> Result<&'a ColumnFamily> {
-        db.cf_handle(name)
-            .ok_or(StorageError::Corrupt("missing expected column family"))
+    /// The `below_seq` used by the most recent `compact` call (or the
+    /// snapshot watermark, if `install_snapshot` has run since): entries
+    /// below this are already reduced to one surviving entry per key, so
+    /// a future `compact` never needs to look at them again.
+    fn read_compact_watermark(meta: &Keyspace) -> Result<u64> {
+        match meta.get(META_COMPACT_SEQ)? {
+            Some(bytes) => from_be_bytes(&bytes),
+            None => Ok(0),
+        }
     }
 
     /// Atomically assign the next sequence number and write the entry at
@@ -272,19 +261,13 @@ impl RaftLog {
     /// `key` rather than removing any row. Returns the assigned sequence
     /// number.
     pub fn append(&self, term: u64, key: &[u8], value: Option<&[u8]>) -> Result<u64> {
-        let cf_log = Self::cf(&self.db, CF_LOG)?;
-        let cf_latest = Self::cf(&self.db, CF_LATEST)?;
-        let cf_index = Self::cf(&self.db, CF_INDEX)?;
-
         let mut guard = self.next_seq.lock().unwrap();
         let seq = *guard;
 
-        let mut batch = WriteBatch::default();
-        batch.put_cf(cf_log, be_bytes(seq), encode_log_entry(term, key, value));
-        batch.put_cf(cf_latest, key, encode_latest_value(seq, value));
-        batch.put_cf(cf_index, index_key(key, seq), []);
-
-        self.db.write(batch)?;
+        let mut batch = self.db.batch();
+        batch.insert(&self.log, be_bytes(seq), encode_log_entry(term, key, value));
+        batch.insert(&self.latest, key, encode_latest_value(seq, value));
+        batch.commit()?;
 
         // Only advance now that the write has durably succeeded, so a
         // failure never leaves a gap or lets another append reuse `seq`.
@@ -294,99 +277,69 @@ impl RaftLog {
         Ok(seq)
     }
 
-    /// The current state and the sequence number that produced it, if the
-    /// key has ever been written and hasn't been compacted away entirely
-    /// (compaction never removes the latest entry for a key, so this is
-    /// only `None` if the key was never written). The inner `Option` is
-    /// `None` when the key's most recent entry was a delete.
+    /// The current state and the sequence number that produced it, if
+    /// known. `None` if the key was never written, or if its most recent
+    /// write was a delete that `compact` has since dropped from `latest`
+    /// (an old tombstone and "never written" are indistinguishable once
+    /// compaction has passed it). The inner `Option` is `None` when the
+    /// key's most recent surviving entry was a delete.
     pub fn get_latest(&self, key: &[u8]) -> Result<Option<(u64, Option<Vec<u8>>)>> {
-        let cf_latest = Self::cf(&self.db, CF_LATEST)?;
-        match self.db.get_cf(cf_latest, key)? {
+        match self.latest.get(key)? {
             Some(bytes) => Ok(Some(decode_latest_value(&bytes)?)),
             None => Ok(None),
         }
-    }
-
-    /// All sequence numbers at which `key` currently has a retained entry
-    /// (put or delete), in ascending order. Sequence numbers compacted away
-    /// won't appear.
-    pub fn seqs_for_key(&self, key: &[u8]) -> Result<Vec<u64>> {
-        let cf_index = Self::cf(&self.db, CF_INDEX)?;
-        let prefix = index_key_prefix(key);
-
-        let iter = self
-            .db
-            .iterator_cf(cf_index, IteratorMode::From(&prefix, Direction::Forward));
-
-        let mut seqs = Vec::new();
-        for item in iter {
-            let (k, _) = item?;
-            if !k.starts_with(&prefix) {
-                break;
-            }
-            seqs.push(decode_index_key_seq(&k, prefix.len())?);
-        }
-        Ok(seqs)
     }
 
     /// Entries with `start <= seq < end`, in ascending seq order. Any seq in
     /// the range that isn't present (compacted away) is silently skipped —
     /// see the module-level note on why that's safe for log-matching.
     pub fn entries_in_range(&self, start: u64, end: u64) -> Result<Vec<LogEntry>> {
-        let cf_log = Self::cf(&self.db, CF_LOG)?;
-        let from = be_bytes(start);
-        let iter = self
-            .db
-            .iterator_cf(cf_log, IteratorMode::From(&from, Direction::Forward));
-
         let mut out = Vec::new();
-        for item in iter {
-            let (k, v) = item?;
+        for item in self.log.range(be_bytes(start)..be_bytes(end)) {
+            let (k, v) = item.into_inner()?;
             let seq = from_be_bytes(&k)?;
-            if seq >= end {
-                break;
-            }
             let (term, key, value) = decode_log_entry(&v)?;
-            out.push(LogEntry { seq, term, key, value });
+            out.push(LogEntry {
+                seq,
+                term,
+                key,
+                value,
+            });
         }
         Ok(out)
     }
 
     /// The seq and term of the most recent log entry, falling back to the
-    /// snapshot watermark if no entries remain in `log` (e.g. right after
-    /// `install_snapshot`, or an entirely fresh log with a snapshot but no
-    /// entries above it). `None` only for a log that has never had an
+    /// floor if no entries remain in `log` (e.g. right after
+    /// `install_snapshot`, or after `compact` has deleted everything up to
+    /// the physical tail). `None` only for a log that has never had an
     /// append or snapshot install.
     pub fn last_entry(&self) -> Result<Option<(u64, u64)>> {
-        let cf_log = Self::cf(&self.db, CF_LOG)?;
-        let mut iter = self.db.iterator_cf(cf_log, IteratorMode::End);
-        if let Some(item) = iter.next() {
-            let (k, v) = item?;
+        if let Some(guard) = self.log.last_key_value() {
+            let (k, v) = guard.into_inner()?;
             let seq = from_be_bytes(&k)?;
             let (term, _, _) = decode_log_entry(&v)?;
             return Ok(Some((seq, term)));
         }
-        let (watermark_seq, watermark_term) = Self::read_watermark(&self.db)?;
-        if watermark_seq > 0 {
-            Ok(Some((watermark_seq, watermark_term)))
+        let (floor_seq, floor_term) = Self::read_floor(&self.meta)?;
+        if floor_seq > 0 {
+            Ok(Some((floor_seq, floor_term)))
         } else {
             Ok(None)
         }
     }
 
-    /// The term recorded at `seq`, if known. Consults the snapshot
-    /// watermark when `seq` is exactly the snapshot boundary and `log` has
-    /// no entry there (it never does, by construction of
-    /// `install_snapshot`).
+    /// The term recorded at `seq`, if known. Consults the floor when `seq`
+    /// is exactly the floor boundary and `log` has no entry there (it never
+    /// does, once a snapshot or compaction has advanced past it).
     pub fn term_at(&self, seq: u64) -> Result<Option<u64>> {
-        let cf_log = Self::cf(&self.db, CF_LOG)?;
-        if let Some(bytes) = self.db.get_cf(cf_log, be_bytes(seq))? {
+        if let Some(bytes) = self.log.get(be_bytes(seq))? {
             let (term, _, _) = decode_log_entry(&bytes)?;
             return Ok(Some(term));
         }
-        let (watermark_seq, watermark_term) = Self::read_watermark(&self.db)?;
-        if watermark_seq > 0 && seq == watermark_seq {
-            return Ok(Some(watermark_term));
+        let (floor_seq, floor_term) = Self::read_floor(&self.meta)?;
+        if floor_seq > 0 && seq == floor_seq {
+            return Ok(Some(floor_term));
         }
         Ok(None)
     }
@@ -394,62 +347,72 @@ impl RaftLog {
     /// Flush `batch` (replacing it with a fresh one) once it reaches
     /// `WRITE_CHUNK` pending writes, bounding a batch's memory regardless of
     /// how large the overall operation is.
-    fn flush_if_full(&self, batch: &mut WriteBatch, pending: &mut usize) -> Result<()> {
+    fn flush_if_full(&self, batch: &mut OwnedWriteBatch, pending: &mut usize) -> Result<()> {
         if *pending >= WRITE_CHUNK {
-            self.db.write(std::mem::take(batch))?;
+            std::mem::replace(batch, self.db.batch()).commit()?;
             *pending = 0;
         }
         Ok(())
     }
 
-    /// Compact entries with `seq < below_seq`: for each key, keep only its
-    /// highest surviving sequence number below the threshold (whether a put
-    /// or a delete tombstone) and drop the rest (from both `log` and
-    /// `index`). Entries at or above `below_seq` are untouched. `latest` is
-    /// never touched, since it's already exactly the compacted view.
+    /// Compact away every `log` entry with `seq < below_seq`. Also drops
+    /// the `latest` tombstone for any key whose most recent write is one of
+    /// the deletes being compacted away: once that's true, "deleted a
+    /// while ago" and "never written" are indistinguishable, so there's
+    /// nothing to gain from keeping the marker. Live values, and
+    /// tombstones more recent than `below_seq`, are never touched.
     ///
-    /// Processes the range in descending order so the decision "is this the
-    /// newest entry for this key below the threshold" only requires
-    /// remembering which *distinct keys* have already been seen — not every
-    /// entry — bounding peak memory to O(distinct keys below the
-    /// threshold), which is the minimum information the task requires.
-    /// Superseded entries are deleted in chunks of `WRITE_CHUNK` rather than
-    /// accumulated into one giant batch.
+    /// Resumes from the previous call's threshold (persisted in `meta`)
+    /// rather than rescanning from 0 every time, so each call only ever
+    /// touches entries added since the last one. Writes are issued in
+    /// chunks of `WRITE_CHUNK` rather than accumulated into one giant batch.
+    ///
+    /// Also records the term of the entry at `below_seq - 1` (the last one
+    /// visited, since the log is gap-free) as the new floor: if this call
+    /// empties `log` all the way down to its physical tail, `last_entry`/
+    /// `term_at` still need an answer for that boundary, the same way they
+    /// do after `install_snapshot`.
     pub fn compact(&self, below_seq: u64) -> Result<()> {
-        if below_seq == 0 {
+        let from = Self::read_compact_watermark(&self.meta)?;
+        if below_seq <= from {
             return Ok(());
         }
-        let cf_log = Self::cf(&self.db, CF_LOG)?;
-        let cf_index = Self::cf(&self.db, CF_INDEX)?;
 
-        let start = be_bytes(below_seq - 1);
-        let iter = self
-            .db
-            .iterator_cf(cf_log, IteratorMode::From(&start, Direction::Reverse));
-
-        let mut seen: HashSet<Vec<u8>> = HashSet::new();
-        let mut batch = WriteBatch::default();
+        let mut batch = self.db.batch();
         let mut pending = 0usize;
+        let mut floor_term = None;
 
-        for item in iter {
-            let (k, v) = item?;
+        for item in self.log.range(be_bytes(from)..be_bytes(below_seq)) {
+            let (k, v) = item.into_inner()?;
             let seq = from_be_bytes(&k)?;
-            debug_assert!(seq < below_seq);
-            let (_, entry_key, _) = decode_log_entry(&v)?;
+            let (term, key, value) = decode_log_entry(&v)?;
+            floor_term = Some(term);
 
-            if seen.contains(&entry_key) {
-                batch.delete_cf(cf_log, be_bytes(seq));
-                batch.delete_cf(cf_index, index_key(&entry_key, seq));
-                pending += 1;
-                self.flush_if_full(&mut batch, &mut pending)?;
-            } else {
-                seen.insert(entry_key);
+            batch.remove(&self.log, k);
+            pending += 1;
+
+            if value.is_none() {
+                // Only drop `latest` if nothing has written `key` since:
+                // otherwise this old tombstone has already been
+                // superseded and `latest` is correctly reflecting
+                // something newer.
+                if let Some((latest_seq, _)) = self.get_latest(&key)?
+                    && latest_seq == seq
+                {
+                    batch.remove(&self.latest, key);
+                    pending += 1;
+                }
             }
+
+            self.flush_if_full(&mut batch, &mut pending)?;
         }
 
-        if pending > 0 {
-            self.db.write(batch)?;
+        if let Some(term) = floor_term {
+            batch.insert(&self.meta, META_FLOOR_SEQ, be_bytes(below_seq - 1));
+            batch.insert(&self.meta, META_FLOOR_TERM, be_bytes(term));
         }
+        batch.insert(&self.meta, META_COMPACT_SEQ, be_bytes(below_seq));
+        batch.commit()?;
         Ok(())
     }
 
@@ -457,13 +420,12 @@ impl RaftLog {
     /// snapshot: a header (magic, version, last_included_seq,
     /// last_included_term) followed by length-prefixed (key, value)
     /// records, read until EOF. Intended for Raft's InstallSnapshot path —
-    /// engine-agnostic and chunkable, unlike a RocksDB-native checkpoint.
+    /// engine-agnostic and chunkable, unlike an `fjall`-native checkpoint.
     /// Tombstoned keys are omitted, since they carry no current value.
     /// Already bounded to O(1) extra memory beyond one record at a time:
     /// entries are written straight to `writer` as they're read from
-    /// RocksDB, never accumulated.
+    /// `fjall`, never accumulated.
     pub fn export_snapshot<W: Write>(&self, writer: &mut W) -> Result<SnapshotMeta> {
-        let cf_latest = Self::cf(&self.db, CF_LATEST)?;
         let (last_included_seq, last_included_term) = match self.last_entry()? {
             Some((seq, term)) => (seq, term),
             None => (0, 0),
@@ -475,8 +437,8 @@ impl RaftLog {
         writer.write_all(&last_included_term.to_be_bytes())?;
 
         let mut entry_count: u64 = 0;
-        for item in self.db.iterator_cf(cf_latest, IteratorMode::Start) {
-            let (key, value_bytes) = item?;
+        for item in self.latest.iter() {
+            let (key, value_bytes) = item.into_inner()?;
             let (_, value) = decode_latest_value(&value_bytes)?;
             let Some(value) = value else {
                 continue; // tombstoned: not part of current state
@@ -496,42 +458,25 @@ impl RaftLog {
         })
     }
 
-    /// Delete every row in `cf`, in chunks, without ever holding more than
-    /// `WRITE_CHUNK` keys in memory at once.
-    fn wipe_cf(&self, cf: &ColumnFamily) -> Result<()> {
-        let mut batch = WriteBatch::default();
-        let mut pending = 0usize;
-        for item in self.db.iterator_cf(cf, IteratorMode::Start) {
-            let (k, _) = item?;
-            batch.delete_cf(cf, k);
-            pending += 1;
-            self.flush_if_full(&mut batch, &mut pending)?;
-        }
-        if pending > 0 {
-            self.db.write(batch)?;
-        }
-        Ok(())
-    }
-
     /// Install a snapshot produced by `export_snapshot`, replacing all
-    /// current log/index/latest state. This is a full wipe (not the
-    /// etcd-style "retain the suffix if it doesn't conflict" optimization):
-    /// every existing `log`, `latest` and `index` row is dropped, then the
-    /// incoming (key, value) records repopulate `latest`/`index` at
-    /// `last_included_seq`, and the snapshot watermark in `meta` is set so
-    /// `last_entry`/`term_at` keep working even though `log` now has
-    /// nothing at or below that point. Subsequent `append` calls continue
-    /// from `last_included_seq + 1`.
+    /// current log/latest state. This is a full wipe (not the etcd-style
+    /// "retain the suffix if it doesn't conflict" optimization): every
+    /// existing `log` and `latest` row is dropped (each `clear()` is an
+    /// O(1) keyspace-level operation), then the incoming (key, value)
+    /// records repopulate `latest` at `last_included_seq`, and the snapshot
+    /// watermark in `meta` is set so `last_entry`/`term_at` keep working
+    /// even though `log` now has nothing at or below that point.
+    /// Subsequent `append` calls continue from `last_included_seq + 1`.
     ///
-    /// Bounded memory: the wipe and the incoming record stream are both
-    /// processed and committed in chunks of `WRITE_CHUNK`, rather than
-    /// buffering the existing keyspace or the whole incoming snapshot in
-    /// memory first. This means the install is not one single atomic
-    /// commit — a crash partway through can leave the store with only some
-    /// chunks applied. That's an accepted trade-off here (installing a
-    /// snapshot is a heavyweight, comparatively rare operation, and Raft's
-    /// InstallSnapshot is naturally retryable — a follower that crashes
-    /// mid-install simply reports needing a snapshot again).
+    /// Bounded memory: the incoming record stream is processed and
+    /// committed in chunks of `WRITE_CHUNK`, rather than buffering the whole
+    /// incoming snapshot in memory first. This means the install is not one
+    /// single atomic commit — a crash partway through can leave the store
+    /// with only some chunks applied. That's an accepted trade-off here
+    /// (installing a snapshot is a heavyweight, comparatively rare
+    /// operation, and Raft's InstallSnapshot is naturally retryable — a
+    /// follower that crashes mid-install simply reports needing a snapshot
+    /// again).
     pub fn install_snapshot<R: Read>(&self, reader: &mut R) -> Result<SnapshotMeta> {
         let mut magic = [0u8; 8];
         reader.read_exact(&mut magic)?;
@@ -550,22 +495,16 @@ impl RaftLog {
         reader.read_exact(&mut term_bytes)?;
         let last_included_term = u64::from_be_bytes(term_bytes);
 
-        let cf_log = Self::cf(&self.db, CF_LOG)?;
-        let cf_latest = Self::cf(&self.db, CF_LATEST)?;
-        let cf_index = Self::cf(&self.db, CF_INDEX)?;
-        let cf_meta = Self::cf(&self.db, CF_META)?;
-
         // Serialize against concurrent appends for the duration of the
         // install, same discipline as `append`.
         let mut guard = self.next_seq.lock().unwrap();
 
-        self.wipe_cf(cf_log)?;
-        self.wipe_cf(cf_index)?;
-        self.wipe_cf(cf_latest)?;
+        self.log.clear()?;
+        self.latest.clear()?;
 
         // Stream incoming records straight into chunked write batches
         // instead of buffering the whole snapshot in memory.
-        let mut batch = WriteBatch::default();
+        let mut batch = self.db.batch();
         let mut pending = 0usize;
         let mut entry_count: u64 = 0;
 
@@ -586,20 +525,23 @@ impl RaftLog {
             let mut value = vec![0u8; value_len];
             reader.read_exact(&mut value)?;
 
-            batch.put_cf(
-                cf_latest,
+            batch.insert(
+                &self.latest,
                 &key,
                 encode_latest_value(last_included_seq, Some(&value)),
             );
-            batch.put_cf(cf_index, index_key(&key, last_included_seq), []);
             entry_count += 1;
             pending += 1;
             self.flush_if_full(&mut batch, &mut pending)?;
         }
 
-        batch.put_cf(cf_meta, META_SNAP_SEQ, be_bytes(last_included_seq));
-        batch.put_cf(cf_meta, META_SNAP_TERM, be_bytes(last_included_term));
-        self.db.write(batch)?;
+        batch.insert(&self.meta, META_FLOOR_SEQ, be_bytes(last_included_seq));
+        batch.insert(&self.meta, META_FLOOR_TERM, be_bytes(last_included_term));
+        // `log` was just wiped, so compaction has nothing to do below
+        // `last_included_seq` — reset the watermark to match, whatever it
+        // was before.
+        batch.insert(&self.meta, META_COMPACT_SEQ, be_bytes(last_included_seq));
+        batch.commit()?;
 
         *guard = last_included_seq + 1;
         drop(guard);
@@ -667,8 +609,10 @@ mod tests {
         assert_eq!(seq, del_seq);
         assert_eq!(val, None);
 
-        // The delete itself is part of history.
-        assert!(log.seqs_for_key(b"k").unwrap().contains(&del_seq));
+        // The tombstone is a normal log entry like any other.
+        let entries = log.entries_in_range(del_seq, del_seq + 1).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].value, None);
 
         // A never-written key is still indistinguishable from nothing.
         assert_eq!(log.get_latest(b"never").unwrap(), None);
@@ -699,28 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn seqs_for_key_tracks_full_history_until_compacted() {
-        let (log, path) = open_temp();
-        let s1 = log.append(1, b"k", Some(b"v1")).unwrap();
-        let s2 = log.append(1, b"k", Some(b"v2")).unwrap();
-        log.append(1, b"other", Some(b"x")).unwrap();
-        let s3 = log.append(1, b"k", Some(b"v3")).unwrap();
-
-        assert_eq!(log.seqs_for_key(b"k").unwrap(), vec![s1, s2, s3]);
-
-        // Compacting below s3 + 1 (i.e. including s3 itself in the
-        // compacted range) should collapse "k"'s history to just s3, its
-        // newest entry. "other" has only ever had one entry, so it's
-        // untouched.
-        log.compact(s3 + 1).unwrap();
-        assert_eq!(log.seqs_for_key(b"k").unwrap(), vec![s3]);
-        assert_eq!(log.seqs_for_key(b"other").unwrap().len(), 1);
-
-        cleanup(&path);
-    }
-
-    #[test]
-    fn compact_keeps_latest_per_key_and_preserves_current_value() {
+    fn compact_removes_entries_below_threshold_but_preserves_current_value() {
         let (log, path) = open_temp();
         log.append(1, b"k", Some(b"v1")).unwrap();
         log.append(1, b"k", Some(b"v2")).unwrap();
@@ -729,7 +652,15 @@ mod tests {
 
         log.compact(above).unwrap();
 
-        assert_eq!(log.seqs_for_key(b"k").unwrap(), vec![s3, above]);
+        // Everything below the threshold is gone from `log`...
+        assert!(log.entries_in_range(0, above).unwrap().is_empty());
+        assert_eq!(log.term_at(1).unwrap(), None);
+        // ...except the floor boundary itself (`below_seq - 1`), which
+        // `last_entry`/`term_at` still need an answer for even once `log`
+        // has nothing left at or below it.
+        assert_eq!(log.term_at(s3).unwrap(), Some(1));
+
+        // ...but `get_latest` still works, since `latest` is untouched.
         let (seq, val) = log.get_latest(b"k").unwrap().unwrap();
         assert_eq!(seq, above);
         assert_eq!(val, Some(b"v4".to_vec()));
@@ -737,31 +668,120 @@ mod tests {
     }
 
     #[test]
-    fn compact_keeps_latest_tombstone_for_a_deleted_key() {
+    fn compact_to_the_tail_leaves_last_entry_and_term_at_answerable() {
+        // Compacting all the way through the current tail empties `log`
+        // entirely (unlike the old per-key compaction, which always left
+        // at least the newest entry behind). `last_entry`/`term_at` must
+        // still be able to answer for that boundary, the same way they do
+        // after `install_snapshot`.
+        let (log, path) = open_temp();
+        log.append(1, b"a", Some(b"1")).unwrap();
+        log.append(1, b"a", Some(b"2")).unwrap();
+        let last = log.append(2, b"b", Some(b"x")).unwrap();
+        log.compact(last + 1).unwrap();
+
+        assert!(log.entries_in_range(0, last + 1).unwrap().is_empty());
+        assert_eq!(log.last_entry().unwrap(), Some((last, 2)));
+        assert_eq!(log.term_at(last).unwrap(), Some(2));
+
+        // Sequencing continues correctly even though `log` is empty.
+        let next = log.append(2, b"c", Some(b"new")).unwrap();
+        assert_eq!(next, last + 1);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compact_resumes_from_the_previous_watermark_across_calls() {
+        // Two compaction passes should each only need to touch entries
+        // added since the last one — the second call must not need to
+        // rescan what the first one already deleted.
+        let (log, path) = open_temp();
+        log.append(1, b"k", Some(b"v1")).unwrap();
+        let s2 = log.append(1, b"k", Some(b"v2")).unwrap();
+        log.compact(s2 + 1).unwrap();
+        assert!(log.entries_in_range(0, s2 + 1).unwrap().is_empty());
+
+        log.append(1, b"k", Some(b"v3")).unwrap();
+        let s4 = log.append(1, b"k", Some(b"v4")).unwrap();
+        log.compact(s4 + 1).unwrap();
+
+        assert!(log.entries_in_range(0, s4 + 1).unwrap().is_empty());
+        let (seq, val) = log.get_latest(b"k").unwrap().unwrap();
+        assert_eq!(seq, s4);
+        assert_eq!(val, Some(b"v4".to_vec()));
+
+        // A second call with a threshold at or below the previous one is a
+        // no-op rather than an error or a rescan.
+        log.compact(s2 + 1).unwrap();
+        assert_eq!(log.get_latest(b"k").unwrap().unwrap().0, s4);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compact_drops_the_latest_tombstone_once_the_delete_is_compacted_away() {
         let (log, path) = open_temp();
         log.append(1, b"k", Some(b"v1")).unwrap();
         let del_seq = log.append(1, b"k", None).unwrap();
         let above = log.append(1, b"other", Some(b"x")).unwrap();
 
+        // Before compaction, the tombstone is still visible.
+        assert_eq!(log.get_latest(b"k").unwrap(), Some((del_seq, None)));
+
         log.compact(above).unwrap();
 
-        assert_eq!(log.seqs_for_key(b"k").unwrap(), vec![del_seq]);
+        // Once the delete itself has been compacted away, the tombstone in
+        // `latest` is dropped too — "deleted a while ago" and "never
+        // written" are now indistinguishable.
+        assert_eq!(log.get_latest(b"k").unwrap(), None);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compact_preserves_a_tombstone_still_above_the_threshold() {
+        let (log, path) = open_temp();
+        log.append(1, b"k", Some(b"v1")).unwrap();
+        let del_seq = log.append(1, b"k", None).unwrap();
+
+        // Compacting only up to (not including) the delete leaves it alone.
+        log.compact(del_seq).unwrap();
         assert_eq!(log.get_latest(b"k").unwrap(), Some((del_seq, None)));
         cleanup(&path);
     }
 
     #[test]
-    fn compact_handles_many_entries_for_the_same_key_across_chunks() {
+    fn compact_does_not_drop_a_tombstone_superseded_by_a_later_write() {
+        let (log, path) = open_temp();
+        log.append(1, b"k", None).unwrap();
+        let put_seq = log.append(1, b"k", Some(b"v2")).unwrap();
+        let above = log.append(1, b"other", Some(b"x")).unwrap();
+
+        log.compact(above).unwrap();
+
+        // `latest` reflects the later write, not the compacted-away
+        // delete, so it must be untouched.
+        assert_eq!(
+            log.get_latest(b"k").unwrap(),
+            Some((put_seq, Some(b"v2".to_vec())))
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compact_handles_many_entries_across_chunks() {
         // Exercises the chunked-flush path in `compact` (WRITE_CHUNK is
-        // 1000): every entry below the threshold is for the same key, so
-        // all but the last must be deleted.
+        // 1000) with more entries below the threshold than fit in one
+        // batch.
         let (log, path) = open_temp();
         let mut last_seq = 0;
         for i in 0..2500u32 {
             last_seq = log.append(1, b"hot", Some(&i.to_be_bytes())).unwrap();
         }
         log.compact(last_seq + 1).unwrap();
-        assert_eq!(log.seqs_for_key(b"hot").unwrap(), vec![last_seq]);
+        assert!(log.entries_in_range(0, last_seq + 1).unwrap().is_empty());
+        let (seq, _) = log.get_latest(b"hot").unwrap().unwrap();
+        assert_eq!(seq, last_seq);
         cleanup(&path);
     }
 
@@ -835,7 +855,6 @@ mod tests {
         // State came across correctly.
         let (seq, val) = target.get_latest(b"a").unwrap().unwrap();
         assert_eq!((seq, val), (last, Some(b"2".to_vec())));
-        assert_eq!(target.seqs_for_key(b"a").unwrap(), vec![last]);
         assert_eq!(target.last_entry().unwrap(), Some((last, 2)));
 
         // Sequencing continues from where the snapshot left off, with no
