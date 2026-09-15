@@ -372,7 +372,11 @@ impl RaftLog {
         for key in &affected_keys {
             match survivors.get(key) {
                 Some((seq, value)) => {
-                    batch.insert(&self.latest, key, encode_latest_value(*seq, value.as_deref()));
+                    batch.insert(
+                        &self.latest,
+                        key,
+                        encode_latest_value(*seq, value.as_deref()),
+                    );
                 }
                 None => batch.remove(&self.latest, key),
             }

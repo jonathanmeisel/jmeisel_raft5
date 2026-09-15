@@ -12,6 +12,14 @@
 //! starts, there's never more than one event loop reading `Common`'s state
 //! at a time -- no locking needed around it.
 //!
+//! This file holds what's shared across every role -- `Common`, `Event`,
+//! the handle types, `PeerConnections`, the driver -- and each role's own
+//! implementation lives in its own submodule (`leader`, `candidate`,
+//! `follower`), private to this module. A submodule sees everything here
+//! (including private fields/methods) since it's a descendant of this
+//! module, same as if the code hadn't moved; the split is purely about file
+//! size, not encapsulation.
+//!
 //! `LeaderHandle::append_log` is the one piece of the public API that does
 //! *not* go through the event loop: `storage::RaftLog::append` is already
 //! safe to call concurrently, and waiting for a commit is just watching a
@@ -51,10 +59,11 @@
 //! doesn't auto-reconnect once its connection drops), so the next attempt
 //! gets a fresh one instead of failing forever.
 //!
-//! This is a skeleton: replication logic (the leader side of AppendEntries)
-//! is still simplified and marked with TODOs. Log-matching (the follower
-//! side, in `Follower::apply_append_entries`) and the candidate's voting
-//! (both sides) are implemented.
+//! This is a skeleton: the leader-side §5.3 backoff optimization is a
+//! simplification (see `leader::Leader::spawn_replication`), and there's no
+//! cluster membership / snapshot-triggering yet. Log-matching (the follower
+//! side), the candidate's voting (both sides), and leader replication
+//! (majority commit + all-peers compaction watermark) are implemented.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -71,17 +80,19 @@ use crate::pb::raft5::raft::{
 };
 use crate::storage::{self, RaftLog, StorageError};
 
+mod candidate;
+mod follower;
+mod leader;
+
+use candidate::Candidate;
+use follower::Follower;
+use leader::Leader;
+
 /// How long to wait for a peer RPC (including connecting, if there's no
 /// cached client yet) before giving up. Shorter than the election timeout,
 /// so a candidate has a chance to hear back (or know it won't) before its
 /// own timer fires again.
 const PEER_RPC_TIMEOUT: Duration = Duration::from_millis(100);
-
-/// How often the leader retries/heartbeats each peer, and how often it
-/// re-checks its own watermarks (`Event::LeaderTick`). Comfortably shorter
-/// than the 150-300ms election timeout, so followers hear from a live
-/// leader well before they'd time out and start a needless election.
-const REPLICATION_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
@@ -163,19 +174,6 @@ fn spawn_election_timer(event_tx: mpsc::Sender<Event>) -> JoinHandle<()> {
     })
 }
 
-/// Periodically pushes `Event::LeaderTick` -- see the variant's doc for why
-/// the leader needs this in addition to reacting to peer responses.
-fn spawn_leader_tick(event_tx: mpsc::Sender<Event>) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(REPLICATION_INTERVAL).await;
-            if event_tx.send(Event::LeaderTick).await.is_err() {
-                return;
-            }
-        }
-    })
-}
-
 /// This node's own `(last_log_index, last_log_term)`, needed both to fill
 /// in a `RequestVoteRequest` we're sending and to evaluate the §5.4.1
 /// up-to-date check on one we've received. `(0, 0)` for an empty log,
@@ -187,106 +185,6 @@ async fn last_log_index_and_term(log: &Arc<RaftLog>) -> (u64, u64) {
         .expect("last_entry task panicked")
         .expect("failed to read last entry")
         .unwrap_or((0, 0))
-}
-
-/// Builds the next `AppendEntries` request for a peer whose next expected
-/// entry is `next_index`, batching everything from there through the
-/// current tail (empty `entries` == a plain heartbeat). Synchronous
-/// storage core, run inside `spawn_blocking` by `Leader::spawn_replication`.
-fn build_append_entries_sync(
-    log: &RaftLog,
-    next_index: u64,
-    leader_id: String,
-    term: u64,
-    leader_commit: u64,
-    compact_seq: u64,
-) -> storage::Result<AppendEntriesRequest> {
-    let prev_log_index = next_index - 1;
-    // TODO: `None` here means this entry has been compacted away, i.e. the
-    // peer has fallen far enough behind that it needs a snapshot rather
-    // than more AppendEntries -- not implemented, so this just falls back
-    // to 0 and lets the usual conflict/backoff path keep retrying (it
-    // won't make progress past this point until entries are available,
-    // but it won't corrupt anything either).
-    let prev_log_term = if prev_log_index == 0 {
-        0
-    } else {
-        log.term_at(prev_log_index)?.unwrap_or(0)
-    };
-    let (last_index, _) = log.last_entry()?.unwrap_or((0, 0));
-    let entries = if next_index <= last_index {
-        // `storage::LogEntry` and `pb::raft5::common::LogEntry` are
-        // structurally identical (the proto mirrors the storage type) but
-        // are distinct Rust types, so each entry needs a field-by-field copy.
-        log.entries_in_range(next_index, last_index + 1)?
-            .into_iter()
-            .map(|e| LogEntry {
-                seq: e.seq,
-                term: e.term,
-                key: e.key,
-                value: e.value,
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    Ok(AppendEntriesRequest {
-        term,
-        leader_id,
-        prev_log_index,
-        prev_log_term,
-        entries,
-        leader_commit,
-        compact_seq,
-    })
-}
-
-/// Requests a vote from `peer`, connecting (or reusing a cached
-/// connection) through `conns`, bounded by `PEER_RPC_TIMEOUT`. `None` on
-/// any failure -- connect error, RPC error, or timeout -- which is always
-/// safe to just ignore: the candidate's own election timer is Raft's
-/// built-in retry mechanism, so there's nothing else to do with a peer
-/// that didn't answer in time.
-async fn request_vote_from_peer(
-    peer: &PeerInfo,
-    req: RequestVoteRequest,
-    conns: &PeerConnections,
-) -> Option<RequestVoteResponse> {
-    let attempt = async {
-        let mut client = conns.get_or_connect(peer).await?;
-        client.request_vote(req).await.ok()
-    };
-    let resp = match tokio::time::timeout(PEER_RPC_TIMEOUT, attempt).await {
-        Ok(Some(resp)) => Some(resp.into_inner()),
-        _ => None,
-    };
-    if resp.is_none() {
-        conns.evict(&peer.id).await;
-    }
-    resp
-}
-
-/// Sends one `AppendEntries` to `peer`, same connect/timeout/evict
-/// handling as `request_vote_from_peer`. `None` on any failure -- the
-/// caller (a replication task, running continuously) just retries on its
-/// next tick.
-async fn append_entries_to_peer(
-    peer: &PeerInfo,
-    req: AppendEntriesRequest,
-    conns: &PeerConnections,
-) -> Option<AppendEntriesResponse> {
-    let attempt = async {
-        let mut client = conns.get_or_connect(peer).await?;
-        client.append_entries(req).await.ok()
-    };
-    let resp = match tokio::time::timeout(PEER_RPC_TIMEOUT, attempt).await {
-        Ok(Some(resp)) => Some(resp.into_inner()),
-        _ => None,
-    };
-    if resp.is_none() {
-        conns.evict(&peer.id).await;
-    }
-    resp
 }
 
 #[derive(Debug)]
@@ -583,703 +481,6 @@ impl Common {
     }
 }
 
-// --- Leader ----------------------------------------------------------------
-
-pub struct Leader {
-    common: Common,
-    replication_tasks: Vec<JoinHandle<()>>,
-    tick_timer: JoinHandle<()>,
-    /// Highest seq each peer is known to have replicated. Missing entry
-    /// (rather than 0) for a peer we haven't heard back from yet -- same
-    /// thing numerically, `recompute_watermarks` just treats an absent
-    /// peer as 0 rather than requiring this to be pre-seeded.
-    peer_match_index: HashMap<String, u64>,
-}
-
-impl Leader {
-    /// Starts one replication task per peer plus a self-tick, publishes a
-    /// `LeaderHandle`, then runs the event loop until a role change is
-    /// needed.
-    // Named `new` (paired with `shutdown`) rather than returning `Self`,
-    // since this runs the whole role lifecycle and hands back `Common` for
-    // the driver to build the *next* role from, not just constructs one.
-    #[allow(clippy::new_ret_no_self)]
-    pub async fn new(common: Common) -> (Role, Common) {
-        let commit_rx = common.commit_tx.subscribe();
-        let role_rx = common.role_tx.subscribe();
-        common.publish_role(RoleHandle::Leader(LeaderHandle {
-            log: Arc::clone(&common.log),
-            term: common.current_term,
-            commit_rx,
-            role_rx,
-        }));
-
-        let replication_tasks = common
-            .peers
-            .iter()
-            .cloned()
-            .map(|peer| {
-                Self::spawn_replication(
-                    peer,
-                    common.node_id.clone(),
-                    common.current_term,
-                    Arc::clone(&common.log),
-                    Arc::clone(&common.peer_conns),
-                    common.commit_tx.subscribe(),
-                    common.compact_tx.subscribe(),
-                    common.event_tx.clone(),
-                )
-            })
-            .collect();
-        let tick_timer = spawn_leader_tick(common.event_tx.clone());
-
-        let mut leader = Leader {
-            common,
-            replication_tasks,
-            tick_timer,
-            peer_match_index: HashMap::new(),
-        };
-        // A zero-peer cluster starts out already at majority (just itself)
-        // -- get commit/compact caught up to whatever's already in the log
-        // without waiting for the first tick.
-        leader.recompute_watermarks().await;
-        let next_role = leader.run().await;
-        (next_role, leader.shutdown())
-    }
-
-    /// Repeatedly sends `AppendEntries` to `peer` (a heartbeat if there's
-    /// nothing new to send), tracking `next_index` locally: advances past
-    /// whatever the peer just accepted, or backs it up using the
-    /// follower's §5.3 conflict hints on rejection. Every response is
-    /// forwarded as `Event::AppendEntriesResponse` so match_index
-    /// aggregation and term step-downs happen on the event loop, not in
-    /// this task -- a connect/RPC failure or timeout just gets silently
-    /// retried next tick, same policy as `Candidate`'s vote requests.
-    // Each parameter is an independent piece of context this task owns for
-    // its whole lifetime (or a channel it reads/writes) -- there's no
-    // natural subgroup to bundle into a struct that wouldn't just move the
-    // same list into a literal at the one call site.
-    #[allow(clippy::too_many_arguments)]
-    fn spawn_replication(
-        peer: PeerInfo,
-        leader_id: String,
-        term: u64,
-        log: Arc<RaftLog>,
-        conns: Arc<PeerConnections>,
-        commit_rx: watch::Receiver<u64>,
-        compact_rx: watch::Receiver<u64>,
-        event_tx: mpsc::Sender<Event>,
-    ) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            let (last_index, _) = last_log_index_and_term(&log).await;
-            let mut next_index = last_index + 1;
-
-            loop {
-                let leader_commit = *commit_rx.borrow();
-                let compact_seq = *compact_rx.borrow();
-                let req = {
-                    let log = Arc::clone(&log);
-                    let leader_id = leader_id.clone();
-                    tokio::task::spawn_blocking(move || {
-                        build_append_entries_sync(
-                            &log,
-                            next_index,
-                            leader_id,
-                            term,
-                            leader_commit,
-                            compact_seq,
-                        )
-                    })
-                    .await
-                    .expect("build_append_entries task panicked")
-                    .expect("failed to read log for replication")
-                };
-
-                if let Some(resp) = append_entries_to_peer(&peer, req, &conns).await {
-                    if resp.success {
-                        next_index = resp.match_index + 1;
-                    } else if let Some(conflict_index) = resp.conflict_index {
-                        // TODO (§5.3 leader-side optimization): search our
-                        // own log for `conflict_term` and, if found, skip
-                        // to just past its last entry instead of always
-                        // trusting the follower's `conflict_index`
-                        // directly. Still correct as-is, just occasionally
-                        // one extra round trip than strictly necessary.
-                        next_index = conflict_index.max(1);
-                    }
-                    // A term bump is handled on the event loop (which
-                    // steps this whole role down, aborting this task) --
-                    // nothing else to do with the response here either way.
-                    if event_tx
-                        .send(Event::AppendEntriesResponse {
-                            from: peer.id.clone(),
-                            resp,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-
-                tokio::time::sleep(REPLICATION_INTERVAL).await;
-            }
-        })
-    }
-
-    async fn run(&mut self) -> Role {
-        loop {
-            let Some(event) = self.common.event_rx.recv().await else {
-                return Role::Follower;
-            };
-            match self.handle_event(event).await {
-                Transition::Continue => {}
-                Transition::Become(role) => return role,
-            }
-        }
-    }
-
-    async fn handle_event(&mut self, event: Event) -> Transition {
-        match event {
-            Event::AppendEntries { req, respond_to } => {
-                // A higher term means someone else won an election; step
-                // down regardless of who they are.
-                if req.term > self.common.current_term {
-                    self.common.advance_term(req.term).await;
-                    let _ = respond_to.send(self.reject_append(req.term));
-                    return Transition::Become(Role::Follower);
-                }
-                // Otherwise it's a stale/duplicate leader -- reject, stay
-                // leader (should be unreachable if term is the sole
-                // leadership marker, but harmless to guard).
-                let _ = respond_to.send(self.reject_append(self.common.current_term));
-                Transition::Continue
-            }
-            Event::AppendEntriesResponse { from, resp } => {
-                if resp.term > self.common.current_term {
-                    self.common.advance_term(resp.term).await;
-                    return Transition::Become(Role::Follower);
-                }
-                // A failure's `match_index` is meaningless (0) -- only a
-                // successful response tells us anything about the peer's
-                // actual progress.
-                if resp.success {
-                    let entry = self.peer_match_index.entry(from).or_insert(0);
-                    *entry = (*entry).max(resp.match_index);
-                    self.recompute_watermarks().await;
-                }
-                Transition::Continue
-            }
-            Event::RequestVote { req, respond_to } => {
-                if req.term > self.common.current_term {
-                    self.common.advance_term(req.term).await;
-                    self.common.vote_for(&req.candidate_id).await;
-                    let _ = respond_to.send(RequestVoteResponse {
-                        term: self.common.current_term,
-                        vote_granted: true,
-                    });
-                    return Transition::Become(Role::Follower);
-                }
-                let _ = respond_to.send(RequestVoteResponse {
-                    term: self.common.current_term,
-                    vote_granted: false,
-                });
-                Transition::Continue
-            }
-            Event::RequestVoteResponse { .. } => Transition::Continue, // stray, ignore
-            Event::ElectionTimeout => Transition::Continue,            // leaders don't run one
-            Event::LeaderTick => {
-                self.recompute_watermarks().await;
-                Transition::Continue
-            }
-        }
-    }
-
-    /// Recomputes `commit_seq` (highest seq replicated to a majority,
-    /// including this node's own log) and `compact_seq` (lowest seq
-    /// replicated to *every* peer) from `peer_match_index`, and publishes
-    /// both via `Common` -- monotonically, so a stale/out-of-order
-    /// response can never make either regress.
-    async fn recompute_watermarks(&mut self) {
-        let (own_last_index, _) = last_log_index_and_term(&self.common.log).await;
-
-        let mut matched: Vec<u64> = self
-            .common
-            .peers
-            .iter()
-            .map(|p| *self.peer_match_index.get(&p.id).unwrap_or(&0))
-            .collect();
-        matched.push(own_last_index);
-        matched.sort_unstable_by(|a, b| b.cmp(a)); // descending
-
-        // The value at position `majority - 1` is the majority-th largest
-        // -- i.e. the highest value at least `majority` entries (including
-        // our own, always the max) are `>=` to.
-        let commit_seq = matched[self.common.majority() - 1];
-        // The last (smallest) entry once sorted descending -- the one
-        // value every single node, without exception, has reached.
-        let compact_seq = *matched.last().expect("always has our own entry");
-
-        self.common.advance_commit(commit_seq);
-        self.common.advance_compact(compact_seq);
-    }
-
-    fn reject_append(&self, term: u64) -> AppendEntriesResponse {
-        AppendEntriesResponse {
-            term,
-            success: false,
-            match_index: 0,
-            conflict_index: None,
-            conflict_term: None,
-        }
-    }
-
-    /// Cancels replication tasks and hands `Common` back. Aborting rather
-    /// than signaling+joining is the simplest thing that works; a graceful
-    /// drain (finish in-flight RPCs first) would need a cancellation token
-    /// instead.
-    fn shutdown(self) -> Common {
-        for task in self.replication_tasks {
-            task.abort();
-        }
-        self.tick_timer.abort();
-        self.common
-    }
-}
-
-// --- Candidate ---------------------------------------------------------
-
-pub struct Candidate {
-    common: Common,
-    vote_tasks: Vec<JoinHandle<()>>,
-    election_timer: JoinHandle<()>,
-    votes_received: usize,
-}
-
-impl Candidate {
-    // See the comment on `Leader::new` re: this not returning `Self`.
-    #[allow(clippy::new_ret_no_self)]
-    pub async fn new(mut common: Common) -> (Role, Common) {
-        common.current_term += 1;
-        common.voted_for = Some(common.node_id.clone());
-        common.persist_term_state().await;
-        common.publish_role(RoleHandle::Candidate);
-
-        let (last_log_index, last_log_term) = last_log_index_and_term(&common.log).await;
-        let vote_tasks = common
-            .peers
-            .iter()
-            .cloned()
-            .map(|peer| {
-                Self::spawn_request_vote(
-                    peer,
-                    common.current_term,
-                    common.node_id.clone(),
-                    last_log_index,
-                    last_log_term,
-                    Arc::clone(&common.peer_conns),
-                    common.event_tx.clone(),
-                )
-            })
-            .collect();
-        // Without this, a split vote (or a cluster too small to reach
-        // majority with the peers that actually answer) would leave the
-        // candidate stuck forever with nothing left to wait on.
-        let election_timer = spawn_election_timer(common.event_tx.clone());
-
-        let mut candidate = Candidate {
-            common,
-            vote_tasks,
-            election_timer,
-            votes_received: 1, // vote for self
-        };
-        // A zero-peer cluster reaches majority on the self-vote alone --
-        // nothing will ever arrive on the event loop to notice that, so
-        // check up front rather than sitting in `run` forever restarting
-        // the election every timeout (see
-        // `candidate_restarts_the_election_after_its_own_timeout`, which
-        // covers the *intended* version of that behavior: peers exist but
-        // aren't answering).
-        let next_role = if candidate.votes_received >= candidate.common.majority() {
-            Role::Leader
-        } else {
-            candidate.run().await
-        };
-        (next_role, candidate.shutdown())
-    }
-
-    /// Calls `peer`'s RequestVote RPC and, if it answers in time, pushes
-    /// the result back as `Event::RequestVoteResponse` so vote counting
-    /// happens on the event loop rather than racing with it.
-    fn spawn_request_vote(
-        peer: PeerInfo,
-        term: u64,
-        candidate_id: String,
-        last_log_index: u64,
-        last_log_term: u64,
-        conns: Arc<PeerConnections>,
-        event_tx: mpsc::Sender<Event>,
-    ) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            let req = RequestVoteRequest {
-                term,
-                candidate_id,
-                last_log_index,
-                last_log_term,
-            };
-            let Some(resp) = request_vote_from_peer(&peer, req, &conns).await else {
-                return;
-            };
-            let _ = event_tx
-                .send(Event::RequestVoteResponse { from: peer.id, resp })
-                .await;
-        })
-    }
-
-    async fn run(&mut self) -> Role {
-        loop {
-            let Some(event) = self.common.event_rx.recv().await else {
-                return Role::Follower;
-            };
-            match self.handle_event(event).await {
-                Transition::Continue => {}
-                Transition::Become(role) => return role,
-            }
-        }
-    }
-
-    async fn handle_event(&mut self, event: Event) -> Transition {
-        match event {
-            Event::RequestVoteResponse { resp, .. } => {
-                if resp.term > self.common.current_term {
-                    self.common.advance_term(resp.term).await;
-                    return Transition::Become(Role::Follower);
-                }
-                if resp.term == self.common.current_term && resp.vote_granted {
-                    self.votes_received += 1;
-                    if self.votes_received >= self.common.majority() {
-                        return Transition::Become(Role::Leader);
-                    }
-                }
-                Transition::Continue
-            }
-            Event::AppendEntries { req, respond_to } => {
-                // A valid leader for this (or a later) term means the
-                // election is over; concede. Only actually advance the
-                // term (and persist) if it's strictly higher -- conceding
-                // to a leader already at our own term needs no term change.
-                if req.term >= self.common.current_term {
-                    if req.term > self.common.current_term {
-                        self.common.advance_term(req.term).await;
-                    }
-                    let _ = respond_to.send(AppendEntriesResponse {
-                        term: self.common.current_term,
-                        success: false, // re-sent once we're a follower
-                        match_index: 0,
-                        conflict_index: None,
-                        conflict_term: None,
-                    });
-                    return Transition::Become(Role::Follower);
-                }
-                let _ = respond_to.send(AppendEntriesResponse {
-                    term: self.common.current_term,
-                    success: false,
-                    match_index: 0,
-                    conflict_index: None,
-                    conflict_term: None,
-                });
-                Transition::Continue
-            }
-            Event::RequestVote { req, respond_to } => {
-                if req.term > self.common.current_term {
-                    self.common.advance_term(req.term).await;
-                    self.common.vote_for(&req.candidate_id).await;
-                    let _ = respond_to.send(RequestVoteResponse {
-                        term: self.common.current_term,
-                        vote_granted: true,
-                    });
-                    return Transition::Become(Role::Follower);
-                }
-                // Already voted for ourselves this term.
-                let _ = respond_to.send(RequestVoteResponse {
-                    term: self.common.current_term,
-                    vote_granted: false,
-                });
-                Transition::Continue
-            }
-            Event::ElectionTimeout => Transition::Become(Role::Candidate), // restart the election
-            Event::AppendEntriesResponse { .. } | Event::LeaderTick => Transition::Continue,
-        }
-    }
-
-    fn shutdown(self) -> Common {
-        for task in self.vote_tasks {
-            task.abort();
-        }
-        self.election_timer.abort();
-        self.common
-    }
-}
-
-// --- Follower ------------------------------------------------------------
-
-/// The outcome of matching+applying one `AppendEntries` call's `entries`
-/// against storage. Doesn't carry `term` -- that's `Common`'s concern, not
-/// storage's.
-struct AppendOutcome {
-    success: bool,
-    match_index: u64,
-    conflict_index: Option<u64>,
-    conflict_term: Option<u64>,
-}
-
-impl AppendOutcome {
-    fn reject(conflict_index: u64, conflict_term: Option<u64>) -> Self {
-        Self {
-            success: false,
-            match_index: 0,
-            conflict_index: Some(conflict_index),
-            conflict_term,
-        }
-    }
-}
-
-/// The synchronous core of Raft's AppendEntries receiver logic (Raft paper
-/// §5.3), run inside `spawn_blocking` by `Follower::apply_append_entries`.
-/// Checks `prev_log_index`/`prev_log_term`, then walks `entries` against
-/// what's already in `log`: entries already present with a matching term
-/// are left alone, the first mismatch truncates the divergent suffix, and
-/// everything past the current tail is appended. `entries` is expected in
-/// ascending, gap-free `seq` order starting at `prev_log_index + 1` --
-/// guaranteed by the leader's own log being gap-free.
-fn apply_append_entries_sync(
-    log: &RaftLog,
-    prev_log_index: u64,
-    prev_log_term: u64,
-    entries: &[LogEntry],
-) -> storage::Result<AppendOutcome> {
-    if prev_log_index > 0 {
-        match log.term_at(prev_log_index)? {
-            Some(term) if term == prev_log_term => {}
-            Some(conflict_term) => {
-                // Fast-backup (§5.3): point the leader at the first index
-                // of the conflicting term, so it can skip the whole run in
-                // one round trip instead of backing up one index at a time.
-                let mut conflict_index = prev_log_index;
-                while conflict_index > 1 {
-                    match log.term_at(conflict_index - 1)? {
-                        Some(term) if term == conflict_term => conflict_index -= 1,
-                        _ => break,
-                    }
-                }
-                return Ok(AppendOutcome::reject(conflict_index, Some(conflict_term)));
-            }
-            None => {
-                // Our log doesn't even reach prev_log_index -- point the
-                // leader at right after whatever we actually have.
-                let next_expected = match log.last_entry()? {
-                    Some((seq, _)) => seq + 1,
-                    None => 1,
-                };
-                return Ok(AppendOutcome::reject(next_expected, None));
-            }
-        }
-    }
-
-    let mut match_index = prev_log_index;
-    for (i, entry) in entries.iter().enumerate() {
-        match log.term_at(entry.seq)? {
-            // Already present with the same term -- by the Log Matching
-            // Property the rest of our log up to here already matches
-            // too, so there's nothing to do.
-            Some(term) if term == entry.term => {
-                match_index = entry.seq;
-            }
-            // Either a conflicting entry (wrong term) or nothing here yet
-            // -- either way, this entry and everything after it in the
-            // batch needs to be (re-)written.
-            other => {
-                if other.is_some() {
-                    log.truncate_from(entry.seq)?;
-                }
-                for fresh in &entries[i..] {
-                    let seq = log.append(fresh.term, &fresh.key, fresh.value.as_deref())?;
-                    debug_assert_eq!(
-                        seq, fresh.seq,
-                        "follower's log position drifted from the leader's indexing"
-                    );
-                    match_index = seq;
-                }
-                break;
-            }
-        }
-    }
-
-    Ok(AppendOutcome {
-        success: true,
-        match_index,
-        conflict_index: None,
-        conflict_term: None,
-    })
-}
-
-pub struct Follower {
-    common: Common,
-    election_timer: JoinHandle<()>,
-    leader_hint: Option<String>,
-}
-
-impl Follower {
-    // See the comment on `Leader::new` re: this not returning `Self`.
-    #[allow(clippy::new_ret_no_self)]
-    pub async fn new(common: Common) -> (Role, Common) {
-        common.publish_role(RoleHandle::Follower(FollowerHandle { leader_hint: None }));
-
-        let election_timer = spawn_election_timer(common.event_tx.clone());
-
-        let mut follower = Follower {
-            common,
-            election_timer,
-            leader_hint: None,
-        };
-        let next_role = follower.run().await;
-        (next_role, follower.shutdown())
-    }
-
-    /// Called whenever a valid AppendEntries/RequestVote is processed, so
-    /// a live leader/candidate keeps this follower from timing out.
-    fn reset_election_timer(&mut self) {
-        self.election_timer.abort();
-        self.election_timer = spawn_election_timer(self.common.event_tx.clone());
-    }
-
-    /// Runs `apply_append_entries_sync` on the blocking pool, then advances
-    /// `commit_tx` to `min(leader_commit, match_index)` (only if the
-    /// entries themselves matched) and `compact_tx` to `req.compact_seq`
-    /// (regardless -- it's independent of whether this particular batch of
-    /// entries matched, and by this point the caller has already confirmed
-    /// `req.term` is at least as current as ours, so the hint is trusted).
-    /// Panics on a storage failure -- see the module doc.
-    async fn apply_append_entries(&mut self, req: &AppendEntriesRequest) -> AppendOutcome {
-        let log = Arc::clone(&self.common.log);
-        let prev_log_index = req.prev_log_index;
-        let prev_log_term = req.prev_log_term;
-        let entries = req.entries.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
-            apply_append_entries_sync(&log, prev_log_index, prev_log_term, &entries)
-        })
-        .await
-        .expect("apply_append_entries task panicked")
-        .expect("failed to apply append entries to storage");
-
-        if outcome.success {
-            self.common
-                .advance_commit(req.leader_commit.min(outcome.match_index));
-        }
-        self.common.advance_compact(req.compact_seq);
-        outcome
-    }
-
-    async fn run(&mut self) -> Role {
-        loop {
-            let Some(event) = self.common.event_rx.recv().await else {
-                return Role::Follower;
-            };
-            match self.handle_event(event).await {
-                Transition::Continue => {}
-                Transition::Become(role) => return role,
-            }
-        }
-    }
-
-    async fn handle_event(&mut self, event: Event) -> Transition {
-        match event {
-            Event::AppendEntries { req, respond_to } => {
-                if req.term < self.common.current_term {
-                    let _ = respond_to.send(AppendEntriesResponse {
-                        term: self.common.current_term,
-                        success: false,
-                        match_index: 0,
-                        conflict_index: None,
-                        conflict_term: None,
-                    });
-                    return Transition::Continue;
-                }
-                if req.term > self.common.current_term {
-                    self.common.advance_term(req.term).await;
-                }
-                self.leader_hint = Some(req.leader_id.clone());
-                self.common
-                    .publish_role(RoleHandle::Follower(FollowerHandle {
-                        leader_hint: self.leader_hint.clone(),
-                    }));
-                self.reset_election_timer();
-
-                let outcome = self.apply_append_entries(&req).await;
-                let _ = respond_to.send(AppendEntriesResponse {
-                    term: self.common.current_term,
-                    success: outcome.success,
-                    match_index: outcome.match_index,
-                    conflict_index: outcome.conflict_index,
-                    conflict_term: outcome.conflict_term,
-                });
-                Transition::Continue
-            }
-            Event::RequestVote { req, respond_to } => {
-                // A strictly higher term means `voted_for` is left over
-                // from an earlier term and no longer applies -- `advance_term`
-                // resets it before the check below, or a candidate in a
-                // brand new term could be denied because of who we voted
-                // for last time. No-op (and no need to call it) if the
-                // term hasn't actually advanced.
-                if req.term > self.common.current_term {
-                    self.common.advance_term(req.term).await;
-                }
-                // Only bother reading our own log (the one check here that
-                // touches storage) if the vote would actually be grantable
-                // otherwise -- no point paying for it on a request that's
-                // going to be denied on term/prior-vote grounds anyway.
-                let grant = if req.term >= self.common.current_term
-                    && self
-                        .common
-                        .voted_for
-                        .as_deref()
-                        .is_none_or(|v| v == req.candidate_id)
-                {
-                    // §5.4.1: only vote for a candidate whose log is at
-                    // least as up to date as ours -- later term wins; if
-                    // equal, the longer (higher-index) log wins. Tuple
-                    // ordering expresses exactly this comparison.
-                    let (our_index, our_term) = last_log_index_and_term(&self.common.log).await;
-                    (req.last_log_term, req.last_log_index) >= (our_term, our_index)
-                } else {
-                    false
-                };
-                if grant {
-                    self.common.vote_for(&req.candidate_id).await;
-                    self.reset_election_timer();
-                }
-                let _ = respond_to.send(RequestVoteResponse {
-                    term: self.common.current_term,
-                    vote_granted: grant,
-                });
-                Transition::Continue
-            }
-            Event::ElectionTimeout => Transition::Become(Role::Candidate),
-            Event::AppendEntriesResponse { .. }
-            | Event::RequestVoteResponse { .. }
-            | Event::LeaderTick => {
-                Transition::Continue // stray messages from a role we no longer hold
-            }
-        }
-    }
-
-    fn shutdown(self) -> Common {
-        self.election_timer.abort();
-        self.common
-    }
-}
-
 // --- Driver ----------------------------------------------------------------
 
 /// Runs forever, handing `Common` from one role to the next. Only one
@@ -1298,12 +499,15 @@ pub async fn run(mut common: Common) -> ! {
     }
 }
 
+/// Shared test infrastructure for this module and its `leader`/`candidate`/
+/// `follower` submodules -- each submodule's own `#[cfg(test)] mod tests`
+/// pulls these in with `use crate::raft::test_support::*;`.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn open_temp_log() -> (Arc<RaftLog>, std::path::PathBuf) {
+    pub(crate) fn open_temp_log() -> (Arc<RaftLog>, std::path::PathBuf) {
         // A nanosecond timestamp alone isn't a reliable unique suffix under
         // parallel test execution -- two tests starting at nearly the same
         // instant can land on the same value (clock resolution, scheduling)
@@ -1322,13 +526,13 @@ mod tests {
         (log, path)
     }
 
-    fn cleanup(path: &std::path::Path) {
+    pub(crate) fn cleanup(path: &std::path::Path) {
         let _ = std::fs::remove_dir_all(path);
     }
 
     /// Spins up a real event loop (as `main` would) and hands back the two
     /// external handles plus the temp dir to clean up afterward.
-    fn spawn_test_node(
+    pub(crate) fn spawn_test_node(
         peers: Vec<PeerInfo>,
     ) -> (watch::Receiver<RoleHandle>, RaftPeerHandle, std::path::PathBuf) {
         let (log, path) = open_temp_log();
@@ -1341,8 +545,8 @@ mod tests {
     /// Like `spawn_test_node`, but also hands back the storage handle (to
     /// check what actually landed in it) and `commit_rx`/`compact_rx` (to
     /// observe replication/watermark progress) -- needed for the
-    /// log-matching and replication tests below.
-    fn spawn_node_with_handles(
+    /// log-matching and replication tests.
+    pub(crate) fn spawn_node_with_handles(
         peers: Vec<PeerInfo>,
     ) -> (
         Arc<RaftLog>,
@@ -1359,7 +563,7 @@ mod tests {
         (log, role_rx, peer_handle, commit_rx, compact_rx, path)
     }
 
-    async fn wait_for_role(
+    pub(crate) async fn wait_for_role(
         role_rx: &mut watch::Receiver<RoleHandle>,
         pred: impl Fn(&RoleHandle) -> bool,
     ) {
@@ -1379,7 +583,7 @@ mod tests {
         .expect("expected role to match the predicate before the timeout")
     }
 
-    fn blank_append_entries(term: u64, leader_id: &str) -> AppendEntriesRequest {
+    pub(crate) fn blank_append_entries(term: u64, leader_id: &str) -> AppendEntriesRequest {
         AppendEntriesRequest {
             term,
             leader_id: leader_id.to_string(),
@@ -1391,7 +595,7 @@ mod tests {
         }
     }
 
-    fn request_vote(term: u64, candidate_id: &str) -> RequestVoteRequest {
+    pub(crate) fn request_vote(term: u64, candidate_id: &str) -> RequestVoteRequest {
         RequestVoteRequest {
             term,
             candidate_id: candidate_id.to_string(),
@@ -1400,7 +604,7 @@ mod tests {
         }
     }
 
-    fn append_entries(
+    pub(crate) fn append_entries(
         term: u64,
         leader_id: &str,
         prev_log_index: u64,
@@ -1419,7 +623,7 @@ mod tests {
         }
     }
 
-    fn log_entry(seq: u64, term: u64, key: &[u8], value: Option<&[u8]>) -> LogEntry {
+    pub(crate) fn log_entry(seq: u64, term: u64, key: &[u8], value: Option<&[u8]>) -> LogEntry {
         LogEntry {
             seq,
             term,
@@ -1428,277 +632,32 @@ mod tests {
         }
     }
 
+    /// Binds an ephemeral local port and immediately releases it, for
+    /// handing a real address to a peer/server pair before either exists.
+    /// Small race (something else could grab the port before we rebind
+    /// it), but standard practice for this kind of test.
+    pub(crate) fn free_local_addr() -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        listener.local_addr().expect("local_addr")
+    }
+
+    pub(crate) fn expect_leader_handle(role: &RoleHandle) -> LeaderHandle {
+        match role {
+            RoleHandle::Leader(h) => h.clone(),
+            _ => panic!("expected Leader"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+    use super::*;
+
     #[tokio::test]
     async fn fresh_node_starts_as_follower() {
         let (mut role_rx, _peer_handle, path) = spawn_test_node(vec![]);
         wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Follower(_))).await;
-        cleanup(&path);
-    }
-
-    #[tokio::test]
-    async fn append_entries_with_higher_term_is_accepted_and_advances_term() {
-        let (_role_rx, peer_handle, path) = spawn_test_node(vec![]);
-
-        let resp = peer_handle
-            .append_entries(blank_append_entries(5, "leader-1"))
-            .await
-            .unwrap();
-
-        assert_eq!(resp.term, 5);
-        assert!(resp.success);
-        cleanup(&path);
-    }
-
-    #[tokio::test]
-    async fn heartbeat_on_an_empty_log_matches_at_index_zero() {
-        let (_log, _role_rx, peer_handle, _commit_rx, _compact_rx, path) = spawn_node_with_handles(vec![]);
-
-        let resp = peer_handle
-            .append_entries(blank_append_entries(1, "leader-1"))
-            .await
-            .unwrap();
-
-        assert!(resp.success);
-        assert_eq!(resp.match_index, 0);
-        cleanup(&path);
-    }
-
-    #[tokio::test]
-    async fn append_entries_appends_fresh_entries_to_an_empty_log() {
-        let (log, _role_rx, peer_handle, _commit_rx, _compact_rx, path) = spawn_node_with_handles(vec![]);
-
-        let entries = vec![
-            log_entry(1, 1, b"a", Some(b"1")),
-            log_entry(2, 1, b"b", Some(b"2")),
-        ];
-        let resp = peer_handle
-            .append_entries(append_entries(1, "leader-1", 0, 0, entries, 0))
-            .await
-            .unwrap();
-
-        assert!(resp.success);
-        assert_eq!(resp.match_index, 2);
-        assert_eq!(
-            log.get_latest(b"a").unwrap(),
-            Some((1, Some(b"1".to_vec())))
-        );
-        assert_eq!(
-            log.get_latest(b"b").unwrap(),
-            Some((2, Some(b"2".to_vec())))
-        );
-        cleanup(&path);
-    }
-
-    #[tokio::test]
-    async fn append_entries_rejects_and_hints_next_index_when_log_is_too_short() {
-        let (_log, _role_rx, peer_handle, _commit_rx, _compact_rx, path) = spawn_node_with_handles(vec![]);
-
-        let resp = peer_handle
-            .append_entries(append_entries(1, "leader-1", 5, 1, vec![], 0))
-            .await
-            .unwrap();
-
-        assert!(!resp.success);
-        assert_eq!(resp.conflict_index, Some(1));
-        assert_eq!(resp.conflict_term, None);
-        cleanup(&path);
-    }
-
-    #[tokio::test]
-    async fn append_entries_rejects_and_hints_the_start_of_the_conflicting_term_run() {
-        let (_log, _role_rx, peer_handle, _commit_rx, _compact_rx, path) = spawn_node_with_handles(vec![]);
-
-        let seed = vec![
-            log_entry(1, 1, b"a", Some(b"1")),
-            log_entry(2, 1, b"b", Some(b"2")),
-            log_entry(3, 1, b"c", Some(b"3")),
-        ];
-        peer_handle
-            .append_entries(append_entries(1, "leader-1", 0, 0, seed, 0))
-            .await
-            .unwrap();
-
-        // Claims prev_log_index 3 was written at term 2, but the follower
-        // actually has term 1 there (and at 1, 2 too) -- the fast-backup
-        // hint should point at the start of that whole term-1 run, not
-        // just one index back.
-        let resp = peer_handle
-            .append_entries(append_entries(2, "leader-1", 3, 2, vec![], 0))
-            .await
-            .unwrap();
-
-        assert!(!resp.success);
-        assert_eq!(resp.conflict_term, Some(1));
-        assert_eq!(resp.conflict_index, Some(1));
-        cleanup(&path);
-    }
-
-    #[tokio::test]
-    async fn append_entries_truncates_a_conflicting_suffix_and_applies_the_leaders_entries() {
-        let (log, _role_rx, peer_handle, _commit_rx, _compact_rx, path) = spawn_node_with_handles(vec![]);
-
-        // Follower picks up a stale entry at seq 2 from an old leader.
-        let stale = vec![
-            log_entry(1, 1, b"a", Some(b"1")),
-            log_entry(2, 1, b"stale", Some(b"old")),
-        ];
-        peer_handle
-            .append_entries(append_entries(1, "leader-1", 0, 0, stale, 0))
-            .await
-            .unwrap();
-
-        // A new leader (higher term) overwrites seq 2 onward.
-        let fresh = vec![log_entry(2, 2, b"fresh", Some(b"new"))];
-        let resp = peer_handle
-            .append_entries(append_entries(2, "leader-2", 1, 1, fresh, 0))
-            .await
-            .unwrap();
-
-        assert!(resp.success);
-        assert_eq!(resp.match_index, 2);
-        // The stale entry's key is gone from `latest`...
-        assert_eq!(log.get_latest(b"stale").unwrap(), None);
-        // ...replaced by the new leader's entry at the same seq.
-        assert_eq!(
-            log.get_latest(b"fresh").unwrap(),
-            Some((2, Some(b"new".to_vec())))
-        );
-        cleanup(&path);
-    }
-
-    #[tokio::test]
-    async fn append_entries_advances_commit_to_the_min_of_leader_commit_and_match_index() {
-        let (_log, _role_rx, peer_handle, mut commit_rx, _compact_rx, path) =
-            spawn_node_with_handles(vec![]);
-
-        let entries = vec![
-            log_entry(1, 1, b"a", Some(b"1")),
-            log_entry(2, 1, b"b", Some(b"2")),
-        ];
-        // leader_commit (1) is lower than match_index (2), so commit should
-        // land at 1, not 2.
-        peer_handle
-            .append_entries(append_entries(1, "leader-1", 0, 0, entries, 1))
-            .await
-            .unwrap();
-
-        commit_rx.changed().await.unwrap();
-        assert_eq!(*commit_rx.borrow(), 1);
-        cleanup(&path);
-    }
-
-    #[tokio::test]
-    async fn request_vote_grants_first_vote_then_denies_a_second_in_the_same_term() {
-        let (_role_rx, peer_handle, path) = spawn_test_node(vec![]);
-
-        let first = peer_handle
-            .request_vote(request_vote(3, "candidate-a"))
-            .await
-            .unwrap();
-        assert!(first.vote_granted);
-
-        let second = peer_handle
-            .request_vote(request_vote(3, "candidate-b"))
-            .await
-            .unwrap();
-        assert!(!second.vote_granted);
-        assert_eq!(second.term, 3);
-
-        cleanup(&path);
-    }
-
-    #[tokio::test]
-    async fn request_vote_with_a_higher_term_is_granted_even_after_voting_this_term() {
-        let (_role_rx, peer_handle, path) = spawn_test_node(vec![]);
-
-        peer_handle
-            .request_vote(request_vote(3, "candidate-a"))
-            .await
-            .unwrap();
-
-        let resp = peer_handle
-            .request_vote(request_vote(4, "candidate-b"))
-            .await
-            .unwrap();
-
-        assert!(resp.vote_granted);
-        assert_eq!(resp.term, 4);
-        cleanup(&path);
-    }
-
-    #[tokio::test]
-    async fn request_vote_denies_a_candidate_whose_log_ends_at_an_older_term() {
-        let (_log, _role_rx, peer_handle, _commit_rx, _compact_rx, path) = spawn_node_with_handles(vec![]);
-
-        // Follower's log ends at term 2.
-        let entries = vec![log_entry(1, 2, b"a", Some(b"1"))];
-        peer_handle
-            .append_entries(append_entries(2, "leader-1", 0, 0, entries, 0))
-            .await
-            .unwrap();
-
-        // Candidate's RPC term (3) is higher, but its own log ends at an
-        // *older* term (1) than ours (2) -- must be denied regardless of
-        // how much longer its log claims to be (index 5).
-        let resp = peer_handle
-            .request_vote(RequestVoteRequest {
-                term: 3,
-                candidate_id: "candidate-a".to_string(),
-                last_log_index: 5,
-                last_log_term: 1,
-            })
-            .await
-            .unwrap();
-
-        assert!(!resp.vote_granted);
-        cleanup(&path);
-    }
-
-    #[tokio::test]
-    async fn request_vote_grants_a_candidate_whose_log_is_at_least_as_up_to_date() {
-        let (_log, _role_rx, peer_handle, _commit_rx, _compact_rx, path) = spawn_node_with_handles(vec![]);
-
-        let entries = vec![log_entry(1, 2, b"a", Some(b"1"))];
-        peer_handle
-            .append_entries(append_entries(2, "leader-1", 0, 0, entries, 0))
-            .await
-            .unwrap();
-
-        // Same term as our last entry (2) and the same index (1) --
-        // "at least as up to date" per §5.4.1, so this should be granted.
-        let resp = peer_handle
-            .request_vote(RequestVoteRequest {
-                term: 3,
-                candidate_id: "candidate-a".to_string(),
-                last_log_index: 1,
-                last_log_term: 2,
-            })
-            .await
-            .unwrap();
-
-        assert!(resp.vote_granted);
-        cleanup(&path);
-    }
-
-    #[tokio::test]
-    async fn granting_a_vote_persists_it_to_storage() {
-        // Complements storage.rs's own round-trip test: this one checks
-        // that `Follower::handle_event` actually calls through to
-        // persistence, not just that the storage layer works in isolation.
-        let (log, path) = open_temp_log();
-        let (common, _role_rx, peer_handle, _commit_rx, _compact_rx) =
-            Common::new("test-node".to_string(), vec![], Arc::clone(&log)).unwrap();
-        tokio::spawn(run(common));
-
-        peer_handle
-            .request_vote(request_vote(9, "candidate-a"))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            log.term_state().unwrap(),
-            (9, Some("candidate-a".to_string()))
-        );
         cleanup(&path);
     }
 
@@ -1709,60 +668,10 @@ mod tests {
         cleanup(&path);
     }
 
-    #[tokio::test]
-    async fn candidate_steps_down_to_follower_on_append_entries_from_a_leader() {
-        let (mut role_rx, peer_handle, path) = spawn_test_node(vec![]);
-        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Candidate)).await;
-
-        // A real leader's AppendEntries at any term at least as high as the
-        // candidate's own (we don't know it exactly from out here, but
-        // u64::MAX always qualifies) should make it concede the election.
-        peer_handle
-            .append_entries(blank_append_entries(u64::MAX, "leader-1"))
-            .await
-            .unwrap();
-
-        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Follower(_))).await;
-        cleanup(&path);
-    }
-
-    #[tokio::test]
-    async fn candidate_restarts_the_election_after_its_own_timeout() {
-        // A real peer that will never answer (nothing listens on this
-        // address), so majority (2, with one peer) can never be reached on
-        // the self-vote alone -- unlike a *zero*-peer cluster, which wins
-        // immediately on its own vote (see
-        // `leader_commits_a_write_immediately_in_a_single_node_cluster`).
-        let peers = vec![PeerInfo {
-            id: "ghost".to_string(),
-            address: "http://127.0.0.1:1".to_string(),
-        }];
-        let (mut role_rx, _peer_handle, path) = spawn_test_node(peers);
-        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Candidate)).await;
-
-        // Without its own timer it would otherwise wait on `event_rx`
-        // forever. Just check it keeps re-publishing `Candidate` rather
-        // than hanging.
-        for _ in 0..2 {
-            role_rx.changed().await.unwrap();
-            assert!(matches!(&*role_rx.borrow(), RoleHandle::Candidate));
-        }
-        cleanup(&path);
-    }
-
-    /// Binds an ephemeral local port and immediately releases it, for
-    /// handing a real address to a peer/server pair before either exists.
-    /// Small race (something else could grab the port before we rebind
-    /// it), but standard practice for this kind of test.
-    fn free_local_addr() -> std::net::SocketAddr {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-        listener.local_addr().expect("local_addr")
-    }
-
     /// End-to-end over real sockets: two full nodes (state machine + a real
     /// `RaftPeerService` bound to a real port), each configured with the
-    /// other as its only peer. Exercises the whole voting path this task
-    /// added -- `Candidate` actually dialing out via `RaftPeerClient`,
+    /// other as its only peer. Exercises the whole voting path --
+    /// `Candidate` actually dialing out via `RaftPeerClient`,
     /// `PeerConnections` caching/reusing that connection, and the
     /// follower-side §5.4.1 check granting the vote -- rather than just the
     /// in-process pieces the other tests cover individually.
@@ -1827,40 +736,13 @@ mod tests {
         cleanup(&path_b);
     }
 
-    fn expect_leader_handle(role: &RoleHandle) -> LeaderHandle {
-        match role {
-            RoleHandle::Leader(h) => h.clone(),
-            _ => panic!("expected Leader"),
-        }
-    }
-
-    /// A zero-peer "cluster" reaches majority on its own self-vote alone
-    /// (see the fix in `Candidate::new`), and then has no peers to wait on
-    /// for commit either -- `Event::LeaderTick` is what's responsible for
-    /// noticing the leader's own growing log and advancing `commit_tx`
-    /// without any peer response ever arriving to trigger it.
-    #[tokio::test]
-    async fn leader_commits_a_write_immediately_in_a_single_node_cluster() {
-        let (mut role_rx, _peer_handle, path) = spawn_test_node(vec![]);
-        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Leader(_))).await;
-        let leader = expect_leader_handle(&role_rx.borrow());
-
-        let seq = tokio::time::timeout(Duration::from_millis(500), leader.append_log(b"k", Some(b"v")))
-            .await
-            .expect("append_log should not hang with no peers to wait on")
-            .unwrap();
-        assert_eq!(seq, 1);
-
-        cleanup(&path);
-    }
-
     /// End-to-end over real sockets, continuing where
     /// `candidate_wins_election_against_a_real_peer_over_the_network`
     /// leaves off: once one of the two nodes wins the election, a write
     /// through its `LeaderHandle` should reach the other node's storage
     /// too (real replication task, real connection, real §5.3 next_index
     /// tracking) and commit (real majority -- both nodes -- computed by
-    /// `recompute_watermarks`) rather than hanging.
+    /// `Leader::recompute_watermarks`) rather than hanging.
     #[tokio::test]
     async fn leader_replicates_a_write_to_a_real_peer_and_commits_it() {
         use crate::grpc::RaftPeerService;
