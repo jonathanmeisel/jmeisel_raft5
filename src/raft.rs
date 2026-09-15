@@ -59,6 +59,49 @@
 //! doesn't auto-reconnect once its connection drops), so the next attempt
 //! gets a fresh one instead of failing forever.
 //!
+//! Before a `Follower` (or a `Candidate` whose real election timed out)
+//! commits to a real, term-incrementing candidacy, it first runs a
+//! `PreCandidate` round: a non-binding pre-vote (Raft dissertation §9.6,
+//! `RequestVoteRequest.dry_run`) that asks every peer "would you grant a
+//! real vote at `current_term + 1`" without either side changing any
+//! state. Only once a majority say yes does it become a real `Candidate`.
+//! This keeps a node that's been partitioned (and so can't possibly win)
+//! from inflating its term every 150-300ms and disrupting a healthy
+//! cluster the moment it reconnects. `Common::election_attempt` counts
+//! consecutive failed cycles (pre-vote or real) since this node last had
+//! reason to believe a leader existed, and backs off the retry timeout
+//! exponentially (`election_timeout_for_attempt`) so a persistently
+//! undecided cluster doesn't hammer itself forever; it resets to 0 the
+//! moment a fresh `Follower` starts (see `follower::Follower::new`).
+//! `PreCandidate` and `Candidate` share nearly all of this machinery --
+//! see `candidate::Campaign`.
+//!
+//! Every other timing constant derives from one `HEARTBEAT` (a future
+//! user-configurable knob): `LEASE_DURATION` is `4 * HEARTBEAT`, and a
+//! follower's own election timeout (the "am I sure there's no leader"
+//! wait) is `LEASE_DURATION` plus an additional `fuzz(0, LEASE_DURATION)`
+//! on top -- see `follower::spawn_lease_expiration_watcher` for why that's
+//! two sequential phases (one deterministic, one randomized) rather than
+//! one combined random draw. `PreCandidate`/`Candidate`'s own
+//! campaign-retry timeout starts at that same `[LEASE_DURATION,
+//! 2*LEASE_DURATION)` range for their first attempt and backs off
+//! exponentially from there (`election_timeout_for_attempt`).
+//!
+//! Leader leasing (`GetLease`, deliberately a separate RPC from
+//! `AppendEntries` since that one can be slow -- it does real log-append
+//! work, a lease probe needs to stay fast) serves two purposes: a leader
+//! that can't retain a quorum of leases can no longer prove it's safe to
+//! serve a linearizable read locally (see `LeaderHandle::has_read_quorum`
+//! -- not consumed by any read path yet, but the plumbing is there), and
+//! a follower holding a live lease refuses *any* vote request (real or
+//! pre-vote) for someone else, so a leader that a majority can still
+//! reach can never be disrupted by a competing election. Losing lease
+//! quorum does not, by itself, force a leader to step down -- only actual
+//! contact revealing a higher term (a real `AppendEntries`/`RequestVote`)
+//! does that; lease loss is a read-safety signal, not a health verdict on
+//! its own, since replication (and therefore write-side commit safety)
+//! has its own independent, majority-based quorum check.
+//!
 //! This is a skeleton: the leader-side §5.3 backoff optimization is a
 //! simplification (see `leader::Leader::spawn_replication`), and there's no
 //! cluster membership / snapshot-triggering yet. Log-matching (the follower
@@ -67,16 +110,17 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tonic::transport::Channel;
 
 use crate::pb::raft5::common::LogEntry;
 use crate::pb::raft5::raft::raft_peer_client::RaftPeerClient;
 use crate::pb::raft5::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, GetLeaseRequest, GetLeaseResponse,
+    RequestVoteRequest, RequestVoteResponse,
 };
 use crate::storage::{self, RaftLog, StorageError};
 
@@ -84,15 +128,37 @@ mod candidate;
 mod follower;
 mod leader;
 
-use candidate::Candidate;
+use candidate::{Candidate, PreCandidate};
 use follower::Follower;
 use leader::Leader;
 
-/// How long to wait for a peer RPC (including connecting, if there's no
-/// cached client yet) before giving up. Shorter than the election timeout,
-/// so a candidate has a chance to hear back (or know it won't) before its
-/// own timer fires again.
-const PEER_RPC_TIMEOUT: Duration = Duration::from_millis(100);
+/// The one base timing unit everything else derives from (see the module
+/// doc). A `u64` millisecond count alongside the `Duration` form since a
+/// couple of derived constants need to do integer arithmetic on it (in a
+/// `const` context, before a `Duration` value could be decomposed back
+/// out again). Will become a user-configurable, per-cluster setting;
+/// hardcoded for now.
+const HEARTBEAT_MS: u64 = 50;
+const HEARTBEAT: Duration = Duration::from_millis(HEARTBEAT_MS);
+
+/// How long a granted lease (see `RaftPeerHandle::get_lease`) stays valid,
+/// on both sides: how long a follower keeps refusing other vote requests
+/// after its last confirmed contact with the leader, and how long a
+/// leader keeps counting a peer's last grant toward its own lease quorum.
+const LEASE_DURATION_MS: u64 = HEARTBEAT_MS * 4;
+const LEASE_DURATION: Duration = Duration::from_millis(LEASE_DURATION_MS);
+
+/// Timeout for a cheap, no-disk-I/O peer RPC (`RequestVote`, `GetLease`) --
+/// including connecting, if there's no cached client yet. Tight, since
+/// these should always be fast; a slow reply is as good as no reply.
+const LIGHTWEIGHT_RPC_TIMEOUT: Duration = Duration::from_millis(HEARTBEAT_MS * 2);
+
+/// Timeout for `AppendEntries` specifically, which -- unlike the above --
+/// does real log-append work on the follower and so can legitimately take
+/// a while under load. Deliberately generous: retrying an already-slow
+/// follower sooner doesn't help if the bottleneck is disk I/O, it just
+/// adds more redundant work on top.
+const APPEND_ENTRIES_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
@@ -121,6 +187,14 @@ pub enum Event {
         from: String,
         resp: RequestVoteResponse,
     },
+    /// Only ever the *leader's* own probe results coming back in --
+    /// answering an inbound `GetLease` never goes through this event loop
+    /// at all (see `RaftPeerHandle::get_lease`), specifically so it can
+    /// never get stuck behind a slow in-progress `AppendEntries`.
+    GetLeaseResponse {
+        from: String,
+        resp: GetLeaseResponse,
+    },
     ElectionTimeout,
     /// Self-notification, leader only: nudges the event loop to recompute
     /// `commit_seq`/`compact_seq` even when no peer response triggers it.
@@ -130,11 +204,13 @@ pub enum Event {
     LeaderTick,
 }
 
-/// Which role to construct next. A plain tag -- unlike the three role
-/// structs, it carries no state, since only one role's state is ever alive
-/// at a time.
+/// Which role to construct next. A plain tag -- unlike the role structs
+/// themselves, it carries no state, since only one role's state is ever
+/// alive at a time.
 pub(crate) enum Role {
     Follower,
+    /// Non-binding pre-vote round -- see the module doc.
+    PreCandidate,
     Candidate,
     Leader,
 }
@@ -156,19 +232,60 @@ fn random_jitter_millis(max: u64) -> u64 {
     RandomState::new().build_hasher().finish() % max
 }
 
-/// Both `Follower` (waiting for a leader) and `Candidate` (waiting for
-/// votes) need this: if nothing interesting happens in time, push
-/// `ElectionTimeout` so the event loop can start/restart an election.
+/// How many consecutive failed election cycles it takes to reach this.
+const MAX_ELECTION_BACKOFF_MS: u64 = 30_000;
+
+/// The jitter window for the `attempt`-th consecutive *campaign* cycle
+/// (`PreCandidate`/`Candidate` waiting on vote responses) since this node
+/// last had reason to believe a leader existed -- see
+/// `Common::election_attempt`. Attempt 0 is `[LEASE_DURATION,
+/// 2*LEASE_DURATION)`, doubling per attempt from there, capped at
+/// `MAX_ELECTION_BACKOFF_MS`, so a persistently undecided cluster (or a
+/// node that genuinely can't reach anyone) backs off instead of retrying
+/// forever at the same tight interval.
 ///
-/// Randomized (150-300ms) per the Raft paper: two nodes with the exact
-/// same fixed timeout tend to become candidates at the same instant, and
-/// then perpetually split-vote against each other every single term
+/// This is *not* what a `Follower` uses to decide it's time to stop
+/// trusting its leader in the first place -- that's
+/// `follower::spawn_lease_expiration_watcher`'s two-phase wait, which
+/// happens to total the same `[LEASE_DURATION, 2*LEASE_DURATION)` range
+/// for different reasons (a deterministic detection phase plus a
+/// randomized settle phase, rather than a single random draw).
+fn election_timeout_for_attempt(attempt: u32) -> Duration {
+    // Cap the shift itself (not just its result) so this can't panic on a
+    // pathologically large attempt count -- 2^20 already blows past the
+    // millisecond cap by many orders of magnitude, so nothing above that
+    // ever changes the (already-capped) outcome.
+    let scale = 1u64 << attempt.min(20);
+    let min = LEASE_DURATION_MS
+        .saturating_mul(scale)
+        .min(MAX_ELECTION_BACKOFF_MS);
+    let max = LEASE_DURATION_MS
+        .saturating_mul(2)
+        .saturating_mul(scale)
+        .min(MAX_ELECTION_BACKOFF_MS);
+    let jitter_range = max.saturating_sub(min);
+    let jitter = if jitter_range == 0 {
+        0
+    } else {
+        random_jitter_millis(jitter_range)
+    };
+    Duration::from_millis(min + jitter)
+}
+
+/// Both `Follower` (waiting for a leader) and `PreCandidate`/`Candidate`
+/// (waiting for votes) need this: if nothing interesting happens in time,
+/// push `ElectionTimeout` so the event loop can start/restart an election.
+///
+/// Randomized per the Raft paper: two nodes with the exact same fixed
+/// timeout tend to become candidates at the same instant, and then
+/// perpetually split-vote against each other every single attempt
 /// (neither's `RequestVote` looks newer than the other's own, so both
 /// just deny each other and restart in lockstep) -- jitter is what breaks
-/// the tie within a few rounds.
-fn spawn_election_timer(event_tx: mpsc::Sender<Event>) -> JoinHandle<()> {
+/// the tie within a few rounds. `attempt` widens that jitter window for
+/// repeated failures; a fresh `Follower` always passes 0.
+fn spawn_election_timer(attempt: u32, event_tx: mpsc::Sender<Event>) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let timeout = Duration::from_millis(150 + random_jitter_millis(150));
+        let timeout = election_timeout_for_attempt(attempt);
         tokio::time::sleep(timeout).await;
         let _ = event_tx.send(Event::ElectionTimeout).await;
     })
@@ -187,11 +304,74 @@ async fn last_log_index_and_term(log: &Arc<RaftLog>) -> (u64, u64) {
         .unwrap_or((0, 0))
 }
 
+/// Evaluates a pre-vote (`RequestVoteRequest.dry_run == true`) without
+/// touching any state -- no term bump, no `voted_for`, no election timer
+/// reset. Reports whether a *real* `RequestVote` at `req.term` would be
+/// granted.
+///
+/// Deliberately doesn't check `voted_for`: it's always scoped to exactly
+/// `current_term` (`Common::advance_term` resets it in the same step it
+/// bumps the term, and `vote_for` is only ever called once `current_term`
+/// already equals the term being voted for), so a real vote can only ever
+/// exist at a term `<= common.current_term`. A dry run that passes the
+/// `req.term > common.current_term` check below is by construction asking
+/// about a term strictly beyond any term a real vote could have been cast
+/// at, so there's no possible conflict to check for. (Two concurrent
+/// candidates can still both pass pre-vote against the same peer this way
+/// -- that's fine, since it's non-binding; the real vote phase's
+/// `voted_for` check is what actually enforces "at most one winner per
+/// term".)
+async fn evaluate_dry_run_vote(common: &Common, req: &RequestVoteRequest) -> bool {
+    if req.term <= common.current_term {
+        return false;
+    }
+    let (our_index, our_term) = last_log_index_and_term(&common.log).await;
+    (req.last_log_term, req.last_log_index) >= (our_term, our_index)
+}
+
+/// Evaluates *and applies* a real `RequestVote` (§5.4.1: term at least as
+/// current, not already voted for someone else this term, candidate's log
+/// at least as up to date as ours), advancing `common`'s term first if
+/// `req.term` is higher and persisting the vote if granted. Returns
+/// whether it granted.
+///
+/// Shared by every role: `Follower` and `PreCandidate` need the full
+/// check since either can have an existing `voted_for` from earlier this
+/// term (a `PreCandidate` never sets one, so it just inherits whatever
+/// `Follower` had); `Candidate` and `Leader` always have `voted_for ==
+/// Some(self)` at their own `current_term`, so for them this simplifies
+/// to exactly their old behavior at `req.term == current_term` (deny) --
+/// but unlike their old behavior, it also correctly withholds the vote at
+/// `req.term > current_term` if the candidate's log isn't actually as up
+/// to date, which the term check alone doesn't guarantee.
+async fn evaluate_real_vote(common: &mut Common, req: &RequestVoteRequest) -> bool {
+    if req.term > common.current_term {
+        common.advance_term(req.term).await;
+    }
+    let grant = if req.term >= common.current_term
+        && common
+            .voted_for
+            .as_deref()
+            .is_none_or(|v| v == req.candidate_id)
+    {
+        let (our_index, our_term) = last_log_index_and_term(&common.log).await;
+        (req.last_log_term, req.last_log_index) >= (our_term, our_index)
+    } else {
+        false
+    };
+    if grant {
+        common.vote_for(&req.candidate_id).await;
+    }
+    grant
+}
+
 #[derive(Debug)]
 pub enum RaftError {
     /// Not (or no longer) the leader. `leader_hint` lets a client retry in
     /// the right place, same as `RaftError`/`NotLeader` in client.proto.
-    NotLeader { leader_hint: Option<String> },
+    NotLeader {
+        leader_hint: Option<String>,
+    },
     Storage(StorageError),
     /// The event loop is gone (node shutting down) before it could reply.
     Disconnected,
@@ -222,6 +402,11 @@ pub struct LeaderHandle {
     /// caller doesn't hang forever on an entry that will never commit
     /// (e.g. because it gets truncated by a new leader instead).
     role_rx: watch::Receiver<RoleHandle>,
+    /// Whether this leader currently holds a quorum of leases -- see the
+    /// module doc. Not consumed by anything yet (no read path exists that
+    /// would check it), but published either way so one can be added
+    /// later without touching this plumbing.
+    read_quorum_rx: watch::Receiver<bool>,
 }
 
 impl LeaderHandle {
@@ -265,6 +450,14 @@ impl LeaderHandle {
         };
         RaftError::NotLeader { leader_hint }
     }
+
+    /// Whether it's currently safe for this leader to serve a
+    /// linearizable read directly from local state, without going
+    /// through the log -- i.e. whether it holds a quorum of leases. See
+    /// the module doc.
+    pub fn has_read_quorum(&self) -> bool {
+        *self.read_quorum_rx.borrow()
+    }
 }
 
 #[derive(Clone)]
@@ -280,6 +473,13 @@ pub struct FollowerHandle {
 #[derive(Clone)]
 pub struct RaftPeerHandle {
     event_tx: mpsc::Sender<Event>,
+    /// Read directly (never through the event loop) by `get_lease` below,
+    /// so answering a lease probe can never get stuck behind whatever the
+    /// event loop is currently doing -- e.g. a slow `AppendEntries`
+    /// mid-disk-write. See the module doc.
+    role_rx: watch::Receiver<RoleHandle>,
+    term_rx: watch::Receiver<u64>,
+    lease_expires_at_tx: Arc<watch::Sender<Option<Instant>>>,
 }
 
 impl RaftPeerHandle {
@@ -305,6 +505,32 @@ impl RaftPeerHandle {
             .await
             .map_err(|_| RaftError::Disconnected)?;
         rx.await.map_err(|_| RaftError::Disconnected)
+    }
+
+    /// Answers a lease probe directly against shared, watch-based state --
+    /// deliberately *not* through `Event`/the sequential event loop, since
+    /// that's exactly what would let a slow, unrelated `AppendEntries`
+    /// stall a probe that's supposed to be fast. Infallible (nothing here
+    /// can actually fail the way a channel send could) and needs no
+    /// `.await`, which is itself part of the point: the type signature
+    /// makes "this can never block on the event loop" visible.
+    pub fn get_lease(&self, req: GetLeaseRequest) -> GetLeaseResponse {
+        if !matches!(&*self.role_rx.borrow(), RoleHandle::Follower(_)) {
+            // Only a follower "recognizes" a leader via lease -- anyone
+            // else (including another leader) has nothing to grant.
+            return GetLeaseResponse {
+                lease_granted: false,
+            };
+        }
+        let granted = req.term == *self.term_rx.borrow();
+        if granted {
+            let _ = self
+                .lease_expires_at_tx
+                .send(Some(Instant::now() + LEASE_DURATION));
+        }
+        GetLeaseResponse {
+            lease_granted: granted,
+        }
     }
 }
 
@@ -353,6 +579,30 @@ pub struct Common {
     /// able to touch these without going through storage first.
     current_term: u64,
     voted_for: Option<String>,
+    /// Mirrors `current_term`, published on every `advance_term` call, so
+    /// `RaftPeerHandle::get_lease`'s fast path can read it without going
+    /// through the event loop.
+    term_tx: watch::Sender<u64>,
+
+    /// Consecutive failed election cycles (pre-vote or real) since this
+    /// node last had reason to believe a leader existed -- see the module
+    /// doc. Not persisted: it's just a backoff hint, not safety-critical
+    /// state, so losing it across a restart is harmless.
+    election_attempt: u32,
+
+    /// When this node stops refusing vote requests from anyone but the
+    /// leader it currently recognizes -- see the module doc on leader
+    /// leasing. `None` means no lease has ever been established (distinct
+    /// from "expired": see `follower::spawn_lease_expiration_watcher` and
+    /// `follower::Follower::has_active_lease`, which each need to treat a
+    /// never-established lease differently -- an already-passed `Instant`
+    /// can't represent both "never granted" and "granted, then lapsed").
+    /// `Arc`-wrapped because `RaftPeerHandle::get_lease` writes to it
+    /// directly (bypassing the event loop entirely, on purpose -- see
+    /// that method), not just whichever role's event loop is currently
+    /// running.
+    lease_expires_at_tx: Arc<watch::Sender<Option<Instant>>>,
+    lease_expires_at_rx: watch::Receiver<Option<Instant>>,
 
     /// Highest seq known committed. Outlives any single role (a follower
     /// applies a leader's `leader_commit` here too), so it lives in
@@ -396,11 +646,24 @@ impl Common {
 
         let (commit_tx, commit_rx) = watch::channel(0);
         let (compact_tx, compact_rx) = watch::channel(0);
+        let (term_tx, term_rx) = watch::channel(current_term);
+        // `None` -- no lease established yet. `has_active_lease` treats
+        // this as "not blocked" (a brand new node that's never contacted
+        // anyone shouldn't refuse votes), while
+        // `spawn_lease_expiration_watcher` treats it as "give this node
+        // the same full grace period a fresh grant would get" -- neither
+        // of those is what an already-elapsed `Instant` would mean, which
+        // is why this is `Option<Instant>` rather than just `Instant`.
+        let (lease_expires_at_tx, lease_expires_at_rx) = watch::channel(None);
+        let lease_expires_at_tx = Arc::new(lease_expires_at_tx);
         let (event_tx, event_rx) = mpsc::channel(256);
         let (role_tx, role_rx) = watch::channel(RoleHandle::Starting);
 
         let peer_handle = RaftPeerHandle {
             event_tx: event_tx.clone(),
+            role_rx: role_tx.subscribe(),
+            term_rx,
+            lease_expires_at_tx: Arc::clone(&lease_expires_at_tx),
         };
 
         let common = Self {
@@ -410,6 +673,10 @@ impl Common {
             peer_conns: Arc::new(PeerConnections::default()),
             current_term,
             voted_for,
+            term_tx,
+            election_attempt: 0,
+            lease_expires_at_tx,
+            lease_expires_at_rx,
             commit_tx,
             compact_tx,
             event_rx,
@@ -456,6 +723,7 @@ impl Common {
         if term > self.current_term {
             self.current_term = term;
             self.voted_for = None;
+            let _ = self.term_tx.send(term);
             self.persist_term_state().await;
         }
     }
@@ -491,6 +759,7 @@ pub async fn run(mut common: Common) -> ! {
     loop {
         let (next_role, next_common) = match role {
             Role::Follower => Follower::new(common).await,
+            Role::PreCandidate => PreCandidate::new(common).await,
             Role::Candidate => Candidate::new(common).await,
             Role::Leader => Leader::new(common).await,
         };
@@ -534,7 +803,11 @@ pub(crate) mod test_support {
     /// external handles plus the temp dir to clean up afterward.
     pub(crate) fn spawn_test_node(
         peers: Vec<PeerInfo>,
-    ) -> (watch::Receiver<RoleHandle>, RaftPeerHandle, std::path::PathBuf) {
+    ) -> (
+        watch::Receiver<RoleHandle>,
+        RaftPeerHandle,
+        std::path::PathBuf,
+    ) {
         let (log, path) = open_temp_log();
         let (common, role_rx, peer_handle, _commit_rx, _compact_rx) =
             Common::new("test-node".to_string(), peers, log).unwrap();
@@ -601,6 +874,7 @@ pub(crate) mod test_support {
             candidate_id: candidate_id.to_string(),
             last_log_index: 0,
             last_log_term: 0,
+            dry_run: false,
         }
     }
 
@@ -809,13 +1083,22 @@ mod tests {
         let (seq, follower_log) = loop {
             let a_is_leader = matches!(&*role_rx_a.borrow(), RoleHandle::Leader(_));
             let (leader, follower_log) = if a_is_leader {
-                (expect_leader_handle(&role_rx_a.borrow()), Arc::clone(&log_b))
+                (
+                    expect_leader_handle(&role_rx_a.borrow()),
+                    Arc::clone(&log_b),
+                )
             } else {
-                (expect_leader_handle(&role_rx_b.borrow()), Arc::clone(&log_a))
+                (
+                    expect_leader_handle(&role_rx_b.borrow()),
+                    Arc::clone(&log_a),
+                )
             };
-            match tokio::time::timeout(Duration::from_millis(2000), leader.append_log(b"k", Some(b"v")))
-                .await
-                .expect("append_log should commit once the peer replicates it")
+            match tokio::time::timeout(
+                Duration::from_millis(2000),
+                leader.append_log(b"k", Some(b"v")),
+            )
+            .await
+            .expect("append_log should commit once the peer replicates it")
             {
                 Ok(seq) => break (seq, follower_log),
                 Err(RaftError::NotLeader { .. }) => {

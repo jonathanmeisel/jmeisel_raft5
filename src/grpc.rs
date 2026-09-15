@@ -16,13 +16,14 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::pb::raft5::client::kv_server::Kv;
 use crate::pb::raft5::client::{
-    write_response, read_response, AddServerRequest, ConfigChangeResponse, ReadOk, ReadRequest,
-    ReadResponse, RemoveServerRequest, WriteRequest, WriteResponse,
+    AddServerRequest, ConfigChangeResponse, ReadOk, ReadRequest, ReadResponse, RemoveServerRequest,
+    WriteRequest, WriteResponse, read_response, write_response,
 };
 use crate::pb::raft5::raft::raft_peer_server::RaftPeer;
 use crate::pb::raft5::raft::{
-    snapshot_chunk, AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotResponse,
-    RequestVoteRequest, RequestVoteResponse, SnapshotChunk,
+    AppendEntriesRequest, AppendEntriesResponse, GetLeaseRequest, GetLeaseResponse,
+    InstallSnapshotResponse, RequestVoteRequest, RequestVoteResponse, SnapshotChunk,
+    snapshot_chunk,
 };
 use crate::raft::{RaftError, RaftPeerHandle};
 use crate::storage::{RaftLog, StorageError};
@@ -58,7 +59,10 @@ impl KvService {
 
 #[tonic::async_trait]
 impl Kv for KvService {
-    async fn write(&self, request: Request<WriteRequest>) -> Result<Response<WriteResponse>, Status> {
+    async fn write(
+        &self,
+        request: Request<WriteRequest>,
+    ) -> Result<Response<WriteResponse>, Status> {
         let req = request.into_inner();
         let log = Arc::clone(&self.log);
 
@@ -91,7 +95,10 @@ impl Kv for KvService {
         // as the "never written" sentinel here.
         let ok = match found {
             Some((seq, value)) => ReadOk { seq, value },
-            None => ReadOk { seq: 0, value: None },
+            None => ReadOk {
+                seq: 0,
+                value: None,
+            },
         };
 
         Ok(Response::new(ReadResponse {
@@ -153,6 +160,18 @@ impl RaftPeer for RaftPeerService {
             .await
             .map_err(raft_err)?;
         Ok(Response::new(resp))
+    }
+
+    async fn get_lease(
+        &self,
+        request: Request<GetLeaseRequest>,
+    ) -> Result<Response<GetLeaseResponse>, Status> {
+        // Deliberately synchronous and infallible -- see
+        // `RaftPeerHandle::get_lease`'s doc for why this must never be
+        // able to get stuck behind, e.g., a slow in-progress AppendEntries.
+        Ok(Response::new(
+            self.peer_handle.get_lease(request.into_inner()),
+        ))
     }
 
     async fn install_snapshot(
@@ -338,7 +357,7 @@ mod tests {
     #[tokio::test]
     async fn append_entries_and_request_vote_reach_the_running_state_machine() {
         let (log, path) = open_temp();
-        let (common, _role_rx, peer_handle, _commit_rx, _compact_rx) =
+        let (common, role_rx, peer_handle, _commit_rx, _compact_rx) =
             raft::Common::new("node-under-test".to_string(), vec![], Arc::clone(&log)).unwrap();
         tokio::spawn(raft::run(common));
 
@@ -360,19 +379,42 @@ mod tests {
         assert_eq!(append_resp.term, 7);
         assert!(append_resp.success);
 
-        // Same term, first vote request seen at it -- should be granted.
-        let vote_resp = svc
-            .request_vote(Request::new(RequestVoteRequest {
-                term: 7,
-                candidate_id: "candidate-1".to_string(),
-                last_log_index: 0,
-                last_log_term: 0,
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(vote_resp.vote_granted);
-        assert_eq!(vote_resp.term, 7);
+        // The AppendEntries above just renewed this follower's lease on
+        // leader-1, so it'll refuse any vote request until that lease
+        // naturally expires -- and since this node's own candidacy timer
+        // shares that exact deadline, it may fire first instead (see
+        // raft::follower's `wait_for_vote_grant_or_role_change` for the
+        // full reasoning). Retry until either happens.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let vote_resp = loop {
+            if !matches!(&*role_rx.borrow(), raft::RoleHandle::Follower(_)) {
+                break None; // moved on to campaigning -- also proves the point
+            }
+            let resp = svc
+                .request_vote(Request::new(RequestVoteRequest {
+                    term: 7,
+                    candidate_id: "candidate-1".to_string(),
+                    last_log_index: 0,
+                    last_log_term: 0,
+                    dry_run: false,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            if resp.vote_granted {
+                break Some(resp);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "neither granted the vote nor moved on to campaigning within the deadline"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+
+        if let Some(vote_resp) = vote_resp {
+            assert!(vote_resp.vote_granted);
+            assert_eq!(vote_resp.term, 7);
+        }
 
         cleanup(&path);
     }

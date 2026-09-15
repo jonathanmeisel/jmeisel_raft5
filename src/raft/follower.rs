@@ -105,6 +105,80 @@ fn apply_append_entries_sync(
     })
 }
 
+/// Watches `lease_expires_at_rx` and fires `Event::ElectionTimeout` once
+/// the lease it tracks has genuinely expired -- no fresh deadline pushed
+/// (by `Follower::renew_lease`, from *either* the event loop or
+/// `RaftPeerHandle::get_lease`'s fully independent fast path -- see the
+/// module doc on why that one specifically must never be blockable) for a
+/// full `LEASE_DURATION` -- *and* an additional random `fuzz(0,
+/// LEASE_DURATION)` on top of that.
+///
+/// Two sequential phases rather than one combined random draw,
+/// deliberately: the first (`LEASE_DURATION`, no jitter) is a clean,
+/// deterministic detection that contact was actually lost, not muddied by
+/// randomness; only the second phase is randomized, to stagger multiple
+/// followers' actual campaign start times and avoid a synchronized
+/// thundering herd.
+///
+/// `None` (no lease ever established, e.g. right at node startup) gets
+/// the same full grace period as a fresh grant would, timed from when
+/// this watcher itself started (i.e. this `Follower` period began) rather
+/// than recomputed on every loop iteration -- recomputing against
+/// `Instant::now()` each time would make the deadline a perpetually
+/// moving target that never actually arrives.
+///
+/// Reactive rather than an abort-and-respawn timer, on purpose: a
+/// `watch::Receiver` wakes up on `changed()` regardless of *which* writer
+/// pushed the update, so this correctly restarts from scratch on a fresh
+/// deadline from either source without either one needing to reach into
+/// the other's task.
+fn spawn_lease_expiration_watcher(
+    mut lease_rx: watch::Receiver<Option<Instant>>,
+    event_tx: mpsc::Sender<Event>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let started_at = Instant::now();
+        loop {
+            let deadline = (*lease_rx.borrow()).unwrap_or(started_at + LEASE_DURATION);
+            let now = Instant::now();
+            if now < deadline {
+                tokio::select! {
+                    _ = tokio::time::sleep(deadline - now) => {}
+                    changed = lease_rx.changed() => {
+                        if changed.is_err() {
+                            return; // node shutting down (Common dropped)
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let fuzz = Duration::from_millis(random_jitter_millis(LEASE_DURATION_MS));
+            tokio::select! {
+                _ = tokio::time::sleep(fuzz) => {}
+                changed = lease_rx.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    continue; // renewed mid-fuzz -- restart from the top
+                }
+            }
+            // The deadline could have moved again right as the fuzz
+            // elapsed (a race between the two `select!` arms) -- double
+            // check before actually declaring the lease dead.
+            let still_expired = match *lease_rx.borrow() {
+                Some(deadline) => Instant::now() >= deadline,
+                None => true,
+            };
+            if !still_expired {
+                continue;
+            }
+            let _ = event_tx.send(Event::ElectionTimeout).await;
+            return;
+        }
+    })
+}
+
 pub struct Follower {
     common: Common,
     election_timer: JoinHandle<()>,
@@ -114,10 +188,18 @@ pub struct Follower {
 impl Follower {
     // See the comment on `Leader::new` re: this not returning `Self`.
     #[allow(clippy::new_ret_no_self)]
-    pub async fn new(common: Common) -> (Role, Common) {
+    pub async fn new(mut common: Common) -> (Role, Common) {
+        // A fresh `Follower` period means this node has (or just got) a
+        // reason to believe a leader exists -- any backoff accumulated
+        // from a past run of failed election attempts no longer applies,
+        // so the next one starts fresh at the base timeout again.
+        common.election_attempt = 0;
         common.publish_role(RoleHandle::Follower(FollowerHandle { leader_hint: None }));
 
-        let election_timer = spawn_election_timer(common.event_tx.clone());
+        let election_timer = spawn_lease_expiration_watcher(
+            common.lease_expires_at_rx.clone(),
+            common.event_tx.clone(),
+        );
 
         let mut follower = Follower {
             common,
@@ -128,11 +210,32 @@ impl Follower {
         (next_role, follower.shutdown())
     }
 
-    /// Called whenever a valid AppendEntries/RequestVote is processed, so
-    /// a live leader/candidate keeps this follower from timing out.
-    fn reset_election_timer(&mut self) {
-        self.election_timer.abort();
-        self.election_timer = spawn_election_timer(self.common.event_tx.clone());
+    /// Called on any sign that campaigning right now would be premature:
+    /// a live leader's `AppendEntries`, a live leader's lease probe, or
+    /// granting our own vote to someone else (give them a chance to win
+    /// before also jumping in ourselves) -- these three cases are folded
+    /// into one shared deadline, so granting a vote also means refusing
+    /// *other* vote requests for one `LEASE_DURATION`, same as genuine
+    /// leader contact would. Just publishes a fresh deadline; the
+    /// reactive watcher task picks it up on its own.
+    fn renew_lease(&mut self) {
+        let _ = self
+            .common
+            .lease_expires_at_tx
+            .send(Some(Instant::now() + LEASE_DURATION));
+    }
+
+    /// Whether we should refuse *any* vote request (real or pre-vote) for
+    /// someone other than our current leader, regardless of term or log
+    /// -- see the module doc on why a leader a majority can still reach
+    /// should never be disrupted by a competing election. `None` (no
+    /// lease ever established) is *not* active -- a node that's never
+    /// actually confirmed a leader has no one to protect.
+    fn has_active_lease(&self) -> bool {
+        match *self.common.lease_expires_at_rx.borrow() {
+            Some(deadline) => Instant::now() < deadline,
+            None => false,
+        }
     }
 
     /// Runs `apply_append_entries_sync` on the blocking pool, then advances
@@ -195,7 +298,7 @@ impl Follower {
                     .publish_role(RoleHandle::Follower(FollowerHandle {
                         leader_hint: self.leader_hint.clone(),
                     }));
-                self.reset_election_timer();
+                self.renew_lease();
 
                 let outcome = self.apply_append_entries(&req).await;
                 let _ = respond_to.send(AppendEntriesResponse {
@@ -208,38 +311,29 @@ impl Follower {
                 Transition::Continue
             }
             Event::RequestVote { req, respond_to } => {
-                // A strictly higher term means `voted_for` is left over
-                // from an earlier term and no longer applies -- `advance_term`
-                // resets it before the check below, or a candidate in a
-                // brand new term could be denied because of who we voted
-                // for last time. No-op (and no need to call it) if the
-                // term hasn't actually advanced.
-                if req.term > self.common.current_term {
-                    self.common.advance_term(req.term).await;
+                if self.has_active_lease() {
+                    // Refuse to disrupt a leader we've recently confirmed
+                    // is alive, regardless of term, log, or whether this
+                    // is a real vote or just a pre-vote -- this is what
+                    // stops a competing election from ever succeeding
+                    // against a leader a majority can still reach.
+                    let _ = respond_to.send(RequestVoteResponse {
+                        term: self.common.current_term,
+                        vote_granted: false,
+                    });
+                    return Transition::Continue;
                 }
-                // Only bother reading our own log (the one check here that
-                // touches storage) if the vote would actually be grantable
-                // otherwise -- no point paying for it on a request that's
-                // going to be denied on term/prior-vote grounds anyway.
-                let grant = if req.term >= self.common.current_term
-                    && self
-                        .common
-                        .voted_for
-                        .as_deref()
-                        .is_none_or(|v| v == req.candidate_id)
-                {
-                    // §5.4.1: only vote for a candidate whose log is at
-                    // least as up to date as ours -- later term wins; if
-                    // equal, the longer (higher-index) log wins. Tuple
-                    // ordering expresses exactly this comparison.
-                    let (our_index, our_term) = last_log_index_and_term(&self.common.log).await;
-                    (req.last_log_term, req.last_log_index) >= (our_term, our_index)
-                } else {
-                    false
-                };
+                if req.dry_run {
+                    let grant = evaluate_dry_run_vote(&self.common, &req).await;
+                    let _ = respond_to.send(RequestVoteResponse {
+                        term: self.common.current_term,
+                        vote_granted: grant,
+                    });
+                    return Transition::Continue;
+                }
+                let grant = evaluate_real_vote(&mut self.common, &req).await;
                 if grant {
-                    self.common.vote_for(&req.candidate_id).await;
-                    self.reset_election_timer();
+                    self.renew_lease();
                 }
                 let _ = respond_to.send(RequestVoteResponse {
                     term: self.common.current_term,
@@ -247,9 +341,10 @@ impl Follower {
                 });
                 Transition::Continue
             }
-            Event::ElectionTimeout => Transition::Become(Role::Candidate),
+            Event::ElectionTimeout => Transition::Become(Role::PreCandidate),
             Event::AppendEntriesResponse { .. }
             | Event::RequestVoteResponse { .. }
+            | Event::GetLeaseResponse { .. }
             | Event::LeaderTick => {
                 Transition::Continue // stray messages from a role we no longer hold
             }
@@ -266,6 +361,37 @@ impl Follower {
 mod tests {
     use super::*;
     use crate::raft::test_support::*;
+
+    /// Retries `req` until it's granted or this node has moved on to
+    /// campaigning itself, whichever comes first -- both outcomes prove
+    /// a lease-based denial isn't permanent. The two are deliberately
+    /// racy against each other here: the same deadline that ends the
+    /// lease also starts this node's own candidacy timer (see the module
+    /// doc on why the two were merged), so on an isolated node (no real
+    /// peer refreshing anything) there's no way to guarantee which one
+    /// wins on any given run. Returns the granted response, or `None` if
+    /// it moved on to campaigning instead.
+    async fn wait_for_vote_grant_or_role_change(
+        peer_handle: &RaftPeerHandle,
+        role_rx: &mut watch::Receiver<RoleHandle>,
+        req: &RequestVoteRequest,
+    ) -> Option<RequestVoteResponse> {
+        let deadline = std::time::Instant::now() + LEASE_DURATION * 10;
+        loop {
+            if !matches!(&*role_rx.borrow(), RoleHandle::Follower(_)) {
+                return None;
+            }
+            let resp = peer_handle.request_vote(req.clone()).await.unwrap();
+            if resp.vote_granted {
+                return Some(resp);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "neither granted the vote nor moved on to campaigning within the deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 
     #[tokio::test]
     async fn append_entries_with_higher_term_is_accepted_and_advances_term() {
@@ -446,20 +572,31 @@ mod tests {
 
     #[tokio::test]
     async fn request_vote_with_a_higher_term_is_granted_even_after_voting_this_term() {
-        let (_role_rx, peer_handle, path) = spawn_test_node(vec![]);
+        let (mut role_rx, peer_handle, path) = spawn_test_node(vec![]);
 
         peer_handle
             .request_vote(request_vote(3, "candidate-a"))
             .await
             .unwrap();
 
-        let resp = peer_handle
-            .request_vote(request_vote(4, "candidate-b"))
-            .await
-            .unwrap();
+        // Granting that vote just renewed this follower's lease (voting
+        // for a prospective leader defers our own campaign, and the two
+        // deadlines are deliberately merged into one -- see the module
+        // doc), so a second, different candidate can't get a vote until
+        // that lease naturally lapses, regardless of term. Once it does,
+        // this node's own candidacy timer -- the very same deadline --
+        // may also fire first; see `wait_for_vote_grant_or_role_change`.
+        let resp = wait_for_vote_grant_or_role_change(
+            &peer_handle,
+            &mut role_rx,
+            &request_vote(4, "candidate-b"),
+        )
+        .await;
 
-        assert!(resp.vote_granted);
-        assert_eq!(resp.term, 4);
+        if let Some(resp) = resp {
+            assert!(resp.vote_granted);
+            assert_eq!(resp.term, 4);
+        }
         cleanup(&path);
     }
 
@@ -484,6 +621,7 @@ mod tests {
                 candidate_id: "candidate-a".to_string(),
                 last_log_index: 5,
                 last_log_term: 1,
+                dry_run: false,
             })
             .await
             .unwrap();
@@ -494,7 +632,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_vote_grants_a_candidate_whose_log_is_at_least_as_up_to_date() {
-        let (_log, _role_rx, peer_handle, _commit_rx, _compact_rx, path) =
+        let (_log, mut role_rx, peer_handle, _commit_rx, _compact_rx, path) =
             spawn_node_with_handles(vec![]);
 
         let entries = vec![log_entry(1, 2, b"a", Some(b"1"))];
@@ -503,19 +641,26 @@ mod tests {
             .await
             .unwrap();
 
+        // The AppendEntries above just renewed this follower's lease on
+        // leader-1, so it'll refuse any vote request until that lease
+        // naturally expires -- wait it out (or for this node's own
+        // candidacy timer, the same deadline, to fire first; see
+        // `wait_for_vote_grant_or_role_change`) before expecting a grant.
+        //
         // Same term as our last entry (2) and the same index (1) --
         // "at least as up to date" per §5.4.1, so this should be granted.
-        let resp = peer_handle
-            .request_vote(RequestVoteRequest {
-                term: 3,
-                candidate_id: "candidate-a".to_string(),
-                last_log_index: 1,
-                last_log_term: 2,
-            })
-            .await
-            .unwrap();
+        let req = RequestVoteRequest {
+            term: 3,
+            candidate_id: "candidate-a".to_string(),
+            last_log_index: 1,
+            last_log_term: 2,
+            dry_run: false,
+        };
+        let resp = wait_for_vote_grant_or_role_change(&peer_handle, &mut role_rx, &req).await;
 
-        assert!(resp.vote_granted);
+        if let Some(resp) = resp {
+            assert!(resp.vote_granted);
+        }
         cleanup(&path);
     }
 
@@ -538,6 +683,240 @@ mod tests {
             log.term_state().unwrap(),
             (9, Some("candidate-a".to_string()))
         );
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn dry_run_vote_grants_without_mutating_any_state() {
+        let (log, _role_rx, peer_handle, _commit_rx, _compact_rx, path) =
+            spawn_node_with_handles(vec![]);
+
+        let resp = peer_handle
+            .request_vote(RequestVoteRequest {
+                term: 5,
+                candidate_id: "candidate-a".to_string(),
+                last_log_index: 0,
+                last_log_term: 0,
+                dry_run: true,
+            })
+            .await
+            .unwrap();
+
+        assert!(resp.vote_granted);
+        // A dry run must not actually record anything -- current_term and
+        // voted_for stay exactly as they were before this call.
+        assert_eq!(log.term_state().unwrap(), (0, None));
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn dry_run_vote_denies_when_term_is_not_higher() {
+        let (_log, _role_rx, peer_handle, _commit_rx, _compact_rx, path) =
+            spawn_node_with_handles(vec![]);
+
+        peer_handle
+            .append_entries(blank_append_entries(5, "leader-1"))
+            .await
+            .unwrap();
+
+        // A dry run at the SAME term (not strictly higher) must be denied
+        // -- granting would mean "yes, you could win term 5", but this
+        // follower already recognizes term 5 as current (and possibly
+        // already voted in it for real).
+        let resp = peer_handle
+            .request_vote(RequestVoteRequest {
+                term: 5,
+                candidate_id: "candidate-a".to_string(),
+                last_log_index: 0,
+                last_log_term: 0,
+                dry_run: true,
+            })
+            .await
+            .unwrap();
+
+        assert!(!resp.vote_granted);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn dry_run_vote_denies_when_candidates_log_is_behind() {
+        let (_log, _role_rx, peer_handle, _commit_rx, _compact_rx, path) =
+            spawn_node_with_handles(vec![]);
+
+        let entries = vec![log_entry(1, 2, b"a", Some(b"1"))];
+        peer_handle
+            .append_entries(append_entries(2, "leader-1", 0, 0, entries, 0))
+            .await
+            .unwrap();
+
+        // Term is high enough (3 > 2), but the candidate's log ends at an
+        // older term (1) than ours (2).
+        let resp = peer_handle
+            .request_vote(RequestVoteRequest {
+                term: 3,
+                candidate_id: "candidate-a".to_string(),
+                last_log_index: 5,
+                last_log_term: 1,
+                dry_run: true,
+            })
+            .await
+            .unwrap();
+
+        assert!(!resp.vote_granted);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn a_granted_dry_run_does_not_block_a_later_real_vote_for_someone_else() {
+        let (_log, _role_rx, peer_handle, _commit_rx, _compact_rx, path) =
+            spawn_node_with_handles(vec![]);
+
+        // Since a dry run never records anything, a later REAL request at
+        // the same term from a *different* candidate must still be
+        // evaluated fresh, not implicitly denied because of who the dry
+        // run was "for".
+        let dry = peer_handle
+            .request_vote(RequestVoteRequest {
+                term: 5,
+                candidate_id: "candidate-a".to_string(),
+                last_log_index: 0,
+                last_log_term: 0,
+                dry_run: true,
+            })
+            .await
+            .unwrap();
+        assert!(dry.vote_granted);
+
+        let real = peer_handle
+            .request_vote(RequestVoteRequest {
+                term: 5,
+                candidate_id: "candidate-b".to_string(),
+                last_log_index: 0,
+                last_log_term: 0,
+                dry_run: false,
+            })
+            .await
+            .unwrap();
+        assert!(real.vote_granted);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn get_lease_grants_when_term_matches_and_denies_otherwise() {
+        let (mut role_rx, peer_handle, path) = spawn_test_node(vec![]);
+        // `get_lease` bypasses the event loop entirely (that's the whole
+        // point), so unlike append_entries/request_vote it doesn't
+        // naturally wait for the driver to actually start -- confirm the
+        // follower role is really published first.
+        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Follower(_))).await;
+
+        // Follower starts at term 0 -- a lease request for term 0 matches.
+        let resp = peer_handle.get_lease(GetLeaseRequest {
+            leader_id: "leader-1".to_string(),
+            term: 0,
+        });
+        assert!(resp.lease_granted);
+
+        // A term that doesn't match the follower's current term is denied.
+        let resp = peer_handle.get_lease(GetLeaseRequest {
+            leader_id: "leader-1".to_string(),
+            term: 5,
+        });
+        assert!(!resp.lease_granted);
+
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn a_granted_lease_blocks_a_vote_request_for_someone_else() {
+        let (mut role_rx, peer_handle, path) = spawn_test_node(vec![]);
+        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Follower(_))).await;
+
+        let resp = peer_handle.get_lease(GetLeaseRequest {
+            leader_id: "leader-1".to_string(),
+            term: 0,
+        });
+        assert!(resp.lease_granted);
+
+        // A vote request arriving while the lease is still active must be
+        // refused outright -- even a real request with a higher term and
+        // a perfectly fine log.
+        let resp = peer_handle
+            .request_vote(RequestVoteRequest {
+                term: 99,
+                candidate_id: "candidate-a".to_string(),
+                last_log_index: 0,
+                last_log_term: 0,
+                dry_run: false,
+            })
+            .await
+            .unwrap();
+        assert!(!resp.vote_granted);
+
+        // Same for a pre-vote.
+        let resp = peer_handle
+            .request_vote(RequestVoteRequest {
+                term: 99,
+                candidate_id: "candidate-a".to_string(),
+                last_log_index: 0,
+                last_log_term: 0,
+                dry_run: true,
+            })
+            .await
+            .unwrap();
+        assert!(!resp.vote_granted);
+
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn a_vote_request_is_granted_normally_once_the_lease_expires() {
+        let (mut role_rx, peer_handle, path) = spawn_test_node(vec![]);
+        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Follower(_))).await;
+
+        peer_handle.get_lease(GetLeaseRequest {
+            leader_id: "leader-1".to_string(),
+            term: 0,
+        });
+
+        // Wait for the lease to naturally expire -- or, since it's the
+        // same deadline, for this node's own candidacy timer to fire
+        // first; see `wait_for_vote_grant_or_role_change`.
+        let req = RequestVoteRequest {
+            term: 1,
+            candidate_id: "candidate-a".to_string(),
+            last_log_index: 0,
+            last_log_term: 0,
+            dry_run: false,
+        };
+        let resp = wait_for_vote_grant_or_role_change(&peer_handle, &mut role_rx, &req).await;
+
+        if let Some(resp) = resp {
+            assert!(resp.vote_granted);
+        }
+        cleanup(&path);
+    }
+
+    /// A follower must not transition to candidate before its lease
+    /// expires -- repeated `GetLease` grants (standing in for the
+    /// leader's periodic probes) should keep deferring the election
+    /// timer indefinitely, well past when it would otherwise have fired.
+    #[tokio::test]
+    async fn periodic_lease_grants_prevent_becoming_a_candidate() {
+        let (mut role_rx, peer_handle, path) = spawn_test_node(vec![]);
+        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Follower(_))).await;
+
+        let deadline = std::time::Instant::now() + LEASE_DURATION * 3;
+        while std::time::Instant::now() < deadline {
+            let resp = peer_handle.get_lease(GetLeaseRequest {
+                leader_id: "leader-1".to_string(),
+                term: 0,
+            });
+            assert!(resp.lease_granted);
+            tokio::time::sleep(HEARTBEAT).await;
+        }
+
+        assert!(matches!(&*role_rx.borrow(), RoleHandle::Follower(_)));
         cleanup(&path);
     }
 }

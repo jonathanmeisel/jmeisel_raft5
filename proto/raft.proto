@@ -19,6 +19,18 @@ service RaftPeer {
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
   rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
 
+  // Leader leasing: deliberately a separate, lightweight RPC rather than
+  // piggybacked on AppendEntries, since AppendEntries can be slow (it does
+  // real log-append work) and a lease probe needs to be fast to reliably
+  // detect quorum loss. A follower grants (and refreshes its own lease
+  // timer) only if `term` matches its current term; a leader tracks
+  // per-peer grants to decide whether it still holds a quorum of leases
+  // (gates serving reads locally without going through the log) and to
+  // avoid disrupting a peer's still-live leader with a competing
+  // election (see RequestVoteRequest.dry_run and the follower's lease
+  // check).
+  rpc GetLease(GetLeaseRequest) returns (GetLeaseResponse);
+
   // Chunked snapshot transfer. Maps directly onto
   // storage::export_snapshot / install_snapshot's Read/Write-based
   // streaming: the leader reads chunks out of the exporter and sends them
@@ -57,11 +69,28 @@ message RequestVoteRequest {
   string candidate_id = 2;
   uint64 last_log_index = 3;
   uint64 last_log_term = 4;
+  // Pre-vote (Raft dissertation §9.6): a non-binding "would you grant
+  // this" check. The responder must answer honestly but must not alter
+  // any of its own state (current_term, voted_for, election timer) --
+  // this lets a node probe whether it could plausibly win a real election
+  // without ever bumping its term, so a partitioned node that can't reach
+  // a majority doesn't disrupt a healthy cluster by inflating its term
+  // once it reconnects.
+  bool dry_run = 5;
 }
 
 message RequestVoteResponse {
   uint64 term = 1;
   bool vote_granted = 2;
+}
+
+message GetLeaseRequest {
+  string leader_id = 1;
+  uint64 term = 2;
+}
+
+message GetLeaseResponse {
+  bool lease_granted = 1;
 }
 
 message SnapshotChunk {
