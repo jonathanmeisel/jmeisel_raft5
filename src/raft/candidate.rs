@@ -240,6 +240,30 @@ impl Campaign {
                 });
                 Transition::Continue
             }
+            Event::InstallSnapshot {
+                header, respond_to, ..
+            } => {
+                // Same concede-or-reject shape as the AppendEntries arm
+                // above, and for the same reason: a campaigning node
+                // never applies the snapshot itself (`data` is unused
+                // here) -- it just concedes if the sender's term is
+                // legitimate, and the leader's own retry will resend once
+                // this node is back to being a Follower able to actually
+                // install it.
+                if header.term >= self.common.current_term {
+                    if header.term > self.common.current_term {
+                        self.common.advance_term(header.term).await;
+                    }
+                    let _ = respond_to.send(InstallSnapshotResponse {
+                        term: self.common.current_term,
+                    });
+                    return Transition::Become(Role::Follower);
+                }
+                let _ = respond_to.send(InstallSnapshotResponse {
+                    term: self.common.current_term,
+                });
+                Transition::Continue
+            }
             Event::RequestVote { req, respond_to } => {
                 if req.dry_run {
                     let grant = evaluate_dry_run_vote(&self.common, &req).await;
@@ -278,6 +302,7 @@ impl Campaign {
             }
             Event::AppendEntriesResponse { .. }
             | Event::GetLeaseResponse { .. }
+            | Event::InstallSnapshotResponse { .. }
             | Event::LeaderTick => Transition::Continue,
         }
     }

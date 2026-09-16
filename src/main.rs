@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // KvService still bypasses the state machine entirely (see its module
     // doc) -- `_role_rx` isn't threaded in yet.
     let kv_server = KvServer::new(KvService::new(Arc::clone(&log)));
-    let raft_peer_server = RaftPeerServer::new(RaftPeerService::new(Arc::clone(&log), peer_handle));
+    let raft_peer_server = RaftPeerServer::new(RaftPeerService::new(peer_handle));
 
     println!("client API listening on {client_addr}");
     println!("peer API listening on {peer_addr}");

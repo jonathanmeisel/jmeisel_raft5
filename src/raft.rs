@@ -120,7 +120,7 @@ use crate::pb::raft5::common::LogEntry;
 use crate::pb::raft5::raft::raft_peer_client::RaftPeerClient;
 use crate::pb::raft5::raft::{
     AppendEntriesRequest, AppendEntriesResponse, GetLeaseRequest, GetLeaseResponse,
-    RequestVoteRequest, RequestVoteResponse,
+    InstallSnapshotResponse, RequestVoteRequest, RequestVoteResponse, SnapshotHeader,
 };
 use crate::storage::{self, RaftLog, StorageError};
 
@@ -160,6 +160,19 @@ const LIGHTWEIGHT_RPC_TIMEOUT: Duration = Duration::from_millis(HEARTBEAT_MS * 2
 /// adds more redundant work on top.
 const APPEND_ENTRIES_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Timeout for a full `InstallSnapshot` transfer -- more generous still
+/// than `AppendEntries`: this moves the *entire* current state, not just a
+/// batch of new entries, so it can take much longer on a large log or a
+/// slow link.
+const SNAPSHOT_RPC_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How much of an exported snapshot's bytes go into each `SnapshotChunk`
+/// sent over the wire. The whole snapshot is still buffered in memory on
+/// both ends first (matching the receiving side's existing "get it
+/// working" tradeoff -- see `grpc::RaftPeerService::install_snapshot`);
+/// this only bounds the size of each individual gRPC message.
+const SNAPSHOT_CHUNK_SIZE: usize = 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
     pub id: String,
@@ -194,6 +207,26 @@ pub enum Event {
     GetLeaseResponse {
         from: String,
         resp: GetLeaseResponse,
+    },
+    /// `data` is the full byte stream `RaftLog::export_snapshot` produced
+    /// (magic/version/seq/term header included) -- `grpc::RaftPeerService`
+    /// reassembles it from the wire but doesn't touch storage itself, so
+    /// the term check and the actual install both happen here, same as
+    /// every other inbound RPC.
+    InstallSnapshot {
+        header: SnapshotHeader,
+        data: Vec<u8>,
+        respond_to: oneshot::Sender<InstallSnapshotResponse>,
+    },
+    /// The leader's own snapshot-send task reporting back what happened,
+    /// same pattern as `AppendEntriesResponse` -- `last_included_seq` is
+    /// carried alongside the raw proto response (which only has `term`)
+    /// so a successful install can advance `Leader::peer_match_index`
+    /// the same way a successful `AppendEntries` does.
+    InstallSnapshotResponse {
+        from: String,
+        resp: InstallSnapshotResponse,
+        last_included_seq: u64,
     },
     ElectionTimeout,
     /// Self-notification, leader only: nudges the event loop to recompute
@@ -397,7 +430,17 @@ pub enum RoleHandle {
 pub struct LeaderHandle {
     log: Arc<RaftLog>,
     term: u64,
-    commit_rx: watch::Receiver<u64>,
+    /// How far `RaftLog::apply_committed` has actually brought `latest`
+    /// up to date -- *not* `commit_tx` directly. `append_log` needs to
+    /// know `latest` itself reflects the entry, not just that it's been
+    /// replicated to a majority: `commit_tx` and this are two independent
+    /// `watch` subscriptions off of `spawn_storage_maintenance_task`, and
+    /// `watch` gives no ordering guarantee between separate subscribers
+    /// waking up on the same update. Waiting on `commit_tx` directly here
+    /// would let `append_log` return before the maintenance task has
+    /// actually run `apply_committed` for this seq, so a caller that
+    /// immediately reads afterward could see stale or missing data.
+    applied_rx: watch::Receiver<u64>,
     /// Used to detect a step-down while waiting in `append_log`, so a
     /// caller doesn't hang forever on an entry that will never commit
     /// (e.g. because it gets truncated by a new leader instead).
@@ -411,7 +454,9 @@ pub struct LeaderHandle {
 
 impl LeaderHandle {
     /// Append a new entry and wait until it's committed (replicated to a
-    /// majority) before returning.
+    /// majority) *and* actually applied to `latest` before returning --
+    /// see `applied_rx`'s doc on why waiting for commit alone isn't
+    /// enough.
     pub async fn append_log(&self, key: &[u8], value: Option<&[u8]>) -> Result<u64, RaftError> {
         let log = Arc::clone(&self.log);
         let term = self.term;
@@ -422,18 +467,18 @@ impl LeaderHandle {
             .map_err(|_| RaftError::Disconnected)?
             .map_err(RaftError::Storage)?;
 
-        let mut commit_rx = self.commit_rx.clone();
+        let mut applied_rx = self.applied_rx.clone();
         let mut role_rx = self.role_rx.clone();
 
         loop {
-            if *commit_rx.borrow() >= seq {
+            if *applied_rx.borrow() >= seq {
                 return Ok(seq);
             }
             if !self.still_leader(&role_rx) {
                 return Err(self.not_leader_error(&role_rx));
             }
             tokio::select! {
-                r = commit_rx.changed() => { r.map_err(|_| RaftError::Disconnected)?; }
+                r = applied_rx.changed() => { r.map_err(|_| RaftError::Disconnected)?; }
                 r = role_rx.changed() => { r.map_err(|_| RaftError::Disconnected)?; }
             }
         }
@@ -502,6 +547,28 @@ impl RaftPeerHandle {
         let (respond_to, rx) = oneshot::channel();
         self.event_tx
             .send(Event::RequestVote { req, respond_to })
+            .await
+            .map_err(|_| RaftError::Disconnected)?;
+        rx.await.map_err(|_| RaftError::Disconnected)
+    }
+
+    /// Unlike `get_lease`, this goes through the event loop like
+    /// `append_entries`/`request_vote`: it needs the full term check
+    /// *and* actually has real storage work to do (`RaftLog::install_snapshot`),
+    /// so there's no way to make it independent of whichever role is
+    /// currently running the way the lease fast path is.
+    pub async fn install_snapshot(
+        &self,
+        header: SnapshotHeader,
+        data: Vec<u8>,
+    ) -> Result<InstallSnapshotResponse, RaftError> {
+        let (respond_to, rx) = oneshot::channel();
+        self.event_tx
+            .send(Event::InstallSnapshot {
+                header,
+                data,
+                respond_to,
+            })
             .await
             .map_err(|_| RaftError::Disconnected)?;
         rx.await.map_err(|_| RaftError::Disconnected)
@@ -612,10 +679,22 @@ pub struct Common {
     /// Highest seq known replicated to *every* peer, not just a majority --
     /// safe to compact below regardless of role: a leader computes it from
     /// `Leader::peer_match_index`, a follower just adopts whatever value
-    /// rides along on `AppendEntries.compact_seq`. Not consumed by
-    /// anything yet (no compaction task wired up), but published either
-    /// way so one can be added later without touching this plumbing.
+    /// rides along on `AppendEntries.compact_seq`. Consumed by
+    /// `spawn_storage_maintenance_task`.
     pub compact_tx: watch::Sender<u64>,
+
+    /// How far `RaftLog::apply_committed` has actually brought `latest`
+    /// up to date -- published by `spawn_storage_maintenance_task` only
+    /// *after* that call returns, deliberately never touched anywhere
+    /// else. This is what `LeaderHandle::append_log` waits on (see its
+    /// doc): `commit_tx` alone only says an entry is safely replicated,
+    /// not that `latest` reflects it yet, since the maintenance task is
+    /// an independent `watch` subscriber with no ordering relationship to
+    /// any other subscriber of `commit_tx`. `Arc`-wrapped so `Common` can
+    /// keep handing out fresh `subscribe()`s (one per `Leader::new`, since
+    /// a new `LeaderHandle` is built on every election) after the one
+    /// sender has already been moved into the maintenance task.
+    applied_tx: Arc<watch::Sender<u64>>,
 
     /// Where peer RPCs (relayed by `RaftPeerService`) and internal timers
     /// land. Shared across roles so anything already queued survives a
@@ -646,6 +725,12 @@ impl Common {
 
         let (commit_tx, commit_rx) = watch::channel(0);
         let (compact_tx, compact_rx) = watch::channel(0);
+        // The initial receiver is discarded -- `Common` hands out fresh
+        // ones later via `applied_tx.subscribe()` (once per `Leader::new`),
+        // which works regardless of whether any earlier receiver is still
+        // alive, as long as the sender itself is.
+        let (applied_tx, _applied_rx) = watch::channel(0);
+        let applied_tx = Arc::new(applied_tx);
         let (term_tx, term_rx) = watch::channel(current_term);
         // `None` -- no lease established yet. `has_active_lease` treats
         // this as "not blocked" (a brand new node that's never contacted
@@ -679,6 +764,7 @@ impl Common {
             lease_expires_at_rx,
             commit_tx,
             compact_tx,
+            applied_tx,
             event_rx,
             event_tx,
             role_tx,
@@ -751,10 +837,91 @@ impl Common {
 
 // --- Driver ----------------------------------------------------------------
 
+/// Storage maintenance: applies newly committed entries to `latest` (see
+/// `RaftLog::apply_committed` -- `latest` must never reflect an
+/// uncommitted write, since a leader change could still roll it back),
+/// publishes `applied_tx` to say so, and then compacts `log` up to
+/// `compact_seq`, every time either watermark advances.
+///
+/// The apply-then-compact ordering matters: `compact` physically removes
+/// `log` entries, and doing that before they've been applied to `latest`
+/// would lose that data permanently (`RaftLog::compact` also
+/// independently clamps itself to `apply_committed`'s watermark as a
+/// second line of defense, but doing both here, always in this order,
+/// keeps the common case simple rather than relying on that clamp to
+/// silently paper over bad ordering). `applied_tx` is published as its
+/// own step, right after `apply_committed` returns and *before* `compact`
+/// even runs -- `LeaderHandle::append_log` needs to know `latest` itself
+/// is caught up, not merely that `compact` was also attempted, and
+/// separating the two means a slow/failing `compact` call can never delay
+/// that signal. Reacting to both `commit_tx` and `compact_tx` (rather
+/// than just one) matters too: a follower's `compact_seq` can advance
+/// independently of its own `commit_tx` (see `Follower::apply_append_entries`),
+/// so watching only one channel could leave the other's progress stalled.
+///
+/// Spawned once per node, independent of role: this is storage
+/// maintenance, not state-machine behavior, so unlike replication/lease/tick
+/// tasks it doesn't need starting or stopping across role transitions.
+///
+/// A failure here is logged rather than panicking (unlike, say, a failed
+/// term persist): falling behind on applying/compacting doesn't corrupt
+/// anything or violate a safety property, it just means `latest` is
+/// briefly stale and the log is larger on disk than it needs to be --
+/// this is maintenance, not a correctness requirement, and it'll simply
+/// retry on the next watermark change.
+fn spawn_storage_maintenance_task(
+    log: Arc<RaftLog>,
+    mut commit_rx: watch::Receiver<u64>,
+    mut compact_rx: watch::Receiver<u64>,
+    applied_tx: Arc<watch::Sender<u64>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                r = commit_rx.changed() => { if r.is_err() { return; } }
+                r = compact_rx.changed() => { if r.is_err() { return; } }
+            }
+            let commit_seq = *commit_rx.borrow();
+            let compact_seq = *compact_rx.borrow();
+
+            let log2 = Arc::clone(&log);
+            match tokio::task::spawn_blocking(move || log2.apply_committed(commit_seq)).await {
+                Ok(Ok(())) => {
+                    // Only ever moves forward -- `commit_seq` is itself
+                    // monotonic (`Common::advance_commit`), so an
+                    // out-of-order wakeup can't regress this.
+                    let _ = applied_tx.send(commit_seq);
+                }
+                Ok(Err(e)) => {
+                    eprintln!("apply_committed to seq {commit_seq} failed: {e}");
+                    continue; // don't attempt to compact past what didn't apply
+                }
+                Err(e) => {
+                    eprintln!("apply_committed task panicked: {e}");
+                    continue;
+                }
+            }
+
+            let log3 = Arc::clone(&log);
+            match tokio::task::spawn_blocking(move || log3.compact(compact_seq)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("compact to seq {compact_seq} failed: {e}"),
+                Err(e) => eprintln!("compact task panicked: {e}"),
+            }
+        }
+    })
+}
+
 /// Runs forever, handing `Common` from one role to the next. Only one
 /// role's event loop is ever active: the previous one has fully returned
 /// (and torn down its background tasks) before the next one starts.
 pub async fn run(mut common: Common) -> ! {
+    let _maintenance_task = spawn_storage_maintenance_task(
+        Arc::clone(&common.log),
+        common.commit_tx.subscribe(),
+        common.compact_tx.subscribe(),
+        Arc::clone(&common.applied_tx),
+    );
     let mut role = Role::Follower;
     loop {
         let (next_role, next_common) = match role {
@@ -772,156 +939,7 @@ pub async fn run(mut common: Common) -> ! {
 /// `follower` submodules -- each submodule's own `#[cfg(test)] mod tests`
 /// pulls these in with `use crate::raft::test_support::*;`.
 #[cfg(test)]
-pub(crate) mod test_support {
-    use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    pub(crate) fn open_temp_log() -> (Arc<RaftLog>, std::path::PathBuf) {
-        // A nanosecond timestamp alone isn't a reliable unique suffix under
-        // parallel test execution -- two tests starting at nearly the same
-        // instant can land on the same value (clock resolution, scheduling)
-        // and collide on the same directory, so a process-wide counter is
-        // layered on top to guarantee uniqueness regardless.
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let mut path = std::env::temp_dir();
-        path.push(format!("raft5_raft_test_{}", std::process::id()));
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        path.push(format!("{suffix:x}_{counter:x}"));
-        let log = Arc::new(RaftLog::open(&path).expect("open"));
-        (log, path)
-    }
-
-    pub(crate) fn cleanup(path: &std::path::Path) {
-        let _ = std::fs::remove_dir_all(path);
-    }
-
-    /// Spins up a real event loop (as `main` would) and hands back the two
-    /// external handles plus the temp dir to clean up afterward.
-    pub(crate) fn spawn_test_node(
-        peers: Vec<PeerInfo>,
-    ) -> (
-        watch::Receiver<RoleHandle>,
-        RaftPeerHandle,
-        std::path::PathBuf,
-    ) {
-        let (log, path) = open_temp_log();
-        let (common, role_rx, peer_handle, _commit_rx, _compact_rx) =
-            Common::new("test-node".to_string(), peers, log).unwrap();
-        tokio::spawn(run(common));
-        (role_rx, peer_handle, path)
-    }
-
-    /// Like `spawn_test_node`, but also hands back the storage handle (to
-    /// check what actually landed in it) and `commit_rx`/`compact_rx` (to
-    /// observe replication/watermark progress) -- needed for the
-    /// log-matching and replication tests.
-    pub(crate) fn spawn_node_with_handles(
-        peers: Vec<PeerInfo>,
-    ) -> (
-        Arc<RaftLog>,
-        watch::Receiver<RoleHandle>,
-        RaftPeerHandle,
-        watch::Receiver<u64>,
-        watch::Receiver<u64>,
-        std::path::PathBuf,
-    ) {
-        let (log, path) = open_temp_log();
-        let (common, role_rx, peer_handle, commit_rx, compact_rx) =
-            Common::new("test-node".to_string(), peers, Arc::clone(&log)).unwrap();
-        tokio::spawn(run(common));
-        (log, role_rx, peer_handle, commit_rx, compact_rx, path)
-    }
-
-    pub(crate) async fn wait_for_role(
-        role_rx: &mut watch::Receiver<RoleHandle>,
-        pred: impl Fn(&RoleHandle) -> bool,
-    ) {
-        // Generous relative to the 150-300ms election timeout: real-network
-        // tests (election + a vote RPC round trip, or a full election
-        // followed by replication) need enough headroom to not flake under
-        // parallel test execution's CPU contention.
-        tokio::time::timeout(Duration::from_millis(1500), async {
-            loop {
-                if pred(&role_rx.borrow()) {
-                    return;
-                }
-                role_rx.changed().await.unwrap();
-            }
-        })
-        .await
-        .expect("expected role to match the predicate before the timeout")
-    }
-
-    pub(crate) fn blank_append_entries(term: u64, leader_id: &str) -> AppendEntriesRequest {
-        AppendEntriesRequest {
-            term,
-            leader_id: leader_id.to_string(),
-            prev_log_index: 0,
-            prev_log_term: 0,
-            entries: vec![],
-            leader_commit: 0,
-            compact_seq: 0,
-        }
-    }
-
-    pub(crate) fn request_vote(term: u64, candidate_id: &str) -> RequestVoteRequest {
-        RequestVoteRequest {
-            term,
-            candidate_id: candidate_id.to_string(),
-            last_log_index: 0,
-            last_log_term: 0,
-            dry_run: false,
-        }
-    }
-
-    pub(crate) fn append_entries(
-        term: u64,
-        leader_id: &str,
-        prev_log_index: u64,
-        prev_log_term: u64,
-        entries: Vec<LogEntry>,
-        leader_commit: u64,
-    ) -> AppendEntriesRequest {
-        AppendEntriesRequest {
-            term,
-            leader_id: leader_id.to_string(),
-            prev_log_index,
-            prev_log_term,
-            entries,
-            leader_commit,
-            compact_seq: 0,
-        }
-    }
-
-    pub(crate) fn log_entry(seq: u64, term: u64, key: &[u8], value: Option<&[u8]>) -> LogEntry {
-        LogEntry {
-            seq,
-            term,
-            key: key.to_vec(),
-            value: value.map(<[u8]>::to_vec),
-        }
-    }
-
-    /// Binds an ephemeral local port and immediately releases it, for
-    /// handing a real address to a peer/server pair before either exists.
-    /// Small race (something else could grab the port before we rebind
-    /// it), but standard practice for this kind of test.
-    pub(crate) fn free_local_addr() -> std::net::SocketAddr {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-        listener.local_addr().expect("local_addr")
-    }
-
-    pub(crate) fn expect_leader_handle(role: &RoleHandle) -> LeaderHandle {
-        match role {
-            RoleHandle::Leader(h) => h.clone(),
-            _ => panic!("expected Leader"),
-        }
-    }
-}
+pub(crate) mod test_support;
 
 #[cfg(test)]
 mod tests {
@@ -984,18 +1002,12 @@ mod tests {
 
         tokio::spawn(
             tonic::transport::Server::builder()
-                .add_service(RaftPeerServer::new(RaftPeerService::new(
-                    log_a,
-                    peer_handle_a,
-                )))
+                .add_service(RaftPeerServer::new(RaftPeerService::new(peer_handle_a)))
                 .serve(addr_a),
         );
         tokio::spawn(
             tonic::transport::Server::builder()
-                .add_service(RaftPeerServer::new(RaftPeerService::new(
-                    log_b,
-                    peer_handle_b,
-                )))
+                .add_service(RaftPeerServer::new(RaftPeerService::new(peer_handle_b)))
                 .serve(addr_b),
         );
 
@@ -1052,18 +1064,12 @@ mod tests {
 
         tokio::spawn(
             tonic::transport::Server::builder()
-                .add_service(RaftPeerServer::new(RaftPeerService::new(
-                    Arc::clone(&log_a),
-                    peer_handle_a,
-                )))
+                .add_service(RaftPeerServer::new(RaftPeerService::new(peer_handle_a)))
                 .serve(addr_a),
         );
         tokio::spawn(
             tonic::transport::Server::builder()
-                .add_service(RaftPeerServer::new(RaftPeerService::new(
-                    Arc::clone(&log_b),
-                    peer_handle_b,
-                )))
+                .add_service(RaftPeerServer::new(RaftPeerService::new(peer_handle_b)))
                 .serve(addr_b),
         );
 
@@ -1128,10 +1134,60 @@ mod tests {
 
         assert_eq!(
             follower_log.get_latest(b"k").unwrap(),
-            Some((seq, Some(b"v".to_vec())))
+            Some((seq, b"v".to_vec()))
         );
 
         cleanup(&path_a);
         cleanup(&path_b);
+    }
+
+    /// A zero-peer cluster's `compact_seq` trivially equals its own last
+    /// index (see `leader::Leader::recompute_watermarks`) -- confirms the
+    /// compaction task spawned by `run` actually reacts to that and does
+    /// real work, not just that the watermark itself advances correctly
+    /// (already covered elsewhere).
+    #[tokio::test]
+    async fn compaction_task_compacts_the_log_as_compact_seq_advances() {
+        let (log, mut role_rx, _peer_handle, _commit_rx, mut compact_rx, path) =
+            spawn_node_with_handles(vec![]);
+        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Leader(_))).await;
+        let leader = expect_leader_handle(&role_rx.borrow());
+
+        leader.append_log(b"a", Some(b"1")).await.unwrap();
+        leader.append_log(b"b", Some(b"2")).await.unwrap();
+        leader.append_log(b"c", Some(b"3")).await.unwrap();
+
+        tokio::time::timeout(Duration::from_millis(1000), async {
+            loop {
+                if *compact_rx.borrow() >= 3 {
+                    return;
+                }
+                compact_rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("compact_seq should advance to the tail in a zero-peer cluster");
+
+        // The compaction task reacts to that same watch channel -- give
+        // it a moment to actually run its (tiny, but still real) blocking
+        // I/O.
+        tokio::time::timeout(Duration::from_millis(1000), async {
+            loop {
+                if log.entries_in_range(1, 3).unwrap().is_empty() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("compaction should have removed the entries below compact_seq");
+
+        // Compaction only removes superseded history -- current values
+        // must still be intact.
+        assert_eq!(log.get_latest(b"a").unwrap(), Some((1, b"1".to_vec())));
+        assert_eq!(log.get_latest(b"b").unwrap(), Some((2, b"2".to_vec())));
+        assert_eq!(log.get_latest(b"c").unwrap(), Some((3, b"3".to_vec())));
+
+        cleanup(&path);
     }
 }

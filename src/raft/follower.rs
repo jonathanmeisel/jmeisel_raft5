@@ -310,6 +310,45 @@ impl Follower {
                 });
                 Transition::Continue
             }
+            Event::InstallSnapshot {
+                header,
+                data,
+                respond_to,
+            } => {
+                if header.term < self.common.current_term {
+                    let _ = respond_to.send(InstallSnapshotResponse {
+                        term: self.common.current_term,
+                    });
+                    return Transition::Continue;
+                }
+                if header.term > self.common.current_term {
+                    self.common.advance_term(header.term).await;
+                }
+                self.leader_hint = Some(header.leader_id.clone());
+                self.common
+                    .publish_role(RoleHandle::Follower(FollowerHandle {
+                        leader_hint: self.leader_hint.clone(),
+                    }));
+                self.renew_lease();
+
+                let log = Arc::clone(&self.common.log);
+                tokio::task::spawn_blocking(move || log.install_snapshot(&mut data.as_slice()))
+                    .await
+                    .expect("install_snapshot task panicked")
+                    .expect("failed to install snapshot");
+
+                // A snapshot only ever contains already-committed state
+                // (Leader Completeness) -- both watermarks can jump
+                // straight to it, same as AppendEntries's
+                // leader_commit/compact_seq hints do.
+                self.common.advance_commit(header.last_included_index);
+                self.common.advance_compact(header.last_included_index);
+
+                let _ = respond_to.send(InstallSnapshotResponse {
+                    term: self.common.current_term,
+                });
+                Transition::Continue
+            }
             Event::RequestVote { req, respond_to } => {
                 if self.has_active_lease() {
                     // Refuse to disrupt a leader we've recently confirmed
@@ -345,6 +384,7 @@ impl Follower {
             Event::AppendEntriesResponse { .. }
             | Event::RequestVoteResponse { .. }
             | Event::GetLeaseResponse { .. }
+            | Event::InstallSnapshotResponse { .. }
             | Event::LeaderTick => {
                 Transition::Continue // stray messages from a role we no longer hold
             }
@@ -438,14 +478,15 @@ mod tests {
 
         assert!(resp.success);
         assert_eq!(resp.match_index, 2);
-        assert_eq!(
-            log.get_latest(b"a").unwrap(),
-            Some((1, Some(b"1".to_vec())))
-        );
-        assert_eq!(
-            log.get_latest(b"b").unwrap(),
-            Some((2, Some(b"2".to_vec())))
-        );
+        // `leader_commit` is 0 here, so nothing has committed yet --
+        // `get_latest` wouldn't reflect these entries even once applied
+        // (see storage's module doc), so check `log` directly instead.
+        let stored = log.entries_in_range(1, 3).unwrap();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].key, b"a");
+        assert_eq!(stored[0].value, Some(b"1".to_vec()));
+        assert_eq!(stored[1].key, b"b");
+        assert_eq!(stored[1].value, Some(b"2".to_vec()));
         cleanup(&path);
     }
 
@@ -519,13 +560,15 @@ mod tests {
 
         assert!(resp.success);
         assert_eq!(resp.match_index, 2);
-        // The stale entry's key is gone from `latest`...
-        assert_eq!(log.get_latest(b"stale").unwrap(), None);
-        // ...replaced by the new leader's entry at the same seq.
-        assert_eq!(
-            log.get_latest(b"fresh").unwrap(),
-            Some((2, Some(b"new".to_vec())))
-        );
+        // `leader_commit` is 0 here, so `get_latest` wouldn't reflect any
+        // of this regardless -- check `log` directly: the stale entry at
+        // seq 2 is gone, replaced by the new leader's entry at the same
+        // seq (a keyspace can only hold one value per exact seq, so this
+        // alone proves the old one didn't survive).
+        let stored = log.entries_in_range(2, 3).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].key, b"fresh");
+        assert_eq!(stored[0].value, Some(b"new".to_vec()));
         cleanup(&path);
     }
 
@@ -917,6 +960,85 @@ mod tests {
         }
 
         assert!(matches!(&*role_rx.borrow(), RoleHandle::Follower(_)));
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_applies_state_and_advances_watermarks() {
+        let (source_log, source_path) = open_temp_log();
+        source_log.append(3, b"a", Some(b"1")).unwrap();
+        let s2 = source_log.append(3, b"b", Some(b"2")).unwrap();
+        // `export_snapshot` only ever reflects committed state -- apply
+        // first so there's actually something for it to export.
+        source_log.apply_committed(s2).unwrap();
+        let mut buf = Vec::new();
+        let meta = source_log.export_snapshot(&mut buf).unwrap();
+
+        let (log, mut role_rx, peer_handle, mut commit_rx, mut compact_rx, path) =
+            spawn_node_with_handles(vec![]);
+        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Follower(_))).await;
+
+        let resp = peer_handle
+            .install_snapshot(
+                SnapshotHeader {
+                    term: 5,
+                    leader_id: "leader-1".to_string(),
+                    last_included_index: meta.last_included_seq,
+                    last_included_term: meta.last_included_term,
+                },
+                buf,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.term, 5);
+        // `install_snapshot` repopulates `latest` at `last_included_seq`
+        // for every key, regardless of the seq each was originally
+        // written at in the source log.
+        assert_eq!(
+            log.get_latest(b"a").unwrap(),
+            Some((meta.last_included_seq, b"1".to_vec()))
+        );
+        assert_eq!(
+            log.get_latest(b"b").unwrap(),
+            Some((meta.last_included_seq, b"2".to_vec()))
+        );
+
+        commit_rx.changed().await.unwrap();
+        assert_eq!(*commit_rx.borrow(), meta.last_included_seq);
+        compact_rx.changed().await.unwrap();
+        assert_eq!(*compact_rx.borrow(), meta.last_included_seq);
+
+        cleanup(&path);
+        cleanup(&source_path);
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_rejects_a_stale_term_and_does_not_touch_storage() {
+        let (log, mut role_rx, peer_handle, _commit_rx, _compact_rx, path) =
+            spawn_node_with_handles(vec![]);
+        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Follower(_))).await;
+
+        peer_handle
+            .append_entries(blank_append_entries(5, "leader-1"))
+            .await
+            .unwrap();
+
+        let resp = peer_handle
+            .install_snapshot(
+                SnapshotHeader {
+                    term: 2,
+                    leader_id: "leader-2".to_string(),
+                    last_included_index: 10,
+                    last_included_term: 1,
+                },
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.term, 5);
+        assert_eq!(log.last_entry().unwrap(), None);
         cleanup(&path);
     }
 }

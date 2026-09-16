@@ -4,11 +4,13 @@
 //! `KvService` is still a stand-in for a real Raft node: there's no leader
 //! election, term tracking, or log replication in its write/read path, so
 //! it just appends/reads locally as if this node were always its own sole
-//! leader at term 0. `RaftPeerService`, on the other hand, forwards
-//! `append_entries`/`request_vote` straight into a live `raft::RaftPeerHandle`
-//! -- whichever role the state machine is currently in decides how to
-//! answer. `install_snapshot` is wired up for real too, since it only needs
-//! `storage::RaftLog`.
+//! leader at term 0. `RaftPeerService`, on the other hand, forwards every
+//! call straight into a live `raft::RaftPeerHandle` -- whichever role the
+//! state machine is currently in decides how to answer. `install_snapshot`
+//! reassembles the incoming stream (transport-level work) but, like every
+//! other call here, never touches `storage::RaftLog` directly -- the term
+//! check and the actual install both happen on the far side of
+//! `RaftPeerHandle`, same as everything else.
 
 use std::sync::Arc;
 
@@ -69,8 +71,15 @@ impl Kv for KvService {
         let seq = tokio::task::spawn_blocking(move || {
             // Placeholder term: there's no leader election/term tracking
             // yet, so every node just appends locally as if it were sole
-            // leader at term 0. Replace once real consensus exists.
-            log.append(0, &req.key, req.value.as_deref())
+            // leader at term 0. `apply_committed` right after mimics what
+            // a real zero-peer cluster does (commits its own writes
+            // immediately, see raft::leader's tests) -- `latest` only
+            // ever reflects committed state (see storage's module doc),
+            // so skipping this would leave every write invisible to
+            // `read` forever. Replace once real consensus exists.
+            let seq = log.append(0, &req.key, req.value.as_deref())?;
+            log.apply_committed(seq)?;
+            Result::<u64, StorageError>::Ok(seq)
         })
         .await
         .map_err(join_err)?
@@ -90,11 +99,15 @@ impl Kv for KvService {
             .map_err(join_err)?
             .map_err(storage_err)?;
 
-        // A never-written key and a deleted key both read as "no value";
-        // seq 0 is never assigned (sequencing starts at 1), so it doubles
-        // as the "never written" sentinel here.
+        // A never-written key and a deleted key both read as "no value"
+        // (storage's `get_latest` already collapses the two -- see its
+        // doc); seq 0 is never assigned (sequencing starts at 1), so it
+        // doubles as the "never written" sentinel here.
         let ok = match found {
-            Some((seq, value)) => ReadOk { seq, value },
+            Some((seq, value)) => ReadOk {
+                seq,
+                value: Some(value),
+            },
             None => ReadOk {
                 seq: 0,
                 value: None,
@@ -126,13 +139,12 @@ impl Kv for KvService {
 }
 
 pub struct RaftPeerService {
-    log: Arc<RaftLog>,
     peer_handle: RaftPeerHandle,
 }
 
 impl RaftPeerService {
-    pub fn new(log: Arc<RaftLog>, peer_handle: RaftPeerHandle) -> Self {
-        Self { log, peer_handle }
+    pub fn new(peer_handle: RaftPeerHandle) -> Self {
+        Self { peer_handle }
     }
 }
 
@@ -180,25 +192,25 @@ impl RaftPeer for RaftPeerService {
     ) -> Result<Response<InstallSnapshotResponse>, Status> {
         let mut stream = request.into_inner();
 
-        // First message must be the header: leader/term metadata for this
-        // RPC, distinct from the storage-level header that
-        // `RaftLog::install_snapshot` parses out of the reassembled bytes
-        // below.
+        // First message must be the header: Raft-protocol metadata
+        // (term/leader_id) for this RPC, distinct from the
+        // storage-level header embedded in the reassembled bytes below
+        // (which `RaftLog::install_snapshot` parses back out itself).
         let first = stream
             .message()
             .await?
             .ok_or_else(|| Status::invalid_argument("empty snapshot stream"))?;
-        match first.part {
-            Some(snapshot_chunk::Part::Header(_)) => {}
+        let header = match first.part {
+            Some(snapshot_chunk::Part::Header(header)) => header,
             _ => return Err(Status::invalid_argument("first chunk must be a header")),
-        }
+        };
 
         // Reassemble the raw byte stream produced by `export_snapshot`.
-        // This buffers the whole snapshot in memory before handing it to
-        // `install_snapshot` -- fine for getting the plumbing working, but
-        // a fully streaming version (a sync `Read` fed by this async loop
-        // through a channel, run inside `spawn_blocking`) would avoid that
-        // if snapshots get large enough for it to matter.
+        // This buffers the whole snapshot in memory before handing it
+        // onward -- fine for getting the plumbing working, but a fully
+        // streaming version (a sync `Read` fed by this async loop through
+        // a channel, run inside `spawn_blocking`) would avoid that if
+        // snapshots get large enough for it to matter.
         let mut buf = Vec::new();
         while let Some(chunk) = stream.message().await? {
             match chunk.part {
@@ -207,13 +219,12 @@ impl RaftPeer for RaftPeerService {
             }
         }
 
-        let log = Arc::clone(&self.log);
-        tokio::task::spawn_blocking(move || log.install_snapshot(&mut buf.as_slice()))
+        let resp = self
+            .peer_handle
+            .install_snapshot(header, buf)
             .await
-            .map_err(join_err)?
-            .map_err(storage_err)?;
-
-        Ok(Response::new(InstallSnapshotResponse { term: 0 }))
+            .map_err(raft_err)?;
+        Ok(Response::new(resp))
     }
 }
 
@@ -361,7 +372,7 @@ mod tests {
             raft::Common::new("node-under-test".to_string(), vec![], Arc::clone(&log)).unwrap();
         tokio::spawn(raft::run(common));
 
-        let svc = RaftPeerService::new(log, peer_handle);
+        let svc = RaftPeerService::new(peer_handle);
 
         let append_resp = svc
             .append_entries(Request::new(AppendEntriesRequest {
