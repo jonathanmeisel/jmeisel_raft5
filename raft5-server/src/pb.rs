@@ -1,18 +1,20 @@
 //! Generated protobuf/gRPC types from `proto/*.proto` (see `build.rs`).
+//!
+//! `client` and `cluster` are generated in the `raft5-shared` crate (also
+//! used by the client library) and re-exported here so the rest of this
+//! crate can keep referring to them as `pb::raft5::client` /
+//! `pb::raft5::cluster`, alongside the `common`/`raft` types generated
+//! locally.
 
 pub mod raft5 {
     pub mod common {
         include!(concat!(env!("OUT_DIR"), "/raft5.common.rs"));
     }
-    pub mod client {
-        include!(concat!(env!("OUT_DIR"), "/raft5.client.rs"));
-    }
     pub mod raft {
         include!(concat!(env!("OUT_DIR"), "/raft5.raft.rs"));
     }
-    pub mod cluster {
-        include!(concat!(env!("OUT_DIR"), "/raft5.cluster.rs"));
-    }
+    pub use raft5_shared::raft5::client;
+    pub use raft5_shared::raft5::cluster;
 }
 
 // --- storage <-> wire conversions -----------------------------------------

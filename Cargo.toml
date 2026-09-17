@@ -1,0 +1,11 @@
+[workspace]
+resolver = "3"
+members = ["raft5-server", "raft5-shared", "raft5-client"]
+
+[workspace.dependencies]
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+prost = "0.14"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"

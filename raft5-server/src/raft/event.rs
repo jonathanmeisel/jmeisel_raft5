@@ -198,6 +198,7 @@ pub enum ConfigChange {
     AddServer {
         server_id: String,
         address: String,
+        client_address: String,
     },
     RemoveServer {
         server_id: String,
@@ -213,13 +214,18 @@ impl ConfigChange {
     pub(super) fn apply_to(&self, config: &ClusterConfig) -> Result<ClusterConfig, RaftError> {
         let invalid = |why| Err(RaftError::InvalidConfigChange(why));
         match self {
-            Self::AddServer { server_id, address } => {
+            Self::AddServer {
+                server_id,
+                address,
+                client_address,
+            } => {
                 if config.contains(server_id) {
                     return invalid("that server is already a member of this cluster");
                 }
                 Ok(config.with_member(ClusterMember {
                     server_id: server_id.clone(),
                     address: address.clone(),
+                    client_address: client_address.clone(),
                     voting: false,
                 }))
             }

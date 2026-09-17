@@ -1,18 +1,23 @@
 [package]
-name = "jmeisel_raft5"
+name = "raft5-server"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "raft5_server"
+
 [dependencies]
-tonic = "0.14"
-tonic-prost = "0.14"
-prost = "0.14"
-tokio = { version = "1", features = ["full"] }
-tokio-stream = "0.1"
+raft5-shared = { path = "../raft5-shared" }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
 fjall = "3.1.10"
 clap = { version = "4.6.7", features = ["derive"] }
 tokio-util = "0.7.19"
+log = "0.4.34"
+env_logger = "0.11.11"
 
 [build-dependencies]
-tonic-prost-build = "0.14"
-
+tonic-prost-build = { workspace = true }

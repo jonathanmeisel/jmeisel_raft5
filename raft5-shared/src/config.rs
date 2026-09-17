@@ -19,7 +19,7 @@
 
 use prost::Message;
 
-use crate::pb::raft5::cluster::{ClusterConfig, ClusterMember};
+use crate::raft5::cluster::{ClusterConfig, ClusterMember};
 
 impl ClusterConfig {
     /// Decode a configuration as stored in a log entry's `value`.

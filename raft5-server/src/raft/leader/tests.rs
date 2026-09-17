@@ -117,6 +117,7 @@ async fn add_server_joins_as_a_non_voting_learner() {
         .propose_config(ConfigChange::AddServer {
             server_id: "new".to_string(),
             address: "http://127.0.0.1:9999".to_string(),
+            client_address: String::new(),
         })
         .await
         .unwrap();
@@ -146,6 +147,7 @@ async fn only_one_membership_change_may_be_in_flight() {
         .propose_config(ConfigChange::AddServer {
             server_id: "a".to_string(),
             address: "http://127.0.0.1:9001".to_string(),
+            client_address: String::new(),
         })
         .await
         .unwrap();
@@ -153,6 +155,7 @@ async fn only_one_membership_change_may_be_in_flight() {
         .propose_config(ConfigChange::AddServer {
             server_id: "b".to_string(),
             address: "http://127.0.0.1:9002".to_string(),
+            client_address: String::new(),
         })
         .await
         .unwrap_err();
@@ -167,6 +170,7 @@ async fn only_one_membership_change_may_be_in_flight() {
         .propose_config(ConfigChange::AddServer {
             server_id: "b".to_string(),
             address: "http://127.0.0.1:9002".to_string(),
+            client_address: String::new(),
         })
         .await
         .unwrap();
@@ -218,6 +222,7 @@ async fn impossible_membership_changes_are_refused() {
         .propose_config(ConfigChange::AddServer {
             server_id: "v1".to_string(),
             address: "http://127.0.0.1:9001".to_string(),
+            client_address: String::new(),
         })
         .await
         .unwrap_err();

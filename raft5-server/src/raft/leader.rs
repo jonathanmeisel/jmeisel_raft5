@@ -12,6 +12,7 @@ mod lease;
 mod replication;
 
 use lease::spawn_lease_prober;
+use log::info;
 use replication::spawn_replication;
 
 /// Periodically pushes `Event::LeaderTick` -- see the variant's doc for why
@@ -115,6 +116,10 @@ impl Leader {
             role_rx,
             read_quorum_rx,
         }));
+        info!(
+            "Transitioned to leader: term {}, index {}",
+            common.current_term, noop_seq
+        );
 
         let tick_timer = spawn_leader_tick(common.cancel_token(), common.event_tx.clone());
 

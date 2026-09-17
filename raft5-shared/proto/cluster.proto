@@ -19,10 +19,19 @@ message ClusterConfig {
 // candidate_id/leader_id/from/to in raft.proto).
 message ClusterMember {
   string server_id = 1;
+  // Where this member's *peer* API (raft.proto) is reached -- used by the
+  // other servers, never by a client.
   string address = 2;
   // Whether this member votes in elections and counts toward the commit
   // quorum. A non-voting member (a "learner") is replicated to like any
   // other follower but is invisible to both quorums -- how a newly added
   // server catches up without stalling the cluster (Raft §4.2.1).
   bool voting = 3;
+  // Where this member's *client* API (client.proto) is reached. Carried in
+  // the configuration so that a client holding any one member's address can
+  // learn every other member's, and can turn a `NotLeader.leader_hint` --
+  // which names a server_id -- into somewhere to actually send its next
+  // request. The peer `address` is no use for that: the two APIs are served
+  // on separate ports.
+  string client_address = 4;
 }

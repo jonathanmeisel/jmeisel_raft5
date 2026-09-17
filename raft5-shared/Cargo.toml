@@ -1,0 +1,15 @@
+[package]
+name = "raft5-shared"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "raft5_shared"
+
+[dependencies]
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }

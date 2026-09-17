@@ -70,6 +70,7 @@ fn kv_service(log: Arc<RaftLog>, node_id: &str) -> (KvService, watch::Receiver<R
     let identity = ClusterMember {
         server_id: node_id.to_string(),
         address: format!("http://127.0.0.1:1/{node_id}"),
+        client_address: format!("http://127.0.0.1:2/{node_id}"),
         voting: true,
     };
     (
@@ -207,6 +208,7 @@ async fn writes_to_a_non_leader_come_back_as_not_leader() {
         .add_server(Request::new(AddServerRequest {
             server_id: "new".to_string(),
             address: "http://127.0.0.1:9999".to_string(),
+            client_address: "http://127.0.0.1:9998".to_string(),
         }))
         .await
         .unwrap()
@@ -267,6 +269,7 @@ async fn add_server_then_remove_server_round_trip_through_the_kv_service() {
         .add_server(Request::new(AddServerRequest {
             server_id: "new".to_string(),
             address: "http://127.0.0.1:9999".to_string(),
+            client_address: "http://127.0.0.1:9998".to_string(),
         }))
         .await
         .unwrap()
@@ -360,6 +363,7 @@ async fn get_config_reports_empty_before_bootstrap_and_the_new_member_right_afte
     svc.add_server(Request::new(AddServerRequest {
         server_id: "new".to_string(),
         address: "http://127.0.0.1:9999".to_string(),
+        client_address: "http://127.0.0.1:9998".to_string(),
     }))
     .await
     .unwrap();

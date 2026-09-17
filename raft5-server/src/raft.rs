@@ -170,6 +170,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use log::warn;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -435,6 +436,7 @@ fn seed_config(node_id: &str, peers: &[PeerInfo]) -> ClusterConfig {
     let member = |id: &str, address: &str| ClusterMember {
         server_id: id.to_string(),
         address: address.to_string(),
+        client_address: String::new(),
         voting: true,
     };
     ClusterConfig {
@@ -883,13 +885,13 @@ fn spawn_storage_maintenance_task(
                     applied_tx.send_replace(commit_seq);
                 }
                 Err(e) => {
-                    eprintln!("apply_committed to seq {commit_seq} failed: {e}");
+                    warn!("apply_committed to seq {commit_seq} failed: {e}");
                     continue; // don't attempt to compact past what didn't apply
                 }
             }
 
             if let Err(e) = store.run(move |log| log.compact(compact_seq)).await {
-                eprintln!("compact to seq {compact_seq} failed: {e}");
+                warn!("compact to seq {compact_seq} failed: {e}");
             }
         }
     })

@@ -4,6 +4,7 @@ fn member(id: &str, voting: bool) -> ClusterMember {
     ClusterMember {
         server_id: id.to_string(),
         address: format!("http://{id}:1"),
+        client_address: format!("http://{id}:2"),
         voting,
     }
 }

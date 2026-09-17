@@ -1,0 +1,18 @@
+[package]
+name = "raft5-client"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "raft5_client"
+
+[dependencies]
+raft5-shared = { path = "../raft5-shared" }
+tonic = { workspace = true }
+tokio = { workspace = true }
+log = "0.4.34"
+
+[dev-dependencies]
+raft5-server = { path = "../raft5-server" }
+tokio-util = "0.7.19"
+env_logger = "0.11.11"

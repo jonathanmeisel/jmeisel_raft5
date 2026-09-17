@@ -2,8 +2,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
+use log::info;
 
-use jmeisel_raft5::serve;
+use raft5_server::serve;
 use tokio_util::sync::CancellationToken;
 
 /// A single Raft node.
@@ -43,10 +44,18 @@ struct Args {
     /// then. Recorded in the cluster configuration at bootstrap.
     #[arg(long)]
     advertise: Option<String>,
+
+    /// URL clients should dial to reach this node's client API. Defaults
+    /// to `client_addr`, with the same wildcard/NAT caveat as
+    /// `advertise`. Recorded in the cluster configuration at bootstrap,
+    /// and how a client that knows any one member can find the others.
+    #[arg(long)]
+    advertise_client: Option<String>,
 }
 
 #[tokio::main]
-async fn main() -> Result<(), jmeisel_raft5::Error> {
+async fn main() -> Result<(), raft5_server::Error> {
+    env_logger::init();
     let args = Args::parse();
     let cancel = CancellationToken::new();
     let node = serve(
@@ -55,6 +64,7 @@ async fn main() -> Result<(), jmeisel_raft5::Error> {
         args.client_addr,
         args.peer_addr,
         args.advertise,
+        args.advertise_client,
         cancel.clone(),
     );
 
@@ -68,7 +78,7 @@ async fn main() -> Result<(), jmeisel_raft5::Error> {
         result = &mut node => return result,
         _ = tokio::signal::ctrl_c() => {}
     }
-    println!("shutting down...");
+    info!("shutting down...");
     cancel.cancel();
     node.await
 }

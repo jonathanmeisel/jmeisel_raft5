@@ -15,7 +15,6 @@
 //! storage call still holding the database lock. `raft::Task` is where
 //! that discipline is actually enforced.
 
-pub mod config;
 pub mod grpc;
 pub mod pb;
 pub mod raft;
@@ -27,6 +26,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
+use log::info;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 
@@ -82,6 +82,8 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 ///   API. Defaults to `peer_addr`, which is wrong whenever that is a
 ///   wildcard bind (`0.0.0.0:...`) or behind NAT -- set it explicitly
 ///   then. Recorded in the cluster configuration at bootstrap.
+/// - `advertise_client`: the same, for the client API -- what clients
+///   are handed when they ask the cluster where its members are.
 // pub fn run(
 //     id: String,
 //     db: &Path,
@@ -110,12 +112,14 @@ pub async fn serve(
     client_addr: SocketAddr,
     peer_addr: SocketAddr,
     advertise: Option<String>,
+    advertise_client: Option<String>,
     cancel: CancellationToken,
 ) -> Result<(), Error> {
     let log = Arc::new(RaftLog::open(db)?);
     let identity = ClusterMember {
         server_id: id.clone(),
         address: advertise.unwrap_or_else(|| format!("http://{peer_addr}")),
+        client_address: advertise_client.unwrap_or_else(|| format!("http://{client_addr}")),
         voting: true,
     };
 
@@ -140,13 +144,13 @@ pub async fn serve(
     let raft_peer_server = RaftPeerServer::new(RaftPeerService::new(peer_handle));
 
     if uninitialized {
-        println!(
+        info!(
             "node {id} is not part of a cluster yet -- send Bootstrap to form a single-node \
              cluster, or AddServer on an existing cluster's leader to join it"
         );
     }
-    println!("client API listening on {client_addr}");
-    println!("peer API listening on {peer_addr}");
+    info!("client API listening on {client_addr}");
+    info!("peer API listening on {peer_addr}");
 
     // `serve_with_shutdown` rather than `serve`: on cancellation tonic
     // stops accepting and then lets the requests already in flight finish,

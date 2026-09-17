@@ -3,6 +3,8 @@
 //! election if it hasn't heard from a leader in time. See the parent
 //! module's doc for how roles fit together generally.
 
+use log::info;
+
 use super::*;
 
 /// The outcome of matching+applying one `AppendEntries` call's `entries`
@@ -243,6 +245,7 @@ impl Follower {
         // so the next one starts fresh at the base timeout again.
         common.election_attempt = 0;
         common.publish_role(follower_handle(&common, None));
+        info!("Transitioned to follower: term {}", common.current_term);
 
         // A learner -- or a server that has been removed from the
         // configuration -- never campaigns, so it gets no election timer

@@ -1,5 +1,5 @@
 //! End-to-end integration test: three real nodes (each a full
-//! `jmeisel_raft5::run` instance, listening on real localhost sockets),
+//! `raft5_server::run` instance, listening on real localhost sockets),
 //! formed into a cluster via the client gRPC API alone -- bootstrap plus
 //! two `AddServer` calls, no internal shortcuts. A write through the
 //! leader is only reported back once committed and applied (see
@@ -31,8 +31,8 @@ async fn three_node_cluster(prefix: &str) -> (TestNode, TestNode, TestNode) {
 
     let c1 = n1.client();
     bootstrap(&c1, &n1.id).await;
-    add_server(&c1, &n2.id, n2.peer_addr).await;
-    add_server(&c1, &n3.id, n3.peer_addr).await;
+    add_server(&c1, &n2).await;
+    add_server(&c1, &n3).await;
     wait_until_voter(&c1, &n2.id).await;
     wait_until_voter(&c1, &n3.id).await;
 

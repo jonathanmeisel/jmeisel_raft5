@@ -88,7 +88,12 @@ message ReadOk {
 
 message AddServerRequest {
   string server_id = 1;
+  // The new server's peer API address, for the rest of the cluster to
+  // replicate to it, and its client API address, for clients to find it
+  // once it is a member. Both end up in the configuration verbatim (see
+  // ClusterMember).
   string address = 2;
+  string client_address = 3;
 }
 
 message RemoveServerRequest {

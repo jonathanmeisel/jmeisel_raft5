@@ -1,5 +1,5 @@
 //! Shared setup for integration tests: spinning up real
-//! `jmeisel_raft5::run` nodes on real localhost sockets and driving them
+//! `raft5_server::run` nodes on real localhost sockets and driving them
 //! purely through the client gRPC API, with retries for the transient
 //! refusals that are a normal part of startup/election/replication
 //! (rather than fixed sleeps guessing how long those take).
@@ -9,15 +9,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use log::warn;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Channel;
 
-use jmeisel_raft5::pb::raft5::client::kv_client::KvClient;
-use jmeisel_raft5::pb::raft5::client::{
+use raft5_server::pb::raft5::client::kv_client::KvClient;
+use raft5_server::pb::raft5::client::{
     AddServerRequest, BootstrapRequest, GetConfigRequest, ReadRequest, WriteRequest,
     config_change_response, read_response, write_response,
 };
-use jmeisel_raft5::pb::raft5::cluster::ClusterMember;
+use raft5_server::pb::raft5::cluster::ClusterMember;
 
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_DELAY: Duration = Duration::from_millis(20);
@@ -32,7 +33,7 @@ pub type Client = KvClient<Channel>;
 
 /// A node started for a test: its own fresh database directory and fixed
 /// addresses, plus a background task running the real
-/// `jmeisel_raft5::run` server loop, the token that stops it, and a
+/// `raft5_server::run` server loop, the token that stops it, and a
 /// client already connected to it -- all `None` while deliberately shut
 /// down via `shut_down` (as opposed to torn down for good via `Drop`).
 pub struct TestNode {
@@ -54,6 +55,13 @@ struct RunningNode {
 
 impl TestNode {
     pub async fn new(id: &str) -> Self {
+        // `try_init` rather than `init`: every test in the binary calls
+        // this, all in the same process (possibly concurrently, since
+        // tests run on their own threads by default), and `init` panics
+        // on a second call. Ignoring the error is fine either way -- the
+        // first call to succeed is the one whose filter/format wins.
+        let _ = env_logger::try_init();
+
         let mut node = Self {
             id: id.to_string(),
             client_addr: free_local_addr(),
@@ -89,16 +97,17 @@ impl TestNode {
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
         let task = tokio::spawn(async move {
-            let node = jmeisel_raft5::serve(
+            let node = raft5_server::serve(
                 id.clone(),
                 &db_dir,
                 client_addr,
                 peer_addr,
                 None,
+                None,
                 cancel_clone,
             );
             if let Err(e) = node.await {
-                eprintln!("node {id} exited with an error: {e}");
+                warn!("node {id} exited with an error: {e}");
             }
         });
         self.running = Some(RunningNode { cancel, task });
@@ -212,17 +221,19 @@ pub async fn bootstrap(client: &Arc<Client>, server_id: &str) {
     }
 }
 
-/// Adds `server_id` to the cluster this client's node leads, retrying on
+/// Adds `node` to the cluster this client's node leads, retrying on
 /// `NotLeader`/`ConfigChangeInProgress`-style transient refusals (e.g. a
 /// membership change from a previous call still committing).
-pub async fn add_server(client: &Arc<Client>, server_id: &str, peer_addr: SocketAddr) {
+pub async fn add_server(client: &Arc<Client>, node: &TestNode) {
+    let server_id = &node.id;
     let mut client = (**client).clone();
     let until = deadline();
     loop {
         let resp = client
             .add_server(AddServerRequest {
                 server_id: server_id.to_string(),
-                address: format!("http://{peer_addr}"),
+                address: format!("http://{}", node.peer_addr),
+                client_address: format!("http://{}", node.client_addr),
             })
             .await;
         match resp {

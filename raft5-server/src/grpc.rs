@@ -225,6 +225,7 @@ impl Kv for KvService {
         self.propose(ConfigChange::AddServer {
             server_id: req.server_id,
             address: req.address,
+            client_address: req.client_address,
         })
         .await
     }

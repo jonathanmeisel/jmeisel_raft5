@@ -4,6 +4,12 @@ use crate::pb::raft5::common::EntryKind;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) fn open_temp_log() -> (Arc<RaftLog>, std::path::PathBuf) {
+    // `try_init` rather than `init`: every test that spins up a node goes
+    // through here, all in the same process, and `init` panics on a
+    // second call. Ignoring the error is fine either way -- the first
+    // call to succeed is the one whose filter/format wins.
+    let _ = env_logger::try_init();
+
     // A nanosecond timestamp alone isn't a reliable unique suffix under
     // parallel test execution -- two tests starting at nearly the same
     // instant can land on the same value (clock resolution, scheduling)
@@ -33,6 +39,7 @@ pub(crate) fn cluster_config(members: &[(&str, bool)]) -> ClusterConfig {
             .map(|(i, (id, voting))| ClusterMember {
                 server_id: (*id).to_string(),
                 address: format!("http://127.0.0.1:{}", 9000 + i),
+                client_address: format!("http://127.0.0.1:{}", 8000 + i),
                 voting: *voting,
             })
             .collect(),

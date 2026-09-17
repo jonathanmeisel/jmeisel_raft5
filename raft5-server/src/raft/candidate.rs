@@ -5,6 +5,8 @@
 //! `CampaignKind`, rather than maintaining two near-identical copies. See
 //! the parent module's doc for how pre-vote fits into the bigger picture.
 
+use log::info;
+
 use super::*;
 
 /// Requests a vote (real or pre-vote, per `req.dry_run`) from `peer`,
@@ -70,6 +72,7 @@ impl Campaign {
                 common.current_term += 1;
                 common.voted_for = Some(common.node_id.clone());
                 common.persist_term_state().await;
+                info!("Transitioned to candidate: term {}", common.current_term);
                 common.current_term
             }
             CampaignKind::PreVote => common.current_term + 1,
