@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package raft5.client;
 
+import "cluster.proto";
+
 // Node-to-client API. Served on a separate port from the peer-to-peer
 // RaftPeer service (raft.proto), since the two have different auth/network
 // exposure requirements (client access vs. mTLS between known cluster
@@ -30,6 +32,14 @@ service Kv {
   // cluster is added via AddServer on that cluster's leader instead, and
   // receives its configuration by replication.
   rpc Bootstrap(BootstrapRequest) returns (ConfigChangeResponse);
+
+  // The cluster configuration currently in force on this node -- whatever
+  // its own log's tail says (Raft §4.1: on append, not on commit), so it
+  // can reflect a change that hasn't finished committing yet. Empty
+  // `members` means this node hasn't been bootstrapped or added to a
+  // cluster yet. Answered by any node, not just the leader: membership is
+  // local, read-only state, unlike a write or a linearizable read.
+  rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
 }
 
 // Carried in every response so a client can find the real leader without a
@@ -97,4 +107,10 @@ message ConfigChangeResponse {
     bool ok = 1;
     RaftError error = 2;
   }
+}
+
+message GetConfigRequest {}
+
+message GetConfigResponse {
+  repeated raft5.cluster.ClusterMember members = 1;
 }

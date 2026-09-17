@@ -45,14 +45,27 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), jmeisel_raft5::Error> {
     let args = Args::parse();
-    run(
+    let (node, cancel) = run(
         args.id,
         &args.db,
         args.client_addr,
         args.peer_addr,
         args.advertise,
-    )
-    .await
+    );
+
+    // Ctrl-C cancels rather than kills: the node then stops accepting
+    // new requests, finishes the ones in flight, and tears down its
+    // state machine and every background task under it before `node`
+    // finally resolves. Awaiting it afterwards is what makes the process
+    // outlive its own shutdown long enough for that to happen.
+    tokio::pin!(node);
+    tokio::select! {
+        result = &mut node => return result,
+        _ = tokio::signal::ctrl_c() => {}
+    }
+    println!("shutting down...");
+    cancel.cancel();
+    node.await
 }

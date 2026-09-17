@@ -60,8 +60,8 @@ impl CampaignKind {
 struct Campaign {
     common: Common,
     kind: CampaignKind,
-    vote_tasks: Vec<JoinHandle<()>>,
-    election_timer: JoinHandle<()>,
+    vote_tasks: Vec<Task>,
+    election_timer: Task,
     votes_received: usize,
 }
 
@@ -94,6 +94,7 @@ impl Campaign {
             .into_iter()
             .map(|peer| {
                 Self::spawn_request_vote(
+                    common.cancel_token(),
                     peer,
                     term,
                     common.node_id.clone(),
@@ -108,7 +109,11 @@ impl Campaign {
         // Without this, a split vote (or a cluster too small to reach
         // majority with the peers that actually answer) would leave the
         // campaign stuck forever with nothing left to wait on.
-        let election_timer = spawn_election_timer(common.election_attempt, common.event_tx.clone());
+        let election_timer = spawn_election_timer(
+            common.cancel_token(),
+            common.election_attempt,
+            common.event_tx.clone(),
+        );
 
         let campaign_common_is_voter = common.is_voter();
         let mut campaign = Campaign {
@@ -134,7 +139,7 @@ impl Campaign {
         } else {
             campaign.run().await
         };
-        (next_role, campaign.shutdown())
+        (next_role, campaign.shutdown().await)
     }
 
     /// Calls `peer`'s RequestVote RPC and, if it answers in time, pushes
@@ -142,6 +147,7 @@ impl Campaign {
     /// happens on the event loop rather than racing with it.
     #[allow(clippy::too_many_arguments)]
     fn spawn_request_vote(
+        cancel: &CancellationToken,
         peer: PeerInfo,
         term: u64,
         candidate_id: String,
@@ -150,8 +156,8 @@ impl Campaign {
         dry_run: bool,
         conns: Arc<PeerConnections>,
         event_tx: mpsc::Sender<Event>,
-    ) -> JoinHandle<()> {
-        tokio::spawn(async move {
+    ) -> Task {
+        Task::spawn(cancel, move |cancel| async move {
             let req = RequestVoteRequest {
                 term,
                 candidate_id,
@@ -159,22 +165,30 @@ impl Campaign {
                 last_log_term,
                 dry_run,
             };
-            let Some(resp) = request_vote_from_peer(&peer, req, &conns).await else {
+            // Wrapped rather than simply awaited: `request_vote_from_peer`
+            // is bounded by `LIGHTWEIGHT_RPC_TIMEOUT`, but an abandoned
+            // campaign shouldn't have to wait out even that much before
+            // this task is gone.
+            let resp = until_cancelled(&cancel, request_vote_from_peer(&peer, req, &conns)).await;
+            let Some(Some(resp)) = resp else {
                 return;
             };
-            let _ = event_tx
-                .send(Event::RequestVoteResponse {
+            send_event(
+                &cancel,
+                &event_tx,
+                Event::RequestVoteResponse {
                     from: peer.id,
                     resp,
-                })
-                .await;
+                },
+            )
+            .await;
         })
     }
 
     async fn run(&mut self) -> Role {
         loop {
-            let Some(event) = self.common.event_rx.recv().await else {
-                return Role::Follower;
+            let Some(event) = self.common.next_event().await else {
+                return Role::Stopped;
             };
             match self.handle_event(event).await {
                 Transition::Continue => {}
@@ -325,11 +339,13 @@ impl Campaign {
         }
     }
 
-    fn shutdown(self) -> Common {
-        for task in self.vote_tasks {
-            task.abort();
-        }
-        self.election_timer.abort();
+    /// Stops this campaign's tasks and hands `Common` back. Every one is
+    /// signalled first and only then joined, so the outstanding vote
+    /// requests wind down in parallel rather than one RPC timeout at a
+    /// time.
+    async fn shutdown(self) -> Common {
+        Task::stop_all(self.vote_tasks).await;
+        self.election_timer.stop().await;
         self.common
     }
 }

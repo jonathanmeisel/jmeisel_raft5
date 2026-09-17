@@ -48,7 +48,12 @@ pub(crate) fn open_temp_log_with_config(
 ) -> (Arc<RaftLog>, NewCommon, std::path::PathBuf) {
     let (log, path) = open_temp_log();
     log.append_config(1, &config.to_bytes()).expect("bootstrap");
-    let common = Common::new(node_id.to_string(), Arc::clone(&log)).unwrap();
+    let common = Common::new(
+        node_id.to_string(),
+        Arc::clone(&log),
+        CancellationToken::new(),
+    )
+    .unwrap();
     (log, common, path)
 }
 
@@ -66,8 +71,13 @@ pub(crate) fn spawn_test_node(
     std::path::PathBuf,
 ) {
     let (log, path) = open_temp_log();
-    let (common, role_rx, peer_handle, _commit_rx, _compact_rx) =
-        Common::new_seeded("test-node".to_string(), peers, log).unwrap();
+    let (common, role_rx, peer_handle, _commit_rx, _compact_rx) = Common::new_seeded(
+        "test-node".to_string(),
+        peers,
+        log,
+        CancellationToken::new(),
+    )
+    .unwrap();
     tokio::spawn(run(common));
     (role_rx, peer_handle, path)
 }
@@ -87,8 +97,13 @@ pub(crate) fn spawn_node_with_handles(
     std::path::PathBuf,
 ) {
     let (log, path) = open_temp_log();
-    let (common, role_rx, peer_handle, commit_rx, compact_rx) =
-        Common::new_seeded("test-node".to_string(), peers, Arc::clone(&log)).unwrap();
+    let (common, role_rx, peer_handle, commit_rx, compact_rx) = Common::new_seeded(
+        "test-node".to_string(),
+        peers,
+        Arc::clone(&log),
+        CancellationToken::new(),
+    )
+    .unwrap();
     tokio::spawn(run(common));
     (log, role_rx, peer_handle, commit_rx, compact_rx, path)
 }

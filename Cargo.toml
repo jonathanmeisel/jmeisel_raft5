@@ -11,6 +11,8 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 fjall = "3.1.10"
 clap = { version = "4.6.7", features = ["derive"] }
+tokio-util = "0.7.19"
 
 [build-dependencies]
 tonic-prost-build = "0.14"
+

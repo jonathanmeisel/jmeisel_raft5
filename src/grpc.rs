@@ -25,9 +25,9 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::pb::raft5::client::kv_server::Kv;
 use crate::pb::raft5::client::{
-    AddServerRequest, BootstrapRequest, ConfigChangeResponse, NotLeader, RaftError as PbRaftError,
-    ReadOk, ReadRequest, ReadResponse, RemoveServerRequest, WriteRequest, WriteResponse,
-    config_change_response, raft_error, read_response, write_response,
+    AddServerRequest, BootstrapRequest, ConfigChangeResponse, GetConfigRequest, GetConfigResponse,
+    NotLeader, RaftError as PbRaftError, ReadOk, ReadRequest, ReadResponse, RemoveServerRequest,
+    WriteRequest, WriteResponse, config_change_response, raft_error, read_response, write_response,
 };
 use crate::pb::raft5::cluster::{ClusterConfig, ClusterMember};
 use crate::pb::raft5::raft::raft_peer_server::RaftPeer;
@@ -274,6 +274,32 @@ impl Kv for KvService {
             result: Some(config_change_response::Result::Ok(true)),
         }))
     }
+
+    async fn get_config(
+        &self,
+        _request: Request<GetConfigRequest>,
+    ) -> Result<Response<GetConfigResponse>, Status> {
+        let log = Arc::clone(&self.log);
+        let bytes = tokio::task::spawn_blocking(move || log.current_config())
+            .await
+            .map_err(join_err)?
+            .map_err(storage_err)?;
+
+        let members = match bytes {
+            Some(bytes) => {
+                ClusterConfig::from_bytes(&bytes)
+                    .map_err(|e| {
+                        Status::internal(format!("stored cluster config was corrupt: {e}"))
+                    })?
+                    .members
+            }
+            // Not bootstrapped or added to a cluster yet -- not an error,
+            // just an empty membership list.
+            None => Vec::new(),
+        };
+
+        Ok(Response::new(GetConfigResponse { members }))
+    }
 }
 
 pub struct RaftPeerService {
@@ -372,6 +398,7 @@ mod tests {
     use crate::pb::raft5::client::{read_response, write_response};
     use crate::raft::{self, RoleHandle};
     use tokio::sync::watch;
+    use tokio_util::sync::CancellationToken;
 
     fn open_temp() -> (Arc<RaftLog>, std::path::PathBuf) {
         // A nanosecond timestamp alone isn't a reliable unique suffix under
@@ -424,8 +451,12 @@ mod tests {
     /// A `KvService` on top of a running state machine, plus the handles
     /// a test needs to watch it.
     fn kv_service(log: Arc<RaftLog>, node_id: &str) -> (KvService, watch::Receiver<RoleHandle>) {
-        let (common, role_rx, _peer_handle, _commit_rx, _compact_rx) =
-            raft::Common::new(node_id.to_string(), Arc::clone(&log)).unwrap();
+        let (common, role_rx, _peer_handle, _commit_rx, _compact_rx) = raft::Common::new(
+            node_id.to_string(),
+            Arc::clone(&log),
+            CancellationToken::new(),
+        )
+        .unwrap();
         let client_handle = common.client_handle();
         tokio::spawn(raft::run(common));
         let identity = ClusterMember {
@@ -693,6 +724,50 @@ mod tests {
         cleanup(&path);
     }
 
+    /// `GetConfig` reflects membership before it commits (Raft §4.1 --
+    /// activation on append), and reports an empty cluster rather than an
+    /// error for a node that hasn't been bootstrapped yet.
+    #[tokio::test]
+    async fn get_config_reports_empty_before_bootstrap_and_the_new_member_right_after_add() {
+        let (log, path) = open_temp();
+        let svc = leader_kv_service(Arc::clone(&log), "solo").await;
+
+        let members = svc
+            .get_config(Request::new(GetConfigRequest {}))
+            .await
+            .unwrap()
+            .into_inner()
+            .members;
+        assert_eq!(
+            members
+                .iter()
+                .map(|m| m.server_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["solo"]
+        );
+
+        svc.add_server(Request::new(AddServerRequest {
+            server_id: "new".to_string(),
+            address: "http://127.0.0.1:9999".to_string(),
+        }))
+        .await
+        .unwrap();
+
+        let members = svc
+            .get_config(Request::new(GetConfigRequest {}))
+            .await
+            .unwrap()
+            .into_inner()
+            .members;
+        let new_member = members
+            .iter()
+            .find(|m| m.server_id == "new")
+            .expect("new member should be visible");
+        assert!(!new_member.voting, "added as a learner");
+
+        cleanup(&path);
+    }
+
     /// Bootstrapping is irreversible, so a client that names the wrong
     /// node is told so rather than silently initializing the one it
     /// happened to reach.
@@ -720,8 +795,12 @@ mod tests {
     #[tokio::test]
     async fn append_entries_and_request_vote_reach_the_running_state_machine() {
         let (log, path) = open_temp();
-        let (common, role_rx, peer_handle, _commit_rx, _compact_rx) =
-            raft::Common::new("node-under-test".to_string(), Arc::clone(&log)).unwrap();
+        let (common, role_rx, peer_handle, _commit_rx, _compact_rx) = raft::Common::new(
+            "node-under-test".to_string(),
+            Arc::clone(&log),
+            CancellationToken::new(),
+        )
+        .unwrap();
         tokio::spawn(raft::run(common));
 
         let svc = RaftPeerService::new(peer_handle);

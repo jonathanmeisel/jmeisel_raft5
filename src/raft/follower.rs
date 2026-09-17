@@ -161,16 +161,19 @@ fn apply_append_entries_sync(
 /// deadline from either source without either one needing to reach into
 /// the other's task.
 fn spawn_lease_expiration_watcher(
+    cancel: &CancellationToken,
     mut lease_rx: watch::Receiver<Option<Instant>>,
     event_tx: mpsc::Sender<Event>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
+) -> Task {
+    Task::spawn(cancel, move |cancel| async move {
         let started_at = Instant::now();
         loop {
             let deadline = (*lease_rx.borrow()).unwrap_or(started_at + LEASE_DURATION);
             let now = Instant::now();
             if now < deadline {
                 tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return,
                     _ = tokio::time::sleep(deadline - now) => {}
                     changed = lease_rx.changed() => {
                         if changed.is_err() {
@@ -183,6 +186,8 @@ fn spawn_lease_expiration_watcher(
 
             let fuzz = Duration::from_millis(random_jitter_millis(LEASE_DURATION_MS));
             tokio::select! {
+                biased;
+                () = cancel.cancelled() => return,
                 _ = tokio::time::sleep(fuzz) => {}
                 changed = lease_rx.changed() => {
                     if changed.is_err() {
@@ -201,7 +206,7 @@ fn spawn_lease_expiration_watcher(
             if !still_expired {
                 continue;
             }
-            let _ = event_tx.send(Event::ElectionTimeout).await;
+            send_event(&cancel, &event_tx, Event::ElectionTimeout).await;
             return;
         }
     })
@@ -224,7 +229,7 @@ fn follower_handle(common: &Common, leader_hint: Option<String>) -> RoleHandle {
 
 pub struct Follower {
     common: Common,
-    election_timer: JoinHandle<()>,
+    election_timer: Task,
     leader_hint: Option<String>,
 }
 
@@ -246,11 +251,18 @@ impl Follower {
         // arms one.
         let election_timer = if common.is_voter() {
             spawn_lease_expiration_watcher(
+                common.cancel_token(),
                 common.lease_expires_at_rx.clone(),
                 common.event_tx.clone(),
             )
         } else {
-            tokio::spawn(std::future::pending())
+            // Nothing to watch for, but still a real `Task` rather than a
+            // bare handle: `shutdown` treats every role's timer the same
+            // way, and a `pending` future left to be dropped is exactly
+            // the loose end this is all meant to avoid.
+            Task::spawn(common.cancel_token(), |cancel| async move {
+                cancel.cancelled().await;
+            })
         };
 
         let mut follower = Follower {
@@ -259,7 +271,7 @@ impl Follower {
             leader_hint: None,
         };
         let next_role = follower.run().await;
-        (next_role, follower.shutdown())
+        (next_role, follower.shutdown().await)
     }
 
     fn not_leader_error(&self) -> RaftError {
@@ -382,8 +394,8 @@ impl Follower {
 
     async fn run(&mut self) -> Role {
         loop {
-            let Some(event) = self.common.event_rx.recv().await else {
-                return Role::Follower;
+            let Some(event) = self.common.next_event().await else {
+                return Role::Stopped;
             };
             match self.handle_event(event).await {
                 Transition::Continue => {}
@@ -544,8 +556,8 @@ impl Follower {
         }
     }
 
-    fn shutdown(self) -> Common {
-        self.election_timer.abort();
+    async fn shutdown(self) -> Common {
+        self.election_timer.stop().await;
         self.common
     }
 }
@@ -1013,8 +1025,13 @@ mod tests {
         // that `Follower::handle_event` actually calls through to
         // persistence, not just that the storage layer works in isolation.
         let (log, path) = open_temp_log();
-        let (common, _role_rx, peer_handle, _commit_rx, _compact_rx) =
-            Common::new_seeded("test-node".to_string(), vec![], Arc::clone(&log)).unwrap();
+        let (common, _role_rx, peer_handle, _commit_rx, _compact_rx) = Common::new_seeded(
+            "test-node".to_string(),
+            vec![],
+            Arc::clone(&log),
+            CancellationToken::new(),
+        )
+        .unwrap();
         tokio::spawn(run(common));
 
         peer_handle

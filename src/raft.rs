@@ -122,17 +122,43 @@
 //!   assumes it is its own cluster, since two nodes doing that would be
 //!   two clusters.
 //!
+//! # Cancellation
+//!
+//! Every background task here -- a role's timers, a leader's per-peer
+//! replication and lease probes, a candidate's vote requests, the storage
+//! maintenance task -- is owned by a `Task`, and every one of those runs
+//! under a child of the node's single root `CancellationToken` (supplied
+//! by `crate::serve`). There are three rules, and `Task` exists to make
+//! them hard to break:
+//!
+//! * **Nothing is detached.** A task is stopped by `Task::stop`, which
+//!   cancels and *then joins*. `JoinHandle::abort` leaves the task
+//!   wherever its last poll got to, which is how an `Arc<RaftLog>` -- and
+//!   with it the database lock -- ends up outliving the node that owned
+//!   it, invisibly, until the next node to open the same directory fails.
+//! * **Long waits are cancellable, storage calls are not.** Peer RPCs,
+//!   heartbeat sleeps and sends into the event loop go through
+//!   `until_cancelled`; `spawn_blocking` calls are always awaited to
+//!   completion, since dropping one doesn't stop it -- it keeps running
+//!   on its own worker thread, still holding what it captured.
+//! * **`run` returning means the node is gone.** Not "is stopping": every
+//!   role has torn down and joined its own tasks, the maintenance task
+//!   has been joined, and `Common` has been dropped, which is what
+//!   releases the gRPC handlers still parked on its channels.
+//!
 //! Still simplified: the leader-side §5.3 backoff optimization (see
 //! `leader::Leader::spawn_replication`), and nothing triggers snapshots
 //! on its own yet -- a snapshot is sent only when a peer has fallen
 //! behind the compaction floor.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tonic::transport::Channel;
 
 use crate::pb::raft5::cluster::{ClusterConfig, ClusterMember};
@@ -192,6 +218,100 @@ const SNAPSHOT_RPC_TIMEOUT: Duration = Duration::from_secs(300);
 /// working" tradeoff -- see `grpc::RaftPeerService::install_snapshot`);
 /// this only bounds the size of each individual gRPC message.
 const SNAPSHOT_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// A spawned background task together with the token that stops it.
+///
+/// Every background task in this module is owned by one of these, and the
+/// only way to get rid of one is `stop`, which signals *and then waits*.
+/// That is the whole point: a `JoinHandle::abort` (or, worse, a handle
+/// simply dropped) leaves the task's last poll wherever it happened to
+/// be, so whatever it was holding -- an `Arc<RaftLog>`, and with it the
+/// database lock -- can outlive the node that owned it. `stop` guarantees
+/// the task has actually returned before the owner moves on.
+pub(crate) struct Task {
+    cancel: CancellationToken,
+    handle: JoinHandle<()>,
+}
+
+impl Task {
+    /// Spawns `body`, handing it a fresh child of `parent`. The child
+    /// relationship is what makes cancellation propagate downward without
+    /// any of these tasks knowing about each other: cancelling the node's
+    /// root token stops every task at once, while `stop` on an individual
+    /// `Task` (a leader dropping one peer's replication, say) cancels only
+    /// that one.
+    fn spawn<F>(parent: &CancellationToken, body: impl FnOnce(CancellationToken) -> F) -> Self
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let cancel = parent.child_token();
+        let handle = tokio::spawn(body(cancel.clone()));
+        Self { cancel, handle }
+    }
+
+    /// Signals the task to stop and waits until it actually has.
+    ///
+    /// A `JoinError` here is either a panic (already reported by the
+    /// default panic hook, and not something this layer can do anything
+    /// about) or an abort that nothing in this module performs -- either
+    /// way the task is over, which is all the caller is waiting for.
+    async fn stop(self) {
+        self.signal();
+        let _ = self.handle.await;
+    }
+
+    /// Signals without waiting. Only useful as the first half of
+    /// `stop_all`.
+    fn signal(&self) {
+        self.cancel.cancel();
+    }
+
+    /// The runtime's id for the spawned task -- for tests asserting that
+    /// a task was (or was not) restarted, since two `Task`s are otherwise
+    /// indistinguishable from the outside.
+    #[cfg(test)]
+    fn id(&self) -> tokio::task::Id {
+        self.handle.id()
+    }
+
+    /// Stops a whole group of tasks, signalling every one of them before
+    /// joining any -- so they wind down concurrently instead of serially,
+    /// each waiting out the one ahead of it.
+    async fn stop_all(tasks: impl IntoIterator<Item = Task>) {
+        let tasks: Vec<Task> = tasks.into_iter().collect();
+        for task in &tasks {
+            task.signal();
+        }
+        for task in tasks {
+            task.stop().await;
+        }
+    }
+}
+
+/// Awaits `fut` unless `cancel` fires first; `None` means cancelled.
+///
+/// Deliberately *not* used around `spawn_blocking` calls. Dropping one of
+/// those mid-flight doesn't stop it -- it keeps running on its own worker
+/// thread, still holding whatever it captured, typically an
+/// `Arc<RaftLog>`. Storage work is short and bounded, so every such await
+/// here is left to complete; only genuinely open-ended waits (a peer RPC,
+/// a heartbeat sleep, a channel send into an event loop that may already
+/// have stopped draining) are wrapped in this.
+async fn until_cancelled<T>(cancel: &CancellationToken, fut: impl Future<Output = T>) -> Option<T> {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => None,
+        value = fut => Some(value),
+    }
+}
+
+/// `until_cancelled` for the common "push an event and keep going unless
+/// there's no one left to push to" step. `true` means the caller should
+/// carry on; `false` means it should return, either because it was
+/// cancelled or because the event loop is gone.
+async fn send_event(cancel: &CancellationToken, tx: &mpsc::Sender<Event>, event: Event) -> bool {
+    matches!(until_cancelled(cancel, tx.send(event)).await, Some(Ok(())))
+}
 
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
@@ -292,6 +412,11 @@ pub(crate) enum Role {
     PreCandidate,
     Candidate,
     Leader,
+    /// Not a role: the node is shutting down (its cancellation token
+    /// fired, or the event channel closed), so `run` stops instead of
+    /// building another one. Every role's event loop can return this, and
+    /// only the driver ever looks at it.
+    Stopped,
 }
 
 /// What a role's event loop decided after handling one event.
@@ -362,11 +487,19 @@ fn election_timeout_for_attempt(attempt: u32) -> Duration {
 /// just deny each other and restart in lockstep) -- jitter is what breaks
 /// the tie within a few rounds. `attempt` widens that jitter window for
 /// repeated failures; a fresh `Follower` always passes 0.
-fn spawn_election_timer(attempt: u32, event_tx: mpsc::Sender<Event>) -> JoinHandle<()> {
-    tokio::spawn(async move {
+fn spawn_election_timer(
+    cancel: &CancellationToken,
+    attempt: u32,
+    event_tx: mpsc::Sender<Event>,
+) -> Task {
+    Task::spawn(cancel, move |cancel| async move {
         let timeout = election_timeout_for_attempt(attempt);
-        tokio::time::sleep(timeout).await;
-        let _ = event_tx.send(Event::ElectionTimeout).await;
+        if until_cancelled(&cancel, tokio::time::sleep(timeout))
+            .await
+            .is_some()
+        {
+            send_event(&cancel, &event_tx, Event::ElectionTimeout).await;
+        }
     })
 }
 
@@ -518,6 +651,22 @@ pub enum RoleHandle {
     /// tests) waiting for a specific role can't be fooled by the channel's
     /// construction-time default.
     Starting,
+    /// This node has shut down and will never publish another role.
+    /// Published by `run` on its way out, for two reasons.
+    ///
+    /// The visible one: a gRPC handler holding a stale `RoleHandle` would
+    /// otherwise still see `Leader` and try to serve a request against a
+    /// state machine that no longer exists.
+    ///
+    /// The load-bearing one: `LeaderHandle` holds a `role_rx` subscribed
+    /// to the very channel it is published on, so a published
+    /// `RoleHandle::Leader` is a reference cycle -- the channel's value
+    /// keeps a receiver alive, and that receiver keeps the channel (and
+    /// its value) alive. Dropping every sender does not break it, so the
+    /// whole handle -- including its `Arc<RaftLog>`, and with it the
+    /// database lock -- would outlive the node forever. Overwriting the
+    /// channel with a variant that holds nothing drops the cycle.
+    Stopped,
 }
 
 #[derive(Clone)]
@@ -542,6 +691,11 @@ pub struct LeaderHandle {
     /// Used to detect a step-down while waiting in `append_log`, so a
     /// caller doesn't hang forever on an entry that will never commit
     /// (e.g. because it gets truncated by a new leader instead).
+    ///
+    /// Note that this is a receiver for the same channel this handle is
+    /// itself published on, which makes a published `RoleHandle::Leader`
+    /// self-referential -- see `RoleHandle::Stopped` for what that costs
+    /// and why `run` publishes over it before the node goes away.
     role_rx: watch::Receiver<RoleHandle>,
     /// Whether this leader currently holds a quorum of leases -- see the
     /// module doc. Not consumed by anything yet (no read path exists that
@@ -862,6 +1016,12 @@ pub struct Common {
     pub event_tx: mpsc::Sender<Event>,
 
     pub role_tx: watch::Sender<RoleHandle>,
+
+    /// This node's root cancellation token, supplied by whoever started
+    /// it (`crate::serve`). Every background task this node spawns runs
+    /// under a child of it, so cancelling it here brings the whole node
+    /// down -- see `Task` and the module doc.
+    cancel: CancellationToken,
 }
 
 /// `(common, role_rx, peer_handle, commit_rx, compact_rx)` -- the state
@@ -974,8 +1134,12 @@ impl Common {
     /// uninitialized: it has no vote, so it never campaigns, and it waits
     /// to be either bootstrapped or replicated to. See
     /// `RoleHandle::Uninitialized`.
-    pub fn new(node_id: String, log: Arc<RaftLog>) -> storage::Result<NewCommon> {
-        Self::build(node_id, log, ClusterConfig::default())
+    pub fn new(
+        node_id: String,
+        log: Arc<RaftLog>,
+        cancel: CancellationToken,
+    ) -> storage::Result<NewCommon> {
+        Self::build(node_id, log, ClusterConfig::default(), cancel)
     }
 
     /// `new`, but with a configuration supplied directly rather than read
@@ -987,15 +1151,17 @@ impl Common {
         node_id: String,
         peers: Vec<PeerInfo>,
         log: Arc<RaftLog>,
+        cancel: CancellationToken,
     ) -> storage::Result<NewCommon> {
         let seed = seed_config(&node_id, &peers);
-        Self::build(node_id, log, seed)
+        Self::build(node_id, log, seed, cancel)
     }
 
     fn build(
         node_id: String,
         log: Arc<RaftLog>,
         fallback: ClusterConfig,
+        cancel: CancellationToken,
     ) -> storage::Result<NewCommon> {
         let (current_term, voted_for) = log.term_state()?;
         let config = load_config(&log)?.unwrap_or(fallback);
@@ -1045,6 +1211,7 @@ impl Common {
             event_rx,
             event_tx,
             role_tx,
+            cancel,
         };
         Ok((common, role_rx, peer_handle, commit_rx, compact_rx))
     }
@@ -1077,6 +1244,24 @@ impl Common {
 
     fn publish_role(&self, handle: RoleHandle) {
         let _ = self.role_tx.send(handle);
+    }
+
+    /// The next event to handle, or `None` if this node is shutting down
+    /// -- either its cancellation token fired or the event channel closed.
+    /// Every role's event loop funnels through here, which is what makes a
+    /// cancelled node stop at once rather than whenever its next timer
+    /// happens to fire.
+    async fn next_event(&mut self) -> Option<Event> {
+        let Self {
+            cancel, event_rx, ..
+        } = self;
+        until_cancelled(cancel, event_rx.recv()).await.flatten()
+    }
+
+    /// A parent for the background tasks a role owns, so that cancelling
+    /// this node cancels them too -- see `Task::spawn`.
+    fn cancel_token(&self) -> &CancellationToken {
+        &self.cancel
     }
 
     /// Every other member of the current configuration -- everyone this
@@ -1208,14 +1393,17 @@ impl Common {
 /// this is maintenance, not a correctness requirement, and it'll simply
 /// retry on the next watermark change.
 fn spawn_storage_maintenance_task(
+    cancel: &CancellationToken,
     log: Arc<RaftLog>,
     mut commit_rx: watch::Receiver<u64>,
     mut compact_rx: watch::Receiver<u64>,
     applied_tx: Arc<watch::Sender<u64>>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
+) -> Task {
+    Task::spawn(cancel, move |cancel| async move {
         loop {
             tokio::select! {
+                biased;
+                () = cancel.cancelled() => return,
                 r = commit_rx.changed() => { if r.is_err() { return; } }
                 r = compact_rx.changed() => { if r.is_err() { return; } }
             }
@@ -1253,8 +1441,9 @@ fn spawn_storage_maintenance_task(
 /// Runs forever, handing `Common` from one role to the next. Only one
 /// role's event loop is ever active: the previous one has fully returned
 /// (and torn down its background tasks) before the next one starts.
-pub async fn run(mut common: Common) -> ! {
-    let _maintenance_task = spawn_storage_maintenance_task(
+pub async fn run(mut common: Common) {
+    let maintenance_task = spawn_storage_maintenance_task(
+        common.cancel_token(),
         Arc::clone(&common.log),
         common.commit_tx.subscribe(),
         common.compact_tx.subscribe(),
@@ -1267,10 +1456,29 @@ pub async fn run(mut common: Common) -> ! {
             Role::PreCandidate => PreCandidate::new(common).await,
             Role::Candidate => Candidate::new(common).await,
             Role::Leader => Leader::new(common).await,
+            // Each role's own `shutdown` has already stopped and joined
+            // that role's tasks by the time it hands `common` back, so
+            // there is nothing left here but the node-wide maintenance
+            // task.
+            Role::Stopped => break,
         };
         role = next_role;
         common = next_common;
     }
+    maintenance_task.stop().await;
+    // Both a courtesy to anyone still holding a `RoleHandle` and a
+    // necessity: it is what breaks the `LeaderHandle` reference cycle
+    // that would otherwise pin this node's `Arc<RaftLog>` (and its
+    // database lock) for the life of the process. See
+    // `RoleHandle::Stopped`.
+    common.publish_role(RoleHandle::Stopped);
+    // Explicit rather than incidental: dropping `Common` is what closes
+    // `event_tx`/`role_tx`/`commit_tx` and so releases any gRPC handler
+    // still parked on one of them (`LeaderHandle::await_applied`, say),
+    // letting the servers finish their own graceful shutdown. It is also
+    // the last `Arc<RaftLog>` this module holds, so the database lock is
+    // free the moment this function returns.
+    drop(common);
 }
 
 /// Shared test infrastructure for this module and its `leader`/`candidate`/
@@ -1299,8 +1507,12 @@ mod tests {
     #[tokio::test]
     async fn an_unbootstrapped_node_waits_instead_of_electing_itself() {
         let (log, path) = open_temp_log();
-        let (common, mut role_rx, _peer_handle, _c, _cc) =
-            Common::new("fresh".to_string(), Arc::clone(&log)).unwrap();
+        let (common, mut role_rx, _peer_handle, _c, _cc) = Common::new(
+            "fresh".to_string(),
+            Arc::clone(&log),
+            CancellationToken::new(),
+        )
+        .unwrap();
         assert!(common.config.members.is_empty());
         tokio::spawn(run(common));
 
@@ -1323,8 +1535,12 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_forms_a_single_node_cluster_that_then_elects_itself() {
         let (log, path) = open_temp_log();
-        let (common, mut role_rx, _peer_handle, _c, _cc) =
-            Common::new("solo".to_string(), Arc::clone(&log)).unwrap();
+        let (common, mut role_rx, _peer_handle, _c, _cc) = Common::new(
+            "solo".to_string(),
+            Arc::clone(&log),
+            CancellationToken::new(),
+        )
+        .unwrap();
         let client = common.client_handle();
         tokio::spawn(run(common));
         wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Uninitialized)).await;
@@ -1372,8 +1588,12 @@ mod tests {
     async fn bootstrap_is_refused_on_a_non_empty_log() {
         let (log, path) = open_temp_log();
         log.append(1, b"a", Some(b"1")).unwrap();
-        let (common, mut role_rx, _peer_handle, _c, _cc) =
-            Common::new("odd-one".to_string(), Arc::clone(&log)).unwrap();
+        let (common, mut role_rx, _peer_handle, _c, _cc) = Common::new(
+            "odd-one".to_string(),
+            Arc::clone(&log),
+            CancellationToken::new(),
+        )
+        .unwrap();
         let client = common.client_handle();
         tokio::spawn(run(common));
         wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Uninitialized)).await;
@@ -1394,8 +1614,12 @@ mod tests {
     #[tokio::test]
     async fn a_replicated_config_entry_initializes_a_fresh_node() {
         let (log, path) = open_temp_log();
-        let (common, mut role_rx, peer_handle, _c, _cc) =
-            Common::new("newcomer".to_string(), Arc::clone(&log)).unwrap();
+        let (common, mut role_rx, peer_handle, _c, _cc) = Common::new(
+            "newcomer".to_string(),
+            Arc::clone(&log),
+            CancellationToken::new(),
+        )
+        .unwrap();
         tokio::spawn(run(common));
         wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Uninitialized)).await;
 
@@ -1437,8 +1661,13 @@ mod tests {
             id: "someone-else".to_string(),
             address: "http://127.0.0.1:1".to_string(),
         }];
-        let (common, _role_rx, _peer_handle, _c, _cc) =
-            Common::new_seeded("n0".to_string(), stale, Arc::clone(&log)).unwrap();
+        let (common, _role_rx, _peer_handle, _c, _cc) = Common::new_seeded(
+            "n0".to_string(),
+            stale,
+            Arc::clone(&log),
+            CancellationToken::new(),
+        )
+        .unwrap();
 
         assert_eq!(common.config, config);
         let mut peer_ids: Vec<_> = common.peers().into_iter().map(|p| p.id).collect();
@@ -1528,6 +1757,7 @@ mod tests {
                     address: format!("http://{addr_b}"),
                 }],
                 Arc::clone(&log_a),
+                CancellationToken::new(),
             )
             .unwrap();
         let (common_b, mut role_rx_b, peer_handle_b, _commit_rx_b, _compact_rx_b) =
@@ -1538,6 +1768,7 @@ mod tests {
                     address: format!("http://{addr_a}"),
                 }],
                 Arc::clone(&log_b),
+                CancellationToken::new(),
             )
             .unwrap();
 
@@ -1592,6 +1823,7 @@ mod tests {
                     address: format!("http://{addr_b}"),
                 }],
                 Arc::clone(&log_a),
+                CancellationToken::new(),
             )
             .unwrap();
         let (common_b, mut role_rx_b, peer_handle_b, _commit_rx_b, _compact_rx_b) =
@@ -1602,6 +1834,7 @@ mod tests {
                     address: format!("http://{addr_a}"),
                 }],
                 Arc::clone(&log_b),
+                CancellationToken::new(),
             )
             .unwrap();
 
@@ -1735,6 +1968,120 @@ mod tests {
         assert_eq!(log.get_latest(b"a").unwrap(), Some((a, b"1".to_vec())));
         assert_eq!(log.get_latest(b"b").unwrap(), Some((b, b"2".to_vec())));
         assert_eq!(log.get_latest(b"c").unwrap(), Some((c, b"3".to_vec())));
+
+        cleanup(&path);
+    }
+
+    /// Runs `common` to completion under `cancel`, cancelling once it
+    /// reaches `role`, and hands back how long the shutdown itself took.
+    /// Panics if the node doesn't stop, so every caller's real assertion
+    /// is the one it makes about `log` afterwards.
+    async fn cancel_once(
+        common: Common,
+        mut role_rx: watch::Receiver<RoleHandle>,
+        cancel: &CancellationToken,
+        role: impl Fn(&RoleHandle) -> bool,
+    ) -> Duration {
+        let node = tokio::spawn(run(common));
+        // Cancelling a node that never got as far as starting its tasks
+        // would prove nothing, so wait until it is genuinely running.
+        wait_for_role(&mut role_rx, role).await;
+
+        let started = Instant::now();
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), node)
+            .await
+            .expect("a cancelled node should stop, not hang")
+            .expect("the node task panicked");
+        started.elapsed()
+    }
+
+    /// Cancellation is how a node is stopped, and `run` returning is the
+    /// proof that everything underneath it stopped too. The `Arc` count
+    /// is what actually checks that: a single abandoned task still
+    /// holding a clone of the log is exactly what leaves the database
+    /// locked against the next node to open the same directory, and it is
+    /// invisible from the outside until that next node fails.
+    ///
+    /// A leader with an unreachable peer is the demanding version of it:
+    /// the self-tick, the storage maintenance task, and a replication
+    /// task looping on a connection that never succeeds -- which has to
+    /// be interrupted rather than merely caught between ticks.
+    #[tokio::test]
+    async fn cancelling_a_leader_stops_every_task_under_it() {
+        let (log, path) = open_temp_log();
+        // `n0` is the only voter, so it wins its own election without
+        // anyone's help; `l1` is a learner at an address nothing is
+        // listening on, which is what gets it replicated to forever
+        // without ever answering. (It has to be a learner rather than a
+        // second voter for both halves to hold at once: a second voter
+        // would have to answer for `n0` to become leader at all.)
+        let config = cluster_config(&[("n0", true), ("l1", false)]);
+        log.append_config(1, &config.to_bytes()).unwrap();
+        let cancel = CancellationToken::new();
+        let (common, role_rx, _peer_handle, _commit_rx, _compact_rx) =
+            Common::new("n0".to_string(), Arc::clone(&log), cancel.clone()).unwrap();
+
+        let took = cancel_once(common, role_rx, &cancel, |r| {
+            matches!(r, RoleHandle::Leader(_))
+        })
+        .await;
+
+        assert_eq!(
+            Arc::strong_count(&log),
+            1,
+            "something the node spawned still holds its log after it shut down"
+        );
+        // Well inside `LIGHTWEIGHT_RPC_TIMEOUT`, let alone the 30s
+        // `AppendEntries` one: the peer-facing tasks are cut short rather
+        // than waited out.
+        assert!(
+            took < LEASE_DURATION,
+            "shutting down took {took:?}, which means something was waited out rather than cancelled"
+        );
+
+        cleanup(&path);
+    }
+
+    /// The same contract for a node that has no configuration at all: it
+    /// publishes `Uninitialized` and arms no election timer, so the path
+    /// out of it is different from a voter's, and a node left running
+    /// because nobody was watching the token would be just as invisible.
+    #[tokio::test]
+    async fn cancelling_an_uninitialized_node_stops_it_too() {
+        let (log, path) = open_temp_log();
+        let cancel = CancellationToken::new();
+        let (common, role_rx, _peer_handle, _commit_rx, _compact_rx) =
+            Common::new("fresh".to_string(), Arc::clone(&log), cancel.clone()).unwrap();
+
+        cancel_once(common, role_rx, &cancel, |r| {
+            matches!(r, RoleHandle::Uninitialized)
+        })
+        .await;
+
+        assert_eq!(Arc::strong_count(&log), 1);
+
+        cleanup(&path);
+    }
+
+    /// A node that is already cancelled before it is ever polled still
+    /// has to come back cleanly rather than, say, settling into being a
+    /// follower first -- `crate::serve` starts the engine and the servers
+    /// together, so a server that fails to bind cancels the token while
+    /// the state machine is still on its first step.
+    #[tokio::test]
+    async fn a_node_cancelled_before_it_starts_stops_immediately() {
+        let (log, path) = open_temp_log();
+        let cancel = CancellationToken::new();
+        let (common, _role_rx, _peer_handle, _commit_rx, _compact_rx) =
+            Common::new("stillborn".to_string(), Arc::clone(&log), cancel.clone()).unwrap();
+        cancel.cancel();
+
+        tokio::time::timeout(Duration::from_secs(5), run(common))
+            .await
+            .expect("an already-cancelled node should stop, not hang");
+
+        assert_eq!(Arc::strong_count(&log), 1);
 
         cleanup(&path);
     }

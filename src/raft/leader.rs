@@ -131,12 +131,16 @@ async fn get_lease_from_peer(
 /// tries again next tick, same policy as everything else -- but a storage
 /// read failure panics, same as `build_replication_step_sync`.
 async fn send_snapshot_to_peer(
+    cancel: &CancellationToken,
     peer: &PeerInfo,
     leader_id: &str,
     term: u64,
     log: &Arc<RaftLog>,
     conns: &PeerConnections,
 ) -> Option<(InstallSnapshotResponse, u64)> {
+    // Deliberately awaited outright rather than through
+    // `until_cancelled`: see that function's doc on why a `spawn_blocking`
+    // holding an `Arc<RaftLog>` must never be abandoned mid-flight.
     let log = Arc::clone(log);
     let (buf, meta) = tokio::task::spawn_blocking(move || -> storage::Result<_> {
         let mut buf = Vec::new();
@@ -172,10 +176,17 @@ async fn send_snapshot_to_peer(
             client.install_snapshot(stream).await.ok();
         resp
     };
-    let resp = match tokio::time::timeout(SNAPSHOT_RPC_TIMEOUT, attempt).await {
-        Ok(Some(resp)) => Some(resp.into_inner()),
-        _ => None,
-    };
+    // The transfer itself is bounded by `SNAPSHOT_RPC_TIMEOUT`, which is
+    // five minutes -- far too long for a shutting-down node to sit
+    // through, so cancellation cuts it short.
+    let resp =
+        match until_cancelled(cancel, tokio::time::timeout(SNAPSHOT_RPC_TIMEOUT, attempt)).await {
+            Some(Ok(Some(resp))) => Some(resp.into_inner()),
+            Some(_) => None,
+            // Cancelled: the node is going away, so there is no next attempt
+            // to keep a connection warm for.
+            None => return None,
+        };
     match resp {
         Some(resp) => Some((resp, meta.last_included_seq)),
         None => {
@@ -187,11 +198,14 @@ async fn send_snapshot_to_peer(
 
 /// Periodically pushes `Event::LeaderTick` -- see the variant's doc for why
 /// the leader needs this in addition to reacting to peer responses.
-fn spawn_leader_tick(event_tx: mpsc::Sender<Event>) -> JoinHandle<()> {
-    tokio::spawn(async move {
+fn spawn_leader_tick(cancel: &CancellationToken, event_tx: mpsc::Sender<Event>) -> Task {
+    Task::spawn(cancel, move |cancel| async move {
         loop {
-            tokio::time::sleep(HEARTBEAT).await;
-            if event_tx.send(Event::LeaderTick).await.is_err() {
+            if until_cancelled(&cancel, tokio::time::sleep(HEARTBEAT))
+                .await
+                .is_none()
+                || !send_event(&cancel, &event_tx, Event::LeaderTick).await
+            {
                 return;
             }
         }
@@ -205,30 +219,43 @@ fn spawn_leader_tick(event_tx: mpsc::Sender<Event>) -> JoinHandle<()> {
 /// Every response is forwarded as `Event::GetLeaseResponse`, same pattern
 /// as replication and voting.
 fn spawn_lease_prober(
+    cancel: &CancellationToken,
     peer: PeerInfo,
     leader_id: String,
     term: u64,
     conns: Arc<PeerConnections>,
     event_tx: mpsc::Sender<Event>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
+) -> Task {
+    Task::spawn(cancel, move |cancel| async move {
         loop {
             let req = GetLeaseRequest {
                 leader_id: leader_id.clone(),
                 term,
             };
-            if let Some(resp) = get_lease_from_peer(&peer, req, &conns).await
-                && event_tx
-                    .send(Event::GetLeaseResponse {
+            let Some(probed) =
+                until_cancelled(&cancel, get_lease_from_peer(&peer, req, &conns)).await
+            else {
+                return;
+            };
+            if let Some(resp) = probed
+                && !send_event(
+                    &cancel,
+                    &event_tx,
+                    Event::GetLeaseResponse {
                         from: peer.id.clone(),
                         resp,
-                    })
-                    .await
-                    .is_err()
+                    },
+                )
+                .await
             {
                 return;
             }
-            tokio::time::sleep(HEARTBEAT).await;
+            if until_cancelled(&cancel, tokio::time::sleep(HEARTBEAT))
+                .await
+                .is_none()
+            {
+                return;
+            }
         }
     })
 }
@@ -240,10 +267,10 @@ pub struct Leader {
     /// than tearing every peer's replication down and starting over --
     /// each task holds per-peer `next_index` state that would be lost.
     /// Every member except us, learners included.
-    replication_tasks: HashMap<String, JoinHandle<()>>,
+    replication_tasks: HashMap<String, Task>,
     /// Same, for lease probes -- but voting members only.
-    lease_tasks: HashMap<String, JoinHandle<()>>,
-    tick_timer: JoinHandle<()>,
+    lease_tasks: HashMap<String, Task>,
+    tick_timer: Task,
     /// Highest seq each peer is known to have replicated. Missing entry
     /// (rather than 0) for a peer we haven't heard back from yet -- same
     /// thing numerically, `recompute_watermarks` just treats an absent
@@ -320,7 +347,7 @@ impl Leader {
             read_quorum_rx,
         }));
 
-        let tick_timer = spawn_leader_tick(common.event_tx.clone());
+        let tick_timer = spawn_leader_tick(common.cancel_token(), common.event_tx.clone());
 
         let mut leader = Leader {
             common,
@@ -343,7 +370,7 @@ impl Leader {
         leader.recompute_watermarks().await;
         leader.recompute_lease_quorum();
         let next_role = leader.run().await;
-        (next_role, leader.shutdown())
+        (next_role, leader.shutdown().await)
     }
 
     /// Repeatedly sends `AppendEntries` to `peer` (a heartbeat if there's
@@ -360,6 +387,7 @@ impl Leader {
     // same list into a literal at the one call site.
     #[allow(clippy::too_many_arguments)]
     fn spawn_replication(
+        cancel: &CancellationToken,
         peer: PeerInfo,
         leader_id: String,
         term: u64,
@@ -368,12 +396,12 @@ impl Leader {
         commit_rx: watch::Receiver<u64>,
         compact_rx: watch::Receiver<u64>,
         event_tx: mpsc::Sender<Event>,
-    ) -> JoinHandle<()> {
-        tokio::spawn(async move {
+    ) -> Task {
+        Task::spawn(cancel, move |cancel| async move {
             let (last_index, _) = last_log_index_and_term(&log).await;
             let mut next_index = last_index + 1;
 
-            loop {
+            while !cancel.is_cancelled() {
                 let leader_commit = *commit_rx.borrow();
                 let compact_seq = *compact_rx.borrow();
                 let step = {
@@ -396,7 +424,13 @@ impl Leader {
 
                 match step {
                     ReplicationStep::AppendEntries(req) => {
-                        if let Some(resp) = append_entries_to_peer(&peer, req, &conns).await {
+                        let Some(answered) =
+                            until_cancelled(&cancel, append_entries_to_peer(&peer, req, &conns))
+                                .await
+                        else {
+                            return;
+                        };
+                        if let Some(resp) = answered {
                             if resp.success {
                                 next_index = resp.match_index + 1;
                             } else if let Some(conflict_index) = resp.conflict_index {
@@ -410,16 +444,18 @@ impl Leader {
                                 next_index = conflict_index.max(1);
                             }
                             // A term bump is handled on the event loop
-                            // (which steps this whole role down, aborting
+                            // (which steps this whole role down, stopping
                             // this task) -- nothing else to do with the
                             // response here either way.
-                            if event_tx
-                                .send(Event::AppendEntriesResponse {
+                            if !send_event(
+                                &cancel,
+                                &event_tx,
+                                Event::AppendEntriesResponse {
                                     from: peer.id.clone(),
                                     resp,
-                                })
-                                .await
-                                .is_err()
+                                },
+                            )
+                            .await
                             {
                                 return;
                             }
@@ -427,21 +463,24 @@ impl Leader {
                     }
                     ReplicationStep::Snapshot => {
                         if let Some((resp, last_included_seq)) =
-                            send_snapshot_to_peer(&peer, &leader_id, term, &log, &conns).await
+                            send_snapshot_to_peer(&cancel, &peer, &leader_id, term, &log, &conns)
+                                .await
                         {
                             // Whatever the peer's log looked like before,
                             // it now starts fresh right after the
                             // snapshot -- resume normal AppendEntries from
                             // there next tick.
                             next_index = last_included_seq + 1;
-                            if event_tx
-                                .send(Event::InstallSnapshotResponse {
+                            if !send_event(
+                                &cancel,
+                                &event_tx,
+                                Event::InstallSnapshotResponse {
                                     from: peer.id.clone(),
                                     resp,
                                     last_included_seq,
-                                })
-                                .await
-                                .is_err()
+                                },
+                            )
+                            .await
                             {
                                 return;
                             }
@@ -449,15 +488,20 @@ impl Leader {
                     }
                 }
 
-                tokio::time::sleep(HEARTBEAT).await;
+                if until_cancelled(&cancel, tokio::time::sleep(HEARTBEAT))
+                    .await
+                    .is_none()
+                {
+                    return;
+                }
             }
         })
     }
 
     async fn run(&mut self) -> Role {
         loop {
-            let Some(event) = self.common.event_rx.recv().await else {
-                return Role::Follower;
+            let Some(event) = self.common.next_event().await else {
+                return Role::Stopped;
             };
             match self.handle_event(event).await {
                 Transition::Continue => {}
@@ -743,6 +787,7 @@ impl Leader {
                 self.replication_tasks.insert(
                     peer.id.clone(),
                     Self::spawn_replication(
+                        self.common.cancel_token(),
                         peer.clone(),
                         self.common.node_id.clone(),
                         self.common.current_term,
@@ -760,6 +805,7 @@ impl Leader {
                 self.lease_tasks.insert(
                     peer.id.clone(),
                     spawn_lease_prober(
+                        self.common.cancel_token(),
                         peer.clone(),
                         self.common.node_id.clone(),
                         self.common.current_term,
@@ -788,9 +834,24 @@ impl Leader {
             .cloned()
             .collect();
 
+        // Signalled in one pass and joined in a second, so several peers
+        // leaving at once wind down concurrently -- and signalled *before*
+        // any is awaited, since a task already parked on `event_tx.send`
+        // can only finish once it hears it is no longer wanted (this same
+        // event loop is what would otherwise be draining it).
+        for id in &demoted {
+            if let Some(task) = self.lease_tasks.get(id) {
+                task.signal();
+            }
+        }
+        for id in &dropped {
+            if let Some(task) = self.replication_tasks.get(id) {
+                task.signal();
+            }
+        }
         for id in &demoted {
             if let Some(task) = self.lease_tasks.remove(id) {
-                task.abort();
+                task.stop().await;
             }
             self.peer_lease_expiry.remove(id);
         }
@@ -799,7 +860,7 @@ impl Leader {
             .retain(|id, _| self.common.config.member(id).is_some_and(|m| !m.voting));
         for id in &dropped {
             if let Some(task) = self.replication_tasks.remove(id) {
-                task.abort();
+                task.stop().await;
             }
             self.peer_match_index.remove(id);
             self.catch_up.remove(id);
@@ -924,18 +985,19 @@ impl Leader {
         }
     }
 
-    /// Cancels replication tasks and hands `Common` back. Aborting rather
-    /// than signaling+joining is the simplest thing that works; a graceful
-    /// drain (finish in-flight RPCs first) would need a cancellation token
-    /// instead.
-    fn shutdown(self) -> Common {
-        for task in self.replication_tasks.into_values() {
-            task.abort();
-        }
-        for task in self.lease_tasks.into_values() {
-            task.abort();
-        }
-        self.tick_timer.abort();
+    /// Stops every task this leader owns -- replication, lease probes and
+    /// the self-tick -- and hands `Common` back only once they have all
+    /// actually returned. Whatever they were holding (peer connections,
+    /// an `Arc<RaftLog>`) is therefore gone by the time the next role, or
+    /// the shutting-down node, gets `Common` back.
+    async fn shutdown(self) -> Common {
+        Task::stop_all(
+            self.replication_tasks
+                .into_values()
+                .chain(self.lease_tasks.into_values())
+                .chain(std::iter::once(self.tick_timer)),
+        )
+        .await;
         self.common
     }
 }
@@ -1000,11 +1062,17 @@ mod tests {
     /// alive, so a test that checks read quorum has to hold one.
     fn bare_leader(common: Common) -> (Leader, watch::Receiver<bool>) {
         let (read_quorum_tx, read_quorum_rx) = watch::channel(false);
+        // A real `Task` (one that does nothing but wait to be stopped)
+        // rather than a bare handle, so these leaders tear down through
+        // exactly the same path as a live one.
+        let tick_timer = Task::spawn(common.cancel_token(), |cancel| async move {
+            cancel.cancelled().await;
+        });
         let leader = Leader {
             common,
             replication_tasks: HashMap::new(),
             lease_tasks: HashMap::new(),
-            tick_timer: tokio::spawn(std::future::pending()),
+            tick_timer,
             peer_match_index: HashMap::new(),
             peer_lease_expiry: HashMap::new(),
             read_quorum_tx,
@@ -1369,7 +1437,7 @@ mod tests {
         cleanup(&path);
     }
 
-    fn sorted_keys(tasks: &HashMap<String, JoinHandle<()>>) -> Vec<&str> {
+    fn sorted_keys(tasks: &HashMap<String, Task>) -> Vec<&str> {
         let mut ids: Vec<&str> = tasks.keys().map(String::as_str).collect();
         ids.sort_unstable();
         ids
@@ -1486,8 +1554,13 @@ mod tests {
                 address: "http://127.0.0.1:2".to_string(),
             },
         ];
-        let (mut common, _role_rx, _peer_handle, commit_rx, _compact_rx) =
-            Common::new_seeded("n0".to_string(), peers, Arc::clone(&log)).unwrap();
+        let (mut common, _role_rx, _peer_handle, commit_rx, _compact_rx) = Common::new_seeded(
+            "n0".to_string(),
+            peers,
+            Arc::clone(&log),
+            CancellationToken::new(),
+        )
+        .unwrap();
         common.current_term = 7;
         // ... plus the no-op this leader opens term 7 with.
         let noop = log.append_noop(7).unwrap();
@@ -1616,6 +1689,7 @@ mod tests {
                     address: format!("http://{addr_b}"),
                 }],
                 Arc::clone(&log_a),
+                CancellationToken::new(),
             )
             .unwrap();
         let (common_b, mut role_rx_b, peer_handle_b, _commit_rx_b, _compact_rx_b) =
@@ -1626,6 +1700,7 @@ mod tests {
                     address: format!("http://{addr_a}"),
                 }],
                 Arc::clone(&log_b),
+                CancellationToken::new(),
             )
             .unwrap();
 
@@ -1741,6 +1816,7 @@ mod tests {
                     address: format!("http://{addr_b}"),
                 }],
                 Arc::clone(&log_a),
+                CancellationToken::new(),
             )
             .unwrap();
         let (common_b, mut role_rx_b, peer_handle_b, _commit_rx_b, _compact_rx_b) =
@@ -1751,6 +1827,7 @@ mod tests {
                     address: format!("http://{addr_a}"),
                 }],
                 Arc::clone(&log_b),
+                CancellationToken::new(),
             )
             .unwrap();
 
