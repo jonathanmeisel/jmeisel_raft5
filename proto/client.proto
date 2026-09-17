@@ -22,6 +22,14 @@ service Kv {
   // consensus for atomic multi-member changes can come later if needed).
   rpc AddServer(AddServerRequest) returns (ConfigChangeResponse);
   rpc RemoveServer(RemoveServerRequest) returns (ConfigChangeResponse);
+
+  // Form a single-node cluster around this node (Raft §4.4). Refused by
+  // any node that already has a configuration or a non-empty log:
+  // bootstrapping twice is how one cluster silently becomes two, each
+  // half believing it is the whole. A server meant to *join* an existing
+  // cluster is added via AddServer on that cluster's leader instead, and
+  // receives its configuration by replication.
+  rpc Bootstrap(BootstrapRequest) returns (ConfigChangeResponse);
 }
 
 // Carried in every response so a client can find the real leader without a
@@ -74,6 +82,13 @@ message AddServerRequest {
 }
 
 message RemoveServerRequest {
+  string server_id = 1;
+}
+
+message BootstrapRequest {
+  // Optional guard: if set, the node refuses unless this is its own id.
+  // Bootstrapping is irreversible, so it is worth being able to say out
+  // loud which node you believe you are talking to.
   string server_id = 1;
 }
 

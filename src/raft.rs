@@ -102,11 +102,30 @@
 //! its own, since replication (and therefore write-side commit safety)
 //! has its own independent, majority-based quorum check.
 //!
-//! This is a skeleton: the leader-side §5.3 backoff optimization is a
-//! simplification (see `leader::Leader::spawn_replication`), and there's no
-//! cluster membership / snapshot-triggering yet. Log-matching (the follower
-//! side), the candidate's voting (both sides), and leader replication
-//! (majority commit + all-peers compaction watermark) are implemented.
+//! # Cluster membership
+//!
+//! Membership is not configuration a node is started with -- it lives in
+//! the log, as `Config` entries replicated and log-matched like any other
+//! (Raft §4). Three consequences run through this module:
+//!
+//! * A configuration takes effect on **append**, not on commit (§4.1).
+//!   `Common::reload_config` is called wherever one may have appeared,
+//!   and `storage::RaftLog::current_config` explains why waiting for
+//!   commitment would deadlock.
+//! * Members are **voters or learners** (§4.2.1). Everyone is replicated
+//!   to; only voters count toward a quorum, campaign, or hold a lease.
+//!   A server is added as a learner and promoted automatically once it
+//!   can keep up -- see `leader::Leader::review_learner_progress`.
+//! * A node whose log holds no configuration belongs to **no cluster**
+//!   (`RoleHandle::Uninitialized`, §4.4). It answers RPCs and waits to be
+//!   bootstrapped (`ClientHandle::bootstrap`) or replicated to; it never
+//!   assumes it is its own cluster, since two nodes doing that would be
+//!   two clusters.
+//!
+//! Still simplified: the leader-side §5.3 backoff optimization (see
+//! `leader::Leader::spawn_replication`), and nothing triggers snapshots
+//! on its own yet -- a snapshot is sent only when a peer has fallen
+//! behind the compaction floor.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -116,6 +135,7 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tonic::transport::Channel;
 
+use crate::pb::raft5::cluster::{ClusterConfig, ClusterMember};
 use crate::pb::raft5::common::LogEntry;
 use crate::pb::raft5::raft::raft_peer_client::RaftPeerClient;
 use crate::pb::raft5::raft::{
@@ -138,7 +158,7 @@ use leader::Leader;
 /// `const` context, before a `Duration` value could be decomposed back
 /// out again). Will become a user-configurable, per-cluster setting;
 /// hardcoded for now.
-const HEARTBEAT_MS: u64 = 50;
+pub(crate) const HEARTBEAT_MS: u64 = 50;
 const HEARTBEAT: Duration = Duration::from_millis(HEARTBEAT_MS);
 
 /// How long a granted lease (see `RaftPeerHandle::get_lease`) stays valid,
@@ -177,6 +197,15 @@ const SNAPSHOT_CHUNK_SIZE: usize = 1024 * 1024;
 pub struct PeerInfo {
     pub id: String,
     pub address: String,
+}
+
+impl From<&ClusterMember> for PeerInfo {
+    fn from(m: &ClusterMember) -> Self {
+        Self {
+            id: m.server_id.clone(),
+            address: m.address.clone(),
+        }
+    }
 }
 
 /// Inbound events a role's event loop reacts to. Requests carry their own
@@ -235,6 +264,23 @@ pub enum Event {
     /// `commit_tx` after a client write there), and also keeps watermarks
     /// from stalling between replication rounds in a multi-peer one.
     LeaderTick,
+    /// Self-notification: a `Config` entry was just appended to our own
+    /// log, so the active configuration has changed *as of now* -- a
+    /// configuration takes effect on append, not on commit (Raft §4.1).
+    /// A membership change to propose. Handled on the leader's event
+    /// loop, which is the only place with the state to enforce the two
+    /// guards a config change needs (see `leader::Leader::propose_config`).
+    ProposeConfig {
+        change: ConfigChange,
+        respond_to: oneshot::Sender<Result<u64, RaftError>>,
+    },
+    /// An operator asking this node to form a single-node cluster around
+    /// itself (Raft §4.4). Only ever accepted by a node that has no
+    /// configuration *and* an empty log -- see `Follower::bootstrap`.
+    Bootstrap {
+        config: ClusterConfig,
+        respond_to: oneshot::Sender<Result<(), RaftError>>,
+    },
 }
 
 /// Which role to construct next. A plain tag -- unlike the role structs
@@ -337,6 +383,17 @@ async fn last_log_index_and_term(log: &Arc<RaftLog>) -> (u64, u64) {
         .unwrap_or((0, 0))
 }
 
+/// The term of the entry at `seq`, or `None` if we no longer have (or
+/// never had) one there. Async wrapper over `RaftLog::term_at`, same
+/// shape as `last_log_index_and_term`.
+async fn term_at(log: &Arc<RaftLog>, seq: u64) -> Option<u64> {
+    let log = Arc::clone(log);
+    tokio::task::spawn_blocking(move || log.term_at(seq))
+        .await
+        .expect("term_at task panicked")
+        .expect("failed to read term at seq")
+}
+
 /// Evaluates a pre-vote (`RequestVoteRequest.dry_run == true`) without
 /// touching any state -- no term bump, no `voted_for`, no election timer
 /// reset. Reports whether a *real* `RequestVote` at `req.term` would be
@@ -408,6 +465,35 @@ pub enum RaftError {
     Storage(StorageError),
     /// The event loop is gone (node shutting down) before it could reply.
     Disconnected,
+    /// `Bootstrap` on a node that is already part of a cluster. Refused
+    /// rather than applied, since bootstrapping twice is how one cluster
+    /// silently becomes two -- see `follower::Follower::bootstrap`.
+    AlreadyInitialized,
+    /// A membership change is already appended and not yet committed.
+    /// Raft allows only one at a time (§4.1): overlapping single-server
+    /// changes can produce two configurations with no common majority,
+    /// which is exactly the disjoint-quorum split the one-at-a-time rule
+    /// exists to prevent.
+    ConfigChangeInProgress,
+    /// This leader hasn't yet committed an entry from its own term, so it
+    /// can't safely propose a membership change (Ongaro 2015): until
+    /// then it can't be sure the configuration it is building on won't
+    /// itself be rolled back.
+    NotCaughtUp,
+    /// The change doesn't apply to the current configuration -- adding a
+    /// server that is already a member, removing one that isn't, or
+    /// removing the last voter.
+    InvalidConfigChange(&'static str),
+}
+
+/// Who to point a client at, given a role handle. `None` unless this node
+/// currently knows of a leader -- a candidate, or a follower that hasn't
+/// heard from one yet, has nowhere to send them.
+pub fn leader_hint_of(role: &RoleHandle) -> Option<String> {
+    match role {
+        RoleHandle::Follower(f) => f.leader_hint.clone(),
+        _ => None,
+    }
 }
 
 /// A cheap, cloneable snapshot of "what can the outside world do right
@@ -419,6 +505,14 @@ pub enum RoleHandle {
     Leader(LeaderHandle),
     Follower(FollowerHandle),
     Candidate,
+    /// This node's log holds no cluster configuration at all, so it isn't
+    /// part of any cluster yet (Raft §4.4). Internally it is just a
+    /// follower with no vote: it answers every RPC and will happily be
+    /// replicated to -- which is exactly how a server *added* to an
+    /// existing cluster leaves this state, since the `Config` entry
+    /// naming it arrives as an ordinary log entry. The other way out is
+    /// `Bootstrap`, which makes it a single-node cluster.
+    Uninitialized,
     /// The value the `watch` channel holds before the driver has published
     /// anything real. Never sent by any role -- exists so callers (and
     /// tests) waiting for a specific role can't be fooled by the channel's
@@ -430,6 +524,10 @@ pub enum RoleHandle {
 pub struct LeaderHandle {
     log: Arc<RaftLog>,
     term: u64,
+    /// For `propose_config`, which -- unlike `append_log` -- can't just
+    /// write to the log directly: the guards a membership change needs
+    /// live on the event loop (see `leader::Leader::propose_config`).
+    event_tx: mpsc::Sender<Event>,
     /// How far `RaftLog::apply_committed` has actually brought `latest`
     /// up to date -- *not* `commit_tx` directly. `append_log` needs to
     /// know `latest` itself reflects the entry, not just that it's been
@@ -467,9 +565,34 @@ impl LeaderHandle {
             .map_err(|_| RaftError::Disconnected)?
             .map_err(RaftError::Storage)?;
 
+        self.await_applied(seq).await
+    }
+
+    /// Propose a single-server membership change and wait until it
+    /// commits. Returns the seq of the `Config` entry.
+    ///
+    /// The change itself takes effect on *append* (§4.1), so this
+    /// returning is not what makes it real -- it is what makes it
+    /// durable. The wait matters for `RemoveServer` especially: this
+    /// leader may be removing *itself*, and it has to stay leader long
+    /// enough to get the entry committed before stepping down (§4.2.2).
+    pub async fn propose_config(&self, change: ConfigChange) -> Result<u64, RaftError> {
+        let (respond_to, rx) = oneshot::channel();
+        self.event_tx
+            .send(Event::ProposeConfig { change, respond_to })
+            .await
+            .map_err(|_| RaftError::Disconnected)?;
+        let seq = rx.await.map_err(|_| RaftError::Disconnected)??;
+        self.await_applied(seq).await
+    }
+
+    /// Blocks until `seq` has committed *and* been applied, or until this
+    /// node stops being leader at this term -- in which case the entry
+    /// may well be truncated rather than committed, so waiting on it
+    /// forever would hang.
+    async fn await_applied(&self, seq: u64) -> Result<u64, RaftError> {
         let mut applied_rx = self.applied_rx.clone();
         let mut role_rx = self.role_rx.clone();
-
         loop {
             if *applied_rx.borrow() >= seq {
                 return Ok(seq);
@@ -489,11 +612,9 @@ impl LeaderHandle {
     }
 
     fn not_leader_error(&self, role_rx: &watch::Receiver<RoleHandle>) -> RaftError {
-        let leader_hint = match &*role_rx.borrow() {
-            RoleHandle::Follower(f) => f.leader_hint.clone(),
-            _ => None,
-        };
-        RaftError::NotLeader { leader_hint }
+        RaftError::NotLeader {
+            leader_hint: leader_hint_of(&role_rx.borrow()),
+        }
     }
 
     /// Whether it's currently safe for this leader to serve a
@@ -633,11 +754,49 @@ impl PeerConnections {
     }
 }
 
+/// The cluster configuration recorded in `log`, decoded. `None` for a
+/// store that has never seen one.
+fn load_config(log: &RaftLog) -> storage::Result<Option<ClusterConfig>> {
+    match log.current_config()? {
+        Some(bytes) => ClusterConfig::from_bytes(&bytes)
+            .map(Some)
+            .map_err(|_| StorageError::Corrupt("cluster config in the log failed to decode")),
+        None => Ok(None),
+    }
+}
+
+/// A configuration made of `node_id` plus `peers`, all voting -- an
+/// implicit bootstrap.
+///
+/// Test-only, and deliberately so: implicit bootstrap is exactly what
+/// Raft §4.4 warns against, since two nodes started with different peer
+/// lists would each form a cluster believing itself to be the whole
+/// thing. Real nodes start uninitialized and are bootstrapped explicitly.
+#[cfg(test)]
+fn seed_config(node_id: &str, peers: &[PeerInfo]) -> ClusterConfig {
+    let member = |id: &str, address: &str| ClusterMember {
+        server_id: id.to_string(),
+        address: address.to_string(),
+        voting: true,
+    };
+    ClusterConfig {
+        members: std::iter::once(member(node_id, ""))
+            .chain(peers.iter().map(|p| member(&p.id, &p.address)))
+            .collect(),
+        heartbeat_millis: HEARTBEAT_MS,
+    }
+}
+
 /// State shared across every role, threaded from one role's `shutdown`
 /// straight into the next role's `new`.
 pub struct Common {
     pub node_id: String,
-    pub peers: Vec<PeerInfo>,
+    /// The cluster configuration this node is currently operating under:
+    /// who its peers are, and which of them vote. Read from the log (see
+    /// `storage::RaftLog::current_config`) rather than from a flag, and
+    /// re-read whenever a `Config` entry is appended or rolled back --
+    /// on *append*, not on commit, per Raft §4.1.
+    pub config: ClusterConfig,
     pub log: Arc<RaftLog>,
     peer_conns: Arc<PeerConnections>,
 
@@ -707,6 +866,100 @@ pub struct Common {
 
 /// `(common, role_rx, peer_handle, commit_rx, compact_rx)` -- the state
 /// machine plus the external handles a caller needs to observe/drive it.
+/// A single-server membership change (Raft §4.1 -- one server at a time,
+/// not joint consensus). The caller says what it wants; the leader
+/// resolves it against whatever configuration is actually in force, so a
+/// client never has to send (or race on) a whole configuration.
+#[derive(Clone, Debug)]
+pub enum ConfigChange {
+    /// Add `server_id` as a non-voting learner. It is promoted to voter
+    /// automatically once it has caught up -- see
+    /// `leader::Leader::review_learner_progress`. Adding it as a voter
+    /// outright would let a server that is hours behind count toward
+    /// (and stall) every quorum from the moment it joined.
+    AddServer {
+        server_id: String,
+        address: String,
+    },
+    RemoveServer {
+        server_id: String,
+    },
+    /// Leader-internal: a learner has caught up and is now a voter.
+    Promote {
+        server_id: String,
+    },
+}
+
+impl ConfigChange {
+    /// `config` with this change applied, or why it can't be.
+    fn apply_to(&self, config: &ClusterConfig) -> Result<ClusterConfig, RaftError> {
+        let invalid = |why| Err(RaftError::InvalidConfigChange(why));
+        match self {
+            Self::AddServer { server_id, address } => {
+                if config.contains(server_id) {
+                    return invalid("that server is already a member of this cluster");
+                }
+                Ok(config.with_member(ClusterMember {
+                    server_id: server_id.clone(),
+                    address: address.clone(),
+                    voting: false,
+                }))
+            }
+            Self::RemoveServer { server_id } => {
+                if !config.contains(server_id) {
+                    return invalid("that server is not a member of this cluster");
+                }
+                let next = config.without_member(server_id);
+                if next.voters().count() == 0 {
+                    // The removal could never commit: there would be no
+                    // one left to form a quorum of the new configuration.
+                    return invalid("removing that server would leave the cluster with no voters");
+                }
+                Ok(next)
+            }
+            Self::Promote { server_id } => {
+                if !config.contains(server_id) {
+                    return invalid("that server is not a member of this cluster");
+                }
+                Ok(config.with_voter(server_id))
+            }
+        }
+    }
+}
+
+/// What the client-facing service (`grpc::KvService`) talks to: the
+/// current role, plus the one client request that isn't routed by role
+/// (`Bootstrap`, which by definition targets a node that has no leader).
+///
+/// Deliberately separate from `RaftPeerHandle`: the two are served on
+/// different ports precisely because they have different exposure, and
+/// nothing a client sends should be able to reach the peer protocol.
+#[derive(Clone)]
+pub struct ClientHandle {
+    event_tx: mpsc::Sender<Event>,
+    role_rx: watch::Receiver<RoleHandle>,
+}
+
+impl ClientHandle {
+    /// What this node can do right now -- who to point a client at, or
+    /// whether it needs bootstrapping at all.
+    pub fn role(&self) -> RoleHandle {
+        self.role_rx.borrow().clone()
+    }
+
+    /// Form a single-node cluster around this node (Raft §4.4). Refused
+    /// with `AlreadyInitialized` by any node that is already part of one;
+    /// see `follower::Follower::bootstrap`.
+    pub async fn bootstrap(&self, config: ClusterConfig) -> Result<(), RaftError> {
+        let (respond_to, rx) = oneshot::channel();
+        self.event_tx
+            .send(Event::Bootstrap { config, respond_to })
+            .await
+            .map_err(|_| RaftError::Disconnected)?;
+        rx.await.map_err(|_| RaftError::Disconnected)?
+    }
+}
+
 type NewCommon = (
     Common,
     watch::Receiver<RoleHandle>,
@@ -716,12 +969,36 @@ type NewCommon = (
 );
 
 impl Common {
-    pub fn new(
+    /// Membership comes from `log` alone. A store that has never seen a
+    /// configuration yields an empty one, which is how a node starts out
+    /// uninitialized: it has no vote, so it never campaigns, and it waits
+    /// to be either bootstrapped or replicated to. See
+    /// `RoleHandle::Uninitialized`.
+    pub fn new(node_id: String, log: Arc<RaftLog>) -> storage::Result<NewCommon> {
+        Self::build(node_id, log, ClusterConfig::default())
+    }
+
+    /// `new`, but with a configuration supplied directly rather than read
+    /// from the log -- for tests that want a given cluster shape without
+    /// bootstrapping one. Still loses to a configuration in the log, if
+    /// there is one.
+    #[cfg(test)]
+    pub fn new_seeded(
         node_id: String,
         peers: Vec<PeerInfo>,
         log: Arc<RaftLog>,
     ) -> storage::Result<NewCommon> {
+        let seed = seed_config(&node_id, &peers);
+        Self::build(node_id, log, seed)
+    }
+
+    fn build(
+        node_id: String,
+        log: Arc<RaftLog>,
+        fallback: ClusterConfig,
+    ) -> storage::Result<NewCommon> {
         let (current_term, voted_for) = log.term_state()?;
+        let config = load_config(&log)?.unwrap_or(fallback);
 
         let (commit_tx, commit_rx) = watch::channel(0);
         let (compact_tx, compact_rx) = watch::channel(0);
@@ -753,7 +1030,7 @@ impl Common {
 
         let common = Self {
             node_id,
-            peers,
+            config,
             log,
             peer_conns: Arc::new(PeerConnections::default()),
             current_term,
@@ -789,12 +1066,73 @@ impl Common {
         }
     }
 
+    /// A handle for the client-facing service. Taken before `run`
+    /// consumes `Common`.
+    pub fn client_handle(&self) -> ClientHandle {
+        ClientHandle {
+            event_tx: self.event_tx.clone(),
+            role_rx: self.role_tx.subscribe(),
+        }
+    }
+
     fn publish_role(&self, handle: RoleHandle) {
         let _ = self.role_tx.send(handle);
     }
 
+    /// Every other member of the current configuration -- everyone this
+    /// node replicates to and probes, learners included.
+    fn peers(&self) -> Vec<PeerInfo> {
+        self.config
+            .others(&self.node_id)
+            .map(PeerInfo::from)
+            .collect()
+    }
+
+    /// The other *voting* members: who a candidate solicits votes from,
+    /// and whose leases a leader counts toward read quorum. A learner is
+    /// replicated to but is invisible to every quorum (§4.2.1).
+    fn voting_peers(&self) -> Vec<PeerInfo> {
+        self.config
+            .others(&self.node_id)
+            .filter(|m| m.voting)
+            .map(PeerInfo::from)
+            .collect()
+    }
+
+    /// How many votes make a quorum, counting voting members only.
     fn majority(&self) -> usize {
-        self.peers.len().div_ceil(2) + 1
+        self.config.majority()
+    }
+
+    /// Whether this node is itself a voter -- false while it is a learner
+    /// catching up, and false once it has been removed from the cluster.
+    /// Such a node replicates and serves reads but must never campaign.
+    fn is_voter(&self) -> bool {
+        self.config.is_voter(&self.node_id)
+    }
+
+    /// Re-read the active configuration from the log, and report whether
+    /// this node's own right to vote changed as a result. Called whenever
+    /// a `Config` entry may have been appended, truncated away, or
+    /// brought in by a snapshot -- note *appended*, not committed, per
+    /// Raft §4.1 (see `storage::RaftLog::current_config`).
+    ///
+    /// Panics on a storage failure, same as every other storage read on
+    /// the event loop -- see the module doc.
+    async fn reload_config(&mut self) -> bool {
+        let was_voter = self.is_voter();
+        let log = Arc::clone(&self.log);
+        let loaded = tokio::task::spawn_blocking(move || load_config(&log))
+            .await
+            .expect("load_config task panicked")
+            .expect("failed to read the cluster config");
+        // Nothing in the log (or in the compacted fallback) means no
+        // configuration has ever been established here, so there's
+        // nothing to switch to -- keep operating under what we have.
+        if let Some(config) = loaded {
+            self.config = config;
+        }
+        was_voter != self.is_voter()
     }
 
     /// Advance to a higher term, discarding any vote already cast (Raft
@@ -953,6 +1291,210 @@ mod tests {
         cleanup(&path);
     }
 
+    /// A node started against a fresh database belongs to no cluster: it
+    /// answers RPCs and waits, but never campaigns, however long it hears
+    /// nothing (Raft §4.4 -- a node that assumed it was its own cluster
+    /// would elect itself, and a second such node would be a second
+    /// cluster).
+    #[tokio::test]
+    async fn an_unbootstrapped_node_waits_instead_of_electing_itself() {
+        let (log, path) = open_temp_log();
+        let (common, mut role_rx, _peer_handle, _c, _cc) =
+            Common::new("fresh".to_string(), Arc::clone(&log)).unwrap();
+        assert!(common.config.members.is_empty());
+        tokio::spawn(run(common));
+
+        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Uninitialized)).await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(
+            matches!(*role_rx.borrow(), RoleHandle::Uninitialized),
+            "an unbootstrapped node must never campaign"
+        );
+        assert!(
+            log.last_entry().unwrap().is_none(),
+            "and must write nothing"
+        );
+
+        cleanup(&path);
+    }
+
+    /// Bootstrapping writes the configuration as the log's first entry,
+    /// after which the node is a single-node cluster and elects itself.
+    #[tokio::test]
+    async fn bootstrap_forms_a_single_node_cluster_that_then_elects_itself() {
+        let (log, path) = open_temp_log();
+        let (common, mut role_rx, _peer_handle, _c, _cc) =
+            Common::new("solo".to_string(), Arc::clone(&log)).unwrap();
+        let client = common.client_handle();
+        tokio::spawn(run(common));
+        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Uninitialized)).await;
+
+        let config = cluster_config(&[("solo", true)]);
+        client.bootstrap(config.clone()).await.unwrap();
+
+        let stored = log.entries_in_range(1, 2).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].kind, storage::EntryKind::Config);
+        assert_eq!(
+            ClusterConfig::from_bytes(stored[0].value.as_ref().unwrap()).unwrap(),
+            config
+        );
+
+        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Leader(_))).await;
+        cleanup(&path);
+    }
+
+    /// Bootstrapping twice is how one cluster silently becomes two, so a
+    /// node that is already part of one refuses -- whether it learned its
+    /// membership from a bootstrap or, as here, from replication.
+    #[tokio::test]
+    async fn bootstrap_is_refused_once_the_node_belongs_to_a_cluster() {
+        let (_log, (common, mut role_rx, _peer_handle, _c, _cc), path) =
+            open_temp_log_with_config("solo", &cluster_config(&[("solo", true)]));
+        let client = common.client_handle();
+        tokio::spawn(run(common));
+        wait_for_role(&mut role_rx, |r| !matches!(r, RoleHandle::Starting)).await;
+
+        let err = client
+            .bootstrap(cluster_config(&[("solo", true), ("interloper", true)]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RaftError::AlreadyInitialized));
+
+        cleanup(&path);
+    }
+
+    /// The other half of the guard: an empty configuration isn't enough
+    /// on its own. A node with log entries but no configuration has state
+    /// that a bootstrap would silently strand -- it belongs to some
+    /// cluster whose config entry it simply hasn't received yet.
+    #[tokio::test]
+    async fn bootstrap_is_refused_on_a_non_empty_log() {
+        let (log, path) = open_temp_log();
+        log.append(1, b"a", Some(b"1")).unwrap();
+        let (common, mut role_rx, _peer_handle, _c, _cc) =
+            Common::new("odd-one".to_string(), Arc::clone(&log)).unwrap();
+        let client = common.client_handle();
+        tokio::spawn(run(common));
+        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Uninitialized)).await;
+
+        let err = client
+            .bootstrap(cluster_config(&[("odd-one", true)]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RaftError::AlreadyInitialized));
+        assert_eq!(log.last_entry().unwrap().unwrap().0, 1, "nothing appended");
+
+        cleanup(&path);
+    }
+
+    /// The path a server added to an existing cluster takes: it starts
+    /// uninitialized and is initialized purely by replication, with no
+    /// bootstrap anywhere.
+    #[tokio::test]
+    async fn a_replicated_config_entry_initializes_a_fresh_node() {
+        let (log, path) = open_temp_log();
+        let (common, mut role_rx, peer_handle, _c, _cc) =
+            Common::new("newcomer".to_string(), Arc::clone(&log)).unwrap();
+        tokio::spawn(run(common));
+        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Uninitialized)).await;
+
+        // The leader adds it as a learner, so it is a member but still
+        // has no vote -- and so still doesn't campaign.
+        let config = cluster_config(&[("leader-1", true), ("newcomer", false)]);
+        let entry = LogEntry {
+            seq: 1,
+            term: 1,
+            kind: crate::pb::raft5::common::EntryKind::Config as i32,
+            key: Vec::new(),
+            value: Some(config.to_bytes()),
+        };
+        let resp = peer_handle
+            .append_entries(append_entries(1, "leader-1", 0, 0, vec![entry], 0))
+            .await
+            .unwrap();
+        assert!(resp.success);
+
+        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Follower(_))).await;
+        assert_eq!(
+            ClusterConfig::from_bytes(&log.current_config().unwrap().unwrap()).unwrap(),
+            config
+        );
+
+        cleanup(&path);
+    }
+
+    /// Membership comes from the log, not from the flag the node was
+    /// started with: a store that has already been bootstrapped ignores
+    /// the peer list entirely.
+    #[tokio::test]
+    async fn common_takes_its_membership_from_the_log_not_the_peer_argument() {
+        let (log, path) = open_temp_log();
+        let config = cluster_config(&[("n0", true), ("v1", true), ("l1", false)]);
+        log.append_config(1, &config.to_bytes()).unwrap();
+
+        let stale = vec![PeerInfo {
+            id: "someone-else".to_string(),
+            address: "http://127.0.0.1:1".to_string(),
+        }];
+        let (common, _role_rx, _peer_handle, _c, _cc) =
+            Common::new_seeded("n0".to_string(), stale, Arc::clone(&log)).unwrap();
+
+        assert_eq!(common.config, config);
+        let mut peer_ids: Vec<_> = common.peers().into_iter().map(|p| p.id).collect();
+        peer_ids.sort();
+        assert_eq!(peer_ids, vec!["l1", "v1"], "learners are replicated to");
+        assert_eq!(
+            common
+                .voting_peers()
+                .into_iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>(),
+            vec!["v1"],
+            "but only voters are asked for votes"
+        );
+        assert_eq!(common.majority(), 2);
+        assert!(common.is_voter());
+
+        cleanup(&path);
+    }
+
+    /// A learner replicates and answers RPCs, but never starts an
+    /// election: it has no vote, so it could never win one, and a server
+    /// campaigning outside the voting configuration is exactly the
+    /// disruption §4.2.3 warns about.
+    #[tokio::test]
+    async fn a_learner_never_campaigns() {
+        let config = cluster_config(&[("learner", false), ("v1", true), ("v2", true)]);
+        let (_log, (common, mut role_rx, _peer_handle, _c, _cc), path) =
+            open_temp_log_with_config("learner", &config);
+        tokio::spawn(run(common));
+        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Follower(_))).await;
+
+        // Comfortably past the LEASE_DURATION + fuzz window (200-400ms)
+        // in which a voter with unreachable peers would have campaigned.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(
+            matches!(*role_rx.borrow(), RoleHandle::Follower(_)),
+            "a learner must stay a follower no matter how long it hears nothing"
+        );
+
+        cleanup(&path);
+    }
+
+    /// The control for `a_learner_never_campaigns`: the same unreachable
+    /// peers, the same silence -- the only difference is the `voting`
+    /// flag, and it is what decides whether an election happens.
+    #[tokio::test]
+    async fn a_voter_with_the_same_unreachable_peers_does_campaign() {
+        let config = cluster_config(&[("v0", true), ("v1", true), ("v2", true)]);
+        let (_log, (common, mut role_rx, _peer_handle, _c, _cc), path) =
+            open_temp_log_with_config("v0", &config);
+        tokio::spawn(run(common));
+        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Candidate)).await;
+        cleanup(&path);
+    }
+
     #[tokio::test]
     async fn follower_becomes_candidate_after_election_timeout() {
         let (mut role_rx, _peer_handle, path) = spawn_test_node(vec![]);
@@ -978,24 +1520,26 @@ mod tests {
         let (log_a, path_a) = open_temp_log();
         let (log_b, path_b) = open_temp_log();
 
-        let (common_a, mut role_rx_a, peer_handle_a, _commit_rx_a, _compact_rx_a) = Common::new(
-            "node-a".to_string(),
-            vec![PeerInfo {
-                id: "node-b".to_string(),
-                address: format!("http://{addr_b}"),
-            }],
-            Arc::clone(&log_a),
-        )
-        .unwrap();
-        let (common_b, mut role_rx_b, peer_handle_b, _commit_rx_b, _compact_rx_b) = Common::new(
-            "node-b".to_string(),
-            vec![PeerInfo {
-                id: "node-a".to_string(),
-                address: format!("http://{addr_a}"),
-            }],
-            Arc::clone(&log_b),
-        )
-        .unwrap();
+        let (common_a, mut role_rx_a, peer_handle_a, _commit_rx_a, _compact_rx_a) =
+            Common::new_seeded(
+                "node-a".to_string(),
+                vec![PeerInfo {
+                    id: "node-b".to_string(),
+                    address: format!("http://{addr_b}"),
+                }],
+                Arc::clone(&log_a),
+            )
+            .unwrap();
+        let (common_b, mut role_rx_b, peer_handle_b, _commit_rx_b, _compact_rx_b) =
+            Common::new_seeded(
+                "node-b".to_string(),
+                vec![PeerInfo {
+                    id: "node-a".to_string(),
+                    address: format!("http://{addr_a}"),
+                }],
+                Arc::clone(&log_b),
+            )
+            .unwrap();
 
         tokio::spawn(run(common_a));
         tokio::spawn(run(common_b));
@@ -1040,24 +1584,26 @@ mod tests {
         let (log_a, path_a) = open_temp_log();
         let (log_b, path_b) = open_temp_log();
 
-        let (common_a, mut role_rx_a, peer_handle_a, _commit_rx_a, _compact_rx_a) = Common::new(
-            "node-a".to_string(),
-            vec![PeerInfo {
-                id: "node-b".to_string(),
-                address: format!("http://{addr_b}"),
-            }],
-            Arc::clone(&log_a),
-        )
-        .unwrap();
-        let (common_b, mut role_rx_b, peer_handle_b, _commit_rx_b, _compact_rx_b) = Common::new(
-            "node-b".to_string(),
-            vec![PeerInfo {
-                id: "node-a".to_string(),
-                address: format!("http://{addr_a}"),
-            }],
-            Arc::clone(&log_b),
-        )
-        .unwrap();
+        let (common_a, mut role_rx_a, peer_handle_a, _commit_rx_a, _compact_rx_a) =
+            Common::new_seeded(
+                "node-a".to_string(),
+                vec![PeerInfo {
+                    id: "node-b".to_string(),
+                    address: format!("http://{addr_b}"),
+                }],
+                Arc::clone(&log_a),
+            )
+            .unwrap();
+        let (common_b, mut role_rx_b, peer_handle_b, _commit_rx_b, _compact_rx_b) =
+            Common::new_seeded(
+                "node-b".to_string(),
+                vec![PeerInfo {
+                    id: "node-a".to_string(),
+                    address: format!("http://{addr_a}"),
+                }],
+                Arc::clone(&log_b),
+            )
+            .unwrap();
 
         tokio::spawn(run(common_a));
         tokio::spawn(run(common_b));
@@ -1153,13 +1699,15 @@ mod tests {
         wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Leader(_))).await;
         let leader = expect_leader_handle(&role_rx.borrow());
 
-        leader.append_log(b"a", Some(b"1")).await.unwrap();
-        leader.append_log(b"b", Some(b"2")).await.unwrap();
-        leader.append_log(b"c", Some(b"3")).await.unwrap();
+        // Seqs are captured rather than assumed: seq 1 is the
+        // term-opening no-op `Leader::new` appends, so these start at 2.
+        let a = leader.append_log(b"a", Some(b"1")).await.unwrap();
+        let b = leader.append_log(b"b", Some(b"2")).await.unwrap();
+        let c = leader.append_log(b"c", Some(b"3")).await.unwrap();
 
         tokio::time::timeout(Duration::from_millis(1000), async {
             loop {
-                if *compact_rx.borrow() >= 3 {
+                if *compact_rx.borrow() >= c {
                     return;
                 }
                 compact_rx.changed().await.unwrap();
@@ -1173,7 +1721,7 @@ mod tests {
         // I/O.
         tokio::time::timeout(Duration::from_millis(1000), async {
             loop {
-                if log.entries_in_range(1, 3).unwrap().is_empty() {
+                if log.entries_in_range(1, c).unwrap().is_empty() {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1184,9 +1732,9 @@ mod tests {
 
         // Compaction only removes superseded history -- current values
         // must still be intact.
-        assert_eq!(log.get_latest(b"a").unwrap(), Some((1, b"1".to_vec())));
-        assert_eq!(log.get_latest(b"b").unwrap(), Some((2, b"2".to_vec())));
-        assert_eq!(log.get_latest(b"c").unwrap(), Some((3, b"3".to_vec())));
+        assert_eq!(log.get_latest(b"a").unwrap(), Some((a, b"1".to_vec())));
+        assert_eq!(log.get_latest(b"b").unwrap(), Some((b, b"2".to_vec())));
+        assert_eq!(log.get_latest(b"c").unwrap(), Some((c, b"3".to_vec())));
 
         cleanup(&path);
     }

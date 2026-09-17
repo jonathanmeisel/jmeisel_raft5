@@ -1,11 +1,18 @@
 //! gRPC service implementations wiring the generated proto types (`pb`)
 //! into `storage::RaftLog`.
 //!
-//! `KvService` is still a stand-in for a real Raft node: there's no leader
-//! election, term tracking, or log replication in its write/read path, so
-//! it just appends/reads locally as if this node were always its own sole
-//! leader at term 0. `RaftPeerService`, on the other hand, forwards every
-//! call straight into a live `raft::RaftPeerHandle` -- whichever role the
+//! `KvService` is the client-facing half. Everything that changes state
+//! -- writes, membership changes, and a linearizable read -- requires
+//! this node to be the leader, and a node that isn't answers `NotLeader`
+//! with whatever leader hint it has rather than forwarding (Raft §6.2),
+//! so the client retries against the leader directly and exactly one node
+//! does the work. A *stale* read is the one exception: it asks for no
+//! guarantee, so it is served locally by whoever receives it. `Bootstrap`
+//! is the other: by definition it targets a node with no leader at all.
+//!
+//! `RaftPeerService` is the peer-facing half, served on a separate port
+//! since the two have different network exposure. It forwards every call
+//! straight into a live `raft::RaftPeerHandle` -- whichever role the
 //! state machine is currently in decides how to answer. `install_snapshot`
 //! reassembles the incoming stream (transport-level work) but, like every
 //! other call here, never touches `storage::RaftLog` directly -- the term
@@ -18,16 +25,20 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::pb::raft5::client::kv_server::Kv;
 use crate::pb::raft5::client::{
-    AddServerRequest, ConfigChangeResponse, ReadOk, ReadRequest, ReadResponse, RemoveServerRequest,
-    WriteRequest, WriteResponse, read_response, write_response,
+    AddServerRequest, BootstrapRequest, ConfigChangeResponse, NotLeader, RaftError as PbRaftError,
+    ReadOk, ReadRequest, ReadResponse, RemoveServerRequest, WriteRequest, WriteResponse,
+    config_change_response, raft_error, read_response, write_response,
 };
+use crate::pb::raft5::cluster::{ClusterConfig, ClusterMember};
 use crate::pb::raft5::raft::raft_peer_server::RaftPeer;
 use crate::pb::raft5::raft::{
     AppendEntriesRequest, AppendEntriesResponse, GetLeaseRequest, GetLeaseResponse,
     InstallSnapshotResponse, RequestVoteRequest, RequestVoteResponse, SnapshotChunk,
     snapshot_chunk,
 };
-use crate::raft::{RaftError, RaftPeerHandle};
+use crate::raft::{
+    self, ClientHandle, ConfigChange, LeaderHandle, RaftError, RaftPeerHandle, RoleHandle,
+};
 use crate::storage::{RaftLog, StorageError};
 
 fn storage_err(e: StorageError) -> Status {
@@ -36,12 +47,59 @@ fn storage_err(e: StorageError) -> Status {
 
 fn raft_err(e: RaftError) -> Status {
     match e {
-        // Neither RaftPeerHandle method can actually produce this today --
-        // only LeaderHandle::append_log does -- but RaftError is shared, so
-        // this match has to be total.
+        // Only reachable on the peer-facing service, where a structured
+        // client error would have nowhere to go.
         RaftError::NotLeader { .. } => Status::failed_precondition("not leader"),
         RaftError::Storage(e) => storage_err(e),
         RaftError::Disconnected => Status::unavailable("raft event loop is not running"),
+        RaftError::AlreadyInitialized => Status::failed_precondition(
+            "this node is already part of a cluster; to add it to a different one, \
+             use AddServer on that cluster's leader",
+        ),
+        RaftError::ConfigChangeInProgress => {
+            Status::unavailable("another membership change is still in flight")
+        }
+        RaftError::NotCaughtUp => Status::unavailable(
+            "this leader has not yet committed an entry from its own term; retry shortly",
+        ),
+        RaftError::InvalidConfigChange(why) => Status::failed_precondition(why),
+    }
+}
+
+/// `RaftError` as the structured error the client protocol carries, so a
+/// client can find the real leader from the response itself rather than
+/// needing a separate discovery RPC. Only `NotLeader` has somewhere
+/// useful to point; everything else is reported as a plain string, and
+/// genuine internal failures (storage, a dead event loop) stay `Status`
+/// errors rather than being dressed up as an ordinary answer.
+fn client_err(e: RaftError) -> Result<PbRaftError, Status> {
+    Ok(match e {
+        RaftError::NotLeader { leader_hint } => PbRaftError {
+            kind: Some(raft_error::Kind::NotLeader(NotLeader { leader_hint })),
+        },
+        RaftError::ConfigChangeInProgress
+        | RaftError::NotCaughtUp
+        | RaftError::AlreadyInitialized
+        | RaftError::InvalidConfigChange(_) => PbRaftError {
+            kind: Some(raft_error::Kind::Unavailable(
+                raft_err(e).message().to_string(),
+            )),
+        },
+        e => return Err(raft_err(e)),
+    })
+}
+
+/// The leader handle for this node, or the error to hand back to the
+/// client instead. Every write and every membership change goes through
+/// here: a follower answers `NotLeader` with whatever hint it has rather
+/// than forwarding, so a client retries against the leader directly
+/// (Raft §6.2) and there is exactly one node doing the work.
+fn require_leader(role: &RoleHandle) -> Result<LeaderHandle, RaftError> {
+    match role {
+        RoleHandle::Leader(h) => Ok(h.clone()),
+        other => Err(RaftError::NotLeader {
+            leader_hint: raft::leader_hint_of(other),
+        }),
     }
 }
 
@@ -51,11 +109,41 @@ fn join_err(e: tokio::task::JoinError) -> Status {
 
 pub struct KvService {
     log: Arc<RaftLog>,
+    /// How this node's own identity reaches `Bootstrap` -- the
+    /// configuration it forms names itself, and only this node knows what
+    /// it is called and where its peers should dial it.
+    identity: ClusterMember,
+    client_handle: ClientHandle,
 }
 
 impl KvService {
-    pub fn new(log: Arc<RaftLog>) -> Self {
-        Self { log }
+    pub fn new(log: Arc<RaftLog>, identity: ClusterMember, client_handle: ClientHandle) -> Self {
+        Self {
+            log,
+            identity,
+            client_handle,
+        }
+    }
+
+    /// Shared body of `add_server`/`remove_server`: both are the same
+    /// operation with a different `ConfigChange`, and both answer
+    /// `NotLeader` rather than forwarding (Raft §6.2).
+    async fn propose(
+        &self,
+        change: ConfigChange,
+    ) -> Result<Response<ConfigChangeResponse>, Status> {
+        let result = async {
+            let leader = require_leader(&self.client_handle.role())?;
+            leader.propose_config(change).await
+        }
+        .await;
+
+        Ok(Response::new(ConfigChangeResponse {
+            result: Some(match result {
+                Ok(_) => config_change_response::Result::Ok(true),
+                Err(e) => config_change_response::Result::Error(client_err(e)?),
+            }),
+        }))
     }
 }
 
@@ -66,32 +154,45 @@ impl Kv for KvService {
         request: Request<WriteRequest>,
     ) -> Result<Response<WriteResponse>, Status> {
         let req = request.into_inner();
-        let log = Arc::clone(&self.log);
 
-        let seq = tokio::task::spawn_blocking(move || {
-            // Placeholder term: there's no leader election/term tracking
-            // yet, so every node just appends locally as if it were sole
-            // leader at term 0. `apply_committed` right after mimics what
-            // a real zero-peer cluster does (commits its own writes
-            // immediately, see raft::leader's tests) -- `latest` only
-            // ever reflects committed state (see storage's module doc),
-            // so skipping this would leave every write invisible to
-            // `read` forever. Replace once real consensus exists.
-            let seq = log.append(0, &req.key, req.value.as_deref())?;
-            log.apply_committed(seq)?;
-            Result::<u64, StorageError>::Ok(seq)
-        })
-        .await
-        .map_err(join_err)?
-        .map_err(storage_err)?;
+        let result = async {
+            let leader = require_leader(&self.client_handle.role())?;
+            leader.append_log(&req.key, req.value.as_deref()).await
+        }
+        .await;
 
         Ok(Response::new(WriteResponse {
-            result: Some(write_response::Result::Seq(seq)),
+            result: Some(match result {
+                // `append_log` returns only once the entry has committed
+                // *and* been applied, so the moment a client sees this
+                // seq, a read on this node reflects it.
+                Ok(seq) => write_response::Result::Seq(seq),
+                Err(e) => write_response::Result::Error(client_err(e)?),
+            }),
         }))
     }
 
     async fn read(&self, request: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {
         let req = request.into_inner();
+
+        // A linearizable read has to come from a leader that still holds
+        // a quorum of leases: without one it may have been deposed
+        // already and simply not know it yet, and would answer from state
+        // a newer leader has moved past. A stale read asks for none of
+        // that and is served locally by whoever received it.
+        if req.linearizable {
+            let held = match require_leader(&self.client_handle.role()) {
+                Ok(leader) if leader.has_read_quorum() => Ok(()),
+                Ok(_) => Err(RaftError::NotLeader { leader_hint: None }),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = held {
+                return Ok(Response::new(ReadResponse {
+                    result: Some(read_response::Result::Error(client_err(e)?)),
+                }));
+            }
+        }
+
         let log = Arc::clone(&self.log);
 
         let found = tokio::task::spawn_blocking(move || log.get_latest(&req.key))
@@ -121,20 +222,57 @@ impl Kv for KvService {
 
     async fn add_server(
         &self,
-        _request: Request<AddServerRequest>,
+        request: Request<AddServerRequest>,
     ) -> Result<Response<ConfigChangeResponse>, Status> {
-        Err(Status::unimplemented(
-            "cluster membership changes require the raft consensus engine, not yet implemented",
-        ))
+        let req = request.into_inner();
+        // Added as a learner, not a voter: see `ConfigChange::AddServer`.
+        // It is promoted automatically once it has caught up, so from a
+        // client's point of view this one call is the whole operation.
+        self.propose(ConfigChange::AddServer {
+            server_id: req.server_id,
+            address: req.address,
+        })
+        .await
     }
 
     async fn remove_server(
         &self,
-        _request: Request<RemoveServerRequest>,
+        request: Request<RemoveServerRequest>,
     ) -> Result<Response<ConfigChangeResponse>, Status> {
-        Err(Status::unimplemented(
-            "cluster membership changes require the raft consensus engine, not yet implemented",
-        ))
+        let req = request.into_inner();
+        self.propose(ConfigChange::RemoveServer {
+            server_id: req.server_id,
+        })
+        .await
+    }
+
+    async fn bootstrap(
+        &self,
+        request: Request<BootstrapRequest>,
+    ) -> Result<Response<ConfigChangeResponse>, Status> {
+        let req = request.into_inner();
+        if !req.server_id.is_empty() && req.server_id != self.identity.server_id {
+            return Err(Status::failed_precondition(format!(
+                "this node is {}, not {}",
+                self.identity.server_id, req.server_id
+            )));
+        }
+
+        // A cluster of exactly one: the node is its own sole voter, so it
+        // wins the next election unopposed and can then serve AddServer
+        // to grow from there.
+        let config = ClusterConfig {
+            members: vec![self.identity.clone()],
+            heartbeat_millis: raft::HEARTBEAT_MS,
+        };
+        self.client_handle
+            .bootstrap(config)
+            .await
+            .map_err(raft_err)?;
+
+        Ok(Response::new(ConfigChangeResponse {
+            result: Some(config_change_response::Result::Ok(true)),
+        }))
     }
 }
 
@@ -232,7 +370,8 @@ impl RaftPeer for RaftPeerService {
 mod tests {
     use super::*;
     use crate::pb::raft5::client::{read_response, write_response};
-    use crate::raft;
+    use crate::raft::{self, RoleHandle};
+    use tokio::sync::watch;
 
     fn open_temp() -> (Arc<RaftLog>, std::path::PathBuf) {
         // A nanosecond timestamp alone isn't a reliable unique suffix under
@@ -264,10 +403,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(path);
     }
 
+    /// A `KvService` on a node that has been bootstrapped into a
+    /// single-node cluster and has won its election -- i.e. one that can
+    /// actually serve a write.
+    async fn leader_kv_service(log: Arc<RaftLog>, node_id: &str) -> KvService {
+        let (svc, mut role_rx) = kv_service(log, node_id);
+        svc.bootstrap(Request::new(BootstrapRequest::default()))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !matches!(&*role_rx.borrow(), RoleHandle::Leader(_)) {
+                role_rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("a bootstrapped single-node cluster should elect itself");
+        svc
+    }
+
+    /// A `KvService` on top of a running state machine, plus the handles
+    /// a test needs to watch it.
+    fn kv_service(log: Arc<RaftLog>, node_id: &str) -> (KvService, watch::Receiver<RoleHandle>) {
+        let (common, role_rx, _peer_handle, _commit_rx, _compact_rx) =
+            raft::Common::new(node_id.to_string(), Arc::clone(&log)).unwrap();
+        let client_handle = common.client_handle();
+        tokio::spawn(raft::run(common));
+        let identity = ClusterMember {
+            server_id: node_id.to_string(),
+            address: format!("http://127.0.0.1:1/{node_id}"),
+            voting: true,
+        };
+        (KvService::new(log, identity, client_handle), role_rx)
+    }
+
     #[tokio::test]
     async fn write_then_read_round_trips_through_kv_service() {
         let (log, path) = open_temp();
-        let svc = KvService::new(log);
+        let svc = leader_kv_service(log, "kv-test").await;
 
         let write_resp = svc
             .write(Request::new(WriteRequest {
@@ -281,7 +453,10 @@ mod tests {
             Some(write_response::Result::Seq(seq)) => seq,
             other => panic!("expected Seq, got {other:?}"),
         };
-        assert_eq!(seq, 1);
+        assert_eq!(
+            seq, 3,
+            "seq 1 is the bootstrap config entry and seq 2 the leader's no-op"
+        );
 
         let read_resp = svc
             .read(Request::new(ReadRequest {
@@ -305,7 +480,7 @@ mod tests {
     #[tokio::test]
     async fn write_with_no_value_deletes_and_read_reflects_it() {
         let (log, path) = open_temp();
-        let svc = KvService::new(log);
+        let svc = leader_kv_service(log, "kv-test").await;
 
         svc.write(Request::new(WriteRequest {
             key: b"k".to_vec(),
@@ -340,7 +515,7 @@ mod tests {
     #[tokio::test]
     async fn read_of_never_written_key_returns_no_value() {
         let (log, path) = open_temp();
-        let svc = KvService::new(log);
+        let svc = leader_kv_service(log, "kv-test").await;
 
         let read_resp = svc
             .read(Request::new(ReadRequest {
@@ -361,6 +536,183 @@ mod tests {
         cleanup(&path);
     }
 
+    /// A node that isn't the leader answers with a structured
+    /// `NotLeader` rather than forwarding (Raft §6.2), so the client
+    /// retries against the leader directly and exactly one node does the
+    /// work.
+    #[tokio::test]
+    async fn writes_to_a_non_leader_come_back_as_not_leader() {
+        let (log, path) = open_temp();
+        let (svc, _role_rx) = kv_service(log, "bystander");
+
+        let resp = svc
+            .write(Request::new(WriteRequest {
+                key: b"k".to_vec(),
+                value: Some(b"v".to_vec()),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        match resp.result {
+            Some(write_response::Result::Error(e)) => {
+                assert!(matches!(e.kind, Some(raft_error::Kind::NotLeader(_))));
+            }
+            other => panic!("expected NotLeader, got {other:?}"),
+        }
+
+        // Membership changes take the same route.
+        let add = svc
+            .add_server(Request::new(AddServerRequest {
+                server_id: "new".to_string(),
+                address: "http://127.0.0.1:9999".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(
+            add.result,
+            Some(config_change_response::Result::Error(_))
+        ));
+
+        cleanup(&path);
+    }
+
+    /// A stale read is served by whoever receives it, leader or not --
+    /// that is what asking for a stale read means.
+    #[tokio::test]
+    async fn a_stale_read_is_served_without_a_leader() {
+        let (log, path) = open_temp();
+        let (svc, _role_rx) = kv_service(log, "bystander");
+
+        let resp = svc
+            .read(Request::new(ReadRequest {
+                key: b"k".to_vec(),
+                linearizable: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(resp.result, Some(read_response::Result::Ok(_))));
+
+        // A linearizable one is refused, since this node can't show that
+        // its state is current.
+        let strict = svc
+            .read(Request::new(ReadRequest {
+                key: b"k".to_vec(),
+                linearizable: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        match strict.result {
+            Some(read_response::Result::Error(e)) => {
+                assert!(matches!(e.kind, Some(raft_error::Kind::NotLeader(_))));
+            }
+            other => panic!("expected NotLeader, got {other:?}"),
+        }
+
+        cleanup(&path);
+    }
+
+    /// The whole add path through the client API: one call, and the new
+    /// server is a member of the configuration in the leader's log.
+    #[tokio::test]
+    async fn add_server_then_remove_server_round_trip_through_the_kv_service() {
+        let (log, path) = open_temp();
+        let svc = leader_kv_service(Arc::clone(&log), "solo").await;
+
+        let resp = svc
+            .add_server(Request::new(AddServerRequest {
+                server_id: "new".to_string(),
+                address: "http://127.0.0.1:9999".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(
+            resp.result,
+            Some(config_change_response::Result::Ok(true))
+        ));
+
+        let config = ClusterConfig::from_bytes(&log.current_config().unwrap().unwrap()).unwrap();
+        assert!(config.contains("new"));
+        assert!(!config.is_voter("new"), "added as a learner");
+
+        // "new" is unreachable, so it never catches up and stays a
+        // learner -- which means the cluster still commits on "solo"
+        // alone, and can therefore also remove it again.
+        let removed = svc
+            .remove_server(Request::new(RemoveServerRequest {
+                server_id: "new".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(
+            removed.result,
+            Some(config_change_response::Result::Ok(true))
+        ));
+        let config = ClusterConfig::from_bytes(&log.current_config().unwrap().unwrap()).unwrap();
+        assert!(!config.contains("new"));
+
+        cleanup(&path);
+    }
+
+    /// The operator-facing half of bootstrapping: the node names *itself*
+    /// in the configuration it forms, so a client doesn't have to know
+    /// (or be able to lie about) what address this node advertises.
+    #[tokio::test]
+    async fn bootstrap_forms_a_cluster_of_this_node_alone() {
+        let (log, path) = open_temp();
+        let (svc, mut role_rx) = kv_service(Arc::clone(&log), "solo");
+
+        let resp = svc
+            .bootstrap(Request::new(BootstrapRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(
+            resp.result,
+            Some(config_change_response::Result::Ok(true))
+        ));
+
+        let config = ClusterConfig::from_bytes(&log.current_config().unwrap().unwrap()).unwrap();
+        assert_eq!(config.members.len(), 1);
+        assert_eq!(config.members[0].server_id, "solo");
+        assert!(config.members[0].voting);
+
+        // A single-node cluster has no one to lose an election to.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !matches!(&*role_rx.borrow(), RoleHandle::Leader(_)) {
+                role_rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("a bootstrapped single-node cluster should elect itself");
+
+        cleanup(&path);
+    }
+
+    /// Bootstrapping is irreversible, so a client that names the wrong
+    /// node is told so rather than silently initializing the one it
+    /// happened to reach.
+    #[tokio::test]
+    async fn bootstrap_refuses_when_the_named_node_is_someone_else() {
+        let (log, path) = open_temp();
+        let (svc, _role_rx) = kv_service(Arc::clone(&log), "solo");
+
+        let err = svc
+            .bootstrap(Request::new(BootstrapRequest {
+                server_id: "some-other-node".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(log.current_config().unwrap().is_none());
+
+        cleanup(&path);
+    }
+
     /// End-to-end through the actual tonic service: confirms
     /// `RaftPeerService` is wired to a *running* state machine, not just
     /// that `raft::RaftPeerHandle` works in isolation (covered separately
@@ -369,7 +721,7 @@ mod tests {
     async fn append_entries_and_request_vote_reach_the_running_state_machine() {
         let (log, path) = open_temp();
         let (common, role_rx, peer_handle, _commit_rx, _compact_rx) =
-            raft::Common::new("node-under-test".to_string(), vec![], Arc::clone(&log)).unwrap();
+            raft::Common::new("node-under-test".to_string(), Arc::clone(&log)).unwrap();
         tokio::spawn(raft::run(common));
 
         let svc = RaftPeerService::new(peer_handle);

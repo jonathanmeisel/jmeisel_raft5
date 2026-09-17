@@ -1,4 +1,6 @@
 use super::*;
+use crate::pb::raft5::cluster::{ClusterConfig, ClusterMember};
+use crate::pb::raft5::common::EntryKind;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) fn open_temp_log() -> (Arc<RaftLog>, std::path::PathBuf) {
@@ -20,6 +22,36 @@ pub(crate) fn open_temp_log() -> (Arc<RaftLog>, std::path::PathBuf) {
     (log, path)
 }
 
+/// A `ClusterConfig` from `(server_id, voting)` pairs. Addresses point at
+/// ports nothing is listening on: these tests are about what the
+/// configuration *means*, so peers are expected never to answer.
+pub(crate) fn cluster_config(members: &[(&str, bool)]) -> ClusterConfig {
+    ClusterConfig {
+        members: members
+            .iter()
+            .enumerate()
+            .map(|(i, (id, voting))| ClusterMember {
+                server_id: (*id).to_string(),
+                address: format!("http://127.0.0.1:{}", 9000 + i),
+                voting: *voting,
+            })
+            .collect(),
+        heartbeat_millis: HEARTBEAT_MS,
+    }
+}
+
+/// A temp log already bootstrapped with `config`, plus a `Common` reading
+/// its membership from it (rather than from a peer list).
+pub(crate) fn open_temp_log_with_config(
+    node_id: &str,
+    config: &ClusterConfig,
+) -> (Arc<RaftLog>, NewCommon, std::path::PathBuf) {
+    let (log, path) = open_temp_log();
+    log.append_config(1, &config.to_bytes()).expect("bootstrap");
+    let common = Common::new(node_id.to_string(), Arc::clone(&log)).unwrap();
+    (log, common, path)
+}
+
 pub(crate) fn cleanup(path: &std::path::Path) {
     let _ = std::fs::remove_dir_all(path);
 }
@@ -35,7 +67,7 @@ pub(crate) fn spawn_test_node(
 ) {
     let (log, path) = open_temp_log();
     let (common, role_rx, peer_handle, _commit_rx, _compact_rx) =
-        Common::new("test-node".to_string(), peers, log).unwrap();
+        Common::new_seeded("test-node".to_string(), peers, log).unwrap();
     tokio::spawn(run(common));
     (role_rx, peer_handle, path)
 }
@@ -56,7 +88,7 @@ pub(crate) fn spawn_node_with_handles(
 ) {
     let (log, path) = open_temp_log();
     let (common, role_rx, peer_handle, commit_rx, compact_rx) =
-        Common::new("test-node".to_string(), peers, Arc::clone(&log)).unwrap();
+        Common::new_seeded("test-node".to_string(), peers, Arc::clone(&log)).unwrap();
     tokio::spawn(run(common));
     (log, role_rx, peer_handle, commit_rx, compact_rx, path)
 }
@@ -126,6 +158,11 @@ pub(crate) fn log_entry(seq: u64, term: u64, key: &[u8], value: Option<&[u8]>) -
     LogEntry {
         seq,
         term,
+        kind: if value.is_some() {
+            EntryKind::Put
+        } else {
+            EntryKind::Delete
+        } as i32,
         key: key.to_vec(),
         value: value.map(<[u8]>::to_vec),
     }

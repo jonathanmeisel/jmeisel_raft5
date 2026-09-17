@@ -87,10 +87,11 @@ impl Campaign {
 
         let (last_log_index, last_log_term) = last_log_index_and_term(&common.log).await;
         let dry_run = kind == CampaignKind::PreVote;
+        // Voting peers only: a learner has no vote to give, so asking it
+        // would just be a wasted RPC that can never move `votes_received`.
         let vote_tasks = common
-            .peers
-            .iter()
-            .cloned()
+            .voting_peers()
+            .into_iter()
             .map(|peer| {
                 Self::spawn_request_vote(
                     peer,
@@ -109,12 +110,18 @@ impl Campaign {
         // campaign stuck forever with nothing left to wait on.
         let election_timer = spawn_election_timer(common.election_attempt, common.event_tx.clone());
 
+        let campaign_common_is_voter = common.is_voter();
         let mut campaign = Campaign {
             common,
             kind,
             vote_tasks,
             election_timer,
-            votes_received: 1, // vote/pre-vote for self
+            // A vote/pre-vote for ourselves -- but only if we actually
+            // have one. A learner, or a server that has been removed
+            // from the configuration, counts for nothing. (It shouldn't
+            // be campaigning at all; see `Follower::handle_event`. This
+            // is the same rule enforced where it is actually counted.)
+            votes_received: usize::from(campaign_common_is_voter),
         };
         // A zero-peer cluster reaches majority on the self-vote alone --
         // nothing will ever arrive on the event loop to notice that, so
@@ -304,6 +311,17 @@ impl Campaign {
             | Event::GetLeaseResponse { .. }
             | Event::InstallSnapshotResponse { .. }
             | Event::LeaderTick => Transition::Continue,
+            // No leader to forward to yet -- an election is in progress.
+            Event::ProposeConfig { respond_to, .. } => {
+                let _ = respond_to.send(Err(RaftError::NotLeader { leader_hint: None }));
+                Transition::Continue
+            }
+            // Only an uninitialized node can be bootstrapped, and an
+            // uninitialized node never campaigns.
+            Event::Bootstrap { respond_to, .. } => {
+                let _ = respond_to.send(Err(RaftError::AlreadyInitialized));
+                Transition::Continue
+            }
         }
     }
 

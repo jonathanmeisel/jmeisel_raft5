@@ -3,10 +3,12 @@ syntax = "proto3";
 package raft5.cluster;
 
 // The set of servers that make up the cluster, plus the heartbeat interval
-// the leader paces AppendEntries/RequestVote timing around. Not yet wired
-// to a specific RPC -- this is the shared shape for whatever eventually
-// reads/writes cluster membership (e.g. persisted alongside the log,
-// returned to clients, or exchanged between peers).
+// the leader paces AppendEntries/RequestVote timing around.
+//
+// This is the cluster's *configuration*: it is stored as an ordinary log
+// entry (`storage::EntryKind::Config`), replicated like any other entry,
+// and takes effect on every node as soon as that entry is *appended* --
+// not when it commits. See `storage::RaftLog::current_config`.
 message ClusterConfig {
   repeated ClusterMember members = 1;
   uint64 heartbeat_millis = 2;
@@ -18,4 +20,9 @@ message ClusterConfig {
 message ClusterMember {
   string server_id = 1;
   string address = 2;
+  // Whether this member votes in elections and counts toward the commit
+  // quorum. A non-voting member (a "learner") is replicated to like any
+  // other follower but is invisible to both quorums -- how a newly added
+  // server catches up without stalling the cluster (Raft §4.2.1).
+  bool voting = 3;
 }

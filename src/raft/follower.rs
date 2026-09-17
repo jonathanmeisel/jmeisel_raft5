@@ -13,6 +13,15 @@ struct AppendOutcome {
     match_index: u64,
     conflict_index: Option<u64>,
     conflict_term: Option<u64>,
+    /// Whether this call may have changed the active cluster
+    /// configuration -- true if it appended a `Config` entry, and also
+    /// true if it truncated anything, since a rolled-back `Config` entry
+    /// reverts membership just as surely as a new one changes it.
+    ///
+    /// Necessary because a configuration takes effect on *append* (Raft
+    /// §4.1), so the follower has to react to it here rather than waiting
+    /// for it to commit. See `storage::RaftLog::current_config`.
+    config_may_have_changed: bool,
 }
 
 impl AppendOutcome {
@@ -22,6 +31,7 @@ impl AppendOutcome {
             match_index: 0,
             conflict_index: Some(conflict_index),
             conflict_term,
+            config_may_have_changed: false,
         }
     }
 }
@@ -69,6 +79,7 @@ fn apply_append_entries_sync(
     }
 
     let mut match_index = prev_log_index;
+    let mut config_may_have_changed = false;
     for (i, entry) in entries.iter().enumerate() {
         match log.term_at(entry.seq)? {
             // Already present with the same term -- by the Log Matching
@@ -83,9 +94,25 @@ fn apply_append_entries_sync(
             other => {
                 if other.is_some() {
                     log.truncate_from(entry.seq)?;
+                    // Conservative: we don't check whether the discarded
+                    // suffix actually held a `Config` entry, only that
+                    // something was discarded. Truncation is rare, and
+                    // reloading when nothing changed is free.
+                    config_may_have_changed = true;
                 }
+                config_may_have_changed |= entries[i..]
+                    .iter()
+                    .any(|e| e.entry_kind() == storage::EntryKind::Config);
                 for fresh in &entries[i..] {
-                    let seq = log.append(fresh.term, &fresh.key, fresh.value.as_deref())?;
+                    // `append_entry`, not `append`: the entry's kind comes
+                    // from the leader and has to be preserved verbatim, or
+                    // our copy of the log stops matching theirs.
+                    let seq = log.append_entry(
+                        fresh.term,
+                        fresh.entry_kind(),
+                        &fresh.key,
+                        fresh.value.as_deref(),
+                    )?;
                     debug_assert_eq!(
                         seq, fresh.seq,
                         "follower's log position drifted from the leader's indexing"
@@ -102,6 +129,7 @@ fn apply_append_entries_sync(
         match_index,
         conflict_index: None,
         conflict_term: None,
+        config_may_have_changed,
     })
 }
 
@@ -179,6 +207,21 @@ fn spawn_lease_expiration_watcher(
     })
 }
 
+/// What a follower publishes as its role: `Uninitialized` while it has no
+/// cluster configuration at all, `Follower` once it has one. The two are
+/// the same role internally -- an uninitialized node answers every RPC
+/// and is replicated to exactly like a follower, which is how a server
+/// added to an existing cluster receives the very `Config` entry that
+/// initializes it. The distinction is for clients: only one of the two
+/// can be bootstrapped.
+fn follower_handle(common: &Common, leader_hint: Option<String>) -> RoleHandle {
+    if common.config.members.is_empty() {
+        RoleHandle::Uninitialized
+    } else {
+        RoleHandle::Follower(FollowerHandle { leader_hint })
+    }
+}
+
 pub struct Follower {
     common: Common,
     election_timer: JoinHandle<()>,
@@ -194,12 +237,21 @@ impl Follower {
         // from a past run of failed election attempts no longer applies,
         // so the next one starts fresh at the base timeout again.
         common.election_attempt = 0;
-        common.publish_role(RoleHandle::Follower(FollowerHandle { leader_hint: None }));
+        common.publish_role(follower_handle(&common, None));
 
-        let election_timer = spawn_lease_expiration_watcher(
-            common.lease_expires_at_rx.clone(),
-            common.event_tx.clone(),
-        );
+        // A learner -- or a server that has been removed from the
+        // configuration -- never campaigns, so it gets no election timer
+        // at all rather than one whose every firing has to be discarded.
+        // Being promoted to voter re-enters `Follower`, which is what
+        // arms one.
+        let election_timer = if common.is_voter() {
+            spawn_lease_expiration_watcher(
+                common.lease_expires_at_rx.clone(),
+                common.event_tx.clone(),
+            )
+        } else {
+            tokio::spawn(std::future::pending())
+        };
 
         let mut follower = Follower {
             common,
@@ -208,6 +260,69 @@ impl Follower {
         };
         let next_role = follower.run().await;
         (next_role, follower.shutdown())
+    }
+
+    fn not_leader_error(&self) -> RaftError {
+        RaftError::NotLeader {
+            leader_hint: self.leader_hint.clone(),
+        }
+    }
+
+    /// Forms a single-node cluster around this node by appending
+    /// `config` as the first entry in the log (Raft §4.4).
+    ///
+    /// Refused unless this node has neither a configuration nor a single
+    /// log entry. Bootstrapping a node that already has either is how a
+    /// cluster gets silently split in two -- both halves would believe
+    /// they are the whole thing, and both could elect a leader. A server
+    /// meant to *join* an existing cluster is added from that cluster's
+    /// leader instead, and receives its configuration by replication.
+    async fn bootstrap(&mut self, config: ClusterConfig) -> Result<(), RaftError> {
+        if !self.common.config.members.is_empty() {
+            return Err(RaftError::AlreadyInitialized);
+        }
+        let log = Arc::clone(&self.common.log);
+        let bytes = config.to_bytes();
+        let appended = tokio::task::spawn_blocking(move || {
+            if log.last_entry()?.is_some() {
+                return Ok(false);
+            }
+            // Term 1, not 0: 0 is the "before any term" sentinel that an
+            // empty log reports, and this entry has to be reachable by
+            // the §5.4.1 up-to-date check like any other.
+            log.append_config(1, &bytes)?;
+            storage::Result::Ok(true)
+        })
+        .await
+        .expect("bootstrap append task panicked")
+        .map_err(RaftError::Storage)?;
+
+        if !appended {
+            return Err(RaftError::AlreadyInitialized);
+        }
+        self.common.reload_config().await;
+        Ok(())
+    }
+
+    /// Re-reads the cluster configuration, republishes this node's role
+    /// handle to match, and -- if its own right to vote changed --
+    /// re-enters `Follower` so the election timer is rebuilt: a learner
+    /// has none at all, and a node just promoted to voter needs one armed
+    /// (see `Follower::new`).
+    async fn reload_config(&mut self) -> Transition {
+        let voting_changed = self.common.reload_config().await;
+        // Republished unconditionally: gaining (or losing) membership
+        // changes which handle we publish even when our right to vote is
+        // unaffected -- a server added as a learner goes from
+        // `Uninitialized` to `Follower` while staying a non-voter
+        // throughout.
+        self.common
+            .publish_role(follower_handle(&self.common, self.leader_hint.clone()));
+        if voting_changed {
+            Transition::Become(Role::Follower)
+        } else {
+            Transition::Continue
+        }
     }
 
     /// Called on any sign that campaigning right now would be premature:
@@ -295,9 +410,7 @@ impl Follower {
                 }
                 self.leader_hint = Some(req.leader_id.clone());
                 self.common
-                    .publish_role(RoleHandle::Follower(FollowerHandle {
-                        leader_hint: self.leader_hint.clone(),
-                    }));
+                    .publish_role(follower_handle(&self.common, self.leader_hint.clone()));
                 self.renew_lease();
 
                 let outcome = self.apply_append_entries(&req).await;
@@ -308,7 +421,13 @@ impl Follower {
                     conflict_index: outcome.conflict_index,
                     conflict_term: outcome.conflict_term,
                 });
-                Transition::Continue
+                // Answer first, then react: the leader is waiting on this
+                // response, and reloading is our own bookkeeping.
+                if outcome.config_may_have_changed {
+                    self.reload_config().await
+                } else {
+                    Transition::Continue
+                }
             }
             Event::InstallSnapshot {
                 header,
@@ -326,9 +445,7 @@ impl Follower {
                 }
                 self.leader_hint = Some(header.leader_id.clone());
                 self.common
-                    .publish_role(RoleHandle::Follower(FollowerHandle {
-                        leader_hint: self.leader_hint.clone(),
-                    }));
+                    .publish_role(follower_handle(&self.common, self.leader_hint.clone()));
                 self.renew_lease();
 
                 let log = Arc::clone(&self.common.log);
@@ -347,7 +464,11 @@ impl Follower {
                 let _ = respond_to.send(InstallSnapshotResponse {
                     term: self.common.current_term,
                 });
-                Transition::Continue
+                // An install wipes `log`, taking any `Config` entry with
+                // it; the snapshot's own header is where membership comes
+                // from now (see `storage::RaftLog::install_snapshot`), so
+                // this is never optional.
+                self.reload_config().await
             }
             Event::RequestVote { req, respond_to } => {
                 if self.has_active_lease() {
@@ -380,13 +501,45 @@ impl Follower {
                 });
                 Transition::Continue
             }
-            Event::ElectionTimeout => Transition::Become(Role::PreCandidate),
+            Event::Bootstrap { config, respond_to } => {
+                let outcome = self.bootstrap(config).await;
+                let accepted = outcome.is_ok();
+                let _ = respond_to.send(outcome);
+                if accepted {
+                    // We just became a voting member of a (single-node)
+                    // cluster, so re-enter `Follower` to get an election
+                    // timer -- there was none while uninitialized.
+                    Transition::Become(Role::Follower)
+                } else {
+                    Transition::Continue
+                }
+            }
+            Event::ElectionTimeout => {
+                // A learner (or a server that has been removed from the
+                // configuration) must never campaign: it has no vote, so
+                // it could never win, and a removed server campaigning is
+                // exactly the disruption §4.2.3 warns about. It still
+                // replicates and still answers RPCs -- it just waits.
+                //
+                // `Follower::new` doesn't arm a timer for such a node at
+                // all; this is here for the window where the
+                // configuration changes under an already-in-flight one.
+                if self.common.is_voter() {
+                    Transition::Become(Role::PreCandidate)
+                } else {
+                    Transition::Continue
+                }
+            }
             Event::AppendEntriesResponse { .. }
             | Event::RequestVoteResponse { .. }
             | Event::GetLeaseResponse { .. }
             | Event::InstallSnapshotResponse { .. }
             | Event::LeaderTick => {
                 Transition::Continue // stray messages from a role we no longer hold
+            }
+            Event::ProposeConfig { respond_to, .. } => {
+                let _ = respond_to.send(Err(self.not_leader_error()));
+                Transition::Continue
             }
         }
     }
@@ -487,6 +640,153 @@ mod tests {
         assert_eq!(stored[0].value, Some(b"1".to_vec()));
         assert_eq!(stored[1].key, b"b");
         assert_eq!(stored[1].value, Some(b"2".to_vec()));
+        cleanup(&path);
+    }
+
+    /// A follower re-appends replicated entries into its own log, so the
+    /// entry's kind has to survive the round trip -- inferring it from
+    /// `value` would turn the leader's term-opening no-op into a delete
+    /// tombstone for the empty key, and the two logs would stop matching.
+    #[tokio::test]
+    async fn append_entries_preserves_a_replicated_noop_rather_than_flattening_it() {
+        let (log, _role_rx, peer_handle, _commit_rx, _compact_rx, path) =
+            spawn_node_with_handles(vec![]);
+
+        let noop = LogEntry {
+            seq: 1,
+            term: 1,
+            kind: crate::pb::raft5::common::EntryKind::Noop as i32,
+            key: Vec::new(),
+            value: None,
+        };
+        let resp = peer_handle
+            .append_entries(append_entries(
+                1,
+                "leader-1",
+                0,
+                0,
+                vec![noop, log_entry(2, 1, b"a", Some(b"1"))],
+                0,
+            ))
+            .await
+            .unwrap();
+
+        assert!(resp.success);
+        assert_eq!(resp.match_index, 2);
+
+        let stored = log.entries_in_range(1, 3).unwrap();
+        assert_eq!(stored[0].kind, storage::EntryKind::NoOp);
+        assert_eq!(stored[1].kind, storage::EntryKind::Put);
+        cleanup(&path);
+    }
+
+    /// A configuration takes effect the moment it is *appended* (Raft
+    /// §4.1), not when it commits -- so a replicated `Config` entry has
+    /// to change the follower's membership immediately, with
+    /// `leader_commit` still at 0.
+    #[tokio::test]
+    async fn a_replicated_config_entry_takes_effect_on_append_not_on_commit() {
+        let before = cluster_config(&[("test-node", true), ("v1", true)]);
+        let (log, (common, mut role_rx, peer_handle, commit_rx, _cc), path) =
+            open_temp_log_with_config("test-node", &before);
+        tokio::spawn(run(common));
+        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Follower(_))).await;
+
+        let after = cluster_config(&[("test-node", true), ("v1", true), ("v2", true)]);
+        let entry = LogEntry {
+            seq: 2,
+            term: 1,
+            kind: crate::pb::raft5::common::EntryKind::Config as i32,
+            key: Vec::new(),
+            value: Some(after.to_bytes()),
+        };
+        let resp = peer_handle
+            .append_entries(append_entries(1, "v1", 1, 1, vec![entry], 0))
+            .await
+            .unwrap();
+        assert!(resp.success);
+        assert_eq!(*commit_rx.borrow(), 0, "nothing has committed");
+
+        // Visible from storage straight away, uncommitted and unapplied.
+        assert_eq!(
+            ClusterConfig::from_bytes(&log.current_config().unwrap().unwrap()).unwrap(),
+            after
+        );
+        cleanup(&path);
+    }
+
+    /// The flip side of activating on append: if the entry carrying a
+    /// configuration is truncated away by a conflicting leader, the
+    /// previous configuration is in force again.
+    #[tokio::test]
+    async fn a_truncated_config_entry_reverts_the_active_configuration() {
+        let before = cluster_config(&[("test-node", true), ("v1", true)]);
+        let (log, (common, mut role_rx, peer_handle, _c, _cc), path) =
+            open_temp_log_with_config("test-node", &before);
+        tokio::spawn(run(common));
+        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Follower(_))).await;
+
+        let after = cluster_config(&[("test-node", true), ("v1", true), ("v2", true)]);
+        let config_entry = LogEntry {
+            seq: 2,
+            term: 1,
+            kind: crate::pb::raft5::common::EntryKind::Config as i32,
+            key: Vec::new(),
+            value: Some(after.to_bytes()),
+        };
+        peer_handle
+            .append_entries(append_entries(1, "v1", 1, 1, vec![config_entry], 0))
+            .await
+            .unwrap();
+
+        // A leader from a later term overwrites seq 2 with something
+        // else, discarding the configuration that lived there.
+        let resp = peer_handle
+            .append_entries(append_entries(
+                2,
+                "v2",
+                1,
+                1,
+                vec![log_entry(2, 2, b"a", Some(b"1"))],
+                0,
+            ))
+            .await
+            .unwrap();
+        assert!(resp.success);
+        assert_eq!(
+            ClusterConfig::from_bytes(&log.current_config().unwrap().unwrap()).unwrap(),
+            before
+        );
+        cleanup(&path);
+    }
+
+    /// Promotion has to rebuild the election timer: `Follower::new` arms
+    /// one only for a voter, so a learner that is promoted while sitting
+    /// in `Follower` would otherwise never campaign again.
+    #[tokio::test]
+    async fn a_learner_promoted_by_a_replicated_config_starts_campaigning() {
+        let before = cluster_config(&[("test-node", false), ("v1", true), ("v2", true)]);
+        let (_log, (common, mut role_rx, peer_handle, _c, _cc), path) =
+            open_temp_log_with_config("test-node", &before);
+        tokio::spawn(run(common));
+        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Follower(_))).await;
+
+        let after = cluster_config(&[("test-node", true), ("v1", true), ("v2", true)]);
+        let entry = LogEntry {
+            seq: 2,
+            term: 1,
+            kind: crate::pb::raft5::common::EntryKind::Config as i32,
+            key: Vec::new(),
+            value: Some(after.to_bytes()),
+        };
+        peer_handle
+            .append_entries(append_entries(1, "v1", 1, 1, vec![entry], 0))
+            .await
+            .unwrap();
+
+        // Its peers are unreachable, so it can't win -- but it must at
+        // least start trying, which it never did as a learner.
+        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Candidate)).await;
         cleanup(&path);
     }
 
@@ -714,7 +1014,7 @@ mod tests {
         // persistence, not just that the storage layer works in isolation.
         let (log, path) = open_temp_log();
         let (common, _role_rx, peer_handle, _commit_rx, _compact_rx) =
-            Common::new("test-node".to_string(), vec![], Arc::clone(&log)).unwrap();
+            Common::new_seeded("test-node".to_string(), vec![], Arc::clone(&log)).unwrap();
         tokio::spawn(run(common));
 
         peer_handle

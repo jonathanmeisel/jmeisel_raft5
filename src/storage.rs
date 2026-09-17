@@ -1,7 +1,7 @@
 //! Raft log storage backed by `fjall`.
 //!
 //! Layout (three keyspaces):
-//! - `log`:    seq (u64 BE)                -> encoded (term, key, value|tombstone) entry
+//! - `log`:    seq (u64 BE)                -> encoded (term, kind, key, value) entry
 //! - `latest`: key                          -> encoded (seq, value) *committed* current state
 //! - `meta`:   small set of fixed keys: the floor (`floor_seq`,
 //!   `floor_term`) — the seq/term of the highest entry no longer physically
@@ -9,7 +9,14 @@
 //!   compaction watermark (`compact_last_seq`, recorded by `compact` alone,
 //!   for resuming an incremental compaction) — and the applied watermark
 //!   (`applied_seq`, recorded by `apply_committed` alone, for the same
-//!   reason).
+//!   reason) — plus `base_config`, the last cluster configuration to fall
+//!   out of `log` via `compact` or `install_snapshot` (see `config_at`).
+//!
+//! Not every log entry is key/value data: `EntryKind` also covers a
+//! leader's term-opening no-op and the cluster configuration. Those
+//! occupy a seq and take part in log matching and commitment like
+//! anything else, but `apply_committed` skips them, so they never reach
+//! `latest`.
 //!
 //! `append` only ever writes to `log`; `apply_committed` is the *only*
 //! thing that ever writes to `latest`, and it's driven by Raft's own commit
@@ -77,9 +84,19 @@ const META_COMPACT_SEQ: &[u8] = b"compact_last_seq";
 const META_APPLIED_SEQ: &[u8] = b"applied_seq";
 const META_CURRENT_TERM: &[u8] = b"current_term";
 const META_VOTED_FOR: &[u8] = b"voted_for";
+/// The most recent `Config` entry that has been compacted (or snapshotted)
+/// out of `log`. `current_config` falls back to this once the entry
+/// carrying the active configuration no longer physically exists -- a
+/// cluster that hasn't changed membership in a while has its config entry
+/// far below the compaction floor, and losing it would leave the node with
+/// no idea who its peers are.
+const META_BASE_CONFIG: &[u8] = b"base_config";
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"RLOGSNAP";
-const SNAPSHOT_VERSION: u32 = 1;
+/// v2 added the trailing `[config_len][config_bytes]` header field. There's
+/// no v1 compatibility path -- nothing has shipped, and a snapshot without
+/// a configuration would leave its recipient unable to find its peers.
+const SNAPSHOT_VERSION: u32 = 2;
 
 /// Max pending writes buffered in a `WriteBatch` before it's flushed, used
 /// everywhere we process a potentially large range in bounded chunks.
@@ -87,6 +104,8 @@ const WRITE_CHUNK: usize = 1000;
 
 const TAG_PUT: u8 = 0;
 const TAG_DELETE: u8 = 1;
+const TAG_NOOP: u8 = 2;
+const TAG_CONFIG: u8 = 3;
 
 #[derive(Debug)]
 pub enum StorageError {
@@ -127,12 +146,36 @@ pub struct SnapshotMeta {
     pub entry_count: u64,
 }
 
+/// What a log entry does. Only `Put` and `Delete` carry key/value state
+/// machine data; the rest occupy a sequence number -- so they participate
+/// in log matching and commitment like anything else -- but are skipped by
+/// `apply_committed` and so never reach `latest`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    /// A write: `key` and `value` both set.
+    Put,
+    /// A delete tombstone: `key` set, `value` unset.
+    Delete,
+    /// A new leader's term-opening no-op: neither `key` nor `value` set.
+    /// Exists purely so a leader can commit an entry from its *own* term
+    /// before advancing the commit index over anything inherited from a
+    /// previous one (Raft §5.4.2, Figure 8).
+    NoOp,
+    /// A cluster configuration: `value` holds the encoded membership,
+    /// `key` unset. Unlike every other kind, this one takes effect when
+    /// it is *appended* rather than when it commits -- see
+    /// `current_config`.
+    Config,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogEntry {
     pub seq: u64,
     pub term: u64,
+    pub kind: EntryKind,
+    /// Empty unless `kind` is `Put` or `Delete`.
     pub key: Vec<u8>,
-    /// `None` if this entry is a delete tombstone.
+    /// `Some` only when `kind` is `Put`.
     pub value: Option<Vec<u8>>,
 }
 
@@ -158,12 +201,17 @@ fn from_be_bytes(bytes: &[u8]) -> Result<u64> {
     Ok(u64::from_be_bytes(arr))
 }
 
-// Log entry encoding: [term (8 bytes BE)][tag PUT|DELETE (1 byte)][key_len (4 bytes BE)][key][value?]
-fn encode_log_entry(term: u64, key: &[u8], value: Option<&[u8]>) -> Vec<u8> {
+// Log entry encoding: [term (8 bytes BE)][tag (1 byte)][key_len (4 bytes BE)][key][value?]
+fn encode_log_entry(term: u64, kind: EntryKind, key: &[u8], value: Option<&[u8]>) -> Vec<u8> {
     let value_len = value.map_or(0, <[u8]>::len);
     let mut buf = Vec::with_capacity(8 + 1 + 4 + key.len() + value_len);
     buf.extend_from_slice(&term.to_be_bytes());
-    buf.push(if value.is_some() { TAG_PUT } else { TAG_DELETE });
+    buf.push(match kind {
+        EntryKind::Put => TAG_PUT,
+        EntryKind::Delete => TAG_DELETE,
+        EntryKind::NoOp => TAG_NOOP,
+        EntryKind::Config => TAG_CONFIG,
+    });
     buf.extend_from_slice(&(key.len() as u32).to_be_bytes());
     buf.extend_from_slice(key);
     if let Some(v) = value {
@@ -172,7 +220,16 @@ fn encode_log_entry(term: u64, key: &[u8], value: Option<&[u8]>) -> Vec<u8> {
     buf
 }
 
-fn decode_log_entry(bytes: &[u8]) -> Result<(u64, Vec<u8>, Option<Vec<u8>>)> {
+/// One decoded `log` row. Its seq isn't in here because it is the row's
+/// *key*, not part of the encoded value -- the caller already has it.
+struct Decoded {
+    term: u64,
+    kind: EntryKind,
+    key: Vec<u8>,
+    value: Option<Vec<u8>>,
+}
+
+fn decode_log_entry(bytes: &[u8]) -> Result<Decoded> {
     if bytes.len() < 13 {
         return Err(StorageError::Corrupt("log entry too short"));
     }
@@ -183,12 +240,19 @@ fn decode_log_entry(bytes: &[u8]) -> Result<(u64, Vec<u8>, Option<Vec<u8>>)> {
         return Err(StorageError::Corrupt("log entry key_len out of bounds"));
     }
     let key = bytes[13..13 + key_len].to_vec();
-    let value = match tag {
-        TAG_PUT => Some(bytes[13 + key_len..].to_vec()),
-        TAG_DELETE => None,
+    let (kind, value) = match tag {
+        TAG_PUT => (EntryKind::Put, Some(bytes[13 + key_len..].to_vec())),
+        TAG_DELETE => (EntryKind::Delete, None),
+        TAG_NOOP => (EntryKind::NoOp, None),
+        TAG_CONFIG => (EntryKind::Config, Some(bytes[13 + key_len..].to_vec())),
         _ => return Err(StorageError::Corrupt("log entry has unknown tag")),
     };
-    Ok((term, key, value))
+    Ok(Decoded {
+        term,
+        kind,
+        key,
+        value,
+    })
 }
 
 // Latest value encoding: [seq (8 bytes BE)][value] -- always a real value:
@@ -328,11 +392,48 @@ impl RaftLog {
     /// visible via `get_latest` until `apply_committed` confirms it. See
     /// the module doc.
     pub fn append(&self, term: u64, key: &[u8], value: Option<&[u8]>) -> Result<u64> {
+        let kind = if value.is_some() {
+            EntryKind::Put
+        } else {
+            EntryKind::Delete
+        };
+        self.append_entry(term, kind, key, value)
+    }
+
+    /// Append a leader's term-opening no-op (see `EntryKind::NoOp`).
+    pub fn append_noop(&self, term: u64) -> Result<u64> {
+        self.append_entry(term, EntryKind::NoOp, &[], None)
+    }
+
+    /// Append a new cluster configuration (see `EntryKind::Config`).
+    /// `config` is opaque here -- storage neither parses nor validates
+    /// it, it only guarantees the bytes come back out of `current_config`
+    /// once this entry is the newest `Config` in the log.
+    pub fn append_config(&self, term: u64, config: &[u8]) -> Result<u64> {
+        self.append_entry(term, EntryKind::Config, &[], Some(config))
+    }
+
+    /// `append`, but with the entry's kind given explicitly rather than
+    /// inferred from `value`. A follower replaying entries from a leader
+    /// must use this: inferring would flatten every replicated non-state
+    /// entry (a `NoOp`, say) into a `Put` or `Delete`, so the follower's
+    /// copy of the log would no longer be byte-identical to the leader's.
+    pub fn append_entry(
+        &self,
+        term: u64,
+        kind: EntryKind,
+        key: &[u8],
+        value: Option<&[u8]>,
+    ) -> Result<u64> {
         let mut guard = self.next_seq.lock().unwrap();
         let seq = *guard;
 
         let mut batch = self.db.batch();
-        batch.insert(&self.log, be_bytes(seq), encode_log_entry(term, key, value));
+        batch.insert(
+            &self.log,
+            be_bytes(seq),
+            encode_log_entry(term, kind, key, value),
+        );
         batch.commit()?;
 
         // Only advance now that the write has durably succeeded, so a
@@ -420,10 +521,21 @@ impl RaftLog {
         {
             let (k, v) = item.into_inner()?;
             let seq = from_be_bytes(&k)?;
-            let (_, key, value) = decode_log_entry(&v)?;
-            match value {
-                Some(value) => batch.insert(&self.latest, &key, encode_latest_value(seq, &value)),
-                None => batch.remove(&self.latest, &key),
+            let entry = decode_log_entry(&v)?;
+            match entry.kind {
+                EntryKind::Put => batch.insert(
+                    &self.latest,
+                    &entry.key,
+                    encode_latest_value(seq, &entry.value.unwrap_or_default()),
+                ),
+                EntryKind::Delete => batch.remove(&self.latest, &entry.key),
+                // Not state machine data -- these still consume a seq and
+                // move the applied watermark, they just have no effect
+                // here. A `Config` in particular is deliberately *not*
+                // mirrored into `latest`: it takes effect on append, so
+                // `current_config` reads it straight out of `log`, where
+                // it is visible before it commits.
+                EntryKind::NoOp | EntryKind::Config => continue,
             }
             pending += 1;
             self.flush_if_full(&mut batch, &mut pending)?;
@@ -442,12 +554,13 @@ impl RaftLog {
         for item in self.log.range(be_bytes(start)..be_bytes(end)) {
             let (k, v) = item.into_inner()?;
             let seq = from_be_bytes(&k)?;
-            let (term, key, value) = decode_log_entry(&v)?;
+            let entry = decode_log_entry(&v)?;
             out.push(LogEntry {
                 seq,
-                term,
-                key,
-                value,
+                term: entry.term,
+                kind: entry.kind,
+                key: entry.key,
+                value: entry.value,
             });
         }
         Ok(out)
@@ -462,7 +575,7 @@ impl RaftLog {
         if let Some(guard) = self.log.last_key_value() {
             let (k, v) = guard.into_inner()?;
             let seq = from_be_bytes(&k)?;
-            let (term, _, _) = decode_log_entry(&v)?;
+            let term = decode_log_entry(&v)?.term;
             return Ok(Some((seq, term)));
         }
         let (floor_seq, floor_term) = Self::read_floor(&self.meta)?;
@@ -478,7 +591,7 @@ impl RaftLog {
     /// does, once a snapshot or compaction has advanced past it).
     pub fn term_at(&self, seq: u64) -> Result<Option<u64>> {
         if let Some(bytes) = self.log.get(be_bytes(seq))? {
-            let (term, _, _) = decode_log_entry(&bytes)?;
+            let term = decode_log_entry(&bytes)?.term;
             return Ok(Some(term));
         }
         let (floor_seq, floor_term) = Self::read_floor(&self.meta)?;
@@ -486,6 +599,45 @@ impl RaftLog {
             return Ok(Some(floor_term));
         }
         Ok(None)
+    }
+
+    /// The cluster configuration in force as of `as_of_seq`: the newest
+    /// `Config` entry at or below it, or -- if no such entry survives in
+    /// `log` -- whatever `compact`/`install_snapshot` last promoted into
+    /// `meta`. `None` only for a node that has never seen a
+    /// configuration at all (i.e. one that hasn't been bootstrapped).
+    ///
+    /// Deliberately keyed off the *log*, not `latest`: a configuration
+    /// takes effect the moment it is appended, before it commits, so it
+    /// has to be readable before `apply_committed` would ever have seen
+    /// it. (Raft §4.1: a server always uses the latest configuration in
+    /// its log, committed or not. Waiting for commitment instead would
+    /// deadlock a cluster the moment it changed membership, since
+    /// committing the new configuration requires a quorum *of* the new
+    /// configuration.)
+    ///
+    /// Scans backwards from `as_of_seq`, so in the common case it stops
+    /// at the first entry it looks at.
+    pub fn config_at(&self, as_of_seq: u64) -> Result<Option<Vec<u8>>> {
+        for item in self.log.range(..=be_bytes(as_of_seq)).rev() {
+            let (_k, v) = item.into_inner()?;
+            let entry = decode_log_entry(&v)?;
+            if entry.kind == EntryKind::Config {
+                return Ok(Some(entry.value.unwrap_or_default()));
+            }
+        }
+        self.base_config()
+    }
+
+    /// `config_at` for the log's tail -- the configuration this node is
+    /// actually operating under right now.
+    pub fn current_config(&self) -> Result<Option<Vec<u8>>> {
+        self.config_at(u64::MAX)
+    }
+
+    /// The last configuration compacted or snapshotted out of `log`.
+    fn base_config(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self.meta.get(META_BASE_CONFIG)?.map(|b| b.to_vec()))
     }
 
     /// Flush `batch` (replacing it with a fresh one) once it reaches
@@ -536,11 +688,19 @@ impl RaftLog {
         let mut batch = self.db.batch();
         let mut pending = 0usize;
         let mut floor_term = None;
+        let mut dropped_config = None;
 
         for item in self.log.range(be_bytes(from)..be_bytes(below_seq)) {
             let (k, v) = item.into_inner()?;
-            let (term, _key, _value) = decode_log_entry(&v)?;
-            floor_term = Some(term);
+            let entry = decode_log_entry(&v)?;
+            floor_term = Some(entry.term);
+            if entry.kind == EntryKind::Config {
+                // About to delete the entry holding this configuration --
+                // preserve it in `meta` so `current_config` can still
+                // answer once nothing in `log` carries it. Ascending
+                // order, so the last one seen is the newest.
+                dropped_config = Some(entry.value.unwrap_or_default());
+            }
 
             batch.remove(&self.log, k);
             pending += 1;
@@ -551,6 +711,9 @@ impl RaftLog {
             batch.insert(&self.meta, META_FLOOR_SEQ, be_bytes(below_seq - 1));
             batch.insert(&self.meta, META_FLOOR_TERM, be_bytes(term));
         }
+        if let Some(config) = dropped_config {
+            batch.insert(&self.meta, META_BASE_CONFIG, config);
+        }
         batch.insert(&self.meta, META_COMPACT_SEQ, be_bytes(below_seq));
         batch.commit()?;
         Ok(())
@@ -558,8 +721,8 @@ impl RaftLog {
 
     /// Stream the current (post-compaction) state to `writer` as a portable
     /// snapshot: a header (magic, version, last_included_seq,
-    /// last_included_term) followed by length-prefixed (key, value)
-    /// records, read until EOF. Intended for Raft's InstallSnapshot path —
+    /// last_included_term, cluster configuration) followed by
+    /// length-prefixed (key, value) records, read until EOF. Intended for Raft's InstallSnapshot path —
     /// engine-agnostic and chunkable, unlike an `fjall`-native checkpoint.
     /// Every row in `latest` is current state -- there's no tombstone case
     /// to skip (see the module doc). Already bounded to O(1) extra memory
@@ -573,6 +736,15 @@ impl RaftLog {
     /// aren't in `latest` at all yet, so claiming the tail as this
     /// snapshot's boundary would describe state the export doesn't
     /// actually contain.
+    ///
+    /// The header also carries the configuration in force as of
+    /// `last_included_seq`. Installing a snapshot wipes `log`, taking the
+    /// recipient's `Config` entries with it, so without this the receiver
+    /// would come out of the install unable to name a single peer.
+    /// Uncommitted configurations past `last_included_seq` are
+    /// deliberately excluded: the snapshot describes state through that
+    /// point and nothing beyond it, and the leader will replicate any
+    /// later config entry as an ordinary entry right after.
     pub fn export_snapshot<W: Write>(&self, writer: &mut W) -> Result<SnapshotMeta> {
         let last_included_seq = Self::read_applied_seq(&self.meta)?;
         let last_included_term = if last_included_seq == 0 {
@@ -580,11 +752,14 @@ impl RaftLog {
         } else {
             self.term_at(last_included_seq)?.unwrap_or(0)
         };
+        let config = self.config_at(last_included_seq)?.unwrap_or_default();
 
         writer.write_all(SNAPSHOT_MAGIC)?;
         writer.write_all(&SNAPSHOT_VERSION.to_be_bytes())?;
         writer.write_all(&last_included_seq.to_be_bytes())?;
         writer.write_all(&last_included_term.to_be_bytes())?;
+        writer.write_all(&(config.len() as u32).to_be_bytes())?;
+        writer.write_all(&config)?;
 
         let mut entry_count: u64 = 0;
         for item in self.latest.iter() {
@@ -641,6 +816,10 @@ impl RaftLog {
         let mut term_bytes = [0u8; 8];
         reader.read_exact(&mut term_bytes)?;
         let last_included_term = u64::from_be_bytes(term_bytes);
+        let mut config_len_bytes = [0u8; 4];
+        reader.read_exact(&mut config_len_bytes)?;
+        let mut config = vec![0u8; u32::from_be_bytes(config_len_bytes) as usize];
+        reader.read_exact(&mut config)?;
 
         // Serialize against concurrent appends for the duration of the
         // install, same discipline as `append`.
@@ -684,6 +863,12 @@ impl RaftLog {
 
         batch.insert(&self.meta, META_FLOOR_SEQ, be_bytes(last_included_seq));
         batch.insert(&self.meta, META_FLOOR_TERM, be_bytes(last_included_term));
+        // `log` was just wiped, so whatever `Config` entry this node was
+        // running on is gone -- the sender's configuration in the header
+        // becomes the new fallback for `current_config`.
+        if !config.is_empty() {
+            batch.insert(&self.meta, META_BASE_CONFIG, config);
+        }
         // `log` was just wiped, so compaction has nothing to do below
         // `last_included_seq` — reset the watermark to match, whatever it
         // was before.
@@ -821,6 +1006,168 @@ mod tests {
         assert_eq!(log.get_latest(b"k").unwrap().unwrap().0, seq2);
 
         cleanup(&path);
+    }
+
+    #[test]
+    fn append_noop_takes_a_seq_and_round_trips_its_kind() {
+        let (log, path) = open_temp();
+        let s1 = log.append(1, b"a", Some(b"1")).unwrap();
+        let noop = log.append_noop(2).unwrap();
+        let s3 = log.append(2, b"b", Some(b"2")).unwrap();
+
+        // A no-op is a real log entry: it consumes a sequence number, so
+        // the writes around it aren't contiguous.
+        assert_eq!((s1, noop, s3), (1, 2, 3));
+
+        let stored = log.entries_in_range(1, 4).unwrap();
+        assert_eq!(stored[1].kind, EntryKind::NoOp);
+        assert_eq!(stored[1].term, 2);
+        assert!(stored[1].key.is_empty());
+        assert_eq!(stored[1].value, None);
+        // The neighbours still decode as ordinary writes.
+        assert_eq!(stored[0].kind, EntryKind::Put);
+        assert_eq!(stored[2].kind, EntryKind::Put);
+        // And the term is still readable at the no-op's index, which is
+        // what the Figure 8 commit check consults.
+        assert_eq!(log.term_at(noop).unwrap(), Some(2));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_committed_noop_contributes_nothing_to_latest() {
+        let (log, path) = open_temp();
+        log.append(1, b"a", Some(b"1")).unwrap();
+        let noop = log.append_noop(2).unwrap();
+        log.apply_committed(noop).unwrap();
+
+        // The no-op moved the applied watermark without writing a row --
+        // in particular it did not insert an empty key.
+        assert_eq!(log.get_latest(b"a").unwrap(), Some((1, b"1".to_vec())));
+        assert_eq!(log.get_latest(b"").unwrap(), None);
+
+        let mut buf = Vec::new();
+        let meta = log.export_snapshot(&mut buf).unwrap();
+        assert_eq!(meta.entry_count, 1); // just "a"
+        assert_eq!(meta.last_included_seq, noop);
+        assert_eq!(meta.last_included_term, 2);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn current_config_reads_the_newest_config_entry_without_waiting_for_commitment() {
+        let (log, path) = open_temp();
+        assert_eq!(log.current_config().unwrap(), None); // never bootstrapped
+
+        let c1 = log.append_config(1, b"cfg-1").unwrap();
+        log.append(1, b"a", Some(b"1")).unwrap();
+        // Nothing has been applied, so `latest` is still empty -- the
+        // configuration has to be visible anyway (it takes effect on
+        // append), which is exactly why it is read from `log`.
+        assert_eq!(log.get_latest(b"a").unwrap(), None);
+        assert_eq!(log.current_config().unwrap(), Some(b"cfg-1".to_vec()));
+
+        let c2 = log.append_config(1, b"cfg-2").unwrap();
+        assert_eq!(log.current_config().unwrap(), Some(b"cfg-2".to_vec()));
+
+        // `config_at` sees the history the tail has moved past.
+        assert_eq!(log.config_at(c2 - 1).unwrap(), Some(b"cfg-1".to_vec()));
+        assert_eq!(log.config_at(c1).unwrap(), Some(b"cfg-1".to_vec()));
+        assert_eq!(log.config_at(c1 - 1).unwrap(), None);
+
+        // A rolled-back config entry reverts the active configuration,
+        // which is the flip side of activating on append.
+        log.truncate_from(c2).unwrap();
+        assert_eq!(log.current_config().unwrap(), Some(b"cfg-1".to_vec()));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_config_entry_survives_being_compacted_away() {
+        let (log, path) = open_temp();
+        log.append_config(1, b"cfg-1").unwrap();
+        log.append(1, b"a", Some(b"1")).unwrap();
+        let tail = log.append(1, b"b", Some(b"2")).unwrap();
+        log.apply_committed(tail).unwrap();
+
+        // Compact past the config entry entirely: it no longer exists in
+        // `log`, but a node still has to know who its peers are.
+        log.compact(tail + 1).unwrap();
+        assert!(log.entries_in_range(1, tail + 1).unwrap().is_empty());
+        assert_eq!(log.current_config().unwrap(), Some(b"cfg-1".to_vec()));
+
+        // A newer config entry still wins over the compacted fallback.
+        log.append_config(2, b"cfg-2").unwrap();
+        assert_eq!(log.current_config().unwrap(), Some(b"cfg-2".to_vec()));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_config_entry_is_not_state_machine_data() {
+        let (log, path) = open_temp();
+        log.append(1, b"a", Some(b"1")).unwrap();
+        let cfg = log.append_config(1, b"cfg-1").unwrap();
+        log.apply_committed(cfg).unwrap();
+
+        // Applied, but it wrote no row: in particular not an empty key
+        // holding the encoded config, which would then leak into every
+        // snapshot as if it were user data.
+        assert_eq!(log.get_latest(b"").unwrap(), None);
+        let mut buf = Vec::new();
+        assert_eq!(log.export_snapshot(&mut buf).unwrap().entry_count, 1);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_snapshot_carries_the_configuration_to_its_recipient() {
+        let (log, path) = open_temp();
+        log.append_config(1, b"cfg-1").unwrap();
+        let tail = log.append(1, b"a", Some(b"1")).unwrap();
+        log.apply_committed(tail).unwrap();
+
+        let mut buf = Vec::new();
+        log.export_snapshot(&mut buf).unwrap();
+
+        // The target's own config entry is wiped along with its log, so
+        // without the header it would come out of the install with no
+        // idea who is in the cluster.
+        let (target, target_path) = open_temp();
+        target.append_config(1, b"stale-cfg").unwrap();
+        target.install_snapshot(&mut buf.as_slice()).unwrap();
+        assert_eq!(target.current_config().unwrap(), Some(b"cfg-1".to_vec()));
+        assert_eq!(
+            target.get_latest(b"a").unwrap(),
+            Some((tail, b"1".to_vec()))
+        );
+
+        cleanup(&path);
+        cleanup(&target_path);
+    }
+
+    #[test]
+    fn a_snapshot_excludes_a_configuration_past_its_boundary() {
+        let (log, path) = open_temp();
+        log.append_config(1, b"cfg-1").unwrap();
+        let tail = log.append(1, b"a", Some(b"1")).unwrap();
+        log.apply_committed(tail).unwrap();
+        // Appended after the applied watermark, so it is outside what
+        // this snapshot describes -- the leader replicates it as an
+        // ordinary entry right after the install instead.
+        log.append_config(1, b"cfg-2").unwrap();
+
+        let mut buf = Vec::new();
+        log.export_snapshot(&mut buf).unwrap();
+
+        let (target, target_path) = open_temp();
+        target.install_snapshot(&mut buf.as_slice()).unwrap();
+        assert_eq!(target.current_config().unwrap(), Some(b"cfg-1".to_vec()));
+
+        cleanup(&path);
+        cleanup(&target_path);
     }
 
     #[test]
