@@ -3,7 +3,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use jmeisel_raft5::run;
+use jmeisel_raft5::serve;
+use tokio_util::sync::CancellationToken;
 
 /// A single Raft node.
 ///
@@ -47,12 +48,14 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), jmeisel_raft5::Error> {
     let args = Args::parse();
-    let (node, cancel) = run(
+    let cancel = CancellationToken::new();
+    let node = serve(
         args.id,
         &args.db,
         args.client_addr,
         args.peer_addr,
         args.advertise,
+        cancel.clone(),
     );
 
     // Ctrl-C cancels rather than kills: the node then stops accepting

@@ -43,21 +43,36 @@
 //! A persist failure panics rather than continuing on an unpersisted vote
 //! (see those methods).
 //!
-//! Every `storage::RaftLog` call made from async code goes through
-//! `tokio::task::spawn_blocking` -- fjall's calls are synchronous, and
-//! blocking an executor thread on disk I/O (even briefly) can stall
-//! whatever else that thread was scheduled to run. Because of this,
-//! `handle_event` is `async fn` on every role even though most events
-//! don't touch storage, so the one that does (`AppendEntries`, via
-//! `apply_append_entries`) can `.await` its `spawn_blocking` task like
-//! anything else in the loop.
+//! Raft §5.1's term rule -- "if an RPC request *or response* contains term
+//! T > currentTerm, set currentTerm = T and convert to follower" -- is
+//! split by which half of it is uniform. For a **response** it is applied
+//! once, for every role, in `Common::next_event` (see
+//! `Event::response_term`): there is no reply to compose, so adopting the
+//! term is the entire job, and centralising it means a new `Event` variant
+//! cannot quietly skip it. For a **request** each role answers differently
+//! before stepping down -- a leader rejects the append, a follower accepts
+//! it, a candidate still evaluates the vote -- so that half stays in the
+//! role event loops, next to the reply it has to build.
 //!
-//! `Common::peer_conns` caches one gRPC client per peer (keyed by
+//! Every `storage::RaftLog` call made from async code goes through
+//! `store::Store`, which puts it on the blocking pool -- fjall's calls
+//! are synchronous, and blocking an executor thread on disk I/O (even
+//! briefly) can stall whatever else that thread was scheduled to run.
+//! Nothing here calls `spawn_blocking` itself; `Store` is the one place
+//! that does, so the rule cannot be forgotten at a new call site. Because
+//! of this, `handle_event` is `async fn` on every role even though most
+//! events don't touch storage, so the one that does (`AppendEntries`, via
+//! `apply_append_entries`) can `.await` its storage call like anything
+//! else in the loop.
+//!
+//! `Common::peer_conns` holds one gRPC client per peer (keyed by
 //! `PeerInfo::id`), shared across every role and every election so
 //! `RequestVote`/`AppendEntries` calls don't pay a fresh connection setup
-//! each time. A cached client is evicted after any failed call (`Channel`
-//! doesn't auto-reconnect once its connection drops), so the next attempt
-//! gets a fresh one instead of failing forever.
+//! each time. The clients are built with `Endpoint::connect_lazy`, which
+//! dials on first use and re-dials by itself afterwards, so a failed call
+//! needs no eviction and no bookkeeping -- the next call simply
+//! reconnects. That is also what makes handing one out a pure in-memory
+//! lookup rather than something that can block: see `PeerConnections`.
 //!
 //! Before a `Follower` (or a `Candidate` whose real election timed out)
 //! commits to a real, term-incrementing candidacy, it first runs a
@@ -138,9 +153,9 @@
 //!   it, invisibly, until the next node to open the same directory fails.
 //! * **Long waits are cancellable, storage calls are not.** Peer RPCs,
 //!   heartbeat sleeps and sends into the event loop go through
-//!   `until_cancelled`; `spawn_blocking` calls are always awaited to
-//!   completion, since dropping one doesn't stop it -- it keeps running
-//!   on its own worker thread, still holding what it captured.
+//!   `until_cancelled`; `Store` calls are always awaited to completion,
+//!   since dropping a `spawn_blocking` doesn't stop it -- it keeps
+//!   running on its own worker thread, still holding what it captured.
 //! * **`run` returning means the node is gone.** Not "is stopping": every
 //!   role has torn down and joined its own tasks, the maintenance task
 //!   has been joined, and `Common` has been dropped, which is what
@@ -152,31 +167,49 @@
 //! behind the compaction floor.
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
-use tonic::transport::Channel;
 
-use crate::pb::raft5::cluster::{ClusterConfig, ClusterMember};
+use crate::pb::raft5::cluster::ClusterConfig;
 use crate::pb::raft5::common::LogEntry;
-use crate::pb::raft5::raft::raft_peer_client::RaftPeerClient;
 use crate::pb::raft5::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, GetLeaseRequest, GetLeaseResponse,
-    InstallSnapshotResponse, RequestVoteRequest, RequestVoteResponse, SnapshotHeader,
+    AppendEntriesRequest, AppendEntriesResponse, GetLeaseResponse, InstallSnapshotResponse,
+    RequestVoteRequest, RequestVoteResponse, SnapshotHeader,
 };
 use crate::storage::{self, RaftLog, StorageError};
+use crate::store::Store;
 
 mod candidate;
+mod event;
 mod follower;
+mod handles;
 mod leader;
+mod peer;
+mod task;
 
 use candidate::{Candidate, PreCandidate};
 use follower::Follower;
 use leader::Leader;
+
+// Re-exported at the module root rather than left behind a path, for two
+// reasons: these names are `raft`'s public API (`grpc` and `lib` know
+// them as `raft::LeaderHandle`, not `raft::handles::LeaderHandle`), and
+// each role module's `use super::*` picks the whole vocabulary up from
+// here, so splitting this file didn't touch a single role.
+pub use event::{ConfigChange, Event, RaftError};
+pub use handles::{
+    ClientHandle, FollowerHandle, LeaderHandle, RaftPeerHandle, RoleHandle, leader_hint_of,
+};
+pub use peer::PeerInfo;
+
+pub(crate) use event::Role;
+use event::Transition;
+use peer::PeerConnections;
+pub(crate) use task::Task;
+use task::{send_event, until_cancelled};
 
 /// The one base timing unit everything else derives from (see the module
 /// doc). A `u64` millisecond count alongside the `Duration` form since a
@@ -218,212 +251,6 @@ const SNAPSHOT_RPC_TIMEOUT: Duration = Duration::from_secs(300);
 /// working" tradeoff -- see `grpc::RaftPeerService::install_snapshot`);
 /// this only bounds the size of each individual gRPC message.
 const SNAPSHOT_CHUNK_SIZE: usize = 1024 * 1024;
-
-/// A spawned background task together with the token that stops it.
-///
-/// Every background task in this module is owned by one of these, and the
-/// only way to get rid of one is `stop`, which signals *and then waits*.
-/// That is the whole point: a `JoinHandle::abort` (or, worse, a handle
-/// simply dropped) leaves the task's last poll wherever it happened to
-/// be, so whatever it was holding -- an `Arc<RaftLog>`, and with it the
-/// database lock -- can outlive the node that owned it. `stop` guarantees
-/// the task has actually returned before the owner moves on.
-pub(crate) struct Task {
-    cancel: CancellationToken,
-    handle: JoinHandle<()>,
-}
-
-impl Task {
-    /// Spawns `body`, handing it a fresh child of `parent`. The child
-    /// relationship is what makes cancellation propagate downward without
-    /// any of these tasks knowing about each other: cancelling the node's
-    /// root token stops every task at once, while `stop` on an individual
-    /// `Task` (a leader dropping one peer's replication, say) cancels only
-    /// that one.
-    fn spawn<F>(parent: &CancellationToken, body: impl FnOnce(CancellationToken) -> F) -> Self
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        let cancel = parent.child_token();
-        let handle = tokio::spawn(body(cancel.clone()));
-        Self { cancel, handle }
-    }
-
-    /// Signals the task to stop and waits until it actually has.
-    ///
-    /// A `JoinError` here is either a panic (already reported by the
-    /// default panic hook, and not something this layer can do anything
-    /// about) or an abort that nothing in this module performs -- either
-    /// way the task is over, which is all the caller is waiting for.
-    async fn stop(self) {
-        self.signal();
-        let _ = self.handle.await;
-    }
-
-    /// Signals without waiting. Only useful as the first half of
-    /// `stop_all`.
-    fn signal(&self) {
-        self.cancel.cancel();
-    }
-
-    /// The runtime's id for the spawned task -- for tests asserting that
-    /// a task was (or was not) restarted, since two `Task`s are otherwise
-    /// indistinguishable from the outside.
-    #[cfg(test)]
-    fn id(&self) -> tokio::task::Id {
-        self.handle.id()
-    }
-
-    /// Stops a whole group of tasks, signalling every one of them before
-    /// joining any -- so they wind down concurrently instead of serially,
-    /// each waiting out the one ahead of it.
-    async fn stop_all(tasks: impl IntoIterator<Item = Task>) {
-        let tasks: Vec<Task> = tasks.into_iter().collect();
-        for task in &tasks {
-            task.signal();
-        }
-        for task in tasks {
-            task.stop().await;
-        }
-    }
-}
-
-/// Awaits `fut` unless `cancel` fires first; `None` means cancelled.
-///
-/// Deliberately *not* used around `spawn_blocking` calls. Dropping one of
-/// those mid-flight doesn't stop it -- it keeps running on its own worker
-/// thread, still holding whatever it captured, typically an
-/// `Arc<RaftLog>`. Storage work is short and bounded, so every such await
-/// here is left to complete; only genuinely open-ended waits (a peer RPC,
-/// a heartbeat sleep, a channel send into an event loop that may already
-/// have stopped draining) are wrapped in this.
-async fn until_cancelled<T>(cancel: &CancellationToken, fut: impl Future<Output = T>) -> Option<T> {
-    tokio::select! {
-        biased;
-        () = cancel.cancelled() => None,
-        value = fut => Some(value),
-    }
-}
-
-/// `until_cancelled` for the common "push an event and keep going unless
-/// there's no one left to push to" step. `true` means the caller should
-/// carry on; `false` means it should return, either because it was
-/// cancelled or because the event loop is gone.
-async fn send_event(cancel: &CancellationToken, tx: &mpsc::Sender<Event>, event: Event) -> bool {
-    matches!(until_cancelled(cancel, tx.send(event)).await, Some(Ok(())))
-}
-
-#[derive(Debug, Clone)]
-pub struct PeerInfo {
-    pub id: String,
-    pub address: String,
-}
-
-impl From<&ClusterMember> for PeerInfo {
-    fn from(m: &ClusterMember) -> Self {
-        Self {
-            id: m.server_id.clone(),
-            address: m.address.clone(),
-        }
-    }
-}
-
-/// Inbound events a role's event loop reacts to. Requests carry their own
-/// response channel so the loop can reply once it's decided how to handle
-/// them -- every role has to be able to answer AppendEntries/RequestVote,
-/// not just the leader.
-pub enum Event {
-    AppendEntries {
-        req: AppendEntriesRequest,
-        respond_to: oneshot::Sender<AppendEntriesResponse>,
-    },
-    AppendEntriesResponse {
-        from: String,
-        resp: AppendEntriesResponse,
-    },
-    RequestVote {
-        req: RequestVoteRequest,
-        respond_to: oneshot::Sender<RequestVoteResponse>,
-    },
-    RequestVoteResponse {
-        from: String,
-        resp: RequestVoteResponse,
-    },
-    /// Only ever the *leader's* own probe results coming back in --
-    /// answering an inbound `GetLease` never goes through this event loop
-    /// at all (see `RaftPeerHandle::get_lease`), specifically so it can
-    /// never get stuck behind a slow in-progress `AppendEntries`.
-    GetLeaseResponse {
-        from: String,
-        resp: GetLeaseResponse,
-    },
-    /// `data` is the full byte stream `RaftLog::export_snapshot` produced
-    /// (magic/version/seq/term header included) -- `grpc::RaftPeerService`
-    /// reassembles it from the wire but doesn't touch storage itself, so
-    /// the term check and the actual install both happen here, same as
-    /// every other inbound RPC.
-    InstallSnapshot {
-        header: SnapshotHeader,
-        data: Vec<u8>,
-        respond_to: oneshot::Sender<InstallSnapshotResponse>,
-    },
-    /// The leader's own snapshot-send task reporting back what happened,
-    /// same pattern as `AppendEntriesResponse` -- `last_included_seq` is
-    /// carried alongside the raw proto response (which only has `term`)
-    /// so a successful install can advance `Leader::peer_match_index`
-    /// the same way a successful `AppendEntries` does.
-    InstallSnapshotResponse {
-        from: String,
-        resp: InstallSnapshotResponse,
-        last_included_seq: u64,
-    },
-    ElectionTimeout,
-    /// Self-notification, leader only: nudges the event loop to recompute
-    /// `commit_seq`/`compact_seq` even when no peer response triggers it.
-    /// Needed for a zero-peer cluster (nothing else would ever advance
-    /// `commit_tx` after a client write there), and also keeps watermarks
-    /// from stalling between replication rounds in a multi-peer one.
-    LeaderTick,
-    /// Self-notification: a `Config` entry was just appended to our own
-    /// log, so the active configuration has changed *as of now* -- a
-    /// configuration takes effect on append, not on commit (Raft §4.1).
-    /// A membership change to propose. Handled on the leader's event
-    /// loop, which is the only place with the state to enforce the two
-    /// guards a config change needs (see `leader::Leader::propose_config`).
-    ProposeConfig {
-        change: ConfigChange,
-        respond_to: oneshot::Sender<Result<u64, RaftError>>,
-    },
-    /// An operator asking this node to form a single-node cluster around
-    /// itself (Raft §4.4). Only ever accepted by a node that has no
-    /// configuration *and* an empty log -- see `Follower::bootstrap`.
-    Bootstrap {
-        config: ClusterConfig,
-        respond_to: oneshot::Sender<Result<(), RaftError>>,
-    },
-}
-
-/// Which role to construct next. A plain tag -- unlike the role structs
-/// themselves, it carries no state, since only one role's state is ever
-/// alive at a time.
-pub(crate) enum Role {
-    Follower,
-    /// Non-binding pre-vote round -- see the module doc.
-    PreCandidate,
-    Candidate,
-    Leader,
-    /// Not a role: the node is shutting down (its cancellation token
-    /// fired, or the event channel closed), so `run` stops instead of
-    /// building another one. Every role's event loop can return this, and
-    /// only the driver ever looks at it.
-    Stopped,
-}
-
-/// What a role's event loop decided after handling one event.
-enum Transition {
-    Continue,
-    Become(Role),
-}
 
 /// A random value in `[0, max)`. Good enough for election-timeout jitter
 /// without pulling in a `rand` dependency: `RandomState`'s whole purpose is
@@ -507,24 +334,20 @@ fn spawn_election_timer(
 /// in a `RequestVoteRequest` we're sending and to evaluate the §5.4.1
 /// up-to-date check on one we've received. `(0, 0)` for an empty log,
 /// matching Raft's virtual "before the first entry" convention.
-async fn last_log_index_and_term(log: &Arc<RaftLog>) -> (u64, u64) {
-    let log = Arc::clone(log);
-    tokio::task::spawn_blocking(move || log.last_entry())
+async fn last_log_index_and_term(store: &Store) -> (u64, u64) {
+    store
+        .expect("read the last log entry", RaftLog::last_entry)
         .await
-        .expect("last_entry task panicked")
-        .expect("failed to read last entry")
         .unwrap_or((0, 0))
 }
 
 /// The term of the entry at `seq`, or `None` if we no longer have (or
 /// never had) one there. Async wrapper over `RaftLog::term_at`, same
 /// shape as `last_log_index_and_term`.
-async fn term_at(log: &Arc<RaftLog>, seq: u64) -> Option<u64> {
-    let log = Arc::clone(log);
-    tokio::task::spawn_blocking(move || log.term_at(seq))
+async fn term_at(store: &Store, seq: u64) -> Option<u64> {
+    store
+        .expect("read the term at a log index", move |log| log.term_at(seq))
         .await
-        .expect("term_at task panicked")
-        .expect("failed to read term at seq")
 }
 
 /// Evaluates a pre-vote (`RequestVoteRequest.dry_run == true`) without
@@ -548,7 +371,7 @@ async fn evaluate_dry_run_vote(common: &Common, req: &RequestVoteRequest) -> boo
     if req.term <= common.current_term {
         return false;
     }
-    let (our_index, our_term) = last_log_index_and_term(&common.log).await;
+    let (our_index, our_term) = last_log_index_and_term(&common.store).await;
     (req.last_log_term, req.last_log_index) >= (our_term, our_index)
 }
 
@@ -577,7 +400,7 @@ async fn evaluate_real_vote(common: &mut Common, req: &RequestVoteRequest) -> bo
             .as_deref()
             .is_none_or(|v| v == req.candidate_id)
     {
-        let (our_index, our_term) = last_log_index_and_term(&common.log).await;
+        let (our_index, our_term) = last_log_index_and_term(&common.store).await;
         (req.last_log_term, req.last_log_index) >= (our_term, our_index)
     } else {
         false
@@ -586,326 +409,6 @@ async fn evaluate_real_vote(common: &mut Common, req: &RequestVoteRequest) -> bo
         common.vote_for(&req.candidate_id).await;
     }
     grant
-}
-
-#[derive(Debug)]
-pub enum RaftError {
-    /// Not (or no longer) the leader. `leader_hint` lets a client retry in
-    /// the right place, same as `RaftError`/`NotLeader` in client.proto.
-    NotLeader {
-        leader_hint: Option<String>,
-    },
-    Storage(StorageError),
-    /// The event loop is gone (node shutting down) before it could reply.
-    Disconnected,
-    /// `Bootstrap` on a node that is already part of a cluster. Refused
-    /// rather than applied, since bootstrapping twice is how one cluster
-    /// silently becomes two -- see `follower::Follower::bootstrap`.
-    AlreadyInitialized,
-    /// A membership change is already appended and not yet committed.
-    /// Raft allows only one at a time (§4.1): overlapping single-server
-    /// changes can produce two configurations with no common majority,
-    /// which is exactly the disjoint-quorum split the one-at-a-time rule
-    /// exists to prevent.
-    ConfigChangeInProgress,
-    /// This leader hasn't yet committed an entry from its own term, so it
-    /// can't safely propose a membership change (Ongaro 2015): until
-    /// then it can't be sure the configuration it is building on won't
-    /// itself be rolled back.
-    NotCaughtUp,
-    /// The change doesn't apply to the current configuration -- adding a
-    /// server that is already a member, removing one that isn't, or
-    /// removing the last voter.
-    InvalidConfigChange(&'static str),
-}
-
-/// Who to point a client at, given a role handle. `None` unless this node
-/// currently knows of a leader -- a candidate, or a follower that hasn't
-/// heard from one yet, has nowhere to send them.
-pub fn leader_hint_of(role: &RoleHandle) -> Option<String> {
-    match role {
-        RoleHandle::Follower(f) => f.leader_hint.clone(),
-        _ => None,
-    }
-}
-
-/// A cheap, cloneable snapshot of "what can the outside world do right
-/// now", published by whichever role is currently running and refreshed on
-/// every transition. This -- not the role structs themselves -- is what
-/// `KvService` would hold to implement `Write`/`Read`.
-#[derive(Clone)]
-pub enum RoleHandle {
-    Leader(LeaderHandle),
-    Follower(FollowerHandle),
-    Candidate,
-    /// This node's log holds no cluster configuration at all, so it isn't
-    /// part of any cluster yet (Raft §4.4). Internally it is just a
-    /// follower with no vote: it answers every RPC and will happily be
-    /// replicated to -- which is exactly how a server *added* to an
-    /// existing cluster leaves this state, since the `Config` entry
-    /// naming it arrives as an ordinary log entry. The other way out is
-    /// `Bootstrap`, which makes it a single-node cluster.
-    Uninitialized,
-    /// The value the `watch` channel holds before the driver has published
-    /// anything real. Never sent by any role -- exists so callers (and
-    /// tests) waiting for a specific role can't be fooled by the channel's
-    /// construction-time default.
-    Starting,
-    /// This node has shut down and will never publish another role.
-    /// Published by `run` on its way out, for two reasons.
-    ///
-    /// The visible one: a gRPC handler holding a stale `RoleHandle` would
-    /// otherwise still see `Leader` and try to serve a request against a
-    /// state machine that no longer exists.
-    ///
-    /// The load-bearing one: `LeaderHandle` holds a `role_rx` subscribed
-    /// to the very channel it is published on, so a published
-    /// `RoleHandle::Leader` is a reference cycle -- the channel's value
-    /// keeps a receiver alive, and that receiver keeps the channel (and
-    /// its value) alive. Dropping every sender does not break it, so the
-    /// whole handle -- including its `Arc<RaftLog>`, and with it the
-    /// database lock -- would outlive the node forever. Overwriting the
-    /// channel with a variant that holds nothing drops the cycle.
-    Stopped,
-}
-
-#[derive(Clone)]
-pub struct LeaderHandle {
-    log: Arc<RaftLog>,
-    term: u64,
-    /// For `propose_config`, which -- unlike `append_log` -- can't just
-    /// write to the log directly: the guards a membership change needs
-    /// live on the event loop (see `leader::Leader::propose_config`).
-    event_tx: mpsc::Sender<Event>,
-    /// How far `RaftLog::apply_committed` has actually brought `latest`
-    /// up to date -- *not* `commit_tx` directly. `append_log` needs to
-    /// know `latest` itself reflects the entry, not just that it's been
-    /// replicated to a majority: `commit_tx` and this are two independent
-    /// `watch` subscriptions off of `spawn_storage_maintenance_task`, and
-    /// `watch` gives no ordering guarantee between separate subscribers
-    /// waking up on the same update. Waiting on `commit_tx` directly here
-    /// would let `append_log` return before the maintenance task has
-    /// actually run `apply_committed` for this seq, so a caller that
-    /// immediately reads afterward could see stale or missing data.
-    applied_rx: watch::Receiver<u64>,
-    /// Used to detect a step-down while waiting in `append_log`, so a
-    /// caller doesn't hang forever on an entry that will never commit
-    /// (e.g. because it gets truncated by a new leader instead).
-    ///
-    /// Note that this is a receiver for the same channel this handle is
-    /// itself published on, which makes a published `RoleHandle::Leader`
-    /// self-referential -- see `RoleHandle::Stopped` for what that costs
-    /// and why `run` publishes over it before the node goes away.
-    role_rx: watch::Receiver<RoleHandle>,
-    /// Whether this leader currently holds a quorum of leases -- see the
-    /// module doc. Not consumed by anything yet (no read path exists that
-    /// would check it), but published either way so one can be added
-    /// later without touching this plumbing.
-    read_quorum_rx: watch::Receiver<bool>,
-}
-
-impl LeaderHandle {
-    /// Append a new entry and wait until it's committed (replicated to a
-    /// majority) *and* actually applied to `latest` before returning --
-    /// see `applied_rx`'s doc on why waiting for commit alone isn't
-    /// enough.
-    pub async fn append_log(&self, key: &[u8], value: Option<&[u8]>) -> Result<u64, RaftError> {
-        let log = Arc::clone(&self.log);
-        let term = self.term;
-        let key = key.to_vec();
-        let value = value.map(<[u8]>::to_vec);
-        let seq = tokio::task::spawn_blocking(move || log.append(term, &key, value.as_deref()))
-            .await
-            .map_err(|_| RaftError::Disconnected)?
-            .map_err(RaftError::Storage)?;
-
-        self.await_applied(seq).await
-    }
-
-    /// Propose a single-server membership change and wait until it
-    /// commits. Returns the seq of the `Config` entry.
-    ///
-    /// The change itself takes effect on *append* (§4.1), so this
-    /// returning is not what makes it real -- it is what makes it
-    /// durable. The wait matters for `RemoveServer` especially: this
-    /// leader may be removing *itself*, and it has to stay leader long
-    /// enough to get the entry committed before stepping down (§4.2.2).
-    pub async fn propose_config(&self, change: ConfigChange) -> Result<u64, RaftError> {
-        let (respond_to, rx) = oneshot::channel();
-        self.event_tx
-            .send(Event::ProposeConfig { change, respond_to })
-            .await
-            .map_err(|_| RaftError::Disconnected)?;
-        let seq = rx.await.map_err(|_| RaftError::Disconnected)??;
-        self.await_applied(seq).await
-    }
-
-    /// Blocks until `seq` has committed *and* been applied, or until this
-    /// node stops being leader at this term -- in which case the entry
-    /// may well be truncated rather than committed, so waiting on it
-    /// forever would hang.
-    async fn await_applied(&self, seq: u64) -> Result<u64, RaftError> {
-        let mut applied_rx = self.applied_rx.clone();
-        let mut role_rx = self.role_rx.clone();
-        loop {
-            if *applied_rx.borrow() >= seq {
-                return Ok(seq);
-            }
-            if !self.still_leader(&role_rx) {
-                return Err(self.not_leader_error(&role_rx));
-            }
-            tokio::select! {
-                r = applied_rx.changed() => { r.map_err(|_| RaftError::Disconnected)?; }
-                r = role_rx.changed() => { r.map_err(|_| RaftError::Disconnected)?; }
-            }
-        }
-    }
-
-    fn still_leader(&self, role_rx: &watch::Receiver<RoleHandle>) -> bool {
-        matches!(&*role_rx.borrow(), RoleHandle::Leader(h) if h.term == self.term)
-    }
-
-    fn not_leader_error(&self, role_rx: &watch::Receiver<RoleHandle>) -> RaftError {
-        RaftError::NotLeader {
-            leader_hint: leader_hint_of(&role_rx.borrow()),
-        }
-    }
-
-    /// Whether it's currently safe for this leader to serve a
-    /// linearizable read directly from local state, without going
-    /// through the log -- i.e. whether it holds a quorum of leases. See
-    /// the module doc.
-    pub fn has_read_quorum(&self) -> bool {
-        *self.read_quorum_rx.borrow()
-    }
-}
-
-#[derive(Clone)]
-pub struct FollowerHandle {
-    pub leader_hint: Option<String>,
-}
-
-/// The entry point for inbound peer RPCs. Cheap to clone, valid for the
-/// life of the node regardless of which role is currently running --
-/// `RaftPeerService` holds one of these rather than reaching into
-/// `RoleHandle`, since every role has to be able to answer these calls, not
-/// just the leader.
-#[derive(Clone)]
-pub struct RaftPeerHandle {
-    event_tx: mpsc::Sender<Event>,
-    /// Read directly (never through the event loop) by `get_lease` below,
-    /// so answering a lease probe can never get stuck behind whatever the
-    /// event loop is currently doing -- e.g. a slow `AppendEntries`
-    /// mid-disk-write. See the module doc.
-    role_rx: watch::Receiver<RoleHandle>,
-    term_rx: watch::Receiver<u64>,
-    lease_expires_at_tx: Arc<watch::Sender<Option<Instant>>>,
-}
-
-impl RaftPeerHandle {
-    pub async fn append_entries(
-        &self,
-        req: AppendEntriesRequest,
-    ) -> Result<AppendEntriesResponse, RaftError> {
-        let (respond_to, rx) = oneshot::channel();
-        self.event_tx
-            .send(Event::AppendEntries { req, respond_to })
-            .await
-            .map_err(|_| RaftError::Disconnected)?;
-        rx.await.map_err(|_| RaftError::Disconnected)
-    }
-
-    pub async fn request_vote(
-        &self,
-        req: RequestVoteRequest,
-    ) -> Result<RequestVoteResponse, RaftError> {
-        let (respond_to, rx) = oneshot::channel();
-        self.event_tx
-            .send(Event::RequestVote { req, respond_to })
-            .await
-            .map_err(|_| RaftError::Disconnected)?;
-        rx.await.map_err(|_| RaftError::Disconnected)
-    }
-
-    /// Unlike `get_lease`, this goes through the event loop like
-    /// `append_entries`/`request_vote`: it needs the full term check
-    /// *and* actually has real storage work to do (`RaftLog::install_snapshot`),
-    /// so there's no way to make it independent of whichever role is
-    /// currently running the way the lease fast path is.
-    pub async fn install_snapshot(
-        &self,
-        header: SnapshotHeader,
-        data: Vec<u8>,
-    ) -> Result<InstallSnapshotResponse, RaftError> {
-        let (respond_to, rx) = oneshot::channel();
-        self.event_tx
-            .send(Event::InstallSnapshot {
-                header,
-                data,
-                respond_to,
-            })
-            .await
-            .map_err(|_| RaftError::Disconnected)?;
-        rx.await.map_err(|_| RaftError::Disconnected)
-    }
-
-    /// Answers a lease probe directly against shared, watch-based state --
-    /// deliberately *not* through `Event`/the sequential event loop, since
-    /// that's exactly what would let a slow, unrelated `AppendEntries`
-    /// stall a probe that's supposed to be fast. Infallible (nothing here
-    /// can actually fail the way a channel send could) and needs no
-    /// `.await`, which is itself part of the point: the type signature
-    /// makes "this can never block on the event loop" visible.
-    pub fn get_lease(&self, req: GetLeaseRequest) -> GetLeaseResponse {
-        if !matches!(&*self.role_rx.borrow(), RoleHandle::Follower(_)) {
-            // Only a follower "recognizes" a leader via lease -- anyone
-            // else (including another leader) has nothing to grant.
-            return GetLeaseResponse {
-                lease_granted: false,
-            };
-        }
-        let granted = req.term == *self.term_rx.borrow();
-        if granted {
-            let _ = self
-                .lease_expires_at_tx
-                .send(Some(Instant::now() + LEASE_DURATION));
-        }
-        GetLeaseResponse {
-            lease_granted: granted,
-        }
-    }
-}
-
-/// Caches one gRPC client per peer (see the module doc), shared across
-/// every role and every election via `Common::peer_conns`.
-#[derive(Default)]
-struct PeerConnections {
-    clients: AsyncMutex<HashMap<String, RaftPeerClient<Channel>>>,
-}
-
-impl PeerConnections {
-    /// A cloned handle to a cached client for `peer`, connecting (and
-    /// caching the result) if there isn't one yet. `RaftPeerClient` is a
-    /// thin wrapper around a `Channel`, which is cheap to clone and safe
-    /// to use concurrently from many tasks at once. Connect failures
-    /// aren't cached, so the next attempt gets a fresh try.
-    async fn get_or_connect(&self, peer: &PeerInfo) -> Option<RaftPeerClient<Channel>> {
-        let mut clients = self.clients.lock().await;
-        if let Some(client) = clients.get(&peer.id) {
-            return Some(client.clone());
-        }
-        let client = RaftPeerClient::connect(peer.address.clone()).await.ok()?;
-        clients.insert(peer.id.clone(), client.clone());
-        Some(client)
-    }
-
-    /// Drops a peer's cached client, if any, so the next call reconnects
-    /// instead of reusing a connection that's already failed once.
-    /// `Channel` doesn't auto-reconnect on its own once its connection
-    /// drops.
-    async fn evict(&self, peer_id: &str) {
-        self.clients.lock().await.remove(peer_id);
-    }
 }
 
 /// The cluster configuration recorded in `log`, decoded. `None` for a
@@ -928,6 +431,7 @@ fn load_config(log: &RaftLog) -> storage::Result<Option<ClusterConfig>> {
 /// thing. Real nodes start uninitialized and are bootstrapped explicitly.
 #[cfg(test)]
 fn seed_config(node_id: &str, peers: &[PeerInfo]) -> ClusterConfig {
+    use crate::pb::raft5::cluster::ClusterMember;
     let member = |id: &str, address: &str| ClusterMember {
         server_id: id.to_string(),
         address: address.to_string(),
@@ -943,15 +447,22 @@ fn seed_config(node_id: &str, peers: &[PeerInfo]) -> ClusterConfig {
 
 /// State shared across every role, threaded from one role's `shutdown`
 /// straight into the next role's `new`.
+///
+/// Every field is private. That isn't only tidiness: `raft` is a `pub`
+/// module, so a `pub` field here would put this node's event channel,
+/// watermark senders and role publisher on the crate's public API, where
+/// anything could drive them out from under the state machine. The role
+/// modules are descendants of `raft` and so see them all regardless --
+/// which is the intended audience, and the only one.
 pub struct Common {
-    pub node_id: String,
+    node_id: String,
     /// The cluster configuration this node is currently operating under:
     /// who its peers are, and which of them vote. Read from the log (see
     /// `storage::RaftLog::current_config`) rather than from a flag, and
     /// re-read whenever a `Config` entry is appended or rolled back --
     /// on *append*, not on commit, per Raft §4.1.
-    pub config: ClusterConfig,
-    pub log: Arc<RaftLog>,
+    config: ClusterConfig,
+    store: Store,
     peer_conns: Arc<PeerConnections>,
 
     /// Only ever changed via `advance_term`/`vote_for` below, which also
@@ -987,14 +498,14 @@ pub struct Common {
     /// Highest seq known committed. Outlives any single role (a follower
     /// applies a leader's `leader_commit` here too), so it lives in
     /// `Common` rather than inside `Leader`.
-    pub commit_tx: watch::Sender<u64>,
+    commit_tx: watch::Sender<u64>,
 
     /// Highest seq known replicated to *every* peer, not just a majority --
     /// safe to compact below regardless of role: a leader computes it from
     /// `Leader::peer_match_index`, a follower just adopts whatever value
     /// rides along on `AppendEntries.compact_seq`. Consumed by
     /// `spawn_storage_maintenance_task`.
-    pub compact_tx: watch::Sender<u64>,
+    compact_tx: watch::Sender<u64>,
 
     /// How far `RaftLog::apply_committed` has actually brought `latest`
     /// up to date -- published by `spawn_storage_maintenance_task` only
@@ -1012,10 +523,10 @@ pub struct Common {
     /// Where peer RPCs (relayed by `RaftPeerService`) and internal timers
     /// land. Shared across roles so anything already queued survives a
     /// transition.
-    pub event_rx: mpsc::Receiver<Event>,
-    pub event_tx: mpsc::Sender<Event>,
+    event_rx: mpsc::Receiver<Event>,
+    event_tx: mpsc::Sender<Event>,
 
-    pub role_tx: watch::Sender<RoleHandle>,
+    role_tx: watch::Sender<RoleHandle>,
 
     /// This node's root cancellation token, supplied by whoever started
     /// it (`crate::serve`). Every background task this node spawns runs
@@ -1024,109 +535,23 @@ pub struct Common {
     cancel: CancellationToken,
 }
 
-/// `(common, role_rx, peer_handle, commit_rx, compact_rx)` -- the state
-/// machine plus the external handles a caller needs to observe/drive it.
-/// A single-server membership change (Raft §4.1 -- one server at a time,
-/// not joint consensus). The caller says what it wants; the leader
-/// resolves it against whatever configuration is actually in force, so a
-/// client never has to send (or race on) a whole configuration.
-#[derive(Clone, Debug)]
-pub enum ConfigChange {
-    /// Add `server_id` as a non-voting learner. It is promoted to voter
-    /// automatically once it has caught up -- see
-    /// `leader::Leader::review_learner_progress`. Adding it as a voter
-    /// outright would let a server that is hours behind count toward
-    /// (and stall) every quorum from the moment it joined.
-    AddServer {
-        server_id: String,
-        address: String,
-    },
-    RemoveServer {
-        server_id: String,
-    },
-    /// Leader-internal: a learner has caught up and is now a voter.
-    Promote {
-        server_id: String,
-    },
-}
-
-impl ConfigChange {
-    /// `config` with this change applied, or why it can't be.
-    fn apply_to(&self, config: &ClusterConfig) -> Result<ClusterConfig, RaftError> {
-        let invalid = |why| Err(RaftError::InvalidConfigChange(why));
-        match self {
-            Self::AddServer { server_id, address } => {
-                if config.contains(server_id) {
-                    return invalid("that server is already a member of this cluster");
-                }
-                Ok(config.with_member(ClusterMember {
-                    server_id: server_id.clone(),
-                    address: address.clone(),
-                    voting: false,
-                }))
-            }
-            Self::RemoveServer { server_id } => {
-                if !config.contains(server_id) {
-                    return invalid("that server is not a member of this cluster");
-                }
-                let next = config.without_member(server_id);
-                if next.voters().count() == 0 {
-                    // The removal could never commit: there would be no
-                    // one left to form a quorum of the new configuration.
-                    return invalid("removing that server would leave the cluster with no voters");
-                }
-                Ok(next)
-            }
-            Self::Promote { server_id } => {
-                if !config.contains(server_id) {
-                    return invalid("that server is not a member of this cluster");
-                }
-                Ok(config.with_voter(server_id))
-            }
-        }
-    }
-}
-
-/// What the client-facing service (`grpc::KvService`) talks to: the
-/// current role, plus the one client request that isn't routed by role
-/// (`Bootstrap`, which by definition targets a node that has no leader).
+/// What `Common::new` hands back: the state machine itself, plus the
+/// handles a caller needs to observe and drive it.
 ///
-/// Deliberately separate from `RaftPeerHandle`: the two are served on
-/// different ports precisely because they have different exposure, and
-/// nothing a client sends should be able to reach the peer protocol.
-#[derive(Clone)]
-pub struct ClientHandle {
-    event_tx: mpsc::Sender<Event>,
-    role_rx: watch::Receiver<RoleHandle>,
+/// A struct rather than the tuple this used to be, and deliberately.
+/// `commit_rx` and `compact_rx` are both `watch::Receiver<u64>` and mean
+/// very different things, so as adjacent tuple elements they could be
+/// transposed at any call site and still compile -- yielding a node that
+/// compacted at its commit watermark, which is exactly the bug
+/// `RaftLog::compact`'s clamp exists to survive. Named fields make the
+/// mistake unrepresentable instead of merely survivable.
+pub struct NodeHandles {
+    pub common: Common,
+    pub role_rx: watch::Receiver<RoleHandle>,
+    pub peer_handle: RaftPeerHandle,
+    pub commit_rx: watch::Receiver<u64>,
+    pub compact_rx: watch::Receiver<u64>,
 }
-
-impl ClientHandle {
-    /// What this node can do right now -- who to point a client at, or
-    /// whether it needs bootstrapping at all.
-    pub fn role(&self) -> RoleHandle {
-        self.role_rx.borrow().clone()
-    }
-
-    /// Form a single-node cluster around this node (Raft §4.4). Refused
-    /// with `AlreadyInitialized` by any node that is already part of one;
-    /// see `follower::Follower::bootstrap`.
-    pub async fn bootstrap(&self, config: ClusterConfig) -> Result<(), RaftError> {
-        let (respond_to, rx) = oneshot::channel();
-        self.event_tx
-            .send(Event::Bootstrap { config, respond_to })
-            .await
-            .map_err(|_| RaftError::Disconnected)?;
-        rx.await.map_err(|_| RaftError::Disconnected)?
-    }
-}
-
-type NewCommon = (
-    Common,
-    watch::Receiver<RoleHandle>,
-    RaftPeerHandle,
-    watch::Receiver<u64>,
-    watch::Receiver<u64>,
-);
 
 impl Common {
     /// Membership comes from `log` alone. A store that has never seen a
@@ -1134,11 +559,16 @@ impl Common {
     /// uninitialized: it has no vote, so it never campaigns, and it waits
     /// to be either bootstrapped or replicated to. See
     /// `RoleHandle::Uninitialized`.
+    // Same reason the role constructors carry this: what a caller needs
+    // back is not just the `Common` but the handles for reaching it, and
+    // splitting the two into `new` plus a second call would let a caller
+    // hold a `Common` that nothing can observe.
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(
         node_id: String,
         log: Arc<RaftLog>,
         cancel: CancellationToken,
-    ) -> storage::Result<NewCommon> {
+    ) -> storage::Result<NodeHandles> {
         Self::build(node_id, log, ClusterConfig::default(), cancel)
     }
 
@@ -1152,7 +582,7 @@ impl Common {
         peers: Vec<PeerInfo>,
         log: Arc<RaftLog>,
         cancel: CancellationToken,
-    ) -> storage::Result<NewCommon> {
+    ) -> storage::Result<NodeHandles> {
         let seed = seed_config(&node_id, &peers);
         Self::build(node_id, log, seed, cancel)
     }
@@ -1162,7 +592,7 @@ impl Common {
         log: Arc<RaftLog>,
         fallback: ClusterConfig,
         cancel: CancellationToken,
-    ) -> storage::Result<NewCommon> {
+    ) -> storage::Result<NodeHandles> {
         let (current_term, voted_for) = log.term_state()?;
         let config = load_config(&log)?.unwrap_or(fallback);
 
@@ -1197,7 +627,7 @@ impl Common {
         let common = Self {
             node_id,
             config,
-            log,
+            store: Store::new(log),
             peer_conns: Arc::new(PeerConnections::default()),
             current_term,
             voted_for,
@@ -1213,15 +643,29 @@ impl Common {
             role_tx,
             cancel,
         };
-        Ok((common, role_rx, peer_handle, commit_rx, compact_rx))
+        Ok(NodeHandles {
+            common,
+            role_rx,
+            peer_handle,
+            commit_rx,
+            compact_rx,
+        })
     }
 
     /// Advances `commit_tx` to `new_value` if that's higher than what's
     /// already published -- never regresses, in case responses/requests
     /// are ever processed out of order.
+    ///
+    /// `send_replace`, not `send`, and that matters: every `watch` in
+    /// `Common` is *state* that is read back through `borrow()` (this
+    /// method's own comparison, `Leader::propose_config`'s catch-up gate,
+    /// `step_down_if_removed`), not merely a notification. `send` fails
+    /// and leaves the value untouched once the last receiver is dropped,
+    /// so a watermark could silently stop advancing while the code that
+    /// reads it went on believing it. `send_replace` always stores.
     fn advance_commit(&self, new_value: u64) {
         if new_value > *self.commit_tx.borrow() {
-            let _ = self.commit_tx.send(new_value);
+            self.commit_tx.send_replace(new_value);
         }
     }
 
@@ -1229,7 +673,7 @@ impl Common {
     /// to compact" watermark.
     fn advance_compact(&self, new_value: u64) {
         if new_value > *self.compact_tx.borrow() {
-            let _ = self.compact_tx.send(new_value);
+            self.compact_tx.send_replace(new_value);
         }
     }
 
@@ -1243,19 +687,30 @@ impl Common {
     }
 
     fn publish_role(&self, handle: RoleHandle) {
-        let _ = self.role_tx.send(handle);
+        self.role_tx.send_replace(handle);
     }
 
-    /// The next event to handle, or `None` if this node is shutting down
-    /// -- either its cancellation token fired or the event channel closed.
-    /// Every role's event loop funnels through here, which is what makes a
-    /// cancelled node stop at once rather than whenever its next timer
-    /// happens to fire.
-    async fn next_event(&mut self) -> Option<Event> {
+    /// The next thing this node's event loop should do.
+    ///
+    /// Every role funnels through here, which buys two things. Cancelling
+    /// the node stops it at once rather than whenever its next timer
+    /// happens to fire; and Raft §5.1's term rule is applied once, for all
+    /// roles, rather than being rewritten in each of them (see
+    /// `Event::response_term`).
+    async fn next_event(&mut self) -> Next {
         let Self {
             cancel, event_rx, ..
         } = self;
-        until_cancelled(cancel, event_rx.recv()).await.flatten()
+        let Some(Some(event)) = until_cancelled(cancel, event_rx.recv()).await else {
+            return Next::Stop;
+        };
+        if let Some(term) = event.response_term()
+            && term > self.current_term
+        {
+            self.advance_term(term).await;
+            return Next::StepDown;
+        }
+        Next::Handle(event)
     }
 
     /// A parent for the background tasks a role owns, so that cancelling
@@ -1306,11 +761,10 @@ impl Common {
     /// the event loop -- see the module doc.
     async fn reload_config(&mut self) -> bool {
         let was_voter = self.is_voter();
-        let log = Arc::clone(&self.log);
-        let loaded = tokio::task::spawn_blocking(move || load_config(&log))
-            .await
-            .expect("load_config task panicked")
-            .expect("failed to read the cluster config");
+        let loaded = self
+            .store
+            .expect("read the cluster config", load_config)
+            .await;
         // Nothing in the log (or in the compacted fallback) means no
         // configuration has ever been established here, so there's
         // nothing to switch to -- keep operating under what we have.
@@ -1332,7 +786,7 @@ impl Common {
         if term > self.current_term {
             self.current_term = term;
             self.voted_for = None;
-            let _ = self.term_tx.send(term);
+            self.term_tx.send_replace(term);
             self.persist_term_state().await;
         }
     }
@@ -1348,14 +802,25 @@ impl Common {
     /// the same term after a crash, which is a Raft safety violation, not
     /// just a lost write.
     async fn persist_term_state(&self) {
-        let log = Arc::clone(&self.log);
         let term = self.current_term;
         let voted_for = self.voted_for.clone();
-        tokio::task::spawn_blocking(move || log.persist_term_state(term, voted_for.as_deref()))
-            .await
-            .expect("persist_term_state task panicked")
-            .expect("failed to persist raft term/vote state");
+        self.store
+            .expect("persist the raft term/vote state", move |log| {
+                log.persist_term_state(term, voted_for.as_deref())
+            })
+            .await;
     }
+}
+
+/// What `Common::next_event` decided, before any role-specific handling.
+enum Next {
+    Handle(Event),
+    /// A response carried a term higher than ours. `next_event` has
+    /// already adopted it (Raft §5.1); whatever role asked has only to
+    /// stop being that role.
+    StepDown,
+    /// The node is shutting down.
+    Stop,
 }
 
 // --- Driver ----------------------------------------------------------------
@@ -1394,7 +859,7 @@ impl Common {
 /// retry on the next watermark change.
 fn spawn_storage_maintenance_task(
     cancel: &CancellationToken,
-    log: Arc<RaftLog>,
+    store: Store,
     mut commit_rx: watch::Receiver<u64>,
     mut compact_rx: watch::Receiver<u64>,
     applied_tx: Arc<watch::Sender<u64>>,
@@ -1410,29 +875,21 @@ fn spawn_storage_maintenance_task(
             let commit_seq = *commit_rx.borrow();
             let compact_seq = *compact_rx.borrow();
 
-            let log2 = Arc::clone(&log);
-            match tokio::task::spawn_blocking(move || log2.apply_committed(commit_seq)).await {
-                Ok(Ok(())) => {
+            match store.run(move |log| log.apply_committed(commit_seq)).await {
+                Ok(()) => {
                     // Only ever moves forward -- `commit_seq` is itself
                     // monotonic (`Common::advance_commit`), so an
                     // out-of-order wakeup can't regress this.
-                    let _ = applied_tx.send(commit_seq);
+                    applied_tx.send_replace(commit_seq);
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     eprintln!("apply_committed to seq {commit_seq} failed: {e}");
                     continue; // don't attempt to compact past what didn't apply
                 }
-                Err(e) => {
-                    eprintln!("apply_committed task panicked: {e}");
-                    continue;
-                }
             }
 
-            let log3 = Arc::clone(&log);
-            match tokio::task::spawn_blocking(move || log3.compact(compact_seq)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => eprintln!("compact to seq {compact_seq} failed: {e}"),
-                Err(e) => eprintln!("compact task panicked: {e}"),
+            if let Err(e) = store.run(move |log| log.compact(compact_seq)).await {
+                eprintln!("compact to seq {compact_seq} failed: {e}");
             }
         }
     })
@@ -1444,7 +901,7 @@ fn spawn_storage_maintenance_task(
 pub async fn run(mut common: Common) {
     let maintenance_task = spawn_storage_maintenance_task(
         common.cancel_token(),
-        Arc::clone(&common.log),
+        common.store.clone(),
         common.commit_tx.subscribe(),
         common.compact_tx.subscribe(),
         Arc::clone(&common.applied_tx),
@@ -1488,601 +945,4 @@ pub async fn run(mut common: Common) {
 pub(crate) mod test_support;
 
 #[cfg(test)]
-mod tests {
-    use super::test_support::*;
-    use super::*;
-
-    #[tokio::test]
-    async fn fresh_node_starts_as_follower() {
-        let (mut role_rx, _peer_handle, path) = spawn_test_node(vec![]);
-        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Follower(_))).await;
-        cleanup(&path);
-    }
-
-    /// A node started against a fresh database belongs to no cluster: it
-    /// answers RPCs and waits, but never campaigns, however long it hears
-    /// nothing (Raft §4.4 -- a node that assumed it was its own cluster
-    /// would elect itself, and a second such node would be a second
-    /// cluster).
-    #[tokio::test]
-    async fn an_unbootstrapped_node_waits_instead_of_electing_itself() {
-        let (log, path) = open_temp_log();
-        let (common, mut role_rx, _peer_handle, _c, _cc) = Common::new(
-            "fresh".to_string(),
-            Arc::clone(&log),
-            CancellationToken::new(),
-        )
-        .unwrap();
-        assert!(common.config.members.is_empty());
-        tokio::spawn(run(common));
-
-        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Uninitialized)).await;
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        assert!(
-            matches!(*role_rx.borrow(), RoleHandle::Uninitialized),
-            "an unbootstrapped node must never campaign"
-        );
-        assert!(
-            log.last_entry().unwrap().is_none(),
-            "and must write nothing"
-        );
-
-        cleanup(&path);
-    }
-
-    /// Bootstrapping writes the configuration as the log's first entry,
-    /// after which the node is a single-node cluster and elects itself.
-    #[tokio::test]
-    async fn bootstrap_forms_a_single_node_cluster_that_then_elects_itself() {
-        let (log, path) = open_temp_log();
-        let (common, mut role_rx, _peer_handle, _c, _cc) = Common::new(
-            "solo".to_string(),
-            Arc::clone(&log),
-            CancellationToken::new(),
-        )
-        .unwrap();
-        let client = common.client_handle();
-        tokio::spawn(run(common));
-        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Uninitialized)).await;
-
-        let config = cluster_config(&[("solo", true)]);
-        client.bootstrap(config.clone()).await.unwrap();
-
-        let stored = log.entries_in_range(1, 2).unwrap();
-        assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].kind, storage::EntryKind::Config);
-        assert_eq!(
-            ClusterConfig::from_bytes(stored[0].value.as_ref().unwrap()).unwrap(),
-            config
-        );
-
-        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Leader(_))).await;
-        cleanup(&path);
-    }
-
-    /// Bootstrapping twice is how one cluster silently becomes two, so a
-    /// node that is already part of one refuses -- whether it learned its
-    /// membership from a bootstrap or, as here, from replication.
-    #[tokio::test]
-    async fn bootstrap_is_refused_once_the_node_belongs_to_a_cluster() {
-        let (_log, (common, mut role_rx, _peer_handle, _c, _cc), path) =
-            open_temp_log_with_config("solo", &cluster_config(&[("solo", true)]));
-        let client = common.client_handle();
-        tokio::spawn(run(common));
-        wait_for_role(&mut role_rx, |r| !matches!(r, RoleHandle::Starting)).await;
-
-        let err = client
-            .bootstrap(cluster_config(&[("solo", true), ("interloper", true)]))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RaftError::AlreadyInitialized));
-
-        cleanup(&path);
-    }
-
-    /// The other half of the guard: an empty configuration isn't enough
-    /// on its own. A node with log entries but no configuration has state
-    /// that a bootstrap would silently strand -- it belongs to some
-    /// cluster whose config entry it simply hasn't received yet.
-    #[tokio::test]
-    async fn bootstrap_is_refused_on_a_non_empty_log() {
-        let (log, path) = open_temp_log();
-        log.append(1, b"a", Some(b"1")).unwrap();
-        let (common, mut role_rx, _peer_handle, _c, _cc) = Common::new(
-            "odd-one".to_string(),
-            Arc::clone(&log),
-            CancellationToken::new(),
-        )
-        .unwrap();
-        let client = common.client_handle();
-        tokio::spawn(run(common));
-        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Uninitialized)).await;
-
-        let err = client
-            .bootstrap(cluster_config(&[("odd-one", true)]))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RaftError::AlreadyInitialized));
-        assert_eq!(log.last_entry().unwrap().unwrap().0, 1, "nothing appended");
-
-        cleanup(&path);
-    }
-
-    /// The path a server added to an existing cluster takes: it starts
-    /// uninitialized and is initialized purely by replication, with no
-    /// bootstrap anywhere.
-    #[tokio::test]
-    async fn a_replicated_config_entry_initializes_a_fresh_node() {
-        let (log, path) = open_temp_log();
-        let (common, mut role_rx, peer_handle, _c, _cc) = Common::new(
-            "newcomer".to_string(),
-            Arc::clone(&log),
-            CancellationToken::new(),
-        )
-        .unwrap();
-        tokio::spawn(run(common));
-        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Uninitialized)).await;
-
-        // The leader adds it as a learner, so it is a member but still
-        // has no vote -- and so still doesn't campaign.
-        let config = cluster_config(&[("leader-1", true), ("newcomer", false)]);
-        let entry = LogEntry {
-            seq: 1,
-            term: 1,
-            kind: crate::pb::raft5::common::EntryKind::Config as i32,
-            key: Vec::new(),
-            value: Some(config.to_bytes()),
-        };
-        let resp = peer_handle
-            .append_entries(append_entries(1, "leader-1", 0, 0, vec![entry], 0))
-            .await
-            .unwrap();
-        assert!(resp.success);
-
-        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Follower(_))).await;
-        assert_eq!(
-            ClusterConfig::from_bytes(&log.current_config().unwrap().unwrap()).unwrap(),
-            config
-        );
-
-        cleanup(&path);
-    }
-
-    /// Membership comes from the log, not from the flag the node was
-    /// started with: a store that has already been bootstrapped ignores
-    /// the peer list entirely.
-    #[tokio::test]
-    async fn common_takes_its_membership_from_the_log_not_the_peer_argument() {
-        let (log, path) = open_temp_log();
-        let config = cluster_config(&[("n0", true), ("v1", true), ("l1", false)]);
-        log.append_config(1, &config.to_bytes()).unwrap();
-
-        let stale = vec![PeerInfo {
-            id: "someone-else".to_string(),
-            address: "http://127.0.0.1:1".to_string(),
-        }];
-        let (common, _role_rx, _peer_handle, _c, _cc) = Common::new_seeded(
-            "n0".to_string(),
-            stale,
-            Arc::clone(&log),
-            CancellationToken::new(),
-        )
-        .unwrap();
-
-        assert_eq!(common.config, config);
-        let mut peer_ids: Vec<_> = common.peers().into_iter().map(|p| p.id).collect();
-        peer_ids.sort();
-        assert_eq!(peer_ids, vec!["l1", "v1"], "learners are replicated to");
-        assert_eq!(
-            common
-                .voting_peers()
-                .into_iter()
-                .map(|p| p.id)
-                .collect::<Vec<_>>(),
-            vec!["v1"],
-            "but only voters are asked for votes"
-        );
-        assert_eq!(common.majority(), 2);
-        assert!(common.is_voter());
-
-        cleanup(&path);
-    }
-
-    /// A learner replicates and answers RPCs, but never starts an
-    /// election: it has no vote, so it could never win one, and a server
-    /// campaigning outside the voting configuration is exactly the
-    /// disruption §4.2.3 warns about.
-    #[tokio::test]
-    async fn a_learner_never_campaigns() {
-        let config = cluster_config(&[("learner", false), ("v1", true), ("v2", true)]);
-        let (_log, (common, mut role_rx, _peer_handle, _c, _cc), path) =
-            open_temp_log_with_config("learner", &config);
-        tokio::spawn(run(common));
-        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Follower(_))).await;
-
-        // Comfortably past the LEASE_DURATION + fuzz window (200-400ms)
-        // in which a voter with unreachable peers would have campaigned.
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        assert!(
-            matches!(*role_rx.borrow(), RoleHandle::Follower(_)),
-            "a learner must stay a follower no matter how long it hears nothing"
-        );
-
-        cleanup(&path);
-    }
-
-    /// The control for `a_learner_never_campaigns`: the same unreachable
-    /// peers, the same silence -- the only difference is the `voting`
-    /// flag, and it is what decides whether an election happens.
-    #[tokio::test]
-    async fn a_voter_with_the_same_unreachable_peers_does_campaign() {
-        let config = cluster_config(&[("v0", true), ("v1", true), ("v2", true)]);
-        let (_log, (common, mut role_rx, _peer_handle, _c, _cc), path) =
-            open_temp_log_with_config("v0", &config);
-        tokio::spawn(run(common));
-        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Candidate)).await;
-        cleanup(&path);
-    }
-
-    #[tokio::test]
-    async fn follower_becomes_candidate_after_election_timeout() {
-        let (mut role_rx, _peer_handle, path) = spawn_test_node(vec![]);
-        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Candidate)).await;
-        cleanup(&path);
-    }
-
-    /// End-to-end over real sockets: two full nodes (state machine + a real
-    /// `RaftPeerService` bound to a real port), each configured with the
-    /// other as its only peer. Exercises the whole voting path --
-    /// `Candidate` actually dialing out via `RaftPeerClient`,
-    /// `PeerConnections` caching/reusing that connection, and the
-    /// follower-side §5.4.1 check granting the vote -- rather than just the
-    /// in-process pieces the other tests cover individually.
-    #[tokio::test]
-    async fn candidate_wins_election_against_a_real_peer_over_the_network() {
-        use crate::grpc::RaftPeerService;
-        use crate::pb::raft5::raft::raft_peer_server::RaftPeerServer;
-
-        let addr_a = free_local_addr();
-        let addr_b = free_local_addr();
-
-        let (log_a, path_a) = open_temp_log();
-        let (log_b, path_b) = open_temp_log();
-
-        let (common_a, mut role_rx_a, peer_handle_a, _commit_rx_a, _compact_rx_a) =
-            Common::new_seeded(
-                "node-a".to_string(),
-                vec![PeerInfo {
-                    id: "node-b".to_string(),
-                    address: format!("http://{addr_b}"),
-                }],
-                Arc::clone(&log_a),
-                CancellationToken::new(),
-            )
-            .unwrap();
-        let (common_b, mut role_rx_b, peer_handle_b, _commit_rx_b, _compact_rx_b) =
-            Common::new_seeded(
-                "node-b".to_string(),
-                vec![PeerInfo {
-                    id: "node-a".to_string(),
-                    address: format!("http://{addr_a}"),
-                }],
-                Arc::clone(&log_b),
-                CancellationToken::new(),
-            )
-            .unwrap();
-
-        tokio::spawn(run(common_a));
-        tokio::spawn(run(common_b));
-
-        tokio::spawn(
-            tonic::transport::Server::builder()
-                .add_service(RaftPeerServer::new(RaftPeerService::new(peer_handle_a)))
-                .serve(addr_a),
-        );
-        tokio::spawn(
-            tonic::transport::Server::builder()
-                .add_service(RaftPeerServer::new(RaftPeerService::new(peer_handle_b)))
-                .serve(addr_b),
-        );
-
-        // Whichever of the two wins its election first -- a real,
-        // cross-process-style race, same as a real cluster.
-        tokio::select! {
-            _ = wait_for_role(&mut role_rx_a, |r| matches!(r, RoleHandle::Leader(_))) => {}
-            _ = wait_for_role(&mut role_rx_b, |r| matches!(r, RoleHandle::Leader(_))) => {}
-        }
-
-        cleanup(&path_a);
-        cleanup(&path_b);
-    }
-
-    /// End-to-end over real sockets, continuing where
-    /// `candidate_wins_election_against_a_real_peer_over_the_network`
-    /// leaves off: once one of the two nodes wins the election, a write
-    /// through its `LeaderHandle` should reach the other node's storage
-    /// too (real replication task, real connection, real §5.3 next_index
-    /// tracking) and commit (real majority -- both nodes -- computed by
-    /// `Leader::recompute_watermarks`) rather than hanging.
-    #[tokio::test]
-    async fn leader_replicates_a_write_to_a_real_peer_and_commits_it() {
-        use crate::grpc::RaftPeerService;
-        use crate::pb::raft5::raft::raft_peer_server::RaftPeerServer;
-
-        let addr_a = free_local_addr();
-        let addr_b = free_local_addr();
-
-        let (log_a, path_a) = open_temp_log();
-        let (log_b, path_b) = open_temp_log();
-
-        let (common_a, mut role_rx_a, peer_handle_a, _commit_rx_a, _compact_rx_a) =
-            Common::new_seeded(
-                "node-a".to_string(),
-                vec![PeerInfo {
-                    id: "node-b".to_string(),
-                    address: format!("http://{addr_b}"),
-                }],
-                Arc::clone(&log_a),
-                CancellationToken::new(),
-            )
-            .unwrap();
-        let (common_b, mut role_rx_b, peer_handle_b, _commit_rx_b, _compact_rx_b) =
-            Common::new_seeded(
-                "node-b".to_string(),
-                vec![PeerInfo {
-                    id: "node-a".to_string(),
-                    address: format!("http://{addr_a}"),
-                }],
-                Arc::clone(&log_b),
-                CancellationToken::new(),
-            )
-            .unwrap();
-
-        tokio::spawn(run(common_a));
-        tokio::spawn(run(common_b));
-
-        tokio::spawn(
-            tonic::transport::Server::builder()
-                .add_service(RaftPeerServer::new(RaftPeerService::new(peer_handle_a)))
-                .serve(addr_a),
-        );
-        tokio::spawn(
-            tonic::transport::Server::builder()
-                .add_service(RaftPeerServer::new(RaftPeerService::new(peer_handle_b)))
-                .serve(addr_b),
-        );
-
-        tokio::select! {
-            _ = wait_for_role(&mut role_rx_a, |r| matches!(r, RoleHandle::Leader(_))) => {}
-            _ = wait_for_role(&mut role_rx_b, |r| matches!(r, RoleHandle::Leader(_))) => {}
-        }
-
-        // Leadership can still shuffle right after the initial election
-        // settles: e.g. the loser's own election timer, having already
-        // been ticking, fires a competing (higher-term) candidacy before
-        // it ever hears the winner's first heartbeat, and per Raft the
-        // winner correctly steps down on seeing that higher term. That's
-        // correct behavior, not a bug -- so retry against whoever's leader
-        // now, same as a real client would on `NotLeader`, rather than
-        // assuming the first leader observed stays leader.
-        let (seq, follower_log) = loop {
-            let a_is_leader = matches!(&*role_rx_a.borrow(), RoleHandle::Leader(_));
-            let (leader, follower_log) = if a_is_leader {
-                (
-                    expect_leader_handle(&role_rx_a.borrow()),
-                    Arc::clone(&log_b),
-                )
-            } else {
-                (
-                    expect_leader_handle(&role_rx_b.borrow()),
-                    Arc::clone(&log_a),
-                )
-            };
-            match tokio::time::timeout(
-                Duration::from_millis(2000),
-                leader.append_log(b"k", Some(b"v")),
-            )
-            .await
-            .expect("append_log should commit once the peer replicates it")
-            {
-                Ok(seq) => break (seq, follower_log),
-                Err(RaftError::NotLeader { .. }) => {
-                    tokio::select! {
-                        _ = wait_for_role(&mut role_rx_a, |r| matches!(r, RoleHandle::Leader(_))) => {}
-                        _ = wait_for_role(&mut role_rx_b, |r| matches!(r, RoleHandle::Leader(_))) => {}
-                    }
-                }
-                Err(e) => panic!("unexpected append_log error: {e:?}"),
-            }
-        };
-
-        // `append_log` only waits for the leader's own `commit_tx`, which
-        // can advance the instant a majority (both nodes, here) has the
-        // entry -- give the follower's own AppendEntries handling a moment
-        // to actually finish persisting it locally before checking.
-        tokio::time::timeout(Duration::from_millis(500), async {
-            loop {
-                if follower_log.get_latest(b"k").unwrap().is_some() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("follower should eventually receive the replicated entry");
-
-        assert_eq!(
-            follower_log.get_latest(b"k").unwrap(),
-            Some((seq, b"v".to_vec()))
-        );
-
-        cleanup(&path_a);
-        cleanup(&path_b);
-    }
-
-    /// A zero-peer cluster's `compact_seq` trivially equals its own last
-    /// index (see `leader::Leader::recompute_watermarks`) -- confirms the
-    /// compaction task spawned by `run` actually reacts to that and does
-    /// real work, not just that the watermark itself advances correctly
-    /// (already covered elsewhere).
-    #[tokio::test]
-    async fn compaction_task_compacts_the_log_as_compact_seq_advances() {
-        let (log, mut role_rx, _peer_handle, _commit_rx, mut compact_rx, path) =
-            spawn_node_with_handles(vec![]);
-        wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Leader(_))).await;
-        let leader = expect_leader_handle(&role_rx.borrow());
-
-        // Seqs are captured rather than assumed: seq 1 is the
-        // term-opening no-op `Leader::new` appends, so these start at 2.
-        let a = leader.append_log(b"a", Some(b"1")).await.unwrap();
-        let b = leader.append_log(b"b", Some(b"2")).await.unwrap();
-        let c = leader.append_log(b"c", Some(b"3")).await.unwrap();
-
-        tokio::time::timeout(Duration::from_millis(1000), async {
-            loop {
-                if *compact_rx.borrow() >= c {
-                    return;
-                }
-                compact_rx.changed().await.unwrap();
-            }
-        })
-        .await
-        .expect("compact_seq should advance to the tail in a zero-peer cluster");
-
-        // The compaction task reacts to that same watch channel -- give
-        // it a moment to actually run its (tiny, but still real) blocking
-        // I/O.
-        tokio::time::timeout(Duration::from_millis(1000), async {
-            loop {
-                if log.entries_in_range(1, c).unwrap().is_empty() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("compaction should have removed the entries below compact_seq");
-
-        // Compaction only removes superseded history -- current values
-        // must still be intact.
-        assert_eq!(log.get_latest(b"a").unwrap(), Some((a, b"1".to_vec())));
-        assert_eq!(log.get_latest(b"b").unwrap(), Some((b, b"2".to_vec())));
-        assert_eq!(log.get_latest(b"c").unwrap(), Some((c, b"3".to_vec())));
-
-        cleanup(&path);
-    }
-
-    /// Runs `common` to completion under `cancel`, cancelling once it
-    /// reaches `role`, and hands back how long the shutdown itself took.
-    /// Panics if the node doesn't stop, so every caller's real assertion
-    /// is the one it makes about `log` afterwards.
-    async fn cancel_once(
-        common: Common,
-        mut role_rx: watch::Receiver<RoleHandle>,
-        cancel: &CancellationToken,
-        role: impl Fn(&RoleHandle) -> bool,
-    ) -> Duration {
-        let node = tokio::spawn(run(common));
-        // Cancelling a node that never got as far as starting its tasks
-        // would prove nothing, so wait until it is genuinely running.
-        wait_for_role(&mut role_rx, role).await;
-
-        let started = Instant::now();
-        cancel.cancel();
-        tokio::time::timeout(Duration::from_secs(5), node)
-            .await
-            .expect("a cancelled node should stop, not hang")
-            .expect("the node task panicked");
-        started.elapsed()
-    }
-
-    /// Cancellation is how a node is stopped, and `run` returning is the
-    /// proof that everything underneath it stopped too. The `Arc` count
-    /// is what actually checks that: a single abandoned task still
-    /// holding a clone of the log is exactly what leaves the database
-    /// locked against the next node to open the same directory, and it is
-    /// invisible from the outside until that next node fails.
-    ///
-    /// A leader with an unreachable peer is the demanding version of it:
-    /// the self-tick, the storage maintenance task, and a replication
-    /// task looping on a connection that never succeeds -- which has to
-    /// be interrupted rather than merely caught between ticks.
-    #[tokio::test]
-    async fn cancelling_a_leader_stops_every_task_under_it() {
-        let (log, path) = open_temp_log();
-        // `n0` is the only voter, so it wins its own election without
-        // anyone's help; `l1` is a learner at an address nothing is
-        // listening on, which is what gets it replicated to forever
-        // without ever answering. (It has to be a learner rather than a
-        // second voter for both halves to hold at once: a second voter
-        // would have to answer for `n0` to become leader at all.)
-        let config = cluster_config(&[("n0", true), ("l1", false)]);
-        log.append_config(1, &config.to_bytes()).unwrap();
-        let cancel = CancellationToken::new();
-        let (common, role_rx, _peer_handle, _commit_rx, _compact_rx) =
-            Common::new("n0".to_string(), Arc::clone(&log), cancel.clone()).unwrap();
-
-        let took = cancel_once(common, role_rx, &cancel, |r| {
-            matches!(r, RoleHandle::Leader(_))
-        })
-        .await;
-
-        assert_eq!(
-            Arc::strong_count(&log),
-            1,
-            "something the node spawned still holds its log after it shut down"
-        );
-        // Well inside `LIGHTWEIGHT_RPC_TIMEOUT`, let alone the 30s
-        // `AppendEntries` one: the peer-facing tasks are cut short rather
-        // than waited out.
-        assert!(
-            took < LEASE_DURATION,
-            "shutting down took {took:?}, which means something was waited out rather than cancelled"
-        );
-
-        cleanup(&path);
-    }
-
-    /// The same contract for a node that has no configuration at all: it
-    /// publishes `Uninitialized` and arms no election timer, so the path
-    /// out of it is different from a voter's, and a node left running
-    /// because nobody was watching the token would be just as invisible.
-    #[tokio::test]
-    async fn cancelling_an_uninitialized_node_stops_it_too() {
-        let (log, path) = open_temp_log();
-        let cancel = CancellationToken::new();
-        let (common, role_rx, _peer_handle, _commit_rx, _compact_rx) =
-            Common::new("fresh".to_string(), Arc::clone(&log), cancel.clone()).unwrap();
-
-        cancel_once(common, role_rx, &cancel, |r| {
-            matches!(r, RoleHandle::Uninitialized)
-        })
-        .await;
-
-        assert_eq!(Arc::strong_count(&log), 1);
-
-        cleanup(&path);
-    }
-
-    /// A node that is already cancelled before it is ever polled still
-    /// has to come back cleanly rather than, say, settling into being a
-    /// follower first -- `crate::serve` starts the engine and the servers
-    /// together, so a server that fails to bind cancels the token while
-    /// the state machine is still on its first step.
-    #[tokio::test]
-    async fn a_node_cancelled_before_it_starts_stops_immediately() {
-        let (log, path) = open_temp_log();
-        let cancel = CancellationToken::new();
-        let (common, _role_rx, _peer_handle, _commit_rx, _compact_rx) =
-            Common::new("stillborn".to_string(), Arc::clone(&log), cancel.clone()).unwrap();
-        cancel.cancel();
-
-        tokio::time::timeout(Duration::from_secs(5), run(common))
-            .await
-            .expect("an already-cancelled node should stop, not hang");
-
-        assert_eq!(Arc::strong_count(&log), 1);
-
-        cleanup(&path);
-    }
-}
+mod tests;

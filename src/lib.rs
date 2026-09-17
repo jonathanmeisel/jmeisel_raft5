@@ -20,6 +20,7 @@ pub mod grpc;
 pub mod pb;
 pub mod raft;
 pub mod storage;
+pub mod store;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -33,8 +34,9 @@ use grpc::{KvService, RaftPeerService};
 use pb::raft5::client::kv_server::KvServer;
 use pb::raft5::cluster::ClusterMember;
 use pb::raft5::raft::raft_peer_server::RaftPeerServer;
-use raft::Common;
+use raft::{Common, NodeHandles};
 use storage::RaftLog;
+use store::Store;
 
 /// What a node's failure is reported as. `Send + Sync` (unlike a bare
 /// `Box<dyn Error>`) so that `run`'s future can be handed straight to
@@ -80,23 +82,23 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 ///   API. Defaults to `peer_addr`, which is wrong whenever that is a
 ///   wildcard bind (`0.0.0.0:...`) or behind NAT -- set it explicitly
 ///   then. Recorded in the cluster configuration at bootstrap.
-pub fn run(
-    id: String,
-    db: &Path,
-    client_addr: SocketAddr,
-    peer_addr: SocketAddr,
-    advertise: Option<String>,
-) -> (
-    impl Future<Output = Result<(), Error>> + Send + 'static,
-    CancellationToken,
-) {
-    let cancel = CancellationToken::new();
-    // Owned, so the returned future borrows nothing and can be spawned.
-    let db = db.to_path_buf();
-    let token = cancel.clone();
-    let node = async move { serve(id, &db, client_addr, peer_addr, advertise, token).await };
-    (node, cancel)
-}
+// pub fn run(
+//     id: String,
+//     db: &Path,
+//     client_addr: SocketAddr,
+//     peer_addr: SocketAddr,
+//     advertise: Option<String>,
+// ) -> (
+//     impl Future<Output = Result<(), Error>> + Send + 'static,
+//     CancellationToken,
+// ) {
+//     let cancel = CancellationToken::new();
+//     // Owned, so the returned future borrows nothing and can be spawned.
+//     let db = db.to_path_buf();
+//     let token = cancel.clone();
+//     let node = async move { serve(id, &db, client_addr, peer_addr, advertise, token).await };
+//     (node, cancel)
+// }
 
 /// `run`, for a caller that already has a token to shut this node down
 /// with -- one shared with other nodes in the same process, say, or a
@@ -121,13 +123,20 @@ pub async fn serve(
     // machine hasn't published a role yet at this point.
     let uninitialized = log.current_config()?.is_none();
 
-    let (common, _role_rx, peer_handle, _commit_rx, _compact_rx) =
-        Common::new(id.clone(), Arc::clone(&log), cancel.clone())?;
+    let NodeHandles {
+        common,
+        peer_handle,
+        ..
+    } = Common::new(id.clone(), Arc::clone(&log), cancel.clone())?;
     let client_handle = common.client_handle();
 
     // KvService's read/write path still bypasses the state machine (see
     // its module doc); `client_handle` is what `Bootstrap` goes through.
-    let kv_server = KvServer::new(KvService::new(Arc::clone(&log), identity, client_handle));
+    let kv_server = KvServer::new(KvService::new(
+        Store::new(Arc::clone(&log)),
+        identity,
+        client_handle,
+    ));
     let raft_peer_server = RaftPeerServer::new(RaftPeerService::new(peer_handle));
 
     if uninitialized {

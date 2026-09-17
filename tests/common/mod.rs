@@ -6,6 +6,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio_util::sync::CancellationToken;
@@ -21,17 +22,29 @@ use jmeisel_raft5::pb::raft5::cluster::ClusterMember;
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_DELAY: Duration = Duration::from_millis(20);
 
-/// A node started for a test: its own fresh database directory and
-/// fixed addresses, plus a background task running the real
-/// `jmeisel_raft5::run` server loop and the token that stops it --
-/// `None` while deliberately shut down via `shut_down` (as opposed to
-/// torn down for good via `Drop`).
+/// A connected client for a node's client API. `KvClient`'s own RPC
+/// methods take `&mut self`, but the `Channel` underneath is cheap to
+/// clone and safe to use concurrently, so every function below takes
+/// `&Arc<Client>` and clones a private, owned copy out of it to actually
+/// make a call -- the `Arc` is what lets many callers (and `TestNode`
+/// itself) share the one connection without each dialing their own.
+pub type Client = KvClient<Channel>;
+
+/// A node started for a test: its own fresh database directory and fixed
+/// addresses, plus a background task running the real
+/// `jmeisel_raft5::run` server loop, the token that stops it, and a
+/// client already connected to it -- all `None` while deliberately shut
+/// down via `shut_down` (as opposed to torn down for good via `Drop`).
 pub struct TestNode {
     pub id: String,
     pub client_addr: SocketAddr,
     pub peer_addr: SocketAddr,
     pub db_dir: PathBuf,
     running: Option<RunningNode>,
+    /// Private: reached only through the `client()` accessor, so a test
+    /// that reaches for this while the node is down gets a clear panic
+    /// instead of a `None` it has to unwrap itself.
+    client: Option<Arc<Client>>,
 }
 
 struct RunningNode {
@@ -40,15 +53,16 @@ struct RunningNode {
 }
 
 impl TestNode {
-    pub fn new(id: &str) -> Self {
+    pub async fn new(id: &str) -> Self {
         let mut node = Self {
             id: id.to_string(),
             client_addr: free_local_addr(),
             peer_addr: free_local_addr(),
             db_dir: temp_db_dir(id),
             running: None,
+            client: None,
         };
-        node.start_up();
+        node.start_up().await;
         node
     }
 
@@ -56,43 +70,63 @@ impl TestNode {
     /// addresses, and database -- what a real restart looks like:
     /// membership and log persist in `db_dir` across it, so the node
     /// rejoins whatever cluster it left off in rather than coming back
-    /// uninitialized. Panics if it's already running.
+    /// uninitialized. Also (re-)connects `client`, retrying while the
+    /// listener is still coming up. Panics if it's already running.
     ///
     /// No retry on the database lock: `shut_down` doesn't return until
     /// the previous incarnation has fully finished, in-flight storage
     /// work included, so there is nothing left holding it by this point.
-    pub fn start_up(&mut self) {
+    pub async fn start_up(&mut self) {
         assert!(
             self.running.is_none(),
             "node {} is already running",
             self.id
         );
         let id = self.id.clone();
-        let (node, cancel) = jmeisel_raft5::run(
-            id.clone(),
-            &self.db_dir,
-            self.client_addr,
-            self.peer_addr,
-            None,
-        );
+        let db_dir = self.db_dir.clone();
+        let client_addr = self.client_addr;
+        let peer_addr = self.peer_addr;
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
         let task = tokio::spawn(async move {
+            let node = jmeisel_raft5::serve(
+                id.clone(),
+                &db_dir,
+                client_addr,
+                peer_addr,
+                None,
+                cancel_clone,
+            );
             if let Err(e) = node.await {
                 eprintln!("node {id} exited with an error: {e}");
             }
         });
         self.running = Some(RunningNode { cancel, task });
+        self.client = Some(Arc::new(connect(self.client_addr).await));
     }
 
     /// Stops this node and waits for it to actually be gone -- sockets
     /// released, database lock released, every background task joined --
     /// before returning, so a `start_up` right after gets a clean slate.
-    /// Leaves the database alone, so the node comes back from `start_up`
-    /// with everything it had before. A no-op if it isn't running.
+    /// Drops `client` too, so nothing can go on using a connection to a
+    /// node that is no longer there. Leaves the database alone, so the
+    /// node comes back from `start_up` with everything it had before. A
+    /// no-op if it isn't running.
     pub async fn shut_down(&mut self) {
+        self.client = None;
         if let Some(RunningNode { cancel, task }) = self.running.take() {
             cancel.cancel();
             task.await.expect("node task panicked");
         }
+    }
+
+    /// This node's client. Panics if it isn't currently running --
+    /// either it was never started, or it's been `shut_down` and not yet
+    /// `start_up` again.
+    pub fn client(&self) -> Arc<Client> {
+        self.client
+            .clone()
+            .unwrap_or_else(|| panic!("node {} has no client -- is it running?", self.id))
     }
 }
 
@@ -138,7 +172,9 @@ fn deadline() -> Instant {
 
 /// Connects to a node's client API, retrying while its server is still
 /// coming up (the listener may not have bound yet right after spawning).
-pub async fn connect(addr: SocketAddr) -> KvClient<Channel> {
+/// Internal to `TestNode::start_up` -- callers elsewhere get a client via
+/// `TestNode::client` instead of dialing their own.
+async fn connect(addr: SocketAddr) -> Client {
     let until = deadline();
     loop {
         match KvClient::connect(format!("http://{addr}")).await {
@@ -156,7 +192,8 @@ pub async fn connect(addr: SocketAddr) -> KvClient<Channel> {
 /// after `spawn_node`, the node's gRPC service exists but the state
 /// machine hasn't necessarily reached `Uninitialized` internally, so an
 /// immediate `Bootstrap` can transiently race that.
-pub async fn bootstrap(client: &mut KvClient<Channel>, server_id: &str) {
+pub async fn bootstrap(client: &Arc<Client>, server_id: &str) {
+    let mut client = (**client).clone();
     let until = deadline();
     loop {
         let resp = client
@@ -178,7 +215,8 @@ pub async fn bootstrap(client: &mut KvClient<Channel>, server_id: &str) {
 /// Adds `server_id` to the cluster this client's node leads, retrying on
 /// `NotLeader`/`ConfigChangeInProgress`-style transient refusals (e.g. a
 /// membership change from a previous call still committing).
-pub async fn add_server(client: &mut KvClient<Channel>, server_id: &str, peer_addr: SocketAddr) {
+pub async fn add_server(client: &Arc<Client>, server_id: &str, peer_addr: SocketAddr) {
+    let mut client = (**client).clone();
     let until = deadline();
     loop {
         let resp = client
@@ -205,7 +243,8 @@ pub async fn add_server(client: &mut KvClient<Channel>, server_id: &str, peer_ad
 /// isn't (yet) the leader -- e.g. immediately after `bootstrap`, before
 /// the resulting single-node election has finished. Returns the seq the
 /// write committed at.
-pub async fn write(client: &mut KvClient<Channel>, key: &[u8], value: Option<&[u8]>) -> u64 {
+pub async fn write(client: &Arc<Client>, key: &[u8], value: Option<&[u8]>) -> u64 {
+    let mut client = (**client).clone();
     let until = deadline();
     loop {
         let resp = client
@@ -230,7 +269,8 @@ pub async fn write(client: &mut KvClient<Channel>, key: &[u8], value: Option<&[u
 
 /// A (possibly stale) local read of `key`, or `None` if it currently has
 /// no value.
-pub async fn read(client: &mut KvClient<Channel>, key: &[u8]) -> Option<Vec<u8>> {
+pub async fn read(client: &Arc<Client>, key: &[u8]) -> Option<Vec<u8>> {
+    let mut client = (**client).clone();
     let resp = client
         .read(ReadRequest {
             key: key.to_vec(),
@@ -249,7 +289,8 @@ pub async fn read(client: &mut KvClient<Channel>, key: &[u8]) -> Option<Vec<u8>>
 /// (Raft §4.1 -- reflects a change as soon as it's appended, not only
 /// once it commits). Empty if it hasn't been bootstrapped or added to a
 /// cluster yet.
-pub async fn config(client: &mut KvClient<Channel>) -> Vec<ClusterMember> {
+pub async fn config(client: &Arc<Client>) -> Vec<ClusterMember> {
+    let mut client = (**client).clone();
     client
         .get_config(GetConfigRequest {})
         .await
@@ -258,25 +299,23 @@ pub async fn config(client: &mut KvClient<Channel>) -> Vec<ClusterMember> {
         .members
 }
 
-/// Waits until `server_id` shows up as a *voting* member of `node`'s
-/// configuration -- e.g. after `add_server` joins it as a learner,
-/// waiting here for its automatic promotion (Raft §4.2.1) to land. This
-/// matters beyond just membership: a config with fewer voters than
-/// intended changes what majority means, so a caller that needs a
+/// Waits until `server_id` shows up as a *voting* member of `client`'s
+/// node's configuration -- e.g. after `add_server` joins it as a
+/// learner, waiting here for its automatic promotion (Raft §4.2.1) to
+/// land. This matters beyond just membership: a config with fewer voters
+/// than intended changes what majority means, so a caller that needs a
 /// specific voter count (e.g. before deliberately taking one down) has
 /// to confirm it, not assume promotion already finished.
-pub async fn wait_until_voter(node: &TestNode, server_id: &str) {
+pub async fn wait_until_voter(client: &Arc<Client>, server_id: &str) {
     let until = deadline();
-    let mut client = connect(node.client_addr).await;
     loop {
-        let members = config(&mut client).await;
+        let members = config(client).await;
         if members.iter().any(|m| m.server_id == server_id && m.voting) {
             return;
         }
         assert!(
             Instant::now() < until,
-            "{server_id} never became a voter in {node}'s configuration",
-            node = node.id
+            "{server_id} never became a voter in the queried node's configuration"
         );
         tokio::time::sleep(RETRY_DELAY).await;
     }
@@ -286,12 +325,8 @@ pub async fn wait_until_voter(node: &TestNode, server_id: &str) {
 /// value` at (at least) `min_seq` -- a follower applies a commit
 /// asynchronously as `AppendEntries` batches arrive, so this isn't
 /// instantaneous the way the leader's own post-write read is.
-pub async fn assert_eventually_reads(
-    client: &mut KvClient<Channel>,
-    key: &[u8],
-    value: &[u8],
-    min_seq: u64,
-) {
+pub async fn assert_eventually_reads(client: &Arc<Client>, key: &[u8], value: &[u8], min_seq: u64) {
+    let mut client = (**client).clone();
     let until = deadline();
     loop {
         let resp = client
@@ -316,25 +351,38 @@ pub async fn assert_eventually_reads(
     }
 }
 
-/// Tries `attempt` against each of `nodes` in turn, retrying the whole
-/// set until one succeeds (returns `Some`) or the overall deadline
-/// elapses. Shared by `write_to_leader`/`read_from_leader`: both are
-/// "do this against whichever node is currently the leader," discovered
-/// simply by trying -- a non-leader's refusal, or a node that's
-/// unreachable (e.g. one deliberately shut down), just fails `attempt`
-/// and moves on to the next candidate.
-async fn try_each_node<T, Fut>(
-    nodes: &[&TestNode],
-    mut attempt: impl FnMut(SocketAddr) -> Fut,
-) -> (SocketAddr, T)
-where
-    Fut: std::future::Future<Output = Option<T>>,
-{
+/// Finds the cluster's current leader among `nodes`, by attempting a
+/// linearizable read against each of them in turn and retrying the whole
+/// set until one succeeds. A linearizable read succeeding at all is
+/// proof the answering node holds a live read quorum right now (see
+/// `grpc::KvService::read`), not merely that it was first to answer --
+/// so this doubles as leader discovery backed by an actual quorum check,
+/// not just a guess at which node to send further requests to.
+///
+/// Nodes that are down (`shut_down`, so their client is gone) are
+/// skipped rather than treated as a failure -- same as one that's merely
+/// lost the leadership race this round.
+pub async fn find_leader<'a>(nodes: &[&'a TestNode]) -> &'a TestNode {
+    // The key itself is irrelevant -- linearizability, not this specific
+    // key's data, is what proves the answering node is genuinely leading.
+    const PROBE_KEY: &[u8] = b"__raft5_test_find_leader_probe__";
+
     let until = deadline();
     loop {
-        for node in nodes {
-            if let Some(result) = attempt(node.client_addr).await {
-                return (node.client_addr, result);
+        for &node in nodes {
+            if let Some(client) = &node.client {
+                let mut client = (**client).clone();
+                let resp = client
+                    .read(ReadRequest {
+                        key: PROBE_KEY.to_vec(),
+                        linearizable: true,
+                    })
+                    .await;
+                if let Ok(resp) = resp
+                    && matches!(resp.into_inner().result, Some(read_response::Result::Ok(_)))
+                {
+                    return node;
+                }
             }
         }
         assert!(
@@ -343,64 +391,4 @@ where
         );
         tokio::time::sleep(RETRY_DELAY).await;
     }
-}
-
-/// Writes `key`/`value` to whichever of `nodes` is currently the
-/// cluster's leader, discovering it by trying each in turn -- for use
-/// once it isn't known in advance which node that is, e.g. right after a
-/// leadership change. Returns the leader's address (so the caller can
-/// keep talking to the same node afterward) and the seq the write
-/// committed at.
-pub async fn write_to_leader(
-    nodes: &[&TestNode],
-    key: &[u8],
-    value: Option<&[u8]>,
-) -> (SocketAddr, u64) {
-    try_each_node(nodes, |addr| async move {
-        let mut client = KvClient::connect(format!("http://{addr}")).await.ok()?;
-        let resp = client
-            .write(WriteRequest {
-                key: key.to_vec(),
-                value: value.map(<[u8]>::to_vec),
-            })
-            .await
-            .ok()?
-            .into_inner();
-        match resp.result {
-            Some(write_response::Result::Seq(seq)) => Some(seq),
-            _ => None,
-        }
-    })
-    .await
-}
-
-/// Reads `key` from whichever of `nodes` is currently the cluster's
-/// leader -- the read counterpart to `write_to_leader`. With
-/// `linearizable: true` this doubles as leader discovery *backed by a
-/// live read quorum*: a follower, or a leader that has lost its lease
-/// quorum, answers `NotLeader` rather than succeeding (see
-/// `grpc::KvService::read`), so a successful result here is itself
-/// evidence the answering node is genuinely leading right now, not just
-/// the first one to answer.
-pub async fn read_from_leader(
-    nodes: &[&TestNode],
-    key: &[u8],
-    linearizable: bool,
-) -> (SocketAddr, Option<Vec<u8>>) {
-    try_each_node(nodes, |addr| async move {
-        let mut client = KvClient::connect(format!("http://{addr}")).await.ok()?;
-        let resp = client
-            .read(ReadRequest {
-                key: key.to_vec(),
-                linearizable,
-            })
-            .await
-            .ok()?
-            .into_inner();
-        match resp.result {
-            Some(read_response::Result::Ok(ok)) => Some(ok.value),
-            _ => None,
-        }
-    })
-    .await
 }

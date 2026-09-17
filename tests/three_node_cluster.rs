@@ -11,8 +11,8 @@
 mod common;
 
 use common::{
-    TestNode, add_server, assert_eventually_reads, bootstrap, connect, read, read_from_leader,
-    wait_until_voter, write, write_to_leader,
+    TestNode, add_server, assert_eventually_reads, bootstrap, find_leader, read, wait_until_voter,
+    write,
 };
 
 /// Three fresh nodes (ids `{prefix}1`/`{prefix}2`/`{prefix}3`), formed
@@ -25,16 +25,16 @@ use common::{
 /// learner never campaigns, so the other two would be stuck with no one
 /// left able to hold an election).
 async fn three_node_cluster(prefix: &str) -> (TestNode, TestNode, TestNode) {
-    let n1 = TestNode::new(&format!("{prefix}1"));
-    let n2 = TestNode::new(&format!("{prefix}2"));
-    let n3 = TestNode::new(&format!("{prefix}3"));
+    let n1 = TestNode::new(&format!("{prefix}1")).await;
+    let n2 = TestNode::new(&format!("{prefix}2")).await;
+    let n3 = TestNode::new(&format!("{prefix}3")).await;
 
-    let mut c1 = connect(n1.client_addr).await;
-    bootstrap(&mut c1, &n1.id).await;
-    add_server(&mut c1, &n2.id, n2.peer_addr).await;
-    add_server(&mut c1, &n3.id, n3.peer_addr).await;
-    wait_until_voter(&n1, &n2.id).await;
-    wait_until_voter(&n1, &n3.id).await;
+    let c1 = n1.client();
+    bootstrap(&c1, &n1.id).await;
+    add_server(&c1, &n2.id, n2.peer_addr).await;
+    add_server(&c1, &n3.id, n3.peer_addr).await;
+    wait_until_voter(&c1, &n2.id).await;
+    wait_until_voter(&c1, &n3.id).await;
 
     (n1, n2, n3)
 }
@@ -42,23 +42,21 @@ async fn three_node_cluster(prefix: &str) -> (TestNode, TestNode, TestNode) {
 #[tokio::test]
 async fn write_through_a_three_node_cluster_commits_and_reads_back() {
     let (n1, n2, n3) = three_node_cluster("n").await;
-    let mut c1 = connect(n1.client_addr).await;
+    let c1 = n1.client();
 
     // `write` only returns once the entry has committed *and* been
     // applied (see `raft::LeaderHandle::append_log`) -- there is nothing
     // further to wait on here.
-    let seq = write(&mut c1, b"hello", Some(b"world")).await;
+    let seq = write(&c1, b"hello", Some(b"world")).await;
 
-    let value = read(&mut c1, b"hello").await;
+    let value = read(&c1, b"hello").await;
     assert_eq!(value, Some(b"world".to_vec()));
 
     // The value is committed cluster-wide, not just locally on the
     // leader: it eventually reaches both other nodes too, once each has
     // replicated up to `seq`.
-    let mut c2 = connect(n2.client_addr).await;
-    let mut c3 = connect(n3.client_addr).await;
-    assert_eventually_reads(&mut c2, b"hello", b"world", seq).await;
-    assert_eventually_reads(&mut c3, b"hello", b"world", seq).await;
+    assert_eventually_reads(&n2.client(), b"hello", b"world", seq).await;
+    assert_eventually_reads(&n3.client(), b"hello", b"world", seq).await;
 }
 
 /// Covers a leadership change: killing the leader outright, confirming
@@ -73,45 +71,41 @@ async fn a_restarted_node_catches_up_after_a_leadership_change() {
 
     // n1 formed the cluster and has had no reason to step down, so it's
     // still leading -- the write/read round trip works there directly.
-    let mut c1 = connect(n1.client_addr).await;
-    let seq1 = write(&mut c1, b"first", Some(b"one")).await;
-    assert_eq!(read(&mut c1, b"first").await, Some(b"one".to_vec()));
+    let c1 = n1.client();
+    let seq1 = write(&c1, b"first", Some(b"one")).await;
+    assert_eq!(read(&c1, b"first").await, Some(b"one".to_vec()));
 
     // Kill the leader. n2 and n3 have to elect one of themselves before
     // either can serve another request.
     n1.shut_down().await;
 
-    // A *linearizable* read succeeding at all is proof this landed on a
+    // `find_leader` succeeding at all here is proof this landed on a
     // genuine new leader (one holding a live read quorum), not merely
     // the first surviving node to answer -- see `grpc::KvService::read`.
-    // The value itself might not show up on this very first read: a
-    // freshly elected leader's `latest` only catches up to its own
-    // commit index asynchronously (`raft::spawn_storage_maintenance_task`),
-    // so this confirms leadership here and waits for the value
-    // separately, rather than asserting on this exact response.
-    let (leader_addr, _) = read_from_leader(&[&n2, &n3], b"first", true).await;
-    let mut leader_client = connect(leader_addr).await;
-    assert_eventually_reads(&mut leader_client, b"first", b"one", seq1).await;
+    // The value itself might not show up on the leader's very first
+    // linearizable read: a freshly elected leader's `latest` only
+    // catches up to its own commit index asynchronously
+    // (`raft::spawn_storage_maintenance_task`), so this confirms
+    // leadership here and waits for the value separately.
+    let leader = find_leader(&[&n2, &n3]).await;
+    let leader_client = leader.client();
+    assert_eventually_reads(&leader_client, b"first", b"one", seq1).await;
 
     // The new leader takes a fresh write just as well, and reads it back
     // immediately.
-    let (leader_addr, seq2) = write_to_leader(&[&n2, &n3], b"second", Some(b"two")).await;
-    let mut leader_client = connect(leader_addr).await;
-    assert_eq!(
-        read(&mut leader_client, b"second").await,
-        Some(b"two".to_vec())
-    );
+    let seq2 = write(&leader_client, b"second", Some(b"two")).await;
+    assert_eq!(read(&leader_client, b"second").await, Some(b"two".to_vec()));
 
     // Bring the old leader back. It rejoins with a stale log: it missed
     // the entire leadership change, plus "second" outright. Restarting
     // straight onto the same database directory and the same addresses
     // is only safe because `shut_down` waited for the previous
     // incarnation to release both.
-    n1.start_up();
+    n1.start_up().await;
 
     // It eventually catches up on both, via ordinary replication from
     // whichever node is leading now.
-    let mut c1 = connect(n1.client_addr).await;
-    assert_eventually_reads(&mut c1, b"first", b"one", seq1).await;
-    assert_eventually_reads(&mut c1, b"second", b"two", seq2).await;
+    let c1 = n1.client();
+    assert_eventually_reads(&c1, b"first", b"one", seq1).await;
+    assert_eventually_reads(&c1, b"second", b"two", seq2).await;
 }

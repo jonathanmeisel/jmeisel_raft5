@@ -45,7 +45,7 @@ pub(crate) fn cluster_config(members: &[(&str, bool)]) -> ClusterConfig {
 pub(crate) fn open_temp_log_with_config(
     node_id: &str,
     config: &ClusterConfig,
-) -> (Arc<RaftLog>, NewCommon, std::path::PathBuf) {
+) -> (Arc<RaftLog>, NodeHandles, std::path::PathBuf) {
     let (log, path) = open_temp_log();
     log.append_config(1, &config.to_bytes()).expect("bootstrap");
     let common = Common::new(
@@ -71,7 +71,12 @@ pub(crate) fn spawn_test_node(
     std::path::PathBuf,
 ) {
     let (log, path) = open_temp_log();
-    let (common, role_rx, peer_handle, _commit_rx, _compact_rx) = Common::new_seeded(
+    let NodeHandles {
+        common,
+        role_rx,
+        peer_handle,
+        ..
+    } = Common::new_seeded(
         "test-node".to_string(),
         peers,
         log,
@@ -97,7 +102,14 @@ pub(crate) fn spawn_node_with_handles(
     std::path::PathBuf,
 ) {
     let (log, path) = open_temp_log();
-    let (common, role_rx, peer_handle, commit_rx, compact_rx) = Common::new_seeded(
+    let NodeHandles {
+        common,
+        role_rx,
+        peer_handle,
+        commit_rx,
+        compact_rx,
+        ..
+    } = Common::new_seeded(
         "test-node".to_string(),
         peers,
         Arc::clone(&log),
