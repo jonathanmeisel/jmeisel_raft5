@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio_util::sync::CancellationToken;
 
-use raft5_client::Client;
+use raft5_client::{Client, Update};
 
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -238,30 +238,22 @@ async fn concurrent_updates_do_not_lose_writes() {
     );
 }
 
-/// A closure that gives up takes the whole update with it: there is
-/// nothing sensible to write, so nothing is written.
+/// A closure that declines to change anything writes nothing, and the
+/// seq it gets back is the one the key was already at.
 #[tokio::test]
-async fn a_closure_that_fails_writes_nothing() {
+async fn a_noop_update_writes_nothing() {
     let n1 = TestNode::start("n1");
     let client = Client::new([n1.url()]).unwrap();
     bootstrap(&client, "n1").await;
     client.write(b"k", Some(b"before")).await.unwrap();
+    let before = client.read(b"k").await.unwrap();
 
-    let err = client
-        .update(b"k", |_| Err("not today".into()))
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(&err, raft5_client::Error::Update(e) if e.to_string() == "not today"),
-        "expected the closure's own error, got {err}"
-    );
-    assert_eq!(
-        client.read(b"k").await.unwrap().value.as_deref(),
-        Some(&b"before"[..])
-    );
+    let seq = client.update(b"k", |_| Update::Noop).await.unwrap();
+    assert_eq!(seq, before.seq);
+    assert_eq!(client.read(b"k").await.unwrap(), before);
 }
 
-/// Returning no value deletes the key, so the same call that updates a
+/// Writing no value deletes the key, so the same call that updates a
 /// value can also decide it should no longer exist.
 #[tokio::test]
 async fn an_update_returning_nothing_deletes_the_key() {
@@ -270,7 +262,7 @@ async fn an_update_returning_nothing_deletes_the_key() {
     bootstrap(&client, "n1").await;
     client.write(b"k", Some(b"v")).await.unwrap();
 
-    client.update(b"k", |_| Ok(None)).await.unwrap();
+    client.update(b"k", |_| Update::Write(None)).await.unwrap();
     assert_eq!(client.read(b"k").await.unwrap().value, None);
 }
 
@@ -297,8 +289,9 @@ async fn an_update_that_never_wins_gives_up() {
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
                     .block_on(interloper.write(b"k", Some(n.to_string().as_bytes())))
-            })?;
-            Ok(current.map(<[u8]>::to_vec))
+            })
+            .unwrap();
+            Update::Write(current.map(<[u8]>::to_vec))
         })
         .await
         .unwrap_err();
@@ -316,10 +309,9 @@ async fn an_update_that_never_wins_gives_up() {
 
 /// Parses the counter `key` currently holds (absent counts as zero) and
 /// hands back one more than that.
-fn increment(current: Option<&[u8]>) -> Result<Option<Vec<u8>>, raft5_client::BoxError> {
-    let n: u64 = match current {
-        Some(bytes) => std::str::from_utf8(bytes)?.parse()?,
-        None => 0,
-    };
-    Ok(Some((n + 1).to_string().into_bytes()))
+fn increment(current: Option<&[u8]>) -> Update {
+    let n: u64 = current
+        .map(|bytes| std::str::from_utf8(bytes).unwrap().parse().unwrap())
+        .unwrap_or(0);
+    Update::Write(Some((n + 1).to_string().into_bytes()))
 }

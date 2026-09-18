@@ -163,16 +163,23 @@ impl Router {
     /// Asks `kv`'s node what the cluster looks like and adopts the
     /// answer. Any node can answer, leader or not: membership is local,
     /// read-only state. A node that can't answer teaches us nothing,
-    /// which is not worth failing a call over.
-    pub(crate) async fn refresh_config(&self, kv: &Kv) {
+    /// which is not worth failing a call over. Returns whether a
+    /// configuration was adopted.
+    pub(crate) async fn refresh_config(&self, kv: &Kv) -> bool {
         let mut kv = kv.clone();
         let members =
             match tokio::time::timeout(PROBE_TIMEOUT, kv.get_config(GetConfigRequest {})).await {
                 Ok(Ok(resp)) => resp.into_inner().members,
-                Ok(Err(status)) => return debug!("GetConfig refused: {status}"),
-                Err(_) => return debug!("GetConfig timed out"),
+                Ok(Err(status)) => {
+                    debug!("GetConfig refused: {status}");
+                    return false;
+                }
+                Err(_) => {
+                    debug!("GetConfig timed out");
+                    return false;
+                }
             };
-        self.adopt(members);
+        self.adopt(members)
     }
 
     /// Replaces what we know about the cluster with what the cluster
@@ -181,11 +188,13 @@ impl Router {
     /// never in it): every request sent to one of those costs a round
     /// trip to be told `NotLeader`, and a stale read sent to one is
     /// answered from a log that has stopped moving.
-    fn adopt(&self, members: Vec<ClusterMember>) {
+    ///
+    /// Returns whether it did: an empty configuration is ignored.
+    fn adopt(&self, members: Vec<ClusterMember>) -> bool {
         // An empty configuration is a node that hasn't been bootstrapped
         // or added to a cluster yet. It knows less than we do.
         if members.is_empty() {
-            return;
+            return false;
         }
 
         let mut endpoints = Vec::new();
@@ -215,6 +224,7 @@ impl Router {
         if left {
             state.leader = None;
         }
+        true
     }
 
     /// Finds the leader by asking every node we know of, in turn, to

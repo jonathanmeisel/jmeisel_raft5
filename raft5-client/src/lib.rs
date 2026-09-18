@@ -87,9 +87,6 @@ pub enum Error {
     /// [`Client::update`] this means the key stayed contended for every
     /// attempt.
     Conflict { actual_seq: u64 },
-    /// The closure passed to [`Client::update`] failed; nothing was
-    /// written.
-    Update(BoxError),
 }
 
 impl std::fmt::Display for Error {
@@ -105,17 +102,20 @@ impl std::fmt::Display for Error {
                     "the key changed under this write; it is at seq {actual_seq}"
                 )
             }
-            Self::Update(e) => write!(f, "the update closure failed: {e}"),
         }
     }
 }
 
 impl std::error::Error for Error {}
 
-/// Whatever the caller's own [`Client::update`] closure failed with --
-/// the client has no idea what it was trying to do, only that it
-/// couldn't.
-pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+/// What a [`Client::update`] closure decides to do with the key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Update {
+    /// Write this value, or delete the key if it is `None`.
+    Write(Option<Vec<u8>>),
+    /// Leave the key alone; nothing is written.
+    Noop,
+}
 
 /// What a key currently holds. `seq` is the sequence number the value
 /// was written at; a key that has never been written (or has been
@@ -210,7 +210,7 @@ impl Client {
     pub async fn write(&self, key: &[u8], value: Option<&[u8]>) -> Result<u64, Error> {
         let deadline = Instant::now() + DEADLINE;
         loop {
-            match self.update(key, |_| Ok(value.map(<[u8]>::to_vec))).await {
+            match self.update(key, |_| Update::Write(value.map(<[u8]>::to_vec))).await {
                 // Unlike a real update there is nothing here to
                 // reconsider -- the value doesn't depend on what the key
                 // held -- so losing the race just means going round
@@ -222,8 +222,9 @@ impl Client {
         }
     }
 
-    /// Reads `key`, hands what it holds to `f`, and writes back what `f`
-    /// returns (`None` deletes the key) -- but only if nothing else
+    /// Reads `key`, hands what it holds to `f`, and does what `f` returns
+    /// -- [`Update::Write`] writes the value back (`Write(None)` deletes
+    /// the key), [`Update::Noop`] writes nothing -- but only if nothing else
     /// wrote the key in between. This is the read-modify-write the store
     /// itself cannot do: a counter increment, an entry appended to a
     /// list, a flag flipped only if it was where the caller last saw it.
@@ -233,30 +234,33 @@ impl Client {
     /// [`MAX_UPDATE_ATTEMPTS`] times. So `f` may run more than once and
     /// should compute rather than act -- anything it does besides
     /// returning a value will happen again on the next attempt. Its
-    /// argument is `None` when the key currently has no value, and
-    /// returning `Err` abandons the update without writing anything.
+    /// argument is `None` when the key currently has no value. On
+    /// `Noop` the returned sequence number is the one the key was read
+    /// at (0 if it has no value).
     ///
     /// ```no_run
     /// # async fn f(client: raft5_client::Client) -> Result<(), raft5_client::Error> {
     /// client
     ///     .update(b"hits", |current| {
-    ///         let n: u64 = match current {
-    ///             Some(bytes) => std::str::from_utf8(bytes)?.parse()?,
-    ///             None => 0,
-    ///         };
-    ///         Ok(Some((n + 1).to_string().into_bytes()))
+    ///         let n: u64 = current
+    ///             .and_then(|bytes| std::str::from_utf8(bytes).ok()?.parse().ok())
+    ///             .unwrap_or(0);
+    ///         raft5_client::Update::Write(Some((n + 1).to_string().into_bytes()))
     ///     })
     ///     .await?;
     /// # Ok(()) }
     /// ```
     pub async fn update<F>(&self, key: &[u8], mut f: F) -> Result<u64, Error>
     where
-        F: FnMut(Option<&[u8]>) -> Result<Option<Vec<u8>>, BoxError>,
+        F: FnMut(Option<&[u8]>) -> Update,
     {
         let mut last_conflict = 0;
         for _ in 0..MAX_UPDATE_ATTEMPTS {
             let current = self.read(key).await?;
-            let next = f(current.value.as_deref()).map_err(Error::Update)?;
+            let next = match f(current.value.as_deref()) {
+                Update::Write(next) => next,
+                Update::Noop => return Ok(current.seq),
+            };
             // Seq 0 is the cluster's own "this key has no value", so the
             // seq a read hands back is the precondition, unchanged,
             // whether or not the key was there.
@@ -268,28 +272,6 @@ impl Client {
         Err(Error::Conflict {
             actual_seq: last_conflict,
         })
-    }
-
-    /// Writes `value` to `key` only if it is still at `previous_seq` (0
-    /// meaning it has no value), returning the sequence number the write
-    /// committed at.
-    ///
-    /// Unlike [`write`], which retries an unconditional overwrite until it
-    /// lands, this fails outright -- as [`Error::Conflict`] -- the moment
-    /// someone else gets there first, since only the caller knows whether
-    /// the new value is still right in that case. Use [`update`] instead
-    /// when the new value depends on the old one rather than on a seq the
-    /// caller already has in hand.
-    ///
-    /// [`write`]: Client::write
-    /// [`update`]: Client::update
-    pub async fn write_if(
-        &self,
-        key: &[u8],
-        value: Option<&[u8]>,
-        previous_seq: u64,
-    ) -> Result<u64, Error> {
-        self.write_at(key, value, previous_seq).await
     }
 
     /// One conditional write: applied only if `key` is still at
@@ -512,10 +494,21 @@ impl Client {
 ///
 /// Holds only a `Weak`, so the task ends when the last [`Client`] is
 /// dropped rather than keeping it (and its connections) alive forever.
-/// There is nothing to refresh before the first call finds a leader, so
-/// a tick with none is skipped.
+/// There is nothing to refresh on a tick before any call has found a
+/// leader, so a tick with none is skipped.
+///
+/// Before the first tick, the seeds are tried in turn until one hands
+/// over a configuration, so the client's endpoints are the cluster's own
+/// as soon as any seed is reachable rather than after the first request.
 fn spawn_config_refresh(router: Weak<Router>) {
     tokio::spawn(async move {
+        if let Some(router) = router.upgrade() {
+            for node in router.nodes() {
+                if router.refresh_config(&node.connect()).await {
+                    break;
+                }
+            }
+        }
         let mut ticker = tokio::time::interval(CONFIG_REFRESH_INTERVAL);
         ticker.tick().await; // the first tick completes immediately
         loop {

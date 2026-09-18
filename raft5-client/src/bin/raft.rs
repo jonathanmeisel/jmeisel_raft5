@@ -120,21 +120,12 @@ async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
             }
         }
         "write" => {
-            let (key, value, prev_seq) = write_args(args)?;
-            let result = match prev_seq {
-                Some(prev_seq) => {
-                    client
-                        .write_if(key.as_bytes(), Some(value.as_bytes()), prev_seq)
-                        .await
-                }
-                None => client.write(key.as_bytes(), Some(value.as_bytes())).await,
-            };
-            print_seq(result);
+            let [key, value] = fixed_args(args, "write <key> <value>")?;
+            print_seq(client.write(key.as_bytes(), Some(value.as_bytes())).await);
         }
         "delete" => {
-            let key = delete_args(args)?;
-            let result = client.write(key.as_bytes(), None).await;
-            print_seq(result);
+            let [key] = fixed_args(args, "delete <key>")?;
+            print_seq(client.write(key.as_bytes(), None).await);
         }
         "read" => {
             let [key] = fixed_args(args, "read <key>")?;
@@ -171,28 +162,6 @@ async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
     Ok(true)
 }
 
-/// `write <key> <value> [prev_seq]`.
-fn write_args(args: &[String]) -> Result<(&str, &str, Option<u64>), String> {
-    match args {
-        [key, value] => Ok((key, value, None)),
-        [key, value, prev_seq] => Ok((key, value, Some(parse_seq(prev_seq)?))),
-        _ => Err("usage: write <key> <value> [prev_seq]".to_string()),
-    }
-}
-
-/// `delete <key> [prev_seq]`.
-fn delete_args(args: &[String]) -> Result<&str, String> {
-    match args {
-        [key] => Ok(key),
-        _ => Err("usage: delete <key>".to_string()),
-    }
-}
-
-fn parse_seq(s: &str) -> Result<u64, String> {
-    s.parse()
-        .map_err(|_| format!("{s:?} is not a valid sequence number"))
-}
-
 /// Matches `args` against exactly `N` positional arguments, so each
 /// command above can destructure straight into named bindings instead of
 /// indexing.
@@ -227,12 +196,8 @@ fn print_help() {
     println!(
         "{}",
         [
-            "write <key> <value> [prev_seq]   write value to key, retrying until it lands;",
-            "                                  with prev_seq, fails instead if the key has",
-            "                                  moved on from it",
+            "write <key> <value>             write value to key, retrying until it lands",
             "delete <key>                     same as write, with no value",
-            "update <key> <value>             read-modify-write: retries a bounded number of",
-            "                                  times if another write races it",
             "read <key>                       linearizable read",
             "read_stale <key>                 read from whichever node is currently connected,",
             "                                  without confirming it still leads",
