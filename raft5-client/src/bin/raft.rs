@@ -145,14 +145,8 @@ async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
             print_read(client.read_stale(key.as_bytes()).await);
         }
         "add_server" => {
-            let [server_id, peer_address, client_address] = fixed_args(
-                args,
-                "add_server <server_id> <peer_address> <client_address>",
-            )?;
-            match client
-                .add_server(server_id, peer_address, client_address)
-                .await
-            {
+            let [client_address] = fixed_args(args, "add_server <client_address>")?;
+            match client.add_server(client_address).await {
                 Ok(()) => println!("ok"),
                 Err(e) => println!("error: {e}"),
             }
@@ -242,8 +236,7 @@ fn print_help() {
             "read <key>                       linearizable read",
             "read_stale <key>                 read from whichever node is currently connected,",
             "                                  without confirming it still leads",
-            "add_server <id> <peer_addr> <client_addr>",
-            "                                  add a server as a learner",
+            "add_server <client_addr>         add a server as a learner, by its client address",
             "remove_server <id>               remove a server",
             "bootstrap <id>                   form a single-node cluster around <id>",
             "endpoints                        list the client API addresses this client knows of",

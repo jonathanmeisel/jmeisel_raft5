@@ -245,7 +245,6 @@ impl Follower {
         // so the next one starts fresh at the base timeout again.
         common.election_attempt = 0;
         common.publish_role(follower_handle(&common, None));
-        info!("Transitioned to follower: term {}", common.current_term);
 
         // A learner -- or a server that has been removed from the
         // configuration -- never campaigns, so it gets no election timer

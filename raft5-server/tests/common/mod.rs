@@ -231,8 +231,6 @@ pub async fn add_server(client: &Arc<Client>, node: &TestNode) {
     loop {
         let resp = client
             .add_server(AddServerRequest {
-                server_id: server_id.to_string(),
-                address: format!("http://{}", node.peer_addr),
                 client_address: format!("http://{}", node.client_addr),
             })
             .await;

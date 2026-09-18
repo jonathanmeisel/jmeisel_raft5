@@ -135,6 +135,52 @@ fn kv_service(log: Arc<RaftLog>, node_id: &str) -> (KvService, watch::Receiver<R
     )
 }
 
+/// A `KvService` for `node_id`, served on a real listener at an ephemeral
+/// port -- for tests where another node's `add_server` has to reach it
+/// for real (it calls `GetConfig` on whatever `client_address` it's
+/// given). The peer address stays a fake, unreachable one, same as
+/// `kv_service` -- nothing here needs this node reachable over the
+/// *peer* API, only the client one. Torn down by cancelling the
+/// returned token.
+async fn spawn_reachable_kv_service(
+    log: Arc<RaftLog>,
+    node_id: &str,
+) -> (std::net::SocketAddr, CancellationToken) {
+    let raft::NodeHandles { common, .. } = raft::Common::new(
+        node_id.to_string(),
+        Arc::clone(&log),
+        CancellationToken::new(),
+    )
+    .unwrap();
+    let client_handle = common.client_handle();
+    tokio::spawn(raft::run(common));
+
+    let addr = free_local_addr();
+    let identity = ClusterMember {
+        server_id: node_id.to_string(),
+        address: format!("http://127.0.0.1:1/{node_id}"),
+        client_address: format!("http://{addr}"),
+        voting: true,
+    };
+    let svc = KvService::new(Store::new(log), identity, client_handle);
+
+    let cancel = CancellationToken::new();
+    let shutdown = cancel.clone();
+    tokio::spawn(async move {
+        let _ = tonic::transport::Server::builder()
+            .add_service(crate::pb::raft5::client::kv_server::KvServer::new(svc))
+            .serve_with_shutdown(addr, shutdown.cancelled())
+            .await;
+    });
+
+    (addr, cancel)
+}
+
+fn free_local_addr() -> std::net::SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    listener.local_addr().expect("local_addr")
+}
+
 #[tokio::test]
 async fn write_then_read_round_trips_through_kv_service() {
     let (log, path) = open_temp();
@@ -340,11 +386,11 @@ async fn writes_to_a_non_leader_come_back_as_not_leader() {
         other => panic!("expected NotLeader, got {other:?}"),
     }
 
-    // Membership changes take the same route.
+    // Membership changes take the same route. The leader check happens
+    // before `add_server` ever dials `client_address`, so a bystander
+    // answers `NotLeader` without needing it to be reachable.
     let add = svc
         .add_server(Request::new(AddServerRequest {
-            server_id: "new".to_string(),
-            address: "http://127.0.0.1:9999".to_string(),
             client_address: "http://127.0.0.1:9998".to_string(),
         }))
         .await
@@ -402,11 +448,14 @@ async fn add_server_then_remove_server_round_trip_through_the_kv_service() {
     let (log, path) = open_temp();
     let svc = leader_kv_service(Arc::clone(&log), "solo").await;
 
+    // A real, reachable "new" node -- `add_server` now calls `GetConfig`
+    // on it to learn its identity, so it has to actually answer.
+    let (new_log, new_path) = open_temp();
+    let (new_addr, new_cancel) = spawn_reachable_kv_service(new_log, "new").await;
+
     let resp = svc
         .add_server(Request::new(AddServerRequest {
-            server_id: "new".to_string(),
-            address: "http://127.0.0.1:9999".to_string(),
-            client_address: "http://127.0.0.1:9998".to_string(),
+            client_address: format!("http://{new_addr}"),
         }))
         .await
         .unwrap()
@@ -420,8 +469,8 @@ async fn add_server_then_remove_server_round_trip_through_the_kv_service() {
     assert!(config.contains("new"));
     assert!(!config.is_voter("new"), "added as a learner");
 
-    // "new" is unreachable, so it never catches up and stays a
-    // learner -- which means the cluster still commits on "solo"
+    // "new"'s peer address is unreachable, so it never catches up and
+    // stays a learner -- which means the cluster still commits on "solo"
     // alone, and can therefore also remove it again.
     let removed = svc
         .remove_server(Request::new(RemoveServerRequest {
@@ -437,7 +486,9 @@ async fn add_server_then_remove_server_round_trip_through_the_kv_service() {
     let config = ClusterConfig::from_bytes(&log.current_config().unwrap().unwrap()).unwrap();
     assert!(!config.contains("new"));
 
+    new_cancel.cancel();
     cleanup(&path);
+    cleanup(&new_path);
 }
 
 /// The operator-facing half of bootstrapping: the node names *itself*
@@ -497,10 +548,11 @@ async fn get_config_reports_empty_before_bootstrap_and_the_new_member_right_afte
         vec!["solo"]
     );
 
+    let (new_log, new_path) = open_temp();
+    let (new_addr, new_cancel) = spawn_reachable_kv_service(new_log, "new").await;
+
     svc.add_server(Request::new(AddServerRequest {
-        server_id: "new".to_string(),
-        address: "http://127.0.0.1:9999".to_string(),
-        client_address: "http://127.0.0.1:9998".to_string(),
+        client_address: format!("http://{new_addr}"),
     }))
     .await
     .unwrap();
@@ -517,7 +569,9 @@ async fn get_config_reports_empty_before_bootstrap_and_the_new_member_right_afte
         .expect("new member should be visible");
     assert!(!new_member.voting, "added as a learner");
 
+    new_cancel.cancel();
     cleanup(&path);
+    cleanup(&new_path);
 }
 
 /// Bootstrapping is irreversible, so a client that names the wrong

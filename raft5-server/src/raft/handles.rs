@@ -8,6 +8,7 @@
 //! `pub(super)` rather than private because `raft` itself and the role
 //! modules construct them -- nothing outside `raft` can touch them.
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -70,6 +71,28 @@ pub enum RoleHandle {
     /// database lock -- would outlive the node forever. Overwriting the
     /// channel with a variant that holds nothing drops the cycle.
     Stopped,
+}
+
+impl fmt::Display for RoleHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RoleHandle::Leader(h) => write!(f, "Leader (term {})", h.term),
+            RoleHandle::Follower(h) => match &h.leader_hint {
+                Some(hint) => write!(f, "Follower (leader hint: {hint})"),
+                None => write!(f, "Follower (no leader known)"),
+            },
+            RoleHandle::Candidate => write!(f, "Candidate"),
+            RoleHandle::Uninitialized => write!(f, "Uninitialized"),
+            RoleHandle::Starting => write!(f, "Starting"),
+            RoleHandle::Stopped => write!(f, "Stopped"),
+        }
+    }
+}
+
+impl fmt::Debug for RoleHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
 }
 
 #[derive(Clone)]

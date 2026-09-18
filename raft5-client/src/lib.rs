@@ -339,23 +339,18 @@ impl Client {
         .await
     }
 
-    /// Adds a server to the cluster, at the addresses its peer and
-    /// client APIs are reachable on. It joins as a non-voting learner
-    /// and is promoted automatically once it has caught up (Raft
-    /// §4.2.1), so this one call is the whole operation.
+    /// Adds a server to the cluster, at the address its client API is
+    /// reachable on. The leader dials it for its own `GetConfig` to learn
+    /// its server id and peer address, so the caller only has to know
+    /// where its client API is. It joins as a non-voting learner and is
+    /// promoted automatically once it has caught up (Raft §4.2.1), so
+    /// this one call is the whole operation.
     ///
     /// Returns once the change has committed. Only one membership change
     /// may be in flight at a time; a call that collides with another is
     /// retried like any other transient refusal.
-    pub async fn add_server(
-        &self,
-        server_id: &str,
-        peer_address: &str,
-        client_address: &str,
-    ) -> Result<(), Error> {
+    pub async fn add_server(&self, client_address: &str) -> Result<(), Error> {
         let request = AddServerRequest {
-            server_id: server_id.to_string(),
-            address: peer_address.to_string(),
             client_address: client_address.to_string(),
         };
         self.change_config(|mut kv: Kv| {

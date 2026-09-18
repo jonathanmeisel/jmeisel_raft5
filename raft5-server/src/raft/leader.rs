@@ -117,10 +117,6 @@ impl Leader {
             read_quorum_rx,
             noop_seq,
         }));
-        info!(
-            "Transitioned to leader: term {}, index {}",
-            common.current_term, noop_seq
-        );
 
         let tick_timer = spawn_leader_tick(common.cancel_token(), common.event_tx.clone());
 

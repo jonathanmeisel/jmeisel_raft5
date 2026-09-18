@@ -35,6 +35,8 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
+use raft5_shared::raft5::client::kv_client::KvClient;
+use tonic::transport::Endpoint;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::pb::raft5::client::kv_server::Kv;
@@ -103,6 +105,15 @@ fn client_err(e: RaftError) -> Result<PbRaftError, Status> {
         },
         e => return Err(raft_err(e)),
     })
+}
+
+/// A refusal wrapped the same way `propose` wraps one -- for callers
+/// (`add_server`'s leader check) that need to answer this way before
+/// ever reaching `propose` itself.
+fn not_leader_response(e: RaftError) -> Result<Response<ConfigChangeResponse>, Status> {
+    Ok(Response::new(ConfigChangeResponse {
+        result: Some(config_change_response::Result::Error(client_err(e)?)),
+    }))
 }
 
 /// Why a write didn't happen. `RaftError` covers everything the state
@@ -266,6 +277,22 @@ impl KvService {
             }),
         }))
     }
+
+    async fn get_config_internal(&self) -> Result<Vec<ClusterMember>, StorageError> {
+        let bytes = self.store.run(RaftLog::current_config).await?;
+
+        let members = match bytes {
+            Some(bytes) => {
+                ClusterConfig::from_bytes(&bytes)
+                    .map_err(|_| StorageError::Corrupt("stored cluster config was corrupt"))?
+                    .members
+            }
+            // Not bootstrapped or added to a cluster yet -- not an error,
+            // just an empty membership list.
+            None => Vec::new(),
+        };
+        Ok(members)
+    }
 }
 
 #[tonic::async_trait]
@@ -345,13 +372,64 @@ impl Kv for KvService {
         request: Request<AddServerRequest>,
     ) -> Result<Response<ConfigChangeResponse>, Status> {
         let req = request.into_inner();
+
+        // Checked before the round trip below, not just inside `propose`:
+        // a follower has no business dialing the new server only to find
+        // out afterwards that it should have answered `NotLeader` and
+        // sent the caller elsewhere. `propose` still re-checks at the
+        // point of committing, since leadership can change during the
+        // round trip.
+        if let Err(e) = require_leader(&self.client_handle.role()) {
+            return not_leader_response(e);
+        }
+
+        // First, send an RPC to the new server to get its configuration.
+        let mut client = KvClient::new(
+            Endpoint::from_shared(req.client_address.clone())
+                .map_err(|e| Status::invalid_argument(format!("invalid address: {e}")))?
+                .connect_lazy(),
+        );
+        let response = client
+            .get_config(Request::new(GetConfigRequest {}))
+            .await
+            .map_err(|e| {
+                Status::unavailable(format!(
+                    "failed to reach the new server at {}: {e}",
+                    req.client_address
+                ))
+            })?
+            .into_inner();
+
+        let identity = response.identity.ok_or_else(|| {
+            Status::invalid_argument("the new server did not report its identity")
+        })?;
+        if !response.members.is_empty() {
+            return Err(Status::invalid_argument(
+                "the new server is already part of a cluster",
+            ));
+        }
+
+        // Check that the new server hasn't already been added to the configuration.
+        let members = self.get_config_internal().await.map_err(storage_err)?;
+        for member in &members {
+            if member.server_id == identity.server_id
+                || member.address == identity.address
+                || member.client_address == identity.client_address
+            {
+                return Err(Status::invalid_argument(format!(
+                    "the newly added server: {:?} conflicts with an existing server in the configuration: {:?}",
+                    member, identity
+                )));
+            }
+        }
+
         // Added as a learner, not a voter: see `ConfigChange::AddServer`.
         // It is promoted automatically once it has caught up, so from a
         // client's point of view this one call is the whole operation.
         self.propose(ConfigChange::AddServer {
-            server_id: req.server_id,
-            address: req.address,
-            client_address: req.client_address,
+            server_id: identity.server_id,
+            address: identity.address,
+            client_address: identity.client_address,
         })
         .await
     }
@@ -400,26 +478,12 @@ impl Kv for KvService {
         &self,
         _request: Request<GetConfigRequest>,
     ) -> Result<Response<GetConfigResponse>, Status> {
-        let bytes = self
-            .store
-            .run(RaftLog::current_config)
-            .await
-            .map_err(storage_err)?;
+        let members = self.get_config_internal().await.map_err(storage_err)?;
 
-        let members = match bytes {
-            Some(bytes) => {
-                ClusterConfig::from_bytes(&bytes)
-                    .map_err(|e| {
-                        Status::internal(format!("stored cluster config was corrupt: {e}"))
-                    })?
-                    .members
-            }
-            // Not bootstrapped or added to a cluster yet -- not an error,
-            // just an empty membership list.
-            None => Vec::new(),
-        };
-
-        Ok(Response::new(GetConfigResponse { members }))
+        Ok(Response::new(GetConfigResponse {
+            identity: Some(self.identity.clone()),
+            members,
+        }))
     }
 }
 

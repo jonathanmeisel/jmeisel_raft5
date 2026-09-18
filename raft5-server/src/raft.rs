@@ -170,7 +170,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use log::warn;
+use log::{info, warn};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -689,7 +689,10 @@ impl Common {
     }
 
     fn publish_role(&self, handle: RoleHandle) {
-        self.role_tx.send_replace(handle);
+        let previous_handle = self.role_tx.send_replace(handle);
+        if previous_handle.to_string() != self.role_tx.borrow().to_string() {
+            info!("role changed: {}", *self.role_tx.borrow());
+        }
     }
 
     /// The next thing this node's event loop should do.

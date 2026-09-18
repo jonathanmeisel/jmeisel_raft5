@@ -59,10 +59,6 @@ impl TestNode {
     fn url(&self) -> String {
         format!("http://{}", self.client_addr)
     }
-
-    fn peer_url(&self) -> String {
-        format!("http://{}", self.peer_addr)
-    }
 }
 
 impl Drop for TestNode {
@@ -136,14 +132,8 @@ async fn a_client_seeded_with_a_follower_finds_the_leader() {
 
     let admin = Client::new([n1.url()]).unwrap();
     bootstrap(&admin, "n1").await;
-    admin
-        .add_server("n2", &n2.peer_url(), &n2.url())
-        .await
-        .unwrap();
-    admin
-        .add_server("n3", &n3.peer_url(), &n3.url())
-        .await
-        .unwrap();
+    admin.add_server(&n2.url()).await.unwrap();
+    admin.add_server(&n3.url()).await.unwrap();
 
     let client = Client::new([n3.url()]).unwrap();
     client.write(b"k", Some(b"v")).await.unwrap();
@@ -170,14 +160,8 @@ async fn a_seed_that_leaves_the_cluster_is_dropped() {
 
     let client = Client::new([n1.url(), n2.url(), n3.url()]).unwrap();
     bootstrap(&client, "n1").await;
-    client
-        .add_server("n2", &n2.peer_url(), &n2.url())
-        .await
-        .unwrap();
-    client
-        .add_server("n3", &n3.peer_url(), &n3.url())
-        .await
-        .unwrap();
+    client.add_server(&n2.url()).await.unwrap();
+    client.add_server(&n3.url()).await.unwrap();
     assert_eq!(client.endpoints().len(), 3);
 
     client.remove_server("n3").await.unwrap();

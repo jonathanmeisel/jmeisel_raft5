@@ -72,7 +72,6 @@ impl Campaign {
                 common.current_term += 1;
                 common.voted_for = Some(common.node_id.clone());
                 common.persist_term_state().await;
-                info!("Transitioned to candidate: term {}", common.current_term);
                 common.current_term
             }
             CampaignKind::PreVote => common.current_term + 1,

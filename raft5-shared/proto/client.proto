@@ -109,13 +109,11 @@ message ReadOk {
 }
 
 message AddServerRequest {
-  string server_id = 1;
-  // The new server's peer API address, for the rest of the cluster to
-  // replicate to it, and its client API address, for clients to find it
-  // once it is a member. Both end up in the configuration verbatim (see
-  // ClusterMember).
-  string address = 2;
-  string client_address = 3;
+  // The new server's client API address. The leader dials it for its
+  // `GetConfig` to learn the rest of what the configuration needs --
+  // server_id and peer API address -- straight from the server being
+  // added, rather than trusting the caller to supply them correctly.
+  string client_address = 1;
 }
 
 message RemoveServerRequest {
@@ -139,5 +137,6 @@ message ConfigChangeResponse {
 message GetConfigRequest {}
 
 message GetConfigResponse {
-  repeated raft5.cluster.ClusterMember members = 1;
+  raft5.cluster.ClusterMember identity = 1;
+  repeated raft5.cluster.ClusterMember members = 2;
 }
