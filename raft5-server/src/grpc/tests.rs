@@ -36,6 +36,62 @@ fn cleanup(path: &std::path::Path) {
     let _ = std::fs::remove_dir_all(path);
 }
 
+/// A write of `key`, conditional on it currently being at
+/// `previous_seq` -- 0 meaning it must have no value.
+async fn write(
+    svc: &KvService,
+    key: &[u8],
+    value: Option<&[u8]>,
+    previous_seq: u64,
+) -> write_response::Result {
+    svc.write(Request::new(WriteRequest {
+        key: key.to_vec(),
+        value: value.map(<[u8]>::to_vec),
+        previous_seq: Some(previous_seq),
+    }))
+    .await
+    .unwrap()
+    .into_inner()
+    .result
+    .expect("a write response always carries a result")
+}
+
+/// The seq a write that was expected to succeed committed at.
+fn committed(result: write_response::Result) -> u64 {
+    match result {
+        write_response::Result::Seq(seq) => seq,
+        other => panic!("expected the write to commit, got {other:?}"),
+    }
+}
+
+/// What a write that was expected to be refused conflicted with: the
+/// key's actual seq, or `None` for a write still in flight.
+fn conflict(result: write_response::Result) -> Option<u64> {
+    match result {
+        write_response::Result::Error(PbRaftError {
+            kind: Some(raft_error::Kind::Conflict(conflict)),
+        }) => conflict.actual_seq,
+        other => panic!("expected a conflict, got {other:?}"),
+    }
+}
+
+/// A (stale, so always answerable) read of `key`: what it holds, and
+/// the seq that is the precondition for writing it next.
+async fn read(svc: &KvService, key: &[u8]) -> ReadOk {
+    let resp = svc
+        .read(Request::new(ReadRequest {
+            key: key.to_vec(),
+            linearizable: false,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    match resp.result {
+        Some(read_response::Result::Ok(ok)) => ok,
+        other => panic!("expected a successful read, got {other:?}"),
+    }
+}
+
 /// A `KvService` on a node that has been bootstrapped into a
 /// single-node cluster and has won its election -- i.e. one that can
 /// actually serve a write.
@@ -84,18 +140,7 @@ async fn write_then_read_round_trips_through_kv_service() {
     let (log, path) = open_temp();
     let svc = leader_kv_service(log, "kv-test").await;
 
-    let write_resp = svc
-        .write(Request::new(WriteRequest {
-            key: b"hello".to_vec(),
-            value: Some(b"world".to_vec()),
-        }))
-        .await
-        .unwrap()
-        .into_inner();
-    let seq = match write_resp.result {
-        Some(write_response::Result::Seq(seq)) => seq,
-        other => panic!("expected Seq, got {other:?}"),
-    };
+    let seq = committed(write(&svc, b"hello", Some(b"world"), 0).await);
     assert_eq!(
         seq, 3,
         "seq 1 is the bootstrap config entry and seq 2 the leader's no-op"
@@ -125,32 +170,132 @@ async fn write_with_no_value_deletes_and_read_reflects_it() {
     let (log, path) = open_temp();
     let svc = leader_kv_service(log, "kv-test").await;
 
-    svc.write(Request::new(WriteRequest {
+    let seq = committed(write(&svc, b"k", Some(b"v"), 0).await);
+    committed(write(&svc, b"k", None, seq).await);
+
+    assert_eq!(read(&svc, b"k").await.value, None);
+
+    cleanup(&path);
+}
+
+/// The point of the whole thing: a write names the version it was
+/// written against, and one that names a version the key has moved
+/// past is refused rather than silently clobbering it.
+#[tokio::test]
+async fn a_write_must_name_the_version_it_was_written_against() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+
+    let first = committed(write(&svc, b"k", Some(b"one"), 0).await);
+
+    // Someone who still thinks the key is empty is told what it is at
+    // instead, and has written nothing.
+    assert_eq!(
+        conflict(write(&svc, b"k", Some(b"two"), 0).await),
+        Some(first)
+    );
+    assert_eq!(read(&svc, b"k").await.value, Some(b"one".to_vec()));
+
+    // Naming the current version goes through, and invalidates itself
+    // for the next caller.
+    let second = committed(write(&svc, b"k", Some(b"two"), first).await);
+    assert_eq!(read(&svc, b"k").await.value, Some(b"two".to_vec()));
+    assert_eq!(
+        conflict(write(&svc, b"k", Some(b"three"), first).await),
+        Some(second),
+        "the seq that was current a moment ago is exactly the stale one"
+    );
+
+    cleanup(&path);
+}
+
+/// A deleted key is indistinguishable from one that was never written
+/// (storage's `get_latest` collapses the two), and the precondition
+/// follows that: seq 0 means "no value", whichever way it got there.
+#[tokio::test]
+async fn a_deleted_key_takes_a_precondition_of_zero_again() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+
+    let seq = committed(write(&svc, b"k", Some(b"v"), 0).await);
+    committed(write(&svc, b"k", None, seq).await);
+
+    assert_eq!(read(&svc, b"k").await.value, None);
+    committed(write(&svc, b"k", Some(b"again"), 0).await);
+    assert_eq!(read(&svc, b"k").await.value, Some(b"again".to_vec()));
+
+    cleanup(&path);
+}
+
+/// Between an entry being appended and being applied, `latest` still
+/// answers for the version the in-flight write is replacing -- so a
+/// precondition checked against it in that window would be checked
+/// against a value that is already gone. The key's claim is what
+/// closes the window, so a second write is refused outright rather
+/// than validated against a stale answer.
+#[tokio::test]
+async fn a_key_with_a_write_in_flight_refuses_another() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+
+    let claim = svc.claim(b"k").expect("the key starts unclaimed");
+    assert_eq!(
+        conflict(write(&svc, b"k", Some(b"v"), 0).await),
+        None,
+        "a conflict with a write in flight can say nothing about the key"
+    );
+    assert!(
+        svc.claim(b"other").is_some(),
+        "a claim is per key, not a lock on the whole store"
+    );
+
+    drop(claim);
+    committed(write(&svc, b"k", Some(b"v"), 0).await);
+
+    cleanup(&path);
+}
+
+/// A client that disconnects mid-write leaves an entry that may still
+/// commit. Releasing its key at that point would let the next write's
+/// precondition be checked against a `latest` that is about to change,
+/// so the claim outlives the request -- and, just as importantly, does
+/// not outlive the entry.
+#[tokio::test]
+async fn a_cancelled_write_releases_its_key_only_once_the_entry_lands() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+
+    // Dropped before it can finish. Where exactly it got to is up to
+    // the scheduler; what must hold either way is that the key ends up
+    // released and the store ends up consistent with whatever landed.
+    let cancelled = svc.write(Request::new(WriteRequest {
         key: b"k".to_vec(),
         value: Some(b"v".to_vec()),
-    }))
-    .await
-    .unwrap();
+        previous_seq: Some(0),
+    }));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_micros(1), cancelled)
+            .await
+            .is_err(),
+        "the write should not have had time to finish"
+    );
 
-    svc.write(Request::new(WriteRequest {
-        key: b"k".to_vec(),
-        value: None,
-    }))
-    .await
-    .unwrap();
-
-    let read_resp = svc
-        .read(Request::new(ReadRequest {
-            key: b"k".to_vec(),
-            linearizable: false,
-        }))
-        .await
-        .unwrap()
-        .into_inner();
-    match read_resp.result {
-        Some(read_response::Result::Ok(ok)) => assert_eq!(ok.value, None),
-        other => panic!("expected Ok, got {other:?}"),
+    // A leaked claim would fail this until the deadline: the follow-up
+    // write can never be committed while the key is still held.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        // Seq 0 if the cancelled write never landed, its seq if it did.
+        let previous_seq = read(&svc, b"k").await.seq;
+        match write(&svc, b"k", Some(b"after"), previous_seq).await {
+            write_response::Result::Seq(_) => break,
+            other => assert!(
+                std::time::Instant::now() < deadline,
+                "the cancelled write never released its key: {other:?}"
+            ),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    assert_eq!(read(&svc, b"k").await.value, Some(b"after".to_vec()));
 
     cleanup(&path);
 }
@@ -188,16 +333,8 @@ async fn writes_to_a_non_leader_come_back_as_not_leader() {
     let (log, path) = open_temp();
     let (svc, _role_rx) = kv_service(log, "bystander");
 
-    let resp = svc
-        .write(Request::new(WriteRequest {
-            key: b"k".to_vec(),
-            value: Some(b"v".to_vec()),
-        }))
-        .await
-        .unwrap()
-        .into_inner();
-    match resp.result {
-        Some(write_response::Result::Error(e)) => {
+    match write(&svc, b"k", Some(b"v"), 0).await {
+        write_response::Result::Error(e) => {
             assert!(matches!(e.kind, Some(raft_error::Kind::NotLeader(_))));
         }
         other => panic!("expected NotLeader, got {other:?}"),

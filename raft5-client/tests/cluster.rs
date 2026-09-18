@@ -191,3 +191,151 @@ async fn a_seed_that_leaves_the_cluster_is_dropped() {
         "a removed server should not still be in the endpoint list: {endpoints:?}"
     );
 }
+
+/// The read-modify-write the store cannot do on its own: the closure
+/// sees what the key holds and what it returns is written back, so a
+/// counter can be incremented without ever reading a value someone else
+/// has already replaced.
+#[tokio::test]
+async fn update_reads_modifies_and_writes() {
+    let n1 = TestNode::start("n1");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "n1").await;
+
+    for expected in ["1", "2", "3"] {
+        client.update(b"hits", increment).await.unwrap();
+        assert_eq!(
+            client.read(b"hits").await.unwrap().value.as_deref(),
+            Some(expected.as_bytes())
+        );
+    }
+}
+
+/// The point of all of it. Every one of these increments reads a value
+/// that another task is racing to replace; a single lost update -- one
+/// write landing on top of a version it never saw -- and the total
+/// comes up short.
+#[tokio::test]
+async fn concurrent_updates_do_not_lose_writes() {
+    const TASKS: u64 = 4;
+    const PER_TASK: u64 = 5;
+
+    let n1 = TestNode::start("n1");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "n1").await;
+
+    let mut tasks = Vec::new();
+    for _ in 0..TASKS {
+        let client = client.clone();
+        tasks.push(tokio::spawn(async move {
+            for _ in 0..PER_TASK {
+                // Deciding what to do about a lost race is the caller's
+                // job, and with four writers on one key it happens
+                // often: here, simply go round again.
+                loop {
+                    match client.update(b"hits", increment).await {
+                        Ok(_) => break,
+                        Err(raft5_client::Error::Conflict { .. }) => continue,
+                        Err(e) => panic!("increment failed: {e}"),
+                    }
+                }
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.expect("an updating task panicked");
+    }
+
+    let total = client.read(b"hits").await.unwrap();
+    assert_eq!(
+        total.value.as_deref(),
+        Some((TASKS * PER_TASK).to_string().as_bytes()),
+        "every increment must be there, or a write landed on a version it never read"
+    );
+}
+
+/// A closure that gives up takes the whole update with it: there is
+/// nothing sensible to write, so nothing is written.
+#[tokio::test]
+async fn a_closure_that_fails_writes_nothing() {
+    let n1 = TestNode::start("n1");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "n1").await;
+    client.write(b"k", Some(b"before")).await.unwrap();
+
+    let err = client
+        .update(b"k", |_| Err("not today".into()))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, raft5_client::Error::Update(e) if e.to_string() == "not today"),
+        "expected the closure's own error, got {err}"
+    );
+    assert_eq!(
+        client.read(b"k").await.unwrap().value.as_deref(),
+        Some(&b"before"[..])
+    );
+}
+
+/// Returning no value deletes the key, so the same call that updates a
+/// value can also decide it should no longer exist.
+#[tokio::test]
+async fn an_update_returning_nothing_deletes_the_key() {
+    let n1 = TestNode::start("n1");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "n1").await;
+    client.write(b"k", Some(b"v")).await.unwrap();
+
+    client.update(b"k", |_| Ok(None)).await.unwrap();
+    assert_eq!(client.read(b"k").await.unwrap().value, None);
+}
+
+/// A key that is rewritten under the client on every single attempt is
+/// not a race it can win by trying harder, so it stops and says so
+/// rather than looping forever.
+// Multi-threaded so the closure can block on a write of its own: the
+// update API is deliberately synchronous, and this is the one test that
+// needs to do something asynchronous from inside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_update_that_never_wins_gives_up() {
+    let n1 = TestNode::start("n1");
+    let client = Client::new([n1.url()]).unwrap();
+    let interloper = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "n1").await;
+    client.write(b"k", Some(b"0")).await.unwrap();
+
+    let attempts = std::sync::atomic::AtomicU64::new(0);
+    let err = client
+        .update(b"k", |current| {
+            // Runs *after* the read this attempt will be validated
+            // against, so every attempt is doomed before it is sent.
+            let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(interloper.write(b"k", Some(n.to_string().as_bytes())))
+            })?;
+            Ok(current.map(<[u8]>::to_vec))
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, raft5_client::Error::Conflict { .. }),
+        "expected to give up with a conflict, got {err}"
+    );
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        raft5_client::MAX_UPDATE_ATTEMPTS as u64,
+        "it should have used every attempt before giving up"
+    );
+}
+
+/// Parses the counter `key` currently holds (absent counts as zero) and
+/// hands back one more than that.
+fn increment(current: Option<&[u8]>) -> Result<Option<Vec<u8>>, raft5_client::BoxError> {
+    let n: u64 = match current {
+        Some(bytes) => std::str::from_utf8(bytes)?.parse()?,
+        None => 0,
+    };
+    Ok(Some((n + 1).to_string().into_bytes()))
+}

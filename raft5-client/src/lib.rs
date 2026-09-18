@@ -59,6 +59,13 @@ const RETRY_DELAY: Duration = Duration::from_millis(20);
 /// to be leading.
 const CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How many times [`Client::update`] re-reads and re-runs its closure
+/// after losing a race for the key. Each attempt is a fresh read of a
+/// value someone else just wrote, so losing several in a row means real
+/// contention on that one key rather than bad luck, and the caller is
+/// better placed than this library to decide what to do about it.
+pub const MAX_UPDATE_ATTEMPTS: usize = 5;
+
 #[derive(Debug)]
 pub enum Error {
     /// A seed address (or one the cluster advertised) that isn't a
@@ -74,6 +81,15 @@ pub enum Error {
     /// refused outright. The text is the last refusal or transport
     /// failure seen.
     Unavailable(String),
+    /// The key was written by someone else between this client reading
+    /// it and writing it back, so nothing was written. `actual_seq` is
+    /// what the key is at instead (0 if it has no value). From
+    /// [`Client::update`] this means the key stayed contended for every
+    /// attempt.
+    Conflict { actual_seq: u64 },
+    /// The closure passed to [`Client::update`] failed; nothing was
+    /// written.
+    Update(BoxError),
 }
 
 impl std::fmt::Display for Error {
@@ -83,11 +99,23 @@ impl std::fmt::Display for Error {
             Self::NoSeeds => write!(f, "a client needs at least one seed address"),
             Self::InvalidArgument(why) => write!(f, "{why}"),
             Self::Unavailable(why) => write!(f, "the cluster could not serve the request: {why}"),
+            Self::Conflict { actual_seq } => {
+                write!(
+                    f,
+                    "the key changed under this write; it is at seq {actual_seq}"
+                )
+            }
+            Self::Update(e) => write!(f, "the update closure failed: {e}"),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+/// Whatever the caller's own [`Client::update`] closure failed with --
+/// the client has no idea what it was trying to do, only that it
+/// couldn't.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// What a key currently holds. `seq` is the sequence number the value
 /// was written at; a key that has never been written (or has been
@@ -110,6 +138,11 @@ enum Reply<T> {
     /// yet, a membership change still in flight, a leader that hasn't
     /// yet committed an entry from its own term.
     Unavailable(String),
+    /// A write whose precondition didn't hold. `Some(seq)` is what the
+    /// key is actually at, which no amount of retrying will change --
+    /// only re-reading and deciding again will. `None` means another
+    /// write to the key is still in flight, which is transient.
+    Conflict(Option<u64>),
 }
 
 impl<T> Reply<T> {
@@ -121,6 +154,7 @@ impl<T> Reply<T> {
             Some(raft_error::Kind::Unavailable(why) | raft_error::Kind::Timeout(why)) => {
                 Self::Unavailable(why)
             }
+            Some(raft_error::Kind::Conflict(conflict)) => Self::Conflict(conflict.actual_seq),
             None => Self::Unavailable("the node refused without saying why".to_string()),
         }
     }
@@ -158,18 +192,96 @@ impl Client {
     }
 
     /// Writes `value` to `key`, or deletes `key` if `value` is `None`,
-    /// returning the sequence number it committed at. Returns only once
-    /// the write has been committed *and* applied, so a read that
-    /// follows it reflects it.
+    /// whatever it currently holds, returning the sequence number it
+    /// committed at. Returns only once the write has been committed
+    /// *and* applied, so a read that follows it reflects it.
+    ///
+    /// Every write the cluster accepts is conditional (see
+    /// [`update`], which this is the degenerate case of), so an
+    /// unconditional overwrite is a read and a write: under contention
+    /// it may lose the race and try again.
     ///
     /// A write interrupted by a lost connection may be retried after it
     /// has already committed, since nothing tells the client which of the
     /// two happened. The retry rewrites the same key with the same value,
     /// so the only trace of it is a second sequence number.
+    ///
+    /// [`update`]: Client::update
     pub async fn write(&self, key: &[u8], value: Option<&[u8]>) -> Result<u64, Error> {
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            match self.update(key, |_| Ok(value.map(<[u8]>::to_vec))).await {
+                // Unlike a real update there is nothing here to
+                // reconsider -- the value doesn't depend on what the key
+                // held -- so losing the race just means going round
+                // again, to the same deadline the rest of the client
+                // works to.
+                Err(Error::Conflict { .. }) if Instant::now() < deadline => {}
+                other => return other,
+            }
+        }
+    }
+
+    /// Reads `key`, hands what it holds to `f`, and writes back what `f`
+    /// returns (`None` deletes the key) -- but only if nothing else
+    /// wrote the key in between. This is the read-modify-write the store
+    /// itself cannot do: a counter increment, an entry appended to a
+    /// list, a flag flipped only if it was where the caller last saw it.
+    ///
+    /// Losing that race is not a failure: the value is re-read, `f` runs
+    /// again on what is there now, and the write is retried, up to
+    /// [`MAX_UPDATE_ATTEMPTS`] times. So `f` may run more than once and
+    /// should compute rather than act -- anything it does besides
+    /// returning a value will happen again on the next attempt. Its
+    /// argument is `None` when the key currently has no value, and
+    /// returning `Err` abandons the update without writing anything.
+    ///
+    /// ```no_run
+    /// # async fn f(client: raft5_client::Client) -> Result<(), raft5_client::Error> {
+    /// client
+    ///     .update(b"hits", |current| {
+    ///         let n: u64 = match current {
+    ///             Some(bytes) => std::str::from_utf8(bytes)?.parse()?,
+    ///             None => 0,
+    ///         };
+    ///         Ok(Some((n + 1).to_string().into_bytes()))
+    ///     })
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn update<F>(&self, key: &[u8], mut f: F) -> Result<u64, Error>
+    where
+        F: FnMut(Option<&[u8]>) -> Result<Option<Vec<u8>>, BoxError>,
+    {
+        let mut last_conflict = 0;
+        for _ in 0..MAX_UPDATE_ATTEMPTS {
+            let current = self.read(key).await?;
+            let next = f(current.value.as_deref()).map_err(Error::Update)?;
+            // Seq 0 is the cluster's own "this key has no value", so the
+            // seq a read hands back is the precondition, unchanged,
+            // whether or not the key was there.
+            match self.write_at(key, next.as_deref(), current.seq).await {
+                Err(Error::Conflict { actual_seq }) => last_conflict = actual_seq,
+                other => return other,
+            }
+        }
+        Err(Error::Conflict {
+            actual_seq: last_conflict,
+        })
+    }
+
+    /// One conditional write: applied only if `key` is still at
+    /// `previous_seq` (0 meaning it has no value).
+    async fn write_at(
+        &self,
+        key: &[u8],
+        value: Option<&[u8]>,
+        previous_seq: u64,
+    ) -> Result<u64, Error> {
         let request = WriteRequest {
             key: key.to_vec(),
             value: value.map(<[u8]>::to_vec),
+            previous_seq: Some(previous_seq),
         };
         self.call(|mut kv: Kv| {
             let request = request.clone();
@@ -272,7 +384,9 @@ impl Client {
             match kv.bootstrap(request.clone()).await {
                 Ok(resp) => match config_reply(resp) {
                     Reply::Ok(()) => return Ok(()),
-                    Reply::NotLeader(_) | Reply::Unavailable(_) => {
+                    // A membership change has no key and so no
+                    // precondition; `Conflict` is unreachable here.
+                    Reply::NotLeader(_) | Reply::Unavailable(_) | Reply::Conflict(_) => {
                         last = Some(format!("{} refused to bootstrap", node.key));
                     }
                 },
@@ -341,6 +455,19 @@ impl Client {
                         // The leader is the right node; the cluster just
                         // isn't ready to answer yet. Keep the connection.
                         Ok(Ok(Reply::Unavailable(why))) => last = Some(why),
+                        // Nothing to decide: the key is at a version this
+                        // write wasn't written against, and re-sending it
+                        // unchanged can only be refused again. Whoever
+                        // built the request has to look again.
+                        Ok(Ok(Reply::Conflict(Some(actual_seq)))) => {
+                            return Err(Error::Conflict { actual_seq });
+                        }
+                        // A conflict with a write still in flight, on the
+                        // other hand, says nothing about the key yet --
+                        // it resolves on its own once that one lands.
+                        Ok(Ok(Reply::Conflict(None))) => {
+                            last = Some(format!("{} has this key mid-write", leader.key));
+                        }
                         Ok(Err(status)) => {
                             self.router.forget(&leader.key);
                             last = Some(format!("{}: {status}", leader.key));

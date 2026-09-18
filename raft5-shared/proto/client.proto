@@ -49,6 +49,7 @@ message RaftError {
     NotLeader not_leader = 1;
     string unavailable = 2; // e.g. no leader elected yet
     string timeout = 3;
+    WriteConflict conflict = 4;
   }
 }
 
@@ -57,9 +58,30 @@ message NotLeader {
   optional string leader_hint = 1;
 }
 
+// A write whose precondition didn't hold. Nothing was written.
+message WriteConflict {
+  // What the key is actually at (0 = no value), for a `previous_seq`
+  // that simply didn't match. Unset when the conflict was with another
+  // write to the same key still in flight: nothing settled can be said
+  // about the key until that one lands, and -- unlike a mismatch --
+  // re-sending the same request shortly may well succeed.
+  optional uint64 actual_seq = 1;
+}
+
 message WriteRequest {
   bytes key = 1;
   optional bytes value = 2; // unset = delete
+  // The sequence number this key must currently be at for the write to
+  // apply, which is what makes a read-modify-write possible: the caller
+  // names the version it read, and a write that raced it is refused
+  // (with `WriteConflict`) rather than silently overwriting.
+  //
+  // Unset -- or 0, the value `ReadOk.seq` already carries for a key
+  // with no value -- requires that the key currently have no value, so
+  // a caller can echo back the seq it read without special-casing a key
+  // that wasn't there. Every write carries a precondition; there is no
+  // unconditional overwrite.
+  optional uint64 previous_seq = 3;
 }
 
 message WriteResponse {

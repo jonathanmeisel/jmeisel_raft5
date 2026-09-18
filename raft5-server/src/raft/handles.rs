@@ -101,10 +101,12 @@ pub struct LeaderHandle {
     /// and why `run` publishes over it before the node goes away.
     pub(super) role_rx: watch::Receiver<RoleHandle>,
     /// Whether this leader currently holds a quorum of leases -- see the
-    /// module doc. Not consumed by anything yet (no read path exists that
-    /// would check it), but published either way so one can be added
-    /// later without touching this plumbing.
+    /// module doc. What a linearizable read checks before answering.
     pub(super) read_quorum_rx: watch::Receiver<bool>,
+    /// This leader's own no-op entry (Raft §5.4.2), against which
+    /// `applied_rx` says whether `latest` is complete -- see
+    /// `await_caught_up`.
+    pub(super) noop_seq: u64,
 }
 
 impl LeaderHandle {
@@ -180,6 +182,32 @@ impl LeaderHandle {
     /// the module doc.
     pub fn has_read_quorum(&self) -> bool {
         *self.read_quorum_rx.borrow()
+    }
+
+    /// Waits until `latest` reflects every write that any previous
+    /// leader committed.
+    ///
+    /// A leader inherits a log tail it has not applied yet, and
+    /// `latest` only ever reflects *applied* entries (see
+    /// `RaftLog::apply_committed`). Winning an election says nothing
+    /// about having caught up on it: this leader may be moments away
+    /// from applying a write it cannot yet see. Its own no-op sits
+    /// after everything it inherited, so once that has been applied, so
+    /// has everything before it.
+    ///
+    /// Anything that answers from `latest` and claims to be current --
+    /// a linearizable read, the precondition on a conditional write --
+    /// has to wait here first, or it will answer from a gap it doesn't
+    /// know it has. `has_read_quorum` asks a different question (is
+    /// this node still the leader *now*) and neither implies the other.
+    ///
+    /// Waiting rather than refusing because this resolves on its own,
+    /// usually within a heartbeat of the election: a caller told "not
+    /// yet" would only sleep and ask again. It still returns
+    /// `NotLeader` rather than waiting forever if this node is deposed
+    /// before it gets there.
+    pub async fn await_caught_up(&self) -> Result<(), RaftError> {
+        self.await_applied(self.noop_seq).await.map(|_| ())
     }
 }
 
@@ -310,3 +338,6 @@ impl ClientHandle {
         rx.await.map_err(|_| RaftError::Disconnected)?
     }
 }
+
+#[cfg(test)]
+mod tests;

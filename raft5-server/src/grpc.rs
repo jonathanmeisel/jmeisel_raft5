@@ -10,6 +10,19 @@
 //! guarantee, so it is served locally by whoever receives it. `Bootstrap`
 //! is the other: by definition it targets a node with no leader at all.
 //!
+//! Every write is conditional: it names the sequence number the key must
+//! currently be at, and is refused with `WriteConflict` if it isn't.
+//! That is what makes a read-modify-write possible over a protocol where
+//! a client's read and its write are two separate round trips. Two
+//! things have to hold for that check to mean anything, and
+//! `conditional_write` below establishes both before it appends: this
+//! leader's `latest` must be complete (`LeaderHandle::await_caught_up`),
+//! and no other write to the same key may be in flight
+//! (`KvService::claim`). Between an entry being appended and being
+//! applied, `latest` still answers for the version that entry replaces,
+//! and a precondition checked against it then would be checked against
+//! a value that is already gone.
+//!
 //! `RaftPeerService` is the peer-facing half, served on a separate port
 //! since the two have different network exposure. It forwards every call
 //! straight into a live `raft::RaftPeerHandle` -- whichever role the
@@ -19,13 +32,17 @@
 //! check and the actual install both happen on the far side of
 //! `RaftPeerHandle`, same as everything else.
 
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::pb::raft5::client::kv_server::Kv;
 use crate::pb::raft5::client::{
     AddServerRequest, BootstrapRequest, ConfigChangeResponse, GetConfigRequest, GetConfigResponse,
     NotLeader, RaftError as PbRaftError, ReadOk, ReadRequest, ReadResponse, RemoveServerRequest,
-    WriteRequest, WriteResponse, config_change_response, raft_error, read_response, write_response,
+    WriteConflict, WriteRequest, WriteResponse, config_change_response, raft_error, read_response,
+    write_response,
 };
 use crate::pb::raft5::cluster::{ClusterConfig, ClusterMember};
 use crate::pb::raft5::raft::raft_peer_server::RaftPeer;
@@ -88,6 +105,52 @@ fn client_err(e: RaftError) -> Result<PbRaftError, Status> {
     })
 }
 
+/// Why a write didn't happen. `RaftError` covers everything the state
+/// machine can refuse; the rest is specific to a conditional write and
+/// never reaches the state machine at all.
+enum WriteError {
+    Raft(RaftError),
+    /// The precondition didn't hold. `Some(seq)` is what the key is
+    /// actually at (0 for no value); `None` means another write to the
+    /// same key is still in flight, so there is nothing settled to
+    /// report yet.
+    Conflict(Option<u64>),
+    Internal(Status),
+}
+
+impl From<RaftError> for WriteError {
+    fn from(e: RaftError) -> Self {
+        Self::Raft(e)
+    }
+}
+
+/// `WriteError` as the client protocol carries it -- `client_err` for
+/// the state machine's half, and a conflict is an ordinary answer rather
+/// than an error, since it says something specific about the key.
+fn write_err(e: WriteError) -> Result<PbRaftError, Status> {
+    match e {
+        WriteError::Raft(e) => client_err(e),
+        WriteError::Conflict(actual_seq) => Ok(PbRaftError {
+            kind: Some(raft_error::Kind::Conflict(WriteConflict { actual_seq })),
+        }),
+        WriteError::Internal(status) => Err(status),
+    }
+}
+
+/// One write's exclusive claim on a key, released on drop. Held from
+/// before the write's precondition is checked until its entry has been
+/// applied -- see the module doc for why that whole span matters.
+struct KeyGuard {
+    writing: Arc<Mutex<HashSet<Vec<u8>>>>,
+    key: Vec<u8>,
+}
+
+impl Drop for KeyGuard {
+    fn drop(&mut self) {
+        self.writing.lock().unwrap().remove(&self.key);
+    }
+}
+
 /// The leader handle for this node, or the error to hand back to the
 /// client instead. Every write and every membership change goes through
 /// here: a follower answers `NotLeader` with whatever hint it has rather
@@ -109,6 +172,10 @@ pub struct KvService {
     /// it is called and where its peers should dial it.
     identity: ClusterMember,
     client_handle: ClientHandle,
+    /// Keys with a write in flight on this node. A synchronous mutex
+    /// with no `.await` under it, same discipline as
+    /// `raft::peer::PeerConnections`.
+    writing: Arc<Mutex<HashSet<Vec<u8>>>>,
 }
 
 impl KvService {
@@ -117,7 +184,66 @@ impl KvService {
             store,
             identity,
             client_handle,
+            writing: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Claims `key` for one write, or `None` if another write already
+    /// holds it. `HashSet::insert` reporting whether it added anything
+    /// is the test-and-set: two writes racing here cannot both win.
+    fn claim(&self, key: &[u8]) -> Option<KeyGuard> {
+        self.writing
+            .lock()
+            .unwrap()
+            .insert(key.to_vec())
+            .then(|| KeyGuard {
+                writing: Arc::clone(&self.writing),
+                key: key.to_vec(),
+            })
+    }
+
+    /// Checks a write's precondition and, if it holds, appends it.
+    ///
+    /// The append runs in a task of its own that owns the key's claim,
+    /// so that the claim is released when the *entry* resolves rather
+    /// than when this call does. A client that disconnects mid-write
+    /// leaves an entry that may still commit, and releasing its key at
+    /// that point would let the next write's precondition be checked
+    /// against a `latest` that is about to change.
+    async fn conditional_write(&self, req: WriteRequest) -> Result<u64, WriteError> {
+        let leader = require_leader(&self.client_handle.role())?;
+        // The precondition is checked against `latest`, so a leader that
+        // may still be missing entries has no business checking it.
+        // Before the claim rather than after, so that a leader still
+        // catching up isn't holding keys no one can write while it does.
+        leader.await_caught_up().await?;
+
+        // Claimed before the precondition is read, so that two writes
+        // racing here cannot both find the key at the version each is
+        // about to supersede.
+        let guard = self.claim(&req.key).ok_or(WriteError::Conflict(None))?;
+
+        let key = req.key.clone();
+        let actual = self
+            .store
+            .run(move |log| log.get_latest(&key))
+            .await
+            .map_err(|e| WriteError::Raft(RaftError::Storage(e)))?
+            // Seq 0 is never assigned, so it doubles as "this key has no
+            // value" -- the same sentinel `read` hands back, which is
+            // what lets a client echo a seq it read straight back here.
+            .map_or(0, |(seq, _)| seq);
+        if actual != req.previous_seq.unwrap_or(0) {
+            return Err(WriteError::Conflict(Some(actual)));
+        }
+
+        tokio::spawn(async move {
+            let _guard = guard;
+            leader.append_log(&req.key, req.value.as_deref()).await
+        })
+        .await
+        .map_err(|e| WriteError::Internal(Status::internal(format!("the write task failed: {e}"))))?
+        .map_err(WriteError::Raft)
     }
 
     /// Shared body of `add_server`/`remove_server`: both are the same
@@ -148,13 +274,7 @@ impl Kv for KvService {
         &self,
         request: Request<WriteRequest>,
     ) -> Result<Response<WriteResponse>, Status> {
-        let req = request.into_inner();
-
-        let result = async {
-            let leader = require_leader(&self.client_handle.role())?;
-            leader.append_log(&req.key, req.value.as_deref()).await
-        }
-        .await;
+        let result = self.conditional_write(request.into_inner()).await;
 
         Ok(Response::new(WriteResponse {
             result: Some(match result {
@@ -162,7 +282,7 @@ impl Kv for KvService {
                 // *and* been applied, so the moment a client sees this
                 // seq, a read on this node reflects it.
                 Ok(seq) => write_response::Result::Seq(seq),
-                Err(e) => write_response::Result::Error(client_err(e)?),
+                Err(e) => write_response::Result::Error(write_err(e)?),
             }),
         }))
     }
@@ -173,12 +293,18 @@ impl Kv for KvService {
         // A linearizable read has to come from a leader that still holds
         // a quorum of leases: without one it may have been deposed
         // already and simply not know it yet, and would answer from state
-        // a newer leader has moved past. A stale read asks for none of
-        // that and is served locally by whoever received it.
+        // a newer leader has moved past. It also has to come from one
+        // that has caught up on the log it inherited, or it would answer
+        // from a gap in the other direction -- a write it has committed
+        // but not yet applied. A stale read asks for none of that and is
+        // served locally by whoever received it.
         if req.linearizable {
             let held = match require_leader(&self.client_handle.role()) {
-                Ok(leader) if leader.has_read_quorum() => Ok(()),
-                Ok(_) => Err(RaftError::NotLeader { leader_hint: None }),
+                Ok(leader) => match leader.await_caught_up().await {
+                    Ok(()) if leader.has_read_quorum() => Ok(()),
+                    Ok(()) => Err(RaftError::NotLeader { leader_hint: None }),
+                    Err(e) => Err(e),
+                },
                 Err(e) => Err(e),
             };
             if let Err(e) = held {

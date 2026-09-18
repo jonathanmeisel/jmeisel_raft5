@@ -115,6 +115,7 @@ impl Leader {
             applied_rx,
             role_rx,
             read_quorum_rx,
+            noop_seq,
         }));
         info!(
             "Transitioned to leader: term {}, index {}",

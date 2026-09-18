@@ -254,14 +254,35 @@ pub async fn add_server(client: &Arc<Client>, node: &TestNode) {
 /// isn't (yet) the leader -- e.g. immediately after `bootstrap`, before
 /// the resulting single-node election has finished. Returns the seq the
 /// write committed at.
+///
+/// Every write is conditional, so this reads the key first to find the
+/// version to write against, exactly as `raft5_client::Client::update`
+/// does; a write that loses that race is retried along with everything
+/// else.
 pub async fn write(client: &Arc<Client>, key: &[u8], value: Option<&[u8]>) -> u64 {
     let mut client = (**client).clone();
     let until = deadline();
     loop {
+        let current = client
+            .read(ReadRequest {
+                key: key.to_vec(),
+                linearizable: false,
+            })
+            .await
+            .expect("read RPC failed")
+            .into_inner();
+        // Seq 0 -- what a key with no value reads as -- is also the
+        // precondition for writing one that isn't there.
+        let previous_seq = match current.result {
+            Some(read_response::Result::Ok(ok)) => ok.seq,
+            other => panic!("expected a successful read, got {other:?}"),
+        };
+
         let resp = client
             .write(WriteRequest {
                 key: key.to_vec(),
                 value: value.map(<[u8]>::to_vec),
+                previous_seq: Some(previous_seq),
             })
             .await
             .expect("write RPC failed");
