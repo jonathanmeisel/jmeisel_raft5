@@ -270,6 +270,28 @@ impl Client {
         })
     }
 
+    /// Writes `value` to `key` only if it is still at `previous_seq` (0
+    /// meaning it has no value), returning the sequence number the write
+    /// committed at.
+    ///
+    /// Unlike [`write`], which retries an unconditional overwrite until it
+    /// lands, this fails outright -- as [`Error::Conflict`] -- the moment
+    /// someone else gets there first, since only the caller knows whether
+    /// the new value is still right in that case. Use [`update`] instead
+    /// when the new value depends on the old one rather than on a seq the
+    /// caller already has in hand.
+    ///
+    /// [`write`]: Client::write
+    /// [`update`]: Client::update
+    pub async fn write_if(
+        &self,
+        key: &[u8],
+        value: Option<&[u8]>,
+        previous_seq: u64,
+    ) -> Result<u64, Error> {
+        self.write_at(key, value, previous_seq).await
+    }
+
     /// One conditional write: applied only if `key` is still at
     /// `previous_seq` (0 meaning it has no value).
     async fn write_at(

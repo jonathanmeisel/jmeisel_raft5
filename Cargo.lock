@@ -984,10 +984,12 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 name = "raft5-client"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "env_logger",
  "log",
  "raft5-server",
  "raft5-shared",
+ "shell-words",
  "tokio",
  "tokio-util",
  "tonic",
@@ -1120,6 +1122,12 @@ dependencies = [
  "log",
  "xxhash-rust",
 ]
+
+[[package]]
+name = "shell-words"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
 
 [[package]]
 name = "signal-hook-registry"
