@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["raft5-server", "raft5-shared", "raft5-client"]
+members = ["raft5-server", "raft5-shared", "raft5-client", "raft5-lock"]
 
 [workspace.dependencies]
 tonic = "0.14"
