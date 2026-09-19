@@ -11,8 +11,8 @@
 mod common;
 
 use common::{
-    TestNode, add_server, assert_eventually_reads, bootstrap, find_leader, read, wait_until_voter,
-    write,
+    TestNode, add_server, assert_eventually_reads, begin, bootstrap, buffer_write, commit,
+    find_leader, read, wait_until_voter, write,
 };
 
 /// Three fresh nodes (ids `{prefix}1`/`{prefix}2`/`{prefix}3`), formed
@@ -108,4 +108,58 @@ async fn a_restarted_node_catches_up_after_a_leadership_change() {
     let c1 = n1.client();
     assert_eventually_reads(&c1, b"first", b"one", seq1).await;
     assert_eventually_reads(&c1, b"second", b"two", seq2).await;
+}
+
+/// A transaction across a real three-node cluster: every key it wrote
+/// replicates to every node, and arrives at the same sequence number on
+/// each -- one entry, so there is only one for them to arrive at.
+#[tokio::test]
+async fn a_transaction_replicates_all_of_its_keys_at_one_seq() {
+    let (n1, n2, n3) = three_node_cluster("t").await;
+    let c1 = n1.client();
+
+    write(&c1, b"alice", Some(b"10")).await;
+    write(&c1, b"bob", Some(b"10")).await;
+
+    let txn = begin(&c1, std::time::Duration::from_secs(5)).await;
+    buffer_write(&c1, &txn, b"alice", Some(b"9")).await;
+    buffer_write(&c1, &txn, b"bob", Some(b"11")).await;
+    let seq = commit(&c1, &txn).await.expect("the transaction should commit");
+
+    // Committed *and* applied by the time commit returns, so the leader
+    // already reads back both keys.
+    assert_eq!(read(&c1, b"alice").await, Some(b"9".to_vec()));
+    assert_eq!(read(&c1, b"bob").await, Some(b"11".to_vec()));
+
+    // And the whole entry reaches the others, not half of it.
+    for node in [&n2, &n3] {
+        assert_eventually_reads(&node.client(), b"alice", b"9", seq).await;
+        assert_eventually_reads(&node.client(), b"bob", b"11", seq).await;
+    }
+}
+
+/// A transaction belongs to the leader that opened it. Kill that leader
+/// mid-transaction and the commit fails rather than half-applying -- and
+/// because nothing was appended, the keys are exactly as they were.
+#[tokio::test]
+async fn a_transaction_does_not_survive_the_death_of_its_leader() {
+    let (mut n1, n2, n3) = three_node_cluster("d").await;
+    let leader_is_n1 = find_leader(&[&n1, &n2, &n3]).await.id == n1.id;
+    assert!(leader_is_n1, "the bootstrapped node should still be leading");
+
+    let c1 = n1.client();
+    write(&c1, b"k", Some(b"original")).await;
+
+    let txn = begin(&c1, std::time::Duration::from_secs(5)).await;
+    buffer_write(&c1, &txn, b"k", Some(b"never")).await;
+
+    n1.shut_down().await;
+
+    // Whoever leads now has never heard of this transaction, and the key
+    // is untouched: nothing was appended, because nothing is appended
+    // until commit.
+    let survivor = find_leader(&[&n2, &n3]).await;
+    assert_eq!(read(&survivor.client(), b"k").await, Some(b"original".to_vec()));
+    // ...and it is writable again, so no lock outlived the leader.
+    write(&survivor.client(), b"k", Some(b"after")).await;
 }

@@ -1,7 +1,7 @@
 //! Raft log storage backed by `fjall`.
 //!
 //! Layout (three keyspaces):
-//! - `log`:    seq (u64 BE)                -> encoded (term, kind, key, value) entry
+//! - `log`:    seq (u64 BE)                -> encoded (term, payload) entry
 //! - `latest`: key                          -> encoded (seq, value) *committed* current state
 //! - `meta`:   small set of fixed keys: the floor (`floor_seq`,
 //!   `floor_term`) — the seq/term of the highest entry no longer physically
@@ -12,11 +12,15 @@
 //!   reason) — plus `base_config`, the last cluster configuration to fall
 //!   out of `log` via `compact` or `install_snapshot` (see `config_at`).
 //!
-//! Not every log entry is key/value data: `EntryKind` also covers a
+//! Not every log entry is key/value data: `EntryPayload` also covers a
 //! leader's term-opening no-op and the cluster configuration. Those
 //! occupy a seq and take part in log matching and commitment like
 //! anything else, but `apply_committed` skips them, so they never reach
 //! `latest`.
+//!
+//! A `Write` payload carries *any number* of mutations, and they apply to
+//! `latest` together: one entry, one seq, one batch. That is what makes a
+//! multi-key transaction possible -- see `apply_committed`.
 //!
 //! `append` only ever writes to `log`; `apply_committed` is the *only*
 //! thing that ever writes to `latest`, and it's driven by Raft's own commit
@@ -61,6 +65,27 @@
 //! never need term information that far back — comparisons only ever happen
 //! in the live tail.
 //!
+//! Note on visibility, since a multi-key entry invites the question: a
+//! `fjall` batch is atomic in that all of it lands or none of it does,
+//! but *not* in that readers see it all at once. `Batch::commit` takes
+//! its sequence number before it walks the batch inserting into
+//! memtables, and a point read runs at `SeqNo::MAX`, so a reader on
+//! another thread can catch a batch halfway through.
+//!
+//! That is fine here, and no barrier is needed, because nothing reads
+//! more than one key of `latest` in one operation. `get_latest` reads a
+//! single key, which has no "half" to see. `export_snapshot` iterates the
+//! whole keyspace, but `Keyspace::iter` opens a snapshot nonce and reads
+//! at that instant, so it is already pinned to one point in time.
+//!
+//! What this does mean is that two *separate* reads straddling a commit
+//! see two different points in time -- read `a`, then read `b`, and the
+//! entry that wrote both may have landed in between. That is not a torn
+//! batch, it is two reads at two times, and no storage-level lock can fix
+//! it. A caller that needs several keys as of one instant takes read
+//! locks on them, which is what the transactions in `grpc::KvService` are
+//! for.
+//!
 //! Note on memory: `compact`, `apply_committed`, and `install_snapshot`
 //! operate on fjall iterators, which pin a consistent point-in-time view as
 //! of iterator creation — so it's safe to interleave reading from one with
@@ -72,6 +97,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch};
+use serde::{Deserialize, Serialize};
 
 mod codec;
 mod meta;
@@ -101,6 +127,17 @@ pub enum StorageError {
     Db(fjall::Error),
     Io(std::io::Error),
     Corrupt(&'static str),
+    /// A row would not decode, or would not encode. Decoding is where
+    /// this is actually interesting: it is how a corrupt, truncated or
+    /// foreign row is refused rather than half-read. Bounds checking used
+    /// to be this module's own job and is now the decoder's.
+    Codec(postcard::Error),
+}
+
+impl From<postcard::Error> for StorageError {
+    fn from(e: postcard::Error) -> Self {
+        StorageError::Codec(e)
+    }
 }
 
 impl From<fjall::Error> for StorageError {
@@ -121,6 +158,7 @@ impl std::fmt::Display for StorageError {
             StorageError::Db(e) => write!(f, "fjall error: {e}"),
             StorageError::Io(e) => write!(f, "io error: {e}"),
             StorageError::Corrupt(msg) => write!(f, "corrupt storage: {msg}"),
+            StorageError::Codec(e) => write!(f, "corrupt storage: {e}"),
         }
     }
 }
@@ -129,37 +167,81 @@ impl std::error::Error for StorageError {}
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 
-/// What a log entry does. Only `Put` and `Delete` carry key/value state
-/// machine data; the rest occupy a sequence number -- so they participate
-/// in log matching and commitment like anything else -- but are skipped by
+/// One key's change within a `Write` entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mutation {
+    pub key: Vec<u8>,
+    /// `None` is a delete: a tombstone in `log`, and an outright removal
+    /// from `latest` when it applies.
+    pub value: Option<Vec<u8>>,
+}
+
+impl Mutation {
+    pub fn new(key: impl Into<Vec<u8>>, value: Option<impl Into<Vec<u8>>>) -> Self {
+        Self {
+            key: key.into(),
+            value: value.map(Into::into),
+        }
+    }
+}
+
+/// What a log entry does. Only `Write` carries key/value state machine
+/// data; the rest occupy a sequence number -- so they participate in log
+/// matching and commitment like anything else -- but are skipped by
 /// `apply_committed` and so never reach `latest`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EntryKind {
-    /// A write: `key` and `value` both set.
-    Put,
-    /// A delete tombstone: `key` set, `value` unset.
-    Delete,
-    /// A new leader's term-opening no-op: neither `key` nor `value` set.
-    /// Exists purely so a leader can commit an entry from its *own* term
-    /// before advancing the commit index over anything inherited from a
-    /// previous one (Raft §5.4.2, Figure 8).
+///
+/// This is an enum with its data inside it rather than a kind tag beside
+/// an always-present key and value, because the two are not independent:
+/// there is no such thing as a `NoOp` with a key, and a `Write` without
+/// mutations is not a write. Saying so in the type means no caller has to
+/// remember it.
+///
+/// **The variant order is the on-disk format.** Postcard writes an enum's
+/// discriminant by position, so variants may be appended but never
+/// reordered or removed -- see `codec`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EntryPayload {
+    /// One or more mutations that apply to `latest` as a single unit.
+    /// A transaction is exactly this: every key it wrote, in one entry, at
+    /// one seq.
+    Write(Vec<Mutation>),
+    /// A new leader's term-opening no-op. Exists purely so a leader can
+    /// commit an entry from its *own* term before advancing the commit
+    /// index over anything inherited from a previous one (Raft §5.4.2,
+    /// Figure 8).
     NoOp,
-    /// A cluster configuration: `value` holds the encoded membership,
-    /// `key` unset. Unlike every other kind, this one takes effect when
-    /// it is *appended* rather than when it commits -- see
-    /// `current_config`.
-    Config,
+    /// A cluster configuration, encoded. Unlike every other payload, this
+    /// one takes effect when it is *appended* rather than when it
+    /// commits -- see `current_config`.
+    Config(Vec<u8>),
+}
+
+impl EntryPayload {
+    /// How many mutations this payload carries -- zero for anything that
+    /// isn't a write. Exists for the follower's check that a replicated
+    /// entry arrived with all of them; see `raft::follower`.
+    /// The mutations this payload carries, empty for anything that isn't
+    /// a write.
+    pub fn writes(&self) -> &[Mutation] {
+        match self {
+            EntryPayload::Write(writes) => writes,
+            EntryPayload::NoOp | EntryPayload::Config(_) => &[],
+        }
+    }
+
+    pub fn mutation_count(&self) -> usize {
+        match self {
+            EntryPayload::Write(writes) => writes.len(),
+            EntryPayload::NoOp | EntryPayload::Config(_) => 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogEntry {
     pub seq: u64,
     pub term: u64,
-    pub kind: EntryKind,
-    /// Empty unless `kind` is `Put` or `Delete`.
-    pub key: Vec<u8>,
-    /// `Some` only when `kind` is `Put`.
-    pub value: Option<Vec<u8>>,
+    pub payload: EntryPayload,
 }
 
 /// Append-only, gap-free, per-key-compactable log on top of `fjall`.
@@ -170,14 +252,6 @@ pub struct RaftLog {
     meta: Keyspace,
     next_seq: Mutex<u64>,
 }
-
-// --- key/value encoding helpers -------------------------------------------
-
-// Log entry encoding: [term (8 bytes BE)][tag (1 byte)][key_len (4 bytes BE)][key][value?]
-
-// Latest value encoding: [seq (8 bytes BE)][value] -- always a real value:
-// `latest` never stores a delete marker (see the module doc), so unlike
-// `log`'s entry encoding there's no tag byte to distinguish.
 
 // --- implementation ---------------------------------------------------
 
@@ -246,59 +320,60 @@ impl RaftLog {
         Ok(())
     }
 
-    /// Atomically assign the next sequence number and write the entry at
-    /// the given Raft term. `value = None` records a delete tombstone for
-    /// `key` rather than removing any row. Returns the assigned sequence
-    /// number.
+    /// Atomically assign the next sequence number and write a one-key
+    /// write at the given Raft term. `value = None` records a delete
+    /// tombstone for `key` rather than removing any row. Returns the
+    /// assigned sequence number.
+    ///
+    /// The degenerate case of `append_writes`, kept because most callers
+    /// -- and every single-key client write -- genuinely have one pair.
+    pub fn append(&self, term: u64, key: &[u8], value: Option<&[u8]>) -> Result<u64> {
+        self.append_writes(term, vec![Mutation::new(key.to_vec(), value.map(<[u8]>::to_vec))])
+    }
+
+    /// Append `writes` as *one* entry at one sequence number, so they
+    /// commit together and apply together. This is what a transaction
+    /// commits through.
     ///
     /// Only ever touches `log` -- an appended entry isn't durable in the
     /// Raft sense yet (it can still be rolled back by `truncate_from` if a
     /// leader change happens before it commits), so it must not be
     /// visible via `get_latest` until `apply_committed` confirms it. See
     /// the module doc.
-    pub fn append(&self, term: u64, key: &[u8], value: Option<&[u8]>) -> Result<u64> {
-        let kind = if value.is_some() {
-            EntryKind::Put
-        } else {
-            EntryKind::Delete
-        };
-        self.append_entry(term, kind, key, value)
+    pub fn append_writes(&self, term: u64, writes: Vec<Mutation>) -> Result<u64> {
+        self.append_payload(term, &EntryPayload::Write(writes))
     }
 
-    /// Append a leader's term-opening no-op (see `EntryKind::NoOp`).
+    /// Append a leader's term-opening no-op (see `EntryPayload::NoOp`).
     pub fn append_noop(&self, term: u64) -> Result<u64> {
-        self.append_entry(term, EntryKind::NoOp, &[], None)
+        self.append_payload(term, &EntryPayload::NoOp)
     }
 
-    /// Append a new cluster configuration (see `EntryKind::Config`).
+    /// Append a new cluster configuration (see `EntryPayload::Config`).
     /// `config` is opaque here -- storage neither parses nor validates
     /// it, it only guarantees the bytes come back out of `current_config`
     /// once this entry is the newest `Config` in the log.
     pub fn append_config(&self, term: u64, config: &[u8]) -> Result<u64> {
-        self.append_entry(term, EntryKind::Config, &[], Some(config))
+        self.append_payload(term, &EntryPayload::Config(config.to_vec()))
     }
 
-    /// `append`, but with the entry's kind given explicitly rather than
-    /// inferred from `value`. A follower replaying entries from a leader
-    /// must use this: inferring would flatten every replicated non-state
-    /// entry (a `NoOp`, say) into a `Put` or `Delete`, so the follower's
-    /// copy of the log would no longer be byte-identical to the leader's.
-    pub fn append_entry(
-        &self,
-        term: u64,
-        kind: EntryKind,
-        key: &[u8],
-        value: Option<&[u8]>,
-    ) -> Result<u64> {
+    /// Append an entry whose payload is given whole. A follower replaying
+    /// entries from a leader must use this: anything that reconstructed
+    /// the payload from parts would risk flattening a replicated entry
+    /// into something else -- a `NoOp` into a write, or a multi-key write
+    /// into a single one -- and the follower's copy of the log would stop
+    /// matching the leader's.
+    pub fn append_payload(&self, term: u64, payload: &EntryPayload) -> Result<u64> {
+        // Encoded before the lock is taken: it can fail, and failing
+        // while holding `next_seq` would be a needlessly wide blast
+        // radius for something that never touches sequencing.
+        let encoded = encode_log_entry(term, payload)?;
+
         let mut guard = self.next_seq.lock().unwrap();
         let seq = *guard;
 
         let mut batch = self.db.batch();
-        batch.insert(
-            &self.log,
-            be_bytes(seq),
-            encode_log_entry(term, kind, key, value),
-        );
+        batch.insert(&self.log, be_bytes(seq), encoded);
         batch.commit()?;
 
         // Only advance now that the write has durably succeeded, so a
@@ -368,6 +443,18 @@ impl RaftLog {
     /// delete is permanent -- there's nothing left for anything to ever
     /// need to distinguish it from "never written".
     ///
+    /// An entry's mutations all go into the same batch, and the batch is
+    /// only ever flushed *between* entries, so a `Write` is applied whole
+    /// or not at all -- which is what lets a transaction's keys share one
+    /// seq and one moment of becoming durable.
+    ///
+    /// The cost is that one entry with more mutations than `WRITE_CHUNK`
+    /// makes a batch larger than the chunking is meant to allow. That is
+    /// the right way round -- splitting it would break the guarantee the
+    /// entry exists to provide -- and the size is bounded before anything
+    /// reaches the log, by the cap the client-facing service puts on a
+    /// transaction.
+    ///
     /// Resumes from the previously persisted watermark rather than
     /// rescanning from 0 every time, same discipline as `compact`; a
     /// no-op if `up_to_seq` doesn't advance past it.
@@ -387,22 +474,31 @@ impl RaftLog {
             let (k, v) = item.into_inner()?;
             let seq = from_be_bytes(&k)?;
             let entry = decode_log_entry(&v)?;
-            match entry.kind {
-                EntryKind::Put => batch.insert(
-                    &self.latest,
-                    &entry.key,
-                    encode_latest_value(seq, &entry.value.unwrap_or_default()),
-                ),
-                EntryKind::Delete => batch.remove(&self.latest, &entry.key),
+            match entry.payload {
+                EntryPayload::Write(writes) => {
+                    for m in writes {
+                        match m.value {
+                            Some(value) => batch.insert(
+                                &self.latest,
+                                &m.key,
+                                encode_latest_value(seq, &value)?,
+                            ),
+                            None => batch.remove(&self.latest, &m.key),
+                        }
+                        pending += 1;
+                    }
+                }
                 // Not state machine data -- these still consume a seq and
                 // move the applied watermark, they just have no effect
                 // here. A `Config` in particular is deliberately *not*
                 // mirrored into `latest`: it takes effect on append, so
                 // `current_config` reads it straight out of `log`, where
                 // it is visible before it commits.
-                EntryKind::NoOp | EntryKind::Config => continue,
+                EntryPayload::NoOp | EntryPayload::Config(_) => continue,
             }
-            pending += 1;
+            // Deliberately outside the mutation loop: flushing between
+            // two mutations of one entry is exactly the tear this is
+            // meant to prevent.
             self.flush_if_full(&mut batch, &mut pending)?;
         }
 
@@ -423,9 +519,7 @@ impl RaftLog {
             out.push(LogEntry {
                 seq,
                 term: entry.term,
-                kind: entry.kind,
-                key: entry.key,
-                value: entry.value,
+                payload: entry.payload,
             });
         }
         Ok(out)
@@ -486,9 +580,8 @@ impl RaftLog {
     pub fn config_at(&self, as_of_seq: u64) -> Result<Option<Vec<u8>>> {
         for item in self.log.range(..=be_bytes(as_of_seq)).rev() {
             let (_k, v) = item.into_inner()?;
-            let entry = decode_log_entry(&v)?;
-            if entry.kind == EntryKind::Config {
-                return Ok(Some(entry.value.unwrap_or_default()));
+            if let EntryPayload::Config(config) = decode_log_entry(&v)?.payload {
+                return Ok(Some(config));
             }
         }
         self.base_config()
@@ -508,6 +601,7 @@ impl RaftLog {
     /// Flush `batch` (replacing it with a fresh one) once it reaches
     /// `WRITE_CHUNK` pending writes, bounding a batch's memory regardless of
     /// how large the overall operation is.
+    ///
     fn flush_if_full(&self, batch: &mut OwnedWriteBatch, pending: &mut usize) -> Result<()> {
         if *pending >= WRITE_CHUNK {
             std::mem::replace(batch, self.db.batch()).commit()?;
@@ -559,12 +653,12 @@ impl RaftLog {
             let (k, v) = item.into_inner()?;
             let entry = decode_log_entry(&v)?;
             floor_term = Some(entry.term);
-            if entry.kind == EntryKind::Config {
+            if let EntryPayload::Config(config) = entry.payload {
                 // About to delete the entry holding this configuration --
                 // preserve it in `meta` so `current_config` can still
                 // answer once nothing in `log` carries it. Ascending
                 // order, so the last one seen is the newest.
-                dropped_config = Some(entry.value.unwrap_or_default());
+                dropped_config = Some(config);
             }
 
             batch.remove(&self.log, k);

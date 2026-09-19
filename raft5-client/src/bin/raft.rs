@@ -6,10 +6,11 @@
 //! already found.
 
 use std::io::{self, Write};
+use std::time::Duration;
 
 use clap::Parser;
 
-use raft5_client::{Client, Error};
+use raft5_client::{Client, Error, Transaction};
 
 /// Opens an interactive session against a raft5 cluster.
 #[derive(Parser)]
@@ -67,6 +68,7 @@ async fn main() {
 /// meant for a human to drive.
 async fn repl(client: &Client) {
     let stdin = io::stdin();
+    let mut session = Session::default();
     loop {
         print!("raft> ");
         if io::stdout().flush().is_err() {
@@ -96,7 +98,7 @@ async fn repl(client: &Client) {
             }
         };
 
-        match run(client, &words).await {
+        match run(client, &mut session, &words).await {
             Ok(true) => {}
             Ok(false) => break, // `quit` / `exit`
             Err(e) => eprintln!("{e}"),
@@ -104,9 +106,28 @@ async fn repl(client: &Client) {
     }
 }
 
+/// What the session carries between commands.
+///
+/// Only the open transaction, because only a transaction has anywhere
+/// else to live: it is state on the leader, and its handle has to
+/// outlive the command that opened it or there would be no way to add a
+/// second key to it.
+#[derive(Default)]
+struct Session {
+    transaction: Option<Transaction>,
+}
+
+impl Session {
+    fn open(&self) -> Result<&Transaction, String> {
+        self.transaction
+            .as_ref()
+            .ok_or_else(|| "no transaction is open; use `begin` first".to_string())
+    }
+}
+
 /// Runs one already-tokenized command. Returns `Ok(false)` for `quit` /
 /// `exit`, which is the only thing that ends the session.
-async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
+async fn run(client: &Client, session: &mut Session, words: &[String]) -> Result<bool, String> {
     let Some((cmd, args)) = words.split_first() else {
         return Ok(true);
     };
@@ -134,6 +155,62 @@ async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
         "read_stale" => {
             let [key] = fixed_args(args, "read_stale <key>")?;
             print_read(client.read_stale(key.as_bytes()).await);
+        }
+        "begin" => {
+            let ttl = match args {
+                [] => Duration::from_secs(5),
+                [secs] => Duration::from_secs_f64(
+                    secs.parse().map_err(|_| "usage: begin [seconds]".to_string())?,
+                ),
+                _ => return Err("usage: begin [seconds]".to_string()),
+            };
+            match client.transaction(ttl).await {
+                // Replacing an open transaction drops it, which releases
+                // its locks -- better than silently keeping two and
+                // leaving the first to time out.
+                Ok(txn) => {
+                    if session.transaction.replace(txn).is_some() {
+                        println!("(the previous transaction was dropped)");
+                    }
+                    println!("ok");
+                }
+                Err(e) => println!("error: {e}"),
+            }
+        }
+        "tread" => {
+            let [key] = fixed_args(args, "tread <key>")?;
+            print_read(session.open()?.read(key.as_bytes()).await);
+        }
+        "tbuf" => {
+            let [key, value] = fixed_args(args, "tbuf <key> <value>")?;
+            print_ok(
+                session
+                    .open()?
+                    .buffer_write(key.as_bytes(), Some(value.as_bytes()))
+                    .await,
+            );
+        }
+        "tdel" => {
+            let [key] = fixed_args(args, "tdel <key>")?;
+            print_ok(session.open()?.buffer_write(key.as_bytes(), None).await);
+        }
+        "commit" => {
+            let txn = session
+                .transaction
+                .take()
+                .ok_or_else(|| "no transaction is open; use `begin` first".to_string())?;
+            match txn.commit().await {
+                Ok(0) => println!("ok (nothing was written)"),
+                Ok(seq) => println!("{seq}"),
+                Err(e) => println!("error: {e}"),
+            }
+        }
+        "abort" => {
+            let txn = session
+                .transaction
+                .take()
+                .ok_or_else(|| "no transaction is open".to_string())?;
+            print_ok(txn.abort().await);
         }
         "add_server" => {
             let [client_address] = fixed_args(args, "add_server <client_address>")?;
@@ -192,6 +269,15 @@ fn print_read(result: Result<raft5_client::ReadResult, Error>) {
     }
 }
 
+/// Prints `ok`, or the error. For the commands whose success has nothing
+/// to say beyond having happened.
+fn print_ok(result: Result<(), Error>) {
+    match result {
+        Ok(()) => println!("ok"),
+        Err(e) => println!("error: {e}"),
+    }
+}
+
 fn print_help() {
     println!(
         "{}",
@@ -201,6 +287,12 @@ fn print_help() {
             "read <key>                       linearizable read",
             "read_stale <key>                 read from whichever node is currently connected,",
             "                                  without confirming it still leads",
+            "begin [seconds]                  open a transaction (default 5s)",
+            "tread <key>                      read inside the transaction, locking the key",
+            "tbuf <key> <value>               buffer a write; nothing lands until `commit`",
+            "tdel <key>                       buffer a delete",
+            "commit                           commit every buffered write as one entry",
+            "abort                            give up the transaction and release its locks",
             "add_server <client_addr>         add a server as a learner, by its client address",
             "remove_server <id>               remove a server",
             "bootstrap <id>                   form a single-node cluster around <id>",

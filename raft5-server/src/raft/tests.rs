@@ -67,11 +67,10 @@ async fn bootstrap_forms_a_single_node_cluster_that_then_elects_itself() {
 
     let stored = log.entries_in_range(1, 2).unwrap();
     assert_eq!(stored.len(), 1);
-    assert_eq!(stored[0].kind, storage::EntryKind::Config);
-    assert_eq!(
-        ClusterConfig::from_bytes(stored[0].value.as_ref().unwrap()).unwrap(),
-        config
-    );
+    let storage::EntryPayload::Config(stored_config) = &stored[0].payload else {
+        panic!("bootstrap should append a config entry, got {:?}", stored[0].payload);
+    };
+    assert_eq!(ClusterConfig::from_bytes(stored_config).unwrap(), config);
 
     wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Leader(_))).await;
     cleanup(&path);
@@ -163,8 +162,8 @@ async fn a_replicated_config_entry_initializes_a_fresh_node() {
         seq: 1,
         term: 1,
         kind: crate::pb::raft5::common::EntryKind::Config as i32,
-        key: Vec::new(),
-        value: Some(config.to_bytes()),
+        writes: Vec::new(),
+        config: Some(config.to_bytes()),
     };
     let resp = peer_handle
         .append_entries(append_entries(1, "leader-1", 0, 0, vec![entry], 0))

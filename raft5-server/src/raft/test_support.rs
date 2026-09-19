@@ -188,17 +188,28 @@ pub(crate) fn append_entries(
     }
 }
 
+/// A one-mutation `WRITE` entry, the shape almost every test wants.
+/// `value = None` is a delete.
 pub(crate) fn log_entry(seq: u64, term: u64, key: &[u8], value: Option<&[u8]>) -> LogEntry {
+    write_entry(seq, term, vec![(key.to_vec(), value.map(<[u8]>::to_vec))])
+}
+
+/// A `WRITE` entry carrying any number of mutations -- what a committed
+/// transaction looks like on the wire.
+pub(crate) fn write_entry(
+    seq: u64,
+    term: u64,
+    writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+) -> LogEntry {
     LogEntry {
         seq,
         term,
-        kind: if value.is_some() {
-            EntryKind::Put
-        } else {
-            EntryKind::Delete
-        } as i32,
-        key: key.to_vec(),
-        value: value.map(<[u8]>::to_vec),
+        kind: EntryKind::Write as i32,
+        writes: writes
+            .into_iter()
+            .map(|(key, value)| crate::pb::raft5::common::KeyValue { key, value })
+            .collect(),
+        config: None,
     }
 }
 

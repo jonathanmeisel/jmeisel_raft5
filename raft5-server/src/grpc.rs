@@ -32,19 +32,20 @@
 //! check and the actual install both happen on the far side of
 //! `RaftPeerHandle`, same as everything else.
 
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
-
 use raft5_shared::raft5::client::kv_client::KvClient;
 use tonic::transport::Endpoint;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::pb::raft5::client::kv_server::Kv;
 use crate::pb::raft5::client::{
-    AddServerRequest, BootstrapRequest, ConfigChangeResponse, GetConfigRequest, GetConfigResponse,
-    NotLeader, RaftError as PbRaftError, ReadOk, ReadRequest, ReadResponse, RemoveServerRequest,
-    WriteConflict, WriteRequest, WriteResponse, config_change_response, raft_error, read_response,
-    write_response,
+    AddServerRequest, BootstrapRequest, BufferWriteRequest, BufferWriteResponse,
+    CommitTransactionRequest, CommitTransactionResponse, ConfigChangeResponse,
+    CreateTransactionRequest, CreateTransactionResponse, DropTransactionRequest,
+    DropTransactionResponse, GetConfigRequest, GetConfigResponse, NotLeader,
+    RaftError as PbRaftError, ReadOk, ReadRequest, ReadResponse, RemoveServerRequest,
+    TransactionAborted, WriteConflict, WriteRequest, WriteResponse, buffer_write_response,
+    commit_transaction_response, config_change_response, create_transaction_response,
+    drop_transaction_response, raft_error, read_response, transaction_aborted, write_response,
 };
 use crate::pb::raft5::cluster::{ClusterConfig, ClusterMember};
 use crate::pb::raft5::raft::raft_peer_server::RaftPeer;
@@ -54,10 +55,101 @@ use crate::pb::raft5::raft::{
     snapshot_chunk,
 };
 use crate::raft::{
-    self, ClientHandle, ConfigChange, LeaderHandle, RaftError, RaftPeerHandle, RoleHandle,
+    self, AppendError, ClientHandle, ConfigChange, LeaderHandle, RaftError, RaftPeerHandle,
+    RoleHandle,
 };
+use crate::storage::Mutation;
 use crate::storage::{RaftLog, StorageError};
 use crate::store::Store;
+use crate::txn::{AbortReason, BareGuard, Locks, Refused, TxnId};
+
+/// A transaction's refusal as the client protocol carries it.
+///
+/// Every variant but `TooMuch` is an ordinary answer rather than an
+/// error, the same way a write conflict is: it says something specific
+/// about the transaction that the caller can act on. `TooMuch` is a
+/// genuine refusal to serve -- the request was never going to work at any
+/// time, against any state -- so it stays a `Status`.
+fn txn_err(refused: Refused) -> Result<PbRaftError, Status> {
+    let (reason, key) = match refused {
+        Refused::Conflict { key } => (transaction_aborted::Reason::LockConflict, Some(key)),
+        Refused::Aborted(AbortReason::Expired) => (transaction_aborted::Reason::Expired, None),
+        Refused::Aborted(AbortReason::Wounded) => (transaction_aborted::Reason::Wounded, None),
+        Refused::Unknown => (transaction_aborted::Reason::Unknown, None),
+        Refused::LeaderChanged => (transaction_aborted::Reason::LeaderChanged, None),
+        Refused::TooMuch(why) => return Err(Status::resource_exhausted(why)),
+    };
+    Ok(aborted(reason, key, None))
+}
+
+fn aborted(
+    reason: transaction_aborted::Reason,
+    key: Option<Vec<u8>>,
+    seq: Option<u64>,
+) -> PbRaftError {
+    PbRaftError {
+        kind: Some(raft_error::Kind::Aborted(TransactionAborted {
+            reason: reason as i32,
+            key,
+            seq,
+        })),
+    }
+}
+
+/// Why a transactional request didn't happen: the transaction's own
+/// reasons, plus everything the state machine can refuse.
+enum TxnError {
+    Refused(Refused),
+    Raft(RaftError),
+    /// The commit reached the log and this node then stopped leading.
+    /// Carried separately from every other failure because it is the one
+    /// a client must not retry -- see `raft::AppendError`.
+    InDoubt(u64),
+    Internal(Status),
+}
+
+impl From<Refused> for TxnError {
+    fn from(r: Refused) -> Self {
+        Self::Refused(r)
+    }
+}
+
+impl From<RaftError> for TxnError {
+    fn from(e: RaftError) -> Self {
+        Self::Raft(e)
+    }
+}
+
+impl From<AppendError> for TxnError {
+    fn from(e: AppendError) -> Self {
+        match e {
+            AppendError::NotAppended(e) => Self::Raft(e),
+            AppendError::InDoubt { seq, .. } => Self::InDoubt(seq),
+        }
+    }
+}
+
+fn txn_error(e: TxnError) -> Result<PbRaftError, Status> {
+    match e {
+        TxnError::Refused(r) => txn_err(r),
+        TxnError::Raft(e) => client_err(e),
+        TxnError::InDoubt(seq) => Ok(aborted(
+            transaction_aborted::Reason::InDoubt,
+            None,
+            Some(seq),
+        )),
+        TxnError::Internal(status) => Err(status),
+    }
+}
+
+/// A transaction id off the wire. Fixed-width, so anything else is a
+/// malformed request rather than a transaction that happens not to
+/// exist.
+fn txn_id(bytes: &[u8]) -> Result<TxnId, Status> {
+    bytes
+        .try_into()
+        .map_err(|_| Status::invalid_argument("transaction_id must be 16 bytes"))
+}
 
 fn storage_err(e: StorageError) -> Status {
     Status::internal(e.to_string())
@@ -148,20 +240,6 @@ fn write_err(e: WriteError) -> Result<PbRaftError, Status> {
     }
 }
 
-/// One write's exclusive claim on a key, released on drop. Held from
-/// before the write's precondition is checked until its entry has been
-/// applied -- see the module doc for why that whole span matters.
-struct KeyGuard {
-    writing: Arc<Mutex<HashSet<Vec<u8>>>>,
-    key: Vec<u8>,
-}
-
-impl Drop for KeyGuard {
-    fn drop(&mut self) {
-        self.writing.lock().unwrap().remove(&self.key);
-    }
-}
-
 /// The leader handle for this node, or the error to hand back to the
 /// client instead. Every write and every membership change goes through
 /// here: a follower answers `NotLeader` with whatever hint it has rather
@@ -183,10 +261,12 @@ pub struct KvService {
     /// it is called and where its peers should dial it.
     identity: ClusterMember,
     client_handle: ClientHandle,
-    /// Keys with a write in flight on this node. A synchronous mutex
-    /// with no `.await` under it, same discipline as
-    /// `raft::peer::PeerConnections`.
-    writing: Arc<Mutex<HashSet<Vec<u8>>>>,
+    /// Who holds what, and every open transaction. See `crate::txn`: a
+    /// plain write's claim on a key and a transaction's locks are the
+    /// same table, because a write that could bypass a transaction's
+    /// locks would make its read set a record of something no longer
+    /// true.
+    locks: Locks,
 }
 
 impl KvService {
@@ -195,22 +275,40 @@ impl KvService {
             store,
             identity,
             client_handle,
-            writing: Arc::new(Mutex::new(HashSet::new())),
+            locks: Locks::new(),
         }
     }
 
-    /// Claims `key` for one write, or `None` if another write already
-    /// holds it. `HashSet::insert` reporting whether it added anything
-    /// is the test-and-set: two writes racing here cannot both win.
-    fn claim(&self, key: &[u8]) -> Option<KeyGuard> {
-        self.writing
-            .lock()
-            .unwrap()
-            .insert(key.to_vec())
-            .then(|| KeyGuard {
-                writing: Arc::clone(&self.writing),
-                key: key.to_vec(),
-            })
+    /// The lock table, for the shutdown-scoped sweeper `serve` spawns.
+    pub fn locks(&self) -> Locks {
+        self.locks.clone()
+    }
+
+    /// This node's leader handle, having first told the lock table which
+    /// term it is answering in.
+    ///
+    /// Every request that needs a leader goes through here rather than
+    /// `require_leader` directly, so the table notices a change of term
+    /// at the first request after it rather than at the next sweep. A
+    /// transaction cannot outlive the leader that created it, and the
+    /// sooner that is acted on, the sooner its keys are writable again.
+    fn leader(&self) -> Result<LeaderHandle, RaftError> {
+        let role = self.client_handle.role();
+        let leader = require_leader(&role);
+        self.locks
+            .observe_term(leader.as_ref().ok().map(LeaderHandle::term));
+        leader
+    }
+
+    /// Claims `key` for one plain write, or reports the conflict.
+    fn claim(&self, key: &[u8]) -> Result<BareGuard, WriteError> {
+        self.locks.claim(key).map_err(|_| {
+            // Nothing settled can be said about a key somebody else is
+            // holding: their write may land, or their transaction may
+            // abort. Re-sending shortly may well succeed, which is
+            // exactly what `Conflict(None)` means.
+            WriteError::Conflict(None)
+        })
     }
 
     /// Checks a write's precondition and, if it holds, appends it.
@@ -222,7 +320,7 @@ impl KvService {
     /// that point would let the next write's precondition be checked
     /// against a `latest` that is about to change.
     async fn conditional_write(&self, req: WriteRequest) -> Result<u64, WriteError> {
-        let leader = require_leader(&self.client_handle.role())?;
+        let leader = self.leader()?;
         // The precondition is checked against `latest`, so a leader that
         // may still be missing entries has no business checking it.
         // Before the claim rather than after, so that a leader still
@@ -232,7 +330,7 @@ impl KvService {
         // Claimed before the precondition is read, so that two writes
         // racing here cannot both find the key at the version each is
         // about to supersede.
-        let guard = self.claim(&req.key).ok_or(WriteError::Conflict(None))?;
+        let guard = self.claim(&req.key)?;
 
         let key = req.key.clone();
         let actual = self
@@ -257,6 +355,103 @@ impl KvService {
         .map_err(WriteError::Raft)
     }
 
+    /// A transaction's leader: this node, and only if it is still the
+    /// one the transaction was created under.
+    ///
+    /// The term check is belt to `observe_term`'s braces. `leader()`
+    /// already discards every transaction when the term changes, so a
+    /// transaction from a previous term is normally gone by the time
+    /// anyone asks for it; this catches the ordering where the same
+    /// request observes the change.
+    fn transaction_leader(&self, id: TxnId) -> Result<LeaderHandle, TxnError> {
+        let leader = self.leader()?;
+        if self.locks.term_of(id)? != leader.term() {
+            return Err(Refused::LeaderChanged.into());
+        }
+        Ok(leader)
+    }
+
+    /// A transactional read: take the shared lock, then answer.
+    ///
+    /// `require_leader` and `await_caught_up` come *before* the lock, the
+    /// same ordering and for the same reason as `conditional_write` --
+    /// a leader still catching up should not be holding keys nobody can
+    /// write while it does it.
+    async fn transactional_read(&self, id: TxnId, key: &[u8]) -> Result<ReadOk, TxnError> {
+        let leader = self.transaction_leader(id)?;
+        leader.await_caught_up().await?;
+        if !leader.has_read_quorum() {
+            return Err(RaftError::NotLeader { leader_hint: None }.into());
+        }
+
+        let buffered = self.locks.read(id, key)?;
+
+        let key = key.to_vec();
+        let committed = self
+            .store
+            .run(move |log| log.get_latest(&key))
+            .await
+            .map_err(|e| TxnError::Raft(RaftError::Storage(e)))?;
+
+        // `seq` always describes committed state, even when the value
+        // doesn't: a buffered write has no sequence number yet, because
+        // nothing has been appended. So a buffered read's seq is not a
+        // valid `previous_seq` for a write outside this transaction --
+        // though inside one it is moot, since the lock is what a
+        // transaction uses instead of a precondition.
+        let seq = committed.as_ref().map_or(0, |(seq, _)| *seq);
+        let value = match buffered {
+            Some(buffered) => buffered,
+            None => committed.map(|(_, value)| value),
+        };
+        Ok(ReadOk { seq, value })
+    }
+
+    /// Commit everything a transaction buffered, as one entry.
+    ///
+    /// The append runs in a task of its own owning the transaction's
+    /// locks, so they are released when the *entry* resolves rather than
+    /// when this call does -- the same discipline as `conditional_write`,
+    /// and more load-bearing here. A client that disconnects mid-commit
+    /// would otherwise leave the transaction stuck part-way, and a
+    /// part-way transaction is deliberately exempt from expiry: its
+    /// keys would stay unwritable for the rest of the term.
+    async fn commit(&self, id: TxnId) -> Result<u64, TxnError> {
+        let leader = self.transaction_leader(id)?;
+        let (writes, guard) = self.locks.begin_commit(id, leader.term())?;
+
+        if writes.is_empty() {
+            // Nothing to append, so nothing re-validates the point in
+            // time this transaction read at -- the raft round trip is
+            // what normally does that. Term equality alone isn't enough,
+            // since a partitioned leader still believes it holds its
+            // term; a lease quorum is. (Re-acquiring one in term T is
+            // impossible once a majority has moved to T', which is what
+            // makes this sound rather than merely reassuring.)
+            leader.await_caught_up().await?;
+            if !leader.has_read_quorum() {
+                return Err(RaftError::NotLeader { leader_hint: None }.into());
+            }
+            drop(guard);
+            return Ok(0);
+        }
+
+        let mutations = writes
+            .into_iter()
+            .map(|(key, value)| Mutation { key, value })
+            .collect();
+
+        tokio::spawn(async move {
+            let _guard = guard;
+            leader.append_writes(mutations).await
+        })
+        .await
+        .map_err(|e| {
+            TxnError::Internal(Status::internal(format!("the commit task failed: {e}")))
+        })?
+        .map_err(Into::into)
+    }
+
     /// Shared body of `add_server`/`remove_server`: both are the same
     /// operation with a different `ConfigChange`, and both answer
     /// `NotLeader` rather than forwarding (Raft §6.2).
@@ -265,7 +460,7 @@ impl KvService {
         change: ConfigChange,
     ) -> Result<Response<ConfigChangeResponse>, Status> {
         let result = async {
-            let leader = require_leader(&self.client_handle.role())?;
+            let leader = self.leader()?;
             leader.propose_config(change).await
         }
         .await;
@@ -317,6 +512,29 @@ impl Kv for KvService {
     async fn read(&self, request: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {
         let req = request.into_inner();
 
+        // A transactional read is a different thing: it takes a lock,
+        // and it can be answered from what the transaction itself has
+        // buffered. It also cannot be stale -- a stale read is served by
+        // whichever node received it, and a node that isn't the leader
+        // has neither this transaction nor a lock table to protect it,
+        // so it would hand back unprotected data under a transaction's
+        // name. That is a malformed request rather than a refusal.
+        if let Some(id) = &req.transaction_id {
+            let id = txn_id(id)?;
+            if !req.linearizable {
+                return Err(Status::invalid_argument(
+                    "a transactional read cannot be stale; set linearizable",
+                ));
+            }
+            let result = self.transactional_read(id, &req.key).await;
+            return Ok(Response::new(ReadResponse {
+                result: Some(match result {
+                    Ok(ok) => read_response::Result::Ok(ok),
+                    Err(e) => read_response::Result::Error(txn_error(e)?),
+                }),
+            }));
+        }
+
         // A linearizable read has to come from a leader that still holds
         // a quorum of leases: without one it may have been deposed
         // already and simply not know it yet, and would answer from state
@@ -326,7 +544,7 @@ impl Kv for KvService {
         // but not yet applied. A stale read asks for none of that and is
         // served locally by whoever received it.
         if req.linearizable {
-            let held = match require_leader(&self.client_handle.role()) {
+            let held = match self.leader() {
                 Ok(leader) => match leader.await_caught_up().await {
                     Ok(()) if leader.has_read_quorum() => Ok(()),
                     Ok(()) => Err(RaftError::NotLeader { leader_hint: None }),
@@ -364,6 +582,85 @@ impl Kv for KvService {
 
         Ok(Response::new(ReadResponse {
             result: Some(read_response::Result::Ok(ok)),
+        }))
+    }
+
+    async fn create_transaction(
+        &self,
+        request: Request<CreateTransactionRequest>,
+    ) -> Result<Response<CreateTransactionResponse>, Status> {
+        let ttl = std::time::Duration::from_millis(request.into_inner().ttl_ms);
+
+        let result = async {
+            let leader = self.leader()?;
+            // The transaction's reads will be answered from `latest`, so
+            // a leader that may still be missing entries has no business
+            // opening one -- same precondition as a conditional write.
+            leader.await_caught_up().await?;
+            self.locks
+                .create(leader.term(), ttl, crate::txn::fresh_id())
+                .map_err(TxnError::from)
+        }
+        .await;
+
+        Ok(Response::new(CreateTransactionResponse {
+            result: Some(match result {
+                Ok(id) => create_transaction_response::Result::TransactionId(id.to_vec()),
+                Err(e) => create_transaction_response::Result::Error(txn_error(e)?),
+            }),
+        }))
+    }
+
+    async fn buffer_write(
+        &self,
+        request: Request<BufferWriteRequest>,
+    ) -> Result<Response<BufferWriteResponse>, Status> {
+        let req = request.into_inner();
+        let id = txn_id(&req.transaction_id)?;
+
+        let result = self
+            .transaction_leader(id)
+            .and_then(|_| self.locks.buffer_write(id, &req.key, req.value).map_err(Into::into));
+
+        Ok(Response::new(BufferWriteResponse {
+            result: Some(match result {
+                Ok(()) => buffer_write_response::Result::Ok(true),
+                Err(e) => buffer_write_response::Result::Error(txn_error(e)?),
+            }),
+        }))
+    }
+
+    async fn commit_transaction(
+        &self,
+        request: Request<CommitTransactionRequest>,
+    ) -> Result<Response<CommitTransactionResponse>, Status> {
+        let id = txn_id(&request.into_inner().transaction_id)?;
+        let result = self.commit(id).await;
+
+        Ok(Response::new(CommitTransactionResponse {
+            result: Some(match result {
+                // `append_writes` returns only once the entry has
+                // committed *and* been applied, so by the time a client
+                // sees this seq, every key the transaction wrote reads
+                // back at it.
+                Ok(seq) => commit_transaction_response::Result::Seq(seq),
+                Err(e) => commit_transaction_response::Result::Error(txn_error(e)?),
+            }),
+        }))
+    }
+
+    async fn drop_transaction(
+        &self,
+        request: Request<DropTransactionRequest>,
+    ) -> Result<Response<DropTransactionResponse>, Status> {
+        let id = txn_id(&request.into_inner().transaction_id)?;
+        // Unconditional, and deliberately not leader-checked: giving up
+        // locks should never be refused, and a node that isn't the
+        // leader has none of this transaction's state to give up anyway.
+        self.locks.discard(id);
+
+        Ok(Response::new(DropTransactionResponse {
+            result: Some(drop_transaction_response::Result::Ok(true)),
         }))
     }
 

@@ -42,10 +42,8 @@ async fn a_new_leader_opens_its_term_with_a_noop() {
 
     let stored = log.entries_in_range(1, 2).unwrap();
     assert_eq!(stored.len(), 1, "the first entry of the term is the no-op");
-    assert_eq!(stored[0].kind, storage::EntryKind::NoOp);
+    assert_eq!(stored[0].payload, storage::EntryPayload::NoOp);
     assert_eq!(stored[0].term, leader.term);
-    assert!(stored[0].key.is_empty());
-    assert_eq!(stored[0].value, None);
 
     cleanup(&path);
 }

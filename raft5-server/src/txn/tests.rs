@@ -1,0 +1,379 @@
+use super::*;
+
+fn locks() -> Locks {
+    let locks = Locks::new();
+    locks.observe_term(Some(1));
+    locks
+}
+
+fn txn(locks: &Locks) -> TxnId {
+    locks
+        .create(1, Duration::from_secs(1), fresh_id())
+        .expect("a fresh transaction should open")
+}
+
+fn conflict<T: std::fmt::Debug>(r: Result<T, Refused>) -> Vec<u8> {
+    match r {
+        Err(Refused::Conflict { key }) => key,
+        other => panic!("expected a lock conflict, got {other:?}"),
+    }
+}
+
+/// Reading is shared: any number of transactions can hold the same key,
+/// which is what lets them all proceed as long as none of them writes.
+#[test]
+fn many_transactions_can_read_the_same_key() {
+    let locks = locks();
+    let (a, b, c) = (txn(&locks), txn(&locks), txn(&locks));
+
+    for t in [a, b, c] {
+        assert_eq!(locks.read(t, b"k"), Ok(None));
+    }
+    assert!(locks.is_locked(b"k"));
+}
+
+/// A transaction that is the *only* reader of a key may take it
+/// exclusively -- read-then-write, the commonest thing a transaction
+/// does.
+#[test]
+fn the_sole_reader_of_a_key_can_upgrade_to_a_write() {
+    let locks = locks();
+    let t = txn(&locks);
+
+    locks.read(t, b"k").unwrap();
+    assert_eq!(locks.buffer_write(t, b"k", Some(b"v".to_vec())), Ok(()));
+    // And the write is visible to the transaction that made it.
+    assert_eq!(locks.read(t, b"k"), Ok(Some(Some(b"v".to_vec()))));
+}
+
+/// The regression for encoding shared holders as a set rather than a
+/// count: reading twice must not make a transaction look like two
+/// readers, or it could never upgrade a key it alone had read.
+#[test]
+fn reading_the_same_key_twice_still_allows_an_upgrade() {
+    let locks = locks();
+    let t = txn(&locks);
+
+    locks.read(t, b"k").unwrap();
+    locks.read(t, b"k").unwrap();
+    assert_eq!(
+        locks.buffer_write(t, b"k", Some(b"v".to_vec())),
+        Ok(()),
+        "a transaction that read a key twice is still its only reader"
+    );
+}
+
+/// Two readers, and the younger one wants to write: it is in the older
+/// one's way, not the other way round, so it is refused and the older
+/// one keeps what it had.
+#[test]
+fn a_younger_transaction_cannot_take_a_key_an_older_one_is_reading() {
+    let locks = locks();
+    let older = txn(&locks);
+    let younger = txn(&locks);
+
+    locks.read(older, b"k").unwrap();
+    locks.read(younger, b"k").unwrap();
+
+    assert_eq!(
+        conflict(locks.buffer_write(younger, b"k", Some(b"v".to_vec()))),
+        b"k".to_vec()
+    );
+    assert_eq!(locks.state_of(older), Some(TxnState::Open));
+    assert_eq!(locks.state_of(younger), Some(TxnState::Open));
+}
+
+/// Wound-wait, the reason fail-fast alone isn't enough: an older
+/// transaction takes the key rather than backing off, and the younger one
+/// finds out why on its next request instead of being told it never
+/// existed.
+#[test]
+fn an_older_transaction_wounds_a_younger_holder_and_takes_the_key() {
+    let locks = locks();
+    let older = txn(&locks);
+    let younger = txn(&locks);
+
+    locks.buffer_write(younger, b"k", Some(b"theirs".to_vec())).unwrap();
+    assert_eq!(
+        locks.buffer_write(older, b"k", Some(b"mine".to_vec())),
+        Ok(()),
+        "an older transaction takes the lock rather than failing"
+    );
+
+    assert_eq!(
+        locks.state_of(younger),
+        Some(TxnState::Aborted(AbortReason::Wounded))
+    );
+    assert_eq!(
+        locks.read(younger, b"k"),
+        Err(Refused::Aborted(AbortReason::Wounded)),
+        "the wounded transaction learns why, not just that it failed"
+    );
+    // And it gave up everything, not only the contested key.
+    assert_eq!(
+        locks.buffer_write(younger, b"other", Some(b"v".to_vec())),
+        Err(Refused::Aborted(AbortReason::Wounded))
+    );
+}
+
+/// The oldest transaction is never refused by another transaction,
+/// however many of them are in its way. That is the progress property
+/// wound-wait buys, so it is worth stating as a test rather than only in
+/// a comment.
+#[test]
+fn the_oldest_transaction_wounds_everyone_in_its_way() {
+    let locks = locks();
+    let oldest = txn(&locks);
+    let others: Vec<_> = (0..4).map(|_| txn(&locks)).collect();
+
+    for (i, t) in others.iter().enumerate() {
+        locks.buffer_write(*t, format!("k{i}").as_bytes(), Some(b"v".to_vec())).unwrap();
+    }
+    for i in 0..others.len() {
+        assert_eq!(
+            locks.buffer_write(oldest, format!("k{i}").as_bytes(), Some(b"mine".to_vec())),
+            Ok(())
+        );
+    }
+    for t in &others {
+        assert_eq!(
+            locks.state_of(*t),
+            Some(TxnState::Aborted(AbortReason::Wounded))
+        );
+    }
+}
+
+/// A committing transaction's writes may already be in the log, and an
+/// appended entry cannot be recalled -- so even an older transaction has
+/// to wait its turn rather than wounding it.
+#[test]
+fn a_committing_transaction_is_not_wounded_by_an_older_one() {
+    let locks = locks();
+    let older = txn(&locks);
+    let committing = txn(&locks);
+
+    locks.buffer_write(committing, b"k", Some(b"v".to_vec())).unwrap();
+    let (_writes, _guard) = locks.begin_commit(committing, 1).unwrap();
+
+    assert_eq!(
+        conflict(locks.buffer_write(older, b"k", Some(b"mine".to_vec()))),
+        b"k".to_vec(),
+        "an older transaction must not wound one that is already committing"
+    );
+}
+
+/// A plain single-key write is in the table too, for the same reason and
+/// with the same immunity: its entry may already be on its way to the
+/// log.
+#[test]
+fn a_plain_write_holds_a_key_against_transactions_and_is_never_wounded() {
+    let locks = locks();
+    let t = txn(&locks);
+    let guard = locks.claim(b"k").expect("the key starts unclaimed");
+
+    assert_eq!(conflict(locks.read(t, b"k")), b"k".to_vec());
+    assert_eq!(
+        conflict(locks.buffer_write(t, b"k", Some(b"v".to_vec()))),
+        b"k".to_vec()
+    );
+    assert_eq!(locks.state_of(t), Some(TxnState::Open), "the transaction is refused, not aborted");
+
+    drop(guard);
+    assert_eq!(locks.read(t, b"k"), Ok(None));
+}
+
+/// And the reverse: a transaction's lock -- even a shared one -- keeps a
+/// plain write out, which is what stops a bare write changing a key a
+/// transaction has already read.
+#[test]
+fn a_transactions_read_lock_keeps_a_plain_write_out() {
+    let locks = locks();
+    let t = txn(&locks);
+    locks.read(t, b"k").unwrap();
+
+    assert!(matches!(locks.claim(b"k"), Err(Refused::Conflict { .. })));
+    assert!(locks.claim(b"elsewhere").is_ok(), "a lock is per key, not on the whole store");
+
+    locks.discard(t);
+    assert!(locks.claim(b"k").is_ok());
+}
+
+/// An expired transaction holds nothing, and finds out the moment it asks
+/// for anything. Released on the *conflict* path rather than by a
+/// sweeper, so the key comes free as soon as somebody wants it.
+#[test]
+fn an_expired_transaction_releases_its_locks_to_the_next_request() {
+    let locks = locks();
+    let doomed = locks.create(1, Duration::ZERO, fresh_id()).unwrap();
+    locks.buffer_write(doomed, b"k", Some(b"v".to_vec())).unwrap();
+    assert!(locks.is_locked(b"k"));
+
+    // Younger, so it could never *wound* the holder -- only the holder's
+    // deadline can free this key.
+    let later = txn(&locks);
+    assert_eq!(locks.buffer_write(later, b"k", Some(b"v".to_vec())), Ok(()));
+
+    assert_eq!(
+        locks.state_of(doomed),
+        Some(TxnState::Aborted(AbortReason::Expired))
+    );
+    assert_eq!(
+        locks.begin_commit(doomed, 1).map(|_| ()),
+        Err(Refused::Aborted(AbortReason::Expired)),
+        "an expired transaction must not be able to commit"
+    );
+}
+
+/// The sweeper is the backstop for a transaction nobody collides with,
+/// and it reclaims the tombstone only after a grace period -- long enough
+/// that its owner has had a chance to be told why it died.
+#[test]
+fn the_sweeper_reclaims_an_expired_transaction_nobody_touched() {
+    let locks = locks();
+    let doomed = locks.create(1, Duration::ZERO, fresh_id()).unwrap();
+    locks.buffer_write(doomed, b"k", Some(b"v".to_vec())).unwrap();
+
+    let now = Instant::now();
+    locks.sweep(now, Duration::from_secs(30));
+    assert!(!locks.is_locked(b"k"), "the sweeper should free an expired transaction's locks");
+    assert_eq!(
+        locks.state_of(doomed),
+        Some(TxnState::Aborted(AbortReason::Expired)),
+        "within the grace period the tombstone survives, so the owner can still be told why"
+    );
+
+    locks.sweep(now + Duration::from_secs(31), Duration::from_secs(30));
+    assert_eq!(locks.state_of(doomed), None);
+}
+
+/// A transaction belongs to the leader that created it. A new term means
+/// its reads were validated against state that no longer applies and its
+/// commit can never happen, so it goes, and its locks go with it.
+#[test]
+fn a_change_of_leader_term_discards_every_transaction() {
+    let locks = locks();
+    let t = txn(&locks);
+    locks.buffer_write(t, b"k", Some(b"v".to_vec())).unwrap();
+
+    locks.observe_term(Some(2));
+
+    assert_eq!(locks.state_of(t), None);
+    assert!(!locks.is_locked(b"k"));
+    assert!(locks.claim(b"k").is_ok(), "the key is free for the new term");
+}
+
+/// The epoch check, and the race it exists for: a plain write's claim can
+/// outlive the term it was taken in, because the guard is held until the
+/// entry resolves. Releasing it must not remove a lock that somebody
+/// else has since taken on the same key.
+#[test]
+fn a_claim_released_after_a_term_change_does_not_disturb_the_new_holder() {
+    let locks = locks();
+    let stale = locks.claim(b"k").expect("the key starts unclaimed");
+
+    locks.observe_term(Some(2));
+
+    let fresh = txn(&locks);
+    locks.buffer_write(fresh, b"k", Some(b"v".to_vec())).unwrap();
+
+    drop(stale);
+
+    assert!(
+        locks.is_locked(b"k"),
+        "a release from the previous term must not free the new holder's key"
+    );
+    assert_eq!(locks.state_of(fresh), Some(TxnState::Open));
+}
+
+/// Committing hands back exactly what was buffered, in key order, and
+/// dropping the guard gives the locks up however the commit turned out.
+#[test]
+fn committing_yields_the_buffered_writes_and_the_guard_releases_them() {
+    let locks = locks();
+    let t = txn(&locks);
+    locks.buffer_write(t, b"b", Some(b"2".to_vec())).unwrap();
+    locks.buffer_write(t, b"a", Some(b"1".to_vec())).unwrap();
+    locks.buffer_write(t, b"gone", None).unwrap();
+    locks.read(t, b"witness").unwrap();
+
+    let (writes, guard) = locks.begin_commit(t, 1).unwrap();
+    assert_eq!(
+        writes,
+        vec![
+            (b"a".to_vec(), Some(b"1".to_vec())),
+            (b"b".to_vec(), Some(b"2".to_vec())),
+            (b"gone".to_vec(), None),
+        ]
+    );
+    assert!(locks.is_locked(b"a") && locks.is_locked(b"witness"));
+
+    drop(guard);
+    for key in [&b"a"[..], b"b", b"gone", b"witness"] {
+        assert!(!locks.is_locked(key), "{key:?} should have been released");
+    }
+    assert_eq!(locks.state_of(t), None);
+}
+
+/// Caps are refusals, not clamps: a caller told "yes" to a lifetime this
+/// server won't honour would act on a lease it doesn't have.
+#[test]
+fn an_over_long_lifetime_is_refused_rather_than_shortened() {
+    let locks = locks();
+    assert!(matches!(
+        locks.create(1, MAX_TRANSACTION_TTL + Duration::from_secs(1), fresh_id()),
+        Err(Refused::TooMuch(_))
+    ));
+    assert_eq!(locks.open_count(), 0);
+}
+
+/// A transaction too large to replicate would never commit -- and, being
+/// already in the log and re-proposed forever, would block everything
+/// after it. The only safe place to refuse it is before it reaches the
+/// log at all.
+#[test]
+fn a_transaction_that_buffers_too_much_is_refused_before_it_can_commit() {
+    let locks = locks();
+    let t = txn(&locks);
+
+    for i in 0..MAX_TRANSACTION_KEYS {
+        locks.buffer_write(t, format!("k{i}").as_bytes(), Some(b"v".to_vec())).unwrap();
+    }
+    assert!(matches!(
+        locks.buffer_write(t, b"one-too-many", Some(b"v".to_vec())),
+        Err(Refused::TooMuch(_))
+    ));
+
+    let big = locks.create(1, Duration::from_secs(1), fresh_id()).unwrap();
+    assert!(matches!(
+        locks.buffer_write(big, b"k", Some(vec![0u8; MAX_TRANSACTION_BYTES + 1])),
+        Err(Refused::TooMuch(_))
+    ));
+}
+
+/// Rewriting a key a transaction has already buffered replaces the value
+/// rather than counting against the caps twice.
+#[test]
+fn rewriting_a_buffered_key_replaces_it_rather_than_accumulating() {
+    let locks = locks();
+    let t = txn(&locks);
+
+    for _ in 0..100 {
+        locks
+            .buffer_write(t, b"k", Some(vec![0u8; MAX_TRANSACTION_BYTES / 2]))
+            .expect("rewriting one key should not accumulate");
+    }
+    let (writes, _guard) = locks.begin_commit(t, 1).unwrap();
+    assert_eq!(writes.len(), 1);
+}
+
+/// Dropping is idempotent and silent about an id it doesn't know:
+/// commit-then-drop is the ordinary client path, and the drop shouldn't
+/// have to know whether it raced its own commit.
+#[test]
+fn discarding_an_unknown_transaction_is_not_an_error() {
+    let locks = locks();
+    let t = txn(&locks);
+    locks.discard(t);
+    locks.discard(t);
+    locks.discard(fresh_id());
+}

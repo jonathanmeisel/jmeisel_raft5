@@ -1,7 +1,11 @@
 use std::sync::Arc;
 
 use super::*;
-use crate::pb::raft5::client::{read_response, write_response};
+use crate::pb::raft5::client::{
+    BufferWriteRequest, CommitTransactionRequest, CreateTransactionRequest, DropTransactionRequest,
+    buffer_write_response, commit_transaction_response, create_transaction_response, raft_error,
+    read_response, transaction_aborted, write_response,
+};
 use crate::raft::{self, RoleHandle};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -82,6 +86,7 @@ async fn read(svc: &KvService, key: &[u8]) -> ReadOk {
         .read(Request::new(ReadRequest {
             key: key.to_vec(),
             linearizable: false,
+            transaction_id: None,
         }))
         .await
         .unwrap()
@@ -107,6 +112,13 @@ async fn leader_kv_service(log: Arc<RaftLog>, node_id: &str) -> KvService {
     })
     .await
     .expect("a bootstrapped single-node cluster should elect itself");
+    // The lock table learns which term it is serving from the first
+    // request that needs a leader, and discards everything it held if
+    // that term has changed. Doing it here means a test that takes a
+    // lock directly -- rather than through an RPC -- isn't holding one
+    // from before the node had a term at all, which any real caller
+    // could not be.
+    svc.leader().expect("this node just became the leader");
     svc
 }
 
@@ -196,6 +208,7 @@ async fn write_then_read_round_trips_through_kv_service() {
         .read(Request::new(ReadRequest {
             key: b"hello".to_vec(),
             linearizable: false,
+            transaction_id: None,
         }))
         .await
         .unwrap()
@@ -284,14 +297,14 @@ async fn a_key_with_a_write_in_flight_refuses_another() {
     let (log, path) = open_temp();
     let svc = leader_kv_service(log, "kv-test").await;
 
-    let claim = svc.claim(b"k").expect("the key starts unclaimed");
+    let claim = svc.claim(b"k").ok().expect("the key starts unclaimed");
     assert_eq!(
         conflict(write(&svc, b"k", Some(b"v"), 0).await),
         None,
         "a conflict with a write in flight can say nothing about the key"
     );
     assert!(
-        svc.claim(b"other").is_some(),
+        svc.claim(b"other").is_ok(),
         "a claim is per key, not a lock on the whole store"
     );
 
@@ -355,6 +368,7 @@ async fn read_of_never_written_key_returns_no_value() {
         .read(Request::new(ReadRequest {
             key: b"missing".to_vec(),
             linearizable: false,
+            transaction_id: None,
         }))
         .await
         .unwrap()
@@ -415,6 +429,7 @@ async fn a_stale_read_is_served_without_a_leader() {
         .read(Request::new(ReadRequest {
             key: b"k".to_vec(),
             linearizable: false,
+            transaction_id: None,
         }))
         .await
         .unwrap()
@@ -427,6 +442,7 @@ async fn a_stale_read_is_served_without_a_leader() {
         .read(Request::new(ReadRequest {
             key: b"k".to_vec(),
             linearizable: true,
+            transaction_id: None,
         }))
         .await
         .unwrap()
@@ -668,6 +684,198 @@ async fn append_entries_and_request_vote_reach_the_running_state_machine() {
         assert!(vote_resp.vote_granted);
         assert_eq!(vote_resp.term, 7);
     }
+
+    cleanup(&path);
+}
+
+// --- transactions -----------------------------------------------------
+
+async fn begin_txn(svc: &KvService, ttl_ms: u64) -> Vec<u8> {
+    match svc
+        .create_transaction(Request::new(CreateTransactionRequest { ttl_ms }))
+        .await
+        .unwrap()
+        .into_inner()
+        .result
+    {
+        Some(create_transaction_response::Result::TransactionId(id)) => id,
+        other => panic!("expected a transaction id, got {other:?}"),
+    }
+}
+
+/// A stale read is answered by whichever node received it, and a node
+/// that isn't the leader has neither this transaction nor a lock table
+/// to protect it. Asking for one under a transaction's name is a
+/// malformed request, not a refusal that might succeed later.
+#[tokio::test]
+async fn a_transactional_read_may_not_be_stale() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+    let txn = begin_txn(&svc, 1000).await;
+
+    let status = svc
+        .read(Request::new(ReadRequest {
+            key: b"k".to_vec(),
+            linearizable: false,
+            transaction_id: Some(txn),
+        }))
+        .await
+        .expect_err("a stale transactional read must be refused outright");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    cleanup(&path);
+}
+
+/// A transaction id is fixed-width, so anything else is a malformed
+/// request rather than a transaction that happens not to exist -- worth
+/// distinguishing, since "no such transaction" is an ordinary answer a
+/// client is expected to handle and this is a bug in its caller.
+#[tokio::test]
+async fn a_malformed_transaction_id_is_an_invalid_argument() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+
+    let status = svc
+        .commit_transaction(Request::new(CommitTransactionRequest {
+            transaction_id: b"too short".to_vec(),
+        }))
+        .await
+        .expect_err("a malformed id should be rejected");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    cleanup(&path);
+}
+
+/// Asking for a lifetime the server will not honour is refused rather
+/// than quietly shortened: a client told "yes" would go on to act as
+/// though it had the lease it asked for.
+#[tokio::test]
+async fn an_over_long_transaction_is_refused_rather_than_shortened() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+
+    let too_long = crate::txn::MAX_TRANSACTION_TTL.as_millis() as u64 + 1;
+    let status = svc
+        .create_transaction(Request::new(CreateTransactionRequest { ttl_ms: too_long }))
+        .await
+        .expect_err("an over-long lifetime should be refused");
+    assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+
+    cleanup(&path);
+}
+
+/// Dropping is idempotent and content with an id it has never heard of:
+/// committing and then dropping is the ordinary client path, and a drop
+/// shouldn't have to know whether it raced its own commit.
+#[tokio::test]
+async fn dropping_a_transaction_twice_is_not_an_error() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+    let txn = begin_txn(&svc, 1000).await;
+
+    for _ in 0..2 {
+        svc.drop_transaction(Request::new(DropTransactionRequest {
+            transaction_id: txn.clone(),
+        }))
+        .await
+        .expect("dropping should always be allowed");
+    }
+    svc.drop_transaction(Request::new(DropTransactionRequest {
+        transaction_id: vec![0u8; 16],
+    }))
+    .await
+    .expect("an unknown id is not an error either");
+
+    cleanup(&path);
+}
+
+/// A transaction that was never opened -- or was dropped, or committed
+/// already -- is `UNKNOWN` rather than a silent success.
+#[tokio::test]
+async fn committing_an_unknown_transaction_says_so() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+
+    let result = svc
+        .commit_transaction(Request::new(CommitTransactionRequest {
+            transaction_id: vec![7u8; 16],
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .result;
+    match result {
+        Some(commit_transaction_response::Result::Error(e)) => match e.kind {
+            Some(raft_error::Kind::Aborted(a)) => assert_eq!(
+                a.reason,
+                transaction_aborted::Reason::Unknown as i32,
+                "an id nobody knows should say exactly that"
+            ),
+            other => panic!("expected an abort, got {other:?}"),
+        },
+        other => panic!("expected an error, got {other:?}"),
+    }
+
+    cleanup(&path);
+}
+
+/// The whole path through the service: read, buffer, commit, and every
+/// key visible at the one sequence number the entry landed at.
+#[tokio::test]
+async fn a_committed_transaction_makes_every_key_visible_at_one_seq() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+    committed(write(&svc, b"a", Some(b"1"), 0).await);
+
+    let txn = begin_txn(&svc, 2000).await;
+    let read_back = svc
+        .read(Request::new(ReadRequest {
+            key: b"a".to_vec(),
+            linearizable: true,
+            transaction_id: Some(txn.clone()),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .result;
+    assert!(matches!(
+        read_back,
+        Some(read_response::Result::Ok(ReadOk { value: Some(v), .. })) if v == b"1"
+    ));
+
+    for (key, value) in [(&b"a"[..], &b"2"[..]), (b"b", b"3")] {
+        let resp = svc
+            .buffer_write(Request::new(BufferWriteRequest {
+                transaction_id: txn.clone(),
+                key: key.to_vec(),
+                value: Some(value.to_vec()),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(
+            resp.result,
+            Some(buffer_write_response::Result::Ok(true))
+        ));
+    }
+
+    let seq = match svc
+        .commit_transaction(Request::new(CommitTransactionRequest {
+            transaction_id: txn,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .result
+    {
+        Some(commit_transaction_response::Result::Seq(seq)) => seq,
+        other => panic!("the transaction should have committed, got {other:?}"),
+    };
+
+    let a = read(&svc, b"a").await;
+    let b = read(&svc, b"b").await;
+    assert_eq!((a.value.as_deref(), b.value.as_deref()), (Some(&b"2"[..]), Some(&b"3"[..])));
+    assert_eq!((a.seq, b.seq), (seq, seq), "one entry, so one seq for both keys");
 
     cleanup(&path);
 }

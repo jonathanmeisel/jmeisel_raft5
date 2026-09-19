@@ -288,6 +288,7 @@ async fn probe(kv: &Kv) -> Result<bool, Status> {
     let request = ReadRequest {
         key: PROBE_KEY.to_vec(),
         linearizable: true,
+        transaction_id: None,
     };
     let resp = match tokio::time::timeout(PROBE_TIMEOUT, kv.read(request)).await {
         Ok(resp) => resp?,

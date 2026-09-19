@@ -19,9 +19,53 @@ use crate::pb::raft5::raft::{
     AppendEntriesRequest, AppendEntriesResponse, GetLeaseRequest, GetLeaseResponse,
     InstallSnapshotResponse, RequestVoteRequest, RequestVoteResponse, SnapshotHeader,
 };
+use crate::storage::Mutation;
 use crate::store::Store;
 
 use super::{ConfigChange, Event, LEASE_DURATION, RaftError};
+
+/// Why an append didn't finish, split by the one distinction a caller
+/// can't recover without: whether the entry reached the log.
+///
+/// `append_log`'s callers have never needed it -- a single-key write
+/// that may or may not have landed can simply be re-sent, since rewriting
+/// the same value costs nothing but a second sequence number. A
+/// transaction cannot: replaying a read-modify-write that already applied
+/// applies it twice. So the two cases are told apart here rather than at
+/// each call site.
+#[derive(Debug)]
+pub enum AppendError {
+    /// Nothing was appended. Safe to retry, here or on the new leader.
+    NotAppended(RaftError),
+    /// The entry is in this node's log at `seq`, and this node stopped
+    /// being able to say what happened to it. It may still be replicated
+    /// and committed by the next leader, or it may be truncated -- and
+    /// nothing available here can tell which. **Never retry.**
+    InDoubt { seq: u64, source: RaftError },
+}
+
+impl fmt::Display for AppendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AppendError::NotAppended(e) => write!(f, "{e:?}"),
+            AppendError::InDoubt { seq, source } => write!(
+                f,
+                "the entry at seq {seq} was appended, but this node stopped leading \
+                 before it could confirm what became of it: {source:?}"
+            ),
+        }
+    }
+}
+
+impl From<AppendError> for RaftError {
+    /// Flattens the distinction away, for the callers that genuinely
+    /// don't have one -- see `AppendError`'s doc.
+    fn from(e: AppendError) -> Self {
+        match e {
+            AppendError::NotAppended(e) | AppendError::InDoubt { source: e, .. } => e,
+        }
+    }
+}
 
 /// Who to point a client at, given a role handle. `None` unless this node
 /// currently knows of a leader -- a candidate, or a follower that hasn't
@@ -133,21 +177,40 @@ pub struct LeaderHandle {
 }
 
 impl LeaderHandle {
-    /// Append a new entry and wait until it's committed (replicated to a
-    /// majority) *and* actually applied to `latest` before returning --
-    /// see `applied_rx`'s doc on why waiting for commit alone isn't
+    /// Append a one-key entry and wait until it's committed (replicated
+    /// to a majority) *and* actually applied to `latest` before returning
+    /// -- see `applied_rx`'s doc on why waiting for commit alone isn't
     /// enough.
+    ///
+    /// Flattens `AppendError`, because a single-key write that may or may
+    /// not have landed can just be re-sent; see that type's doc.
     pub async fn append_log(&self, key: &[u8], value: Option<&[u8]>) -> Result<u64, RaftError> {
+        self.append_writes(vec![Mutation::new(key.to_vec(), value.map(<[u8]>::to_vec))])
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Append `writes` as *one* entry -- one seq, committed together and
+    /// applied to `latest` together -- and wait until it has been. This
+    /// is how a transaction commits.
+    ///
+    /// The return distinguishes "nothing was written" from "something was
+    /// written and I can no longer tell you what happened to it", which
+    /// a transaction's caller has to know and a single-key write's does
+    /// not. See `AppendError`.
+    pub async fn append_writes(&self, writes: Vec<Mutation>) -> Result<u64, AppendError> {
         let term = self.term;
-        let key = key.to_vec();
-        let value = value.map(<[u8]>::to_vec);
         let seq = self
             .store
-            .run(move |log| log.append(term, &key, value.as_deref()))
+            .run(move |log| log.append_writes(term, writes))
             .await
-            .map_err(RaftError::Storage)?;
+            .map_err(|e| AppendError::NotAppended(RaftError::Storage(e)))?;
 
-        self.await_applied(seq).await
+        // Past this line the entry exists in the log, so every remaining
+        // way out is in doubt rather than a clean failure.
+        self.await_applied(seq)
+            .await
+            .map_err(|source| AppendError::InDoubt { seq, source })
     }
 
     /// Propose a single-server membership change and wait until it
@@ -197,6 +260,15 @@ impl LeaderHandle {
         RaftError::NotLeader {
             leader_hint: leader_hint_of(&role_rx.borrow()),
         }
+    }
+
+    /// The term this node is leading in.
+    ///
+    /// Read by `grpc::KvService` to notice a change of leader: a
+    /// transaction belongs to the term that created it, and nothing it
+    /// holds should outlive that term.
+    pub fn term(&self) -> u64 {
+        self.term
     }
 
     /// Whether it's currently safe for this leader to serve a

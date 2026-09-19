@@ -265,6 +265,7 @@ pub async fn write(client: &Arc<Client>, key: &[u8], value: Option<&[u8]>) -> u6
             .read(ReadRequest {
                 key: key.to_vec(),
                 linearizable: false,
+                transaction_id: None,
             })
             .await
             .expect("read RPC failed")
@@ -299,12 +300,80 @@ pub async fn write(client: &Arc<Client>, key: &[u8], value: Option<&[u8]>) -> u6
 
 /// A (possibly stale) local read of `key`, or `None` if it currently has
 /// no value.
+/// Opens a transaction on `client`, retrying while the cluster is still
+/// settling. Returns the transaction id.
+pub async fn begin(client: &Arc<Client>, ttl: Duration) -> Vec<u8> {
+    use raft5_shared::raft5::client::{CreateTransactionRequest, create_transaction_response};
+
+    let mut client = (**client).clone();
+    let until = deadline();
+    loop {
+        let resp = client
+            .create_transaction(CreateTransactionRequest {
+                ttl_ms: ttl.as_millis() as u64,
+            })
+            .await;
+        match resp.map(|r| r.into_inner().result) {
+            Ok(Some(create_transaction_response::Result::TransactionId(id))) => return id,
+            other => assert!(
+                Instant::now() < until,
+                "no transaction could be opened: {other:?}"
+            ),
+        }
+        tokio::time::sleep(RETRY_DELAY).await;
+    }
+}
+
+/// Buffers one write into `id`, asserting it was accepted.
+pub async fn buffer_write(client: &Arc<Client>, id: &[u8], key: &[u8], value: Option<&[u8]>) {
+    use raft5_shared::raft5::client::{BufferWriteRequest, buffer_write_response};
+
+    let mut client = (**client).clone();
+    let resp = client
+        .buffer_write(BufferWriteRequest {
+            transaction_id: id.to_vec(),
+            key: key.to_vec(),
+            value: value.map(<[u8]>::to_vec),
+        })
+        .await
+        .expect("buffer_write should reach the node")
+        .into_inner();
+    assert!(
+        matches!(resp.result, Some(buffer_write_response::Result::Ok(true))),
+        "buffer_write was refused: {:?}",
+        resp.result
+    );
+}
+
+/// Commits `id`, returning the sequence number, or the refusal.
+pub async fn commit(
+    client: &Arc<Client>,
+    id: &[u8],
+) -> Result<u64, raft5_shared::raft5::client::RaftError> {
+    use raft5_shared::raft5::client::{CommitTransactionRequest, commit_transaction_response};
+
+    let mut client = (**client).clone();
+    let resp = client
+        .commit_transaction(CommitTransactionRequest {
+            transaction_id: id.to_vec(),
+        })
+        .await
+        .expect("commit should reach the node")
+        .into_inner();
+    match resp.result {
+        Some(commit_transaction_response::Result::Seq(seq)) => Ok(seq),
+        Some(commit_transaction_response::Result::Error(e)) => Err(e),
+        None => panic!("the node answered a commit without a result"),
+    }
+}
+
 pub async fn read(client: &Arc<Client>, key: &[u8]) -> Option<Vec<u8>> {
     let mut client = (**client).clone();
     let resp = client
         .read(ReadRequest {
             key: key.to_vec(),
             linearizable: false,
+            transaction_id: None,
         })
         .await
         .expect("read RPC failed")
@@ -363,6 +432,7 @@ pub async fn assert_eventually_reads(client: &Arc<Client>, key: &[u8], value: &[
             .read(ReadRequest {
                 key: key.to_vec(),
                 linearizable: false,
+                transaction_id: None,
             })
             .await
             .expect("read RPC failed")
@@ -406,6 +476,7 @@ pub async fn find_leader<'a>(nodes: &[&'a TestNode]) -> &'a TestNode {
                     .read(ReadRequest {
                         key: PROBE_KEY.to_vec(),
                         linearizable: true,
+                        transaction_id: None,
                     })
                     .await;
                 if let Ok(resp) = resp

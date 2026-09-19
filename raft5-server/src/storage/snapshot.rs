@@ -72,6 +72,9 @@ impl RaftLog {
         writer.write_all(&(config.len() as u32).to_be_bytes())?;
         writer.write_all(&config)?;
 
+        // `Keyspace::iter` pins a snapshot nonce, so this walks one
+        // point in time even while `apply_committed` is writing: an
+        // entry's mutations can't be caught half-applied here.
         let mut entry_count: u64 = 0;
         for item in self.latest.iter() {
             let (key, value_bytes) = item.into_inner()?;
@@ -165,7 +168,7 @@ impl RaftLog {
             batch.insert(
                 &self.latest,
                 &key,
-                encode_latest_value(last_included_seq, &value),
+                encode_latest_value(last_included_seq, &value)?,
             );
             entry_count += 1;
             pending += 1;

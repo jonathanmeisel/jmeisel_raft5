@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::Mutation;
 use crate::pb::raft5::raft::GetLeaseRequest;
 use crate::raft::test_support::*;
 
@@ -83,10 +84,8 @@ async fn append_entries_appends_fresh_entries_to_an_empty_log() {
     // (see storage's module doc), so check `log` directly instead.
     let stored = log.entries_in_range(1, 3).unwrap();
     assert_eq!(stored.len(), 2);
-    assert_eq!(stored[0].key, b"a");
-    assert_eq!(stored[0].value, Some(b"1".to_vec()));
-    assert_eq!(stored[1].key, b"b");
-    assert_eq!(stored[1].value, Some(b"2".to_vec()));
+    assert_eq!(stored[0].payload.writes(), [Mutation::new(*b"a", Some(*b"1"))]);
+    assert_eq!(stored[1].payload.writes(), [Mutation::new(*b"b", Some(*b"2"))]);
     cleanup(&path);
 }
 
@@ -103,8 +102,8 @@ async fn append_entries_preserves_a_replicated_noop_rather_than_flattening_it() 
         seq: 1,
         term: 1,
         kind: crate::pb::raft5::common::EntryKind::Noop as i32,
-        key: Vec::new(),
-        value: None,
+        writes: Vec::new(),
+        config: None,
     };
     let resp = peer_handle
         .append_entries(append_entries(
@@ -122,8 +121,11 @@ async fn append_entries_preserves_a_replicated_noop_rather_than_flattening_it() 
     assert_eq!(resp.match_index, 2);
 
     let stored = log.entries_in_range(1, 3).unwrap();
-    assert_eq!(stored[0].kind, storage::EntryKind::NoOp);
-    assert_eq!(stored[1].kind, storage::EntryKind::Put);
+    assert_eq!(stored[0].payload, storage::EntryPayload::NoOp);
+    assert_eq!(
+        stored[1].payload,
+        storage::EntryPayload::Write(vec![Mutation::new(*b"a", Some(*b"1"))])
+    );
     cleanup(&path);
 }
 
@@ -153,8 +155,8 @@ async fn a_replicated_config_entry_takes_effect_on_append_not_on_commit() {
         seq: 2,
         term: 1,
         kind: crate::pb::raft5::common::EntryKind::Config as i32,
-        key: Vec::new(),
-        value: Some(after.to_bytes()),
+        writes: Vec::new(),
+        config: Some(after.to_bytes()),
     };
     let resp = peer_handle
         .append_entries(append_entries(1, "v1", 1, 1, vec![entry], 0))
@@ -195,8 +197,8 @@ async fn a_truncated_config_entry_reverts_the_active_configuration() {
         seq: 2,
         term: 1,
         kind: crate::pb::raft5::common::EntryKind::Config as i32,
-        key: Vec::new(),
-        value: Some(after.to_bytes()),
+        writes: Vec::new(),
+        config: Some(after.to_bytes()),
     };
     peer_handle
         .append_entries(append_entries(1, "v1", 1, 1, vec![config_entry], 0))
@@ -248,8 +250,8 @@ async fn a_learner_promoted_by_a_replicated_config_starts_campaigning() {
         seq: 2,
         term: 1,
         kind: crate::pb::raft5::common::EntryKind::Config as i32,
-        key: Vec::new(),
-        value: Some(after.to_bytes()),
+        writes: Vec::new(),
+        config: Some(after.to_bytes()),
     };
     peer_handle
         .append_entries(append_entries(1, "v1", 1, 1, vec![entry], 0))
@@ -339,8 +341,8 @@ async fn append_entries_truncates_a_conflicting_suffix_and_applies_the_leaders_e
     // alone proves the old one didn't survive).
     let stored = log.entries_in_range(2, 3).unwrap();
     assert_eq!(stored.len(), 1);
-    assert_eq!(stored[0].key, b"fresh");
-    assert_eq!(stored[0].value, Some(b"new".to_vec()));
+    assert_eq!(stored[0].payload.writes()[0].key, b"fresh");
+    assert_eq!(stored[0].payload.writes()[0].value, Some(b"new".to_vec()));
     cleanup(&path);
 }
 
@@ -820,5 +822,77 @@ async fn install_snapshot_rejects_a_stale_term_and_does_not_touch_storage() {
 
     assert_eq!(resp.term, 5);
     assert_eq!(log.last_entry().unwrap(), None);
+    cleanup(&path);
+}
+
+/// A transaction is one entry carrying every key it wrote, so a follower
+/// that replayed it with the right seq, term and kind but *fewer
+/// mutations* would still satisfy log matching -- (seq, term) is all that
+/// compares -- and the divergence would become the cluster's truth at the
+/// next leader change. The mutations have to arrive too.
+#[tokio::test]
+async fn append_entries_replays_every_mutation_of_a_multi_key_entry() {
+    let (log, _role_rx, peer_handle, _commit_rx, _compact_rx, path) =
+        spawn_node_with_handles(vec![]);
+
+    let txn = write_entry(
+        1,
+        1,
+        vec![
+            (b"a".to_vec(), Some(b"1".to_vec())),
+            (b"b".to_vec(), Some(b"2".to_vec())),
+            (b"gone".to_vec(), None),
+        ],
+    );
+    let resp = peer_handle
+        .append_entries(append_entries(1, "leader-1", 0, 0, vec![txn], 0))
+        .await
+        .unwrap();
+
+    assert!(resp.success);
+    let stored = log.entries_in_range(1, 2).unwrap();
+    assert_eq!(
+        stored[0].payload,
+        storage::EntryPayload::Write(vec![
+            Mutation::new(*b"a", Some(*b"1")),
+            Mutation::new(*b"b", Some(*b"2")),
+            Mutation::new(*b"gone", None::<Vec<u8>>),
+        ]),
+        "the follower's copy of a transaction must be the leader's, mutation for mutation"
+    );
+    cleanup(&path);
+}
+
+/// An entry whose kind this build doesn't recognize is refused, not
+/// guessed at. Guessing used to be safe -- the unknown value defaulted to
+/// a one-key write, which was wrong but visibly so. It isn't safe now:
+/// the guess would produce a write with no mutations, an entry that
+/// consumes a seq and satisfies log matching while silently dropping
+/// every key it was carrying.
+#[tokio::test]
+async fn append_entries_refuses_an_entry_whose_kind_it_does_not_recognize() {
+    let (log, _role_rx, peer_handle, _commit_rx, _compact_rx, path) =
+        spawn_node_with_handles(vec![]);
+
+    let alien = LogEntry {
+        seq: 1,
+        term: 1,
+        kind: 9999,
+        writes: Vec::new(),
+        config: None,
+    };
+    let resp = peer_handle
+        .append_entries(append_entries(1, "leader-1", 0, 0, vec![alien], 0))
+        .await;
+
+    assert!(
+        resp.is_err(),
+        "an unrecognized entry must fail the batch, not be appended as something else"
+    );
+    assert_eq!(
+        log.entries_in_range(1, 2).unwrap().len(),
+        0,
+        "nothing should have reached the log"
+    );
     cleanup(&path);
 }

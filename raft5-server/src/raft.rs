@@ -202,6 +202,7 @@ use leader::Leader;
 // here, so splitting this file didn't touch a single role.
 pub use event::{ConfigChange, Event, RaftError};
 pub use handles::{
+    AppendError,
     ClientHandle, FollowerHandle, LeaderHandle, RaftPeerHandle, RoleHandle, leader_hint_of,
 };
 pub use peer::PeerInfo;
@@ -263,6 +264,12 @@ fn random_jitter_millis(max: u64) -> u64 {
     use std::hash::{BuildHasher, Hasher};
     RandomState::new().build_hasher().finish() % max
 }
+
+/// How long the storage maintenance task waits before retrying an apply
+/// that failed. Long enough that a persistently failing disk doesn't spin
+/// the blocking pool, short enough that a transient one costs a commit a
+/// noticeable pause rather than the rest of the term.
+const APPLY_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// How many consecutive failed election cycles it takes to reach this.
 const MAX_ELECTION_BACKOFF_MS: u64 = 30_000;
@@ -860,8 +867,15 @@ enum Next {
 /// term persist): falling behind on applying/compacting doesn't corrupt
 /// anything or violate a safety property, it just means `latest` is
 /// briefly stale and the log is larger on disk than it needs to be --
-/// this is maintenance, not a correctness requirement, and it'll simply
-/// retry on the next watermark change.
+/// this is maintenance, not a correctness requirement.
+///
+/// It does have to keep *trying*, though, which is why a failed apply
+/// sleeps and retries the same seq rather than going back to waiting on
+/// the watermarks. Waiting would mean a cluster that has gone quiet never
+/// retries at all, since nothing is left to change a watermark -- and
+/// while that used to cost only a stale read, `applied_tx` is now what
+/// every write and every transaction commit is parked on. A commit that
+/// never hears back holds its locks for the rest of the term.
 fn spawn_storage_maintenance_task(
     cancel: &CancellationToken,
     store: Store,
@@ -888,8 +902,20 @@ fn spawn_storage_maintenance_task(
                     applied_tx.send_replace(commit_seq);
                 }
                 Err(e) => {
-                    warn!("apply_committed to seq {commit_seq} failed: {e}");
-                    continue; // don't attempt to compact past what didn't apply
+                    warn!(
+                        "apply_committed to seq {commit_seq} failed, retrying in \
+                         {APPLY_RETRY_DELAY:?}: {e}"
+                    );
+                    // Don't compact past what didn't apply, and don't go
+                    // back to waiting on a watermark that may never move
+                    // again. `select!` rather than a bare sleep so a
+                    // shutdown isn't held up by the backoff.
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => return,
+                        () = tokio::time::sleep(APPLY_RETRY_DELAY) => {}
+                    }
+                    continue;
                 }
             }
 

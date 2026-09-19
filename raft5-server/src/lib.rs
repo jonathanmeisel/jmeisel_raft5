@@ -20,6 +20,7 @@ pub mod pb;
 pub mod raft;
 pub mod storage;
 pub mod store;
+pub mod txn;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -136,11 +137,9 @@ pub async fn serve(
 
     // KvService's read/write path still bypasses the state machine (see
     // its module doc); `client_handle` is what `Bootstrap` goes through.
-    let kv_server = KvServer::new(KvService::new(
-        Store::new(Arc::clone(&log)),
-        identity,
-        client_handle,
-    ));
+    let kv_service = KvService::new(Store::new(Arc::clone(&log)), identity, client_handle);
+    spawn_transaction_sweeper(kv_service.locks(), cancel.clone());
+    let kv_server = KvServer::new(kv_service);
     let raft_peer_server = RaftPeerServer::new(RaftPeerService::new(peer_handle));
 
     if uninitialized {
@@ -190,4 +189,36 @@ pub async fn serve(
     client_result?;
     peer_result?;
     Ok(())
+}
+
+/// How often abandoned transactions are reclaimed, and how long an
+/// aborted one's record of *why* it died outlives it.
+///
+/// The interval is not a latency budget. An expired transaction's locks
+/// are released by the first request that collides with them, so nothing
+/// waits on this tick to make progress -- it only reclaims transactions
+/// nobody happens to want anything from, which costs memory rather than
+/// time. The grace period is what lets a client that has been quiet come
+/// back and be told `EXPIRED` instead of `UNKNOWN`.
+const TRANSACTION_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const TRANSACTION_TOMBSTONE_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Reclaims transactions nobody collided with, until the node shuts down.
+///
+/// Holds the lock table outright rather than weakly: it is a map behind
+/// an `Arc`, not the service, so keeping it alive costs a few words and
+/// creates no cycle. The cancellation token is what ends this task, the
+/// same one that ends everything else here.
+fn spawn_transaction_sweeper(locks: txn::Locks, cancel: CancellationToken) {
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(TRANSACTION_SWEEP_INTERVAL);
+        loop {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => return,
+                _ = ticks.tick() => {}
+            }
+            locks.sweep(std::time::Instant::now(), TRANSACTION_TOMBSTONE_GRACE);
+        }
+    });
 }

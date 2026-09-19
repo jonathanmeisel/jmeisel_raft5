@@ -88,7 +88,7 @@ fn apply_committed_removes_a_deleted_key_from_latest_entirely() {
     assert_eq!(log.get_latest(b"k").unwrap(), None);
     let entries = log.entries_in_range(del_seq, del_seq + 1).unwrap();
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].value, None);
+    assert_eq!(entries[0].payload.writes(), [Mutation::new(*b"k", None::<Vec<u8>>)]);
 
     assert_eq!(log.get_latest(b"never").unwrap(), None);
     cleanup(&path);
@@ -126,13 +126,11 @@ fn append_noop_takes_a_seq_and_round_trips_its_kind() {
     assert_eq!((s1, noop, s3), (1, 2, 3));
 
     let stored = log.entries_in_range(1, 4).unwrap();
-    assert_eq!(stored[1].kind, EntryKind::NoOp);
+    assert_eq!(stored[1].payload, EntryPayload::NoOp);
     assert_eq!(stored[1].term, 2);
-    assert!(stored[1].key.is_empty());
-    assert_eq!(stored[1].value, None);
     // The neighbours still decode as ordinary writes.
-    assert_eq!(stored[0].kind, EntryKind::Put);
-    assert_eq!(stored[2].kind, EntryKind::Put);
+    assert_eq!(stored[0].payload.writes(), [Mutation::new(*b"a", Some(*b"1"))]);
+    assert_eq!(stored[2].payload.writes(), [Mutation::new(*b"b", Some(*b"2"))]);
     // And the term is still readable at the no-op's index, which is
     // what the Figure 8 commit check consults.
     assert_eq!(log.term_at(noop).unwrap(), Some(2));
@@ -489,10 +487,10 @@ fn entries_in_range_returns_terms_in_order() {
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].seq, 2);
     assert_eq!(entries[0].term, 1);
-    assert_eq!(entries[0].key, b"b");
+    assert_eq!(entries[0].payload.writes()[0].key, b"b");
     assert_eq!(entries[1].seq, 3);
     assert_eq!(entries[1].term, 2);
-    assert_eq!(entries[1].key, b"c");
+    assert_eq!(entries[1].payload.writes()[0].key, b"c");
     cleanup(&path);
 }
 
@@ -672,4 +670,207 @@ fn recovers_next_seq_after_reopen() {
     let seq = reopened.append(1, b"c", Some(b"3")).unwrap();
     assert_eq!(seq, 3);
     cleanup(&path);
+}
+
+// --- multi-key entries ------------------------------------------------
+
+/// Every payload shape has to survive a round trip through the row
+/// encoding, because a `log` row is the only record of what an entry was.
+/// Postcard writes an enum's discriminant positionally, so this is also
+/// the test that notices if `EntryPayload`'s variants are ever reordered.
+#[test]
+fn every_payload_round_trips_through_a_log_row() {
+    let (log, path) = open_temp();
+
+    let payloads = [
+        EntryPayload::NoOp,
+        EntryPayload::Config(b"an encoded config".to_vec()),
+        EntryPayload::Write(vec![Mutation::new(*b"k", Some(*b"v"))]),
+        EntryPayload::Write(vec![Mutation::new(*b"gone", None::<Vec<u8>>)]),
+        EntryPayload::Write(vec![
+            Mutation::new(*b"a", Some(*b"1")),
+            Mutation::new(*b"b", None::<Vec<u8>>),
+            Mutation::new(Vec::new(), Some(Vec::new())),
+        ]),
+    ];
+    for payload in &payloads {
+        log.append_payload(7, payload).unwrap();
+    }
+
+    let stored = log.entries_in_range(1, payloads.len() as u64 + 1).unwrap();
+    let round_tripped: Vec<_> = stored.into_iter().map(|e| e.payload).collect();
+    assert_eq!(round_tripped, payloads);
+
+    cleanup(&path);
+}
+
+/// Bounds checking used to be this module's own job, one hand-written
+/// length guard per field. It is the decoder's now, and a corrupt row has
+/// to still come back as an error rather than a panic or a wrong answer --
+/// that property is the whole reason the hand-rolled framing was safe to
+/// delete.
+#[test]
+fn a_corrupt_log_row_is_refused_rather_than_half_read() {
+    let good = encode_log_entry(
+        1,
+        &EntryPayload::Write(vec![Mutation::new(*b"key", Some(*b"value"))]),
+    )
+    .unwrap();
+
+    // Every truncation of a valid row.
+    for cut in 0..good.len() {
+        assert!(
+            decode_log_entry(&good[..cut]).is_err(),
+            "a row truncated to {cut} of {} bytes decoded anyway",
+            good.len()
+        );
+    }
+
+    // And a row claiming a payload variant that doesn't exist.
+    let mut unknown_variant = good.clone();
+    unknown_variant[1] = 0x7f;
+    assert!(decode_log_entry(&unknown_variant).is_err());
+
+    assert!(decode_log_entry(&good).is_ok(), "the fixture itself is valid");
+}
+
+/// The point of putting a transaction's writes in one entry: they reach
+/// `latest` together, at one seq, or not at all. Applying only up to the
+/// entry *before* it must show none of them.
+#[test]
+fn a_multi_key_entry_applies_all_of_its_writes_at_one_seq() {
+    let (log, path) = open_temp();
+
+    log.append(1, b"untouched", Some(b"before")).unwrap();
+    let txn = log
+        .append_writes(
+            1,
+            vec![
+                Mutation::new(*b"a", Some(*b"1")),
+                Mutation::new(*b"b", Some(*b"2")),
+                Mutation::new(*b"untouched", None::<Vec<u8>>),
+            ],
+        )
+        .unwrap();
+
+    // Committed only as far as the entry before it: none of it is visible.
+    log.apply_committed(txn - 1).unwrap();
+    assert_eq!(log.get_latest(b"a").unwrap(), None);
+    assert_eq!(log.get_latest(b"b").unwrap(), None);
+    assert!(log.get_latest(b"untouched").unwrap().is_some());
+
+    log.apply_committed(txn).unwrap();
+    assert_eq!(log.get_latest(b"a").unwrap(), Some((txn, b"1".to_vec())));
+    assert_eq!(log.get_latest(b"b").unwrap(), Some((txn, b"2".to_vec())));
+    // A delete inside the entry lands with the rest of it.
+    assert_eq!(log.get_latest(b"untouched").unwrap(), None);
+
+    cleanup(&path);
+}
+
+/// An entry with more mutations than `WRITE_CHUNK` is deliberately *not*
+/// split across batches -- splitting it is exactly the tear the entry
+/// exists to prevent -- so it has to apply whole anyway.
+#[test]
+fn a_multi_key_entry_larger_than_a_write_chunk_still_applies_whole() {
+    let (log, path) = open_temp();
+
+    let n = WRITE_CHUNK + 7;
+    let writes: Vec<_> = (0..n)
+        .map(|i| Mutation::new(format!("k{i}"), Some(format!("v{i}"))))
+        .collect();
+    let seq = log.append_writes(1, writes).unwrap();
+    log.apply_committed(seq).unwrap();
+
+    for i in [0, 1, n / 2, n - 1] {
+        assert_eq!(
+            log.get_latest(format!("k{i}").as_bytes()).unwrap(),
+            Some((seq, format!("v{i}").into_bytes())),
+            "key {i} of {n} did not land"
+        );
+    }
+
+    cleanup(&path);
+}
+
+/// Two *separate* point reads straddling a commit see two points in
+/// time -- that is not a torn batch, and no storage-level lock could make
+/// it otherwise. Pinned here because it is the property that decides
+/// where multi-key consistency has to come from: the lock table in
+/// `grpc::KvService`, not `storage`. If this ever stops holding, the
+/// reasoning in the module doc needs revisiting.
+#[test]
+fn two_separate_reads_can_straddle_a_commit() {
+    let (log, path) = open_temp();
+
+    let first = log
+        .append_writes(
+            1,
+            vec![
+                Mutation::new(*b"a", Some(*b"0")),
+                Mutation::new(*b"b", Some(*b"0")),
+            ],
+        )
+        .unwrap();
+    log.apply_committed(first).unwrap();
+
+    // A reader that reads `a`, is interrupted by a whole second entry,
+    // then reads `b`, sees the two keys at different seqs. Spelled out
+    // sequentially rather than raced, so it is a statement about the
+    // interleaving rather than a flaky one about timing.
+    let a = log.get_latest(b"a").unwrap();
+
+    let second = log
+        .append_writes(
+            1,
+            vec![
+                Mutation::new(*b"a", Some(*b"1")),
+                Mutation::new(*b"b", Some(*b"1")),
+            ],
+        )
+        .unwrap();
+    log.apply_committed(second).unwrap();
+
+    let b = log.get_latest(b"b").unwrap();
+
+    assert_eq!(a, Some((first, b"0".to_vec())));
+    assert_eq!(b, Some((second, b"1".to_vec())));
+
+    cleanup(&path);
+}
+
+/// `export_snapshot` is the one thing that reads many keys of `latest` in
+/// a single operation, and `Keyspace::iter` pins a snapshot nonce so it
+/// reads them all at one instant. That is what keeps a snapshot from
+/// capturing an entry half-applied and handing its recipient a state no
+/// node ever had -- a property this module leans on rather than provides,
+/// so it is worth a test that would notice it changing.
+#[test]
+fn a_snapshot_never_captures_an_entry_half_applied() {
+    let (log, path) = open_temp();
+
+    let seq = log
+        .append_writes(
+            1,
+            vec![
+                Mutation::new(*b"a", Some(*b"same")),
+                Mutation::new(*b"b", Some(*b"same")),
+            ],
+        )
+        .unwrap();
+    log.apply_committed(seq).unwrap();
+
+    let mut buf = Vec::new();
+    log.export_snapshot(&mut buf).unwrap();
+
+    let (dest, dest_path) = open_temp();
+    dest.install_snapshot(&mut buf.as_slice()).unwrap();
+    assert_eq!(
+        dest.get_latest(b"a").unwrap().map(|(_, v)| v),
+        dest.get_latest(b"b").unwrap().map(|(_, v)| v),
+        "both keys of one entry must survive a snapshot together"
+    );
+
+    cleanup(&path);
+    cleanup(&dest_path);
 }

@@ -6,6 +6,7 @@
 use log::info;
 
 use super::*;
+use crate::storage::StorageError;
 
 /// The outcome of matching+applying one `AppendEntries` call's `entries`
 /// against storage. Doesn't carry `term` -- that's `Common`'s concern, not
@@ -102,19 +103,23 @@ fn apply_append_entries_sync(
                     // reloading when nothing changed is free.
                     config_may_have_changed = true;
                 }
-                config_may_have_changed |= entries[i..]
-                    .iter()
-                    .any(|e| e.entry_kind() == storage::EntryKind::Config);
+                config_may_have_changed |= entries[i..].iter().any(LogEntry::is_config);
                 for fresh in &entries[i..] {
-                    // `append_entry`, not `append`: the entry's kind comes
-                    // from the leader and has to be preserved verbatim, or
-                    // our copy of the log stops matching theirs.
-                    let seq = log.append_entry(
-                        fresh.term,
-                        fresh.entry_kind(),
-                        &fresh.key,
-                        fresh.value.as_deref(),
-                    )?;
+                    // `append_payload`, not `append`: the payload comes
+                    // from the leader and has to be preserved verbatim --
+                    // its kind *and* every mutation it carries -- or our
+                    // copy of the log stops matching theirs. An entry we
+                    // cannot decode is refused rather than guessed at;
+                    // see `pb::UnknownEntry`.
+                    let payload = fresh
+                        .payload()
+                        .map_err(|_| StorageError::Corrupt("replicated log entry has an unrecognized kind"))?;
+                    debug_assert_eq!(
+                        payload.mutation_count(),
+                        fresh.writes.len(),
+                        "a replicated entry lost mutations on the way into the log"
+                    );
+                    let seq = log.append_payload(fresh.term, &payload)?;
                     debug_assert_eq!(
                         seq, fresh.seq,
                         "follower's log position drifted from the leader's indexing"

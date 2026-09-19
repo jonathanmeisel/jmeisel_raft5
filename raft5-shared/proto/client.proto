@@ -40,6 +40,20 @@ service Kv {
   // cluster yet. Answered by any node, not just the leader: membership is
   // local, read-only state, unlike a write or a linearizable read.
   rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
+
+  // Multi-key transactions. A transaction reads and buffers writes
+  // across any number of keys and commits them as a single log entry,
+  // so they become durable together and apply together.
+  //
+  // Isolation is two-phase locking held in memory on the leader, which
+  // is why every one of these is refused by anyone else: a transaction
+  // belongs to the leader that created it and cannot outlive its term.
+  // Nothing is written until Commit -- Drop, a lost connection, or the
+  // deadline passing all leave the store exactly as it was.
+  rpc CreateTransaction(CreateTransactionRequest) returns (CreateTransactionResponse);
+  rpc BufferWrite(BufferWriteRequest) returns (BufferWriteResponse);
+  rpc CommitTransaction(CommitTransactionRequest) returns (CommitTransactionResponse);
+  rpc DropTransaction(DropTransactionRequest) returns (DropTransactionResponse);
 }
 
 // Carried in every response so a client can find the real leader without a
@@ -50,7 +64,42 @@ message RaftError {
     string unavailable = 2; // e.g. no leader elected yet
     string timeout = 3;
     WriteConflict conflict = 4;
+    TransactionAborted aborted = 5;
   }
+}
+
+// A transaction that is no longer usable, and why. Every reason but
+// IN_DOUBT means nothing was written, so the caller is free to start
+// over and replay whatever it was doing.
+message TransactionAborted {
+  enum Reason {
+    // A key was held by someone this transaction was not allowed to
+    // displace: an older transaction, one already committing, or a plain
+    // Write already in flight. `key` names it.
+    LOCK_CONFLICT = 0;
+    // Its deadline passed. Its locks are already gone.
+    EXPIRED = 1;
+    // No such transaction on this node -- never created, or reclaimed
+    // long enough ago that even the record of its death is gone.
+    UNKNOWN = 2;
+    // The leader changed. A transaction's reads were validated against
+    // the leader that served them, so it cannot be finished anywhere
+    // else.
+    LEADER_CHANGED = 3;
+    // The commit reached the log and then this node stopped leading, so
+    // nothing here can say whether it committed or was rolled back.
+    // `seq` is where it went. Unlike every other reason, this one must
+    // NOT be retried: replaying a read-modify-write that already applied
+    // applies it twice.
+    IN_DOUBT = 4;
+    // An older transaction took one of this one's keys. Deliberate, and
+    // how the oldest transaction is guaranteed to make progress rather
+    // than two transactions aborting each other forever.
+    WOUNDED = 5;
+  }
+  Reason reason = 1;
+  optional bytes key = 2; // which key, for LOCK_CONFLICT
+  optional uint64 seq = 3; // where the entry went, for IN_DOUBT
 }
 
 message NotLeader {
@@ -94,6 +143,15 @@ message WriteResponse {
 message ReadRequest {
   bytes key = 1;
   bool linearizable = 2;
+  // Read as part of this transaction: the key joins its read set and is
+  // held against conflicting writes until it finishes, and a key it has
+  // already buffered a write for reads back as that write.
+  //
+  // Requires `linearizable`. A stale read is answered by whichever node
+  // received it, and a node that isn't the leader has no transaction by
+  // this id and no lock table to protect it -- it would return
+  // unprotected data under a transaction's name.
+  optional bytes transaction_id = 3;
 }
 
 message ReadResponse {
@@ -139,4 +197,64 @@ message GetConfigRequest {}
 message GetConfigResponse {
   raft5.cluster.ClusterMember identity = 1;
   repeated raft5.cluster.ClusterMember members = 2;
+}
+
+// `ttl_ms` is how long the transaction may hold its locks. A value past
+// what this server is willing to grant is refused rather than quietly
+// shortened: a caller told "yes" to a lifetime it will not get would go
+// on to act as though it had one.
+message CreateTransactionRequest {
+  uint64 ttl_ms = 1;
+}
+
+message CreateTransactionResponse {
+  oneof result {
+    bytes transaction_id = 1; // opaque; server-generated
+    RaftError error = 2;
+  }
+}
+
+// Buffer one key's change. Nothing is written: the value is held on the
+// leader until Commit, and the key is locked exclusively from here on.
+message BufferWriteRequest {
+  bytes transaction_id = 1;
+  bytes key = 2;
+  optional bytes value = 3; // unset = delete
+}
+
+message BufferWriteResponse {
+  oneof result {
+    bool ok = 1;
+    RaftError error = 2;
+  }
+}
+
+message CommitTransactionRequest {
+  bytes transaction_id = 1;
+}
+
+message CommitTransactionResponse {
+  oneof result {
+    // The sequence number every key in the transaction was written at --
+    // one entry, so one seq for all of them. Zero for a transaction that
+    // buffered no writes: there was nothing to append, so there is no
+    // sequence number to name.
+    uint64 seq = 1;
+    RaftError error = 2;
+  }
+}
+
+// Give up a transaction and release its locks. Idempotent, and content
+// with an id it has never heard of: committing and then dropping is the
+// ordinary path, and a client shouldn't have to know whether its drop
+// raced its own commit.
+message DropTransactionRequest {
+  bytes transaction_id = 1;
+}
+
+message DropTransactionResponse {
+  oneof result {
+    bool ok = 1;
+    RaftError error = 2;
+  }
 }
