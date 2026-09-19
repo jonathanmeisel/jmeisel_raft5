@@ -207,6 +207,10 @@ pub use handles::{
 };
 pub use peer::PeerInfo;
 
+/// The wire form of an `AppendEntries`, for the one test that has to
+/// speak it over a real socket -- see `grpc::tests`.
+#[cfg(test)]
+pub(crate) use leader::replication::append_entries_stream;
 pub(crate) use event::Role;
 use event::Transition;
 use peer::PeerConnections;
@@ -239,7 +243,75 @@ const LIGHTWEIGHT_RPC_TIMEOUT: Duration = Duration::from_millis(HEARTBEAT_MS * 2
 /// a while under load. Deliberately generous: retrying an already-slow
 /// follower sooner doesn't help if the bottleneck is disk I/O, it just
 /// adds more redundant work on top.
+///
+/// Sized against `MAX_REPLICATION_BATCH_BYTES`: a full batch has to fit
+/// inside this on a link worth replicating over at all. At 16 MiB that is
+/// a floor of roughly 550 KiB/s, which is a very low bar -- but the
+/// relationship is the thing to preserve if either number moves, because
+/// a batch that cannot finish inside the timeout never commits, and
+/// nothing after it commits either.
 const APPEND_ENTRIES_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long replication to one peer may keep failing before it is
+/// reported as a stall rather than a retry. Past this, the likely causes
+/// stop being "the peer is restarting" and start being "this will never
+/// succeed" -- a batch too large for the link, most of all, which pins
+/// the commit index indefinitely with nothing else to show for it.
+const REPLICATION_STALL_WARNING: Duration = Duration::from_secs(60);
+
+// --- the replication size cap chain -----------------------------------
+//
+// These are not independent knobs. If the leader can ever emit an entry
+// the follower will refuse, that entry is already in the log, the leader
+// re-proposes it forever, and the cluster never commits anything again --
+// the failure `txn::MAX_TRANSACTION_BYTES` exists to prevent. So they are
+// derived from one another and the ordering is asserted below.
+//
+// Budgets are in *encoded* bytes, and the three layers do not encode
+// identically: `txn` counts raw key and value bytes, a `log` row is
+// postcard, the wire is protobuf. The headroom between
+// `txn::MAX_TRANSACTION_BYTES` and `MAX_ENTRY_BYTES` is what absorbs the
+// difference between them.
+
+/// The largest single log entry that may exist, anywhere. Enforced at the
+/// only place that can enforce it -- `txn`, before anything reaches the
+/// log -- and everything below is sized so that an entry this large can
+/// always be replicated.
+pub const MAX_ENTRY_BYTES: usize = 16 * 1024 * 1024;
+
+/// How many bytes of log entries one replication round may carry.
+///
+/// A soft budget: `RaftLog::entries_in_range_capped` always yields at
+/// least one entry even when that entry alone exceeds this, so a single
+/// large entry makes progress rather than wedging behind a budget it can
+/// never fit. That is exactly why this must be at least
+/// `MAX_ENTRY_BYTES` -- the "at least one" escape hatch is only safe if
+/// no single entry can outgrow the cap it escapes.
+pub const MAX_REPLICATION_BATCH_BYTES: usize = MAX_ENTRY_BYTES;
+
+/// The receiver's hard ceiling on one `AppendEntries` body. Strictly
+/// above `MAX_REPLICATION_BATCH_BYTES` so that protobuf framing around a
+/// maximal batch can never tip an honest leader over the line.
+pub const MAX_APPEND_ENTRIES_BYTES: usize = MAX_REPLICATION_BATCH_BYTES + 4 * 1024 * 1024;
+
+// Compile-time, not a test: breaking this ordering should fail the
+// build rather than a run. Today the chain is 10 MiB < 16 MiB <= 16 MiB
+// < 20 MiB.
+const _: () = assert!(
+    crate::txn::MAX_TRANSACTION_BYTES < MAX_ENTRY_BYTES,
+    "a transaction must leave room for the framing its log entry adds, or \
+     the leader can append an entry it can never replicate"
+);
+const _: () = assert!(
+    MAX_ENTRY_BYTES <= MAX_REPLICATION_BATCH_BYTES,
+    "a single entry must always fit in one replication round, or the \
+     'always send at least one entry' rule emits batches over the budget"
+);
+const _: () = assert!(
+    MAX_REPLICATION_BATCH_BYTES < MAX_APPEND_ENTRIES_BYTES,
+    "the receiver must accept anything the leader is willing to send, or \
+     an entry is refused forever and the cluster stops committing"
+);
 
 /// Timeout for a full `InstallSnapshot` transfer -- more generous still
 /// than `AppendEntries`: this moves the *entire* current state, not just a
@@ -247,12 +319,15 @@ const APPEND_ENTRIES_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// slow link.
 const SNAPSHOT_RPC_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// How much of an exported snapshot's bytes go into each `SnapshotChunk`
-/// sent over the wire. The whole snapshot is still buffered in memory on
-/// both ends first (matching the receiving side's existing "get it
-/// working" tradeoff -- see `grpc::RaftPeerService::install_snapshot`);
-/// this only bounds the size of each individual gRPC message.
-const SNAPSHOT_CHUNK_SIZE: usize = 1024 * 1024;
+/// How much of an encoded entry batch goes into each `AppendEntriesChunk`
+/// on the wire.
+///
+/// Only bounds the size of one gRPC message; the batch as a whole is
+/// bounded by `MAX_REPLICATION_BATCH_BYTES`. Keeping each message well
+/// under any plausible decode limit is the point -- it is what moves the
+/// ceiling on a batch off the transport's defaults and into the cap
+/// chain below, where it is chosen rather than inherited.
+const APPEND_ENTRIES_CHUNK_SIZE: usize = 1024 * 1024;
 
 /// A random value in `[0, max)`. Good enough for election-timeout jitter
 /// without pulling in a `rand` dependency: `RandomState`'s whole purpose is

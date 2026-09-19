@@ -19,7 +19,10 @@ async fn get_lease_from_peer(
     req: GetLeaseRequest,
     conns: &PeerConnections,
 ) -> Option<GetLeaseResponse> {
-    let mut client = conns.client(peer)?;
+    // `lease_client`, not `client`: a probe on the same connection as a
+    // replication batch waits behind it, and a probe that waits is a
+    // probe that has already failed. See `PeerConnections`.
+    let mut client = conns.lease_client(peer)?;
     let attempt = client.get_lease(req);
     match tokio::time::timeout(LIGHTWEIGHT_RPC_TIMEOUT, attempt).await {
         Ok(Ok(resp)) => Some(resp.into_inner()),

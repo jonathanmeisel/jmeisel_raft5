@@ -32,6 +32,7 @@
 //! check and the actual install both happen on the far side of
 //! `RaftPeerHandle`, same as everything else.
 
+use prost::Message;
 use raft5_shared::raft5::client::kv_client::KvClient;
 use tonic::transport::Endpoint;
 use tonic::{Request, Response, Status, Streaming};
@@ -50,17 +51,18 @@ use crate::pb::raft5::client::{
 use crate::pb::raft5::cluster::{ClusterConfig, ClusterMember};
 use crate::pb::raft5::raft::raft_peer_server::RaftPeer;
 use crate::pb::raft5::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, GetLeaseRequest, GetLeaseResponse,
-    InstallSnapshotResponse, RequestVoteRequest, RequestVoteResponse, SnapshotChunk,
-    snapshot_chunk,
+    AppendEntriesChunk, AppendEntriesResponse, AppendEntriesRequest, EntryBatch, GetLeaseRequest,
+    GetLeaseResponse, InstallSnapshotResponse, RequestVoteRequest, RequestVoteResponse,
+    SnapshotChunk, append_entries_chunk, snapshot_chunk,
 };
 use crate::raft::{
-    self, AppendError, ClientHandle, ConfigChange, LeaderHandle, RaftError, RaftPeerHandle,
-    RoleHandle,
+    self, AppendError, ClientHandle, ConfigChange, LeaderHandle, MAX_APPEND_ENTRIES_BYTES,
+    RaftError, RaftPeerHandle, RoleHandle,
 };
 use crate::storage::Mutation;
 use crate::storage::{RaftLog, StorageError};
 use crate::store::Store;
+use crate::store::ChunkReader;
 use crate::txn::{AbortReason, BareGuard, Locks, Refused, TxnId};
 
 /// A transaction's refusal as the client protocol carries it.
@@ -794,18 +796,151 @@ impl RaftPeerService {
     }
 }
 
+/// What `reassemble_append_entries` decided about a stream.
+#[derive(Debug)]
+enum Reassembled {
+    /// A complete request, ready for the event loop to rule on properly.
+    Request(Box<AppendEntriesRequest>),
+    /// Refused here, before the event loop, and why. Still answered with
+    /// an ordinary response rather than an error -- see below.
+    Refused(&'static str),
+}
+
+/// Reads one `AppendEntries` stream back into the request it was split
+/// from.
+///
+/// A free function rather than a method for a practical reason:
+/// `tonic::Streaming` has no public constructor, so anything taking a
+/// `Request<Streaming<_>>` cannot be tested at all -- and the rules
+/// below (header first, the size ceiling, the declared-versus-actual
+/// byte count, the stale-term fast path) are exactly the part worth
+/// testing.
+///
+/// `current_term` is a lower bound on this node's term, used only to
+/// refuse early. Everything that gets past it is still checked on the
+/// event loop, which is where §5.1 actually lives.
+async fn reassemble_append_entries<S>(mut stream: S, current_term: u64) -> Result<Reassembled, Status>
+where
+    S: futures_core::Stream<Item = Result<AppendEntriesChunk, Status>> + Unpin,
+{
+    use futures_util::StreamExt;
+
+    let first = stream
+        .next()
+        .await
+        .transpose()?
+        .ok_or_else(|| Status::invalid_argument("empty append_entries stream"))?;
+    let header = match first.part {
+        Some(append_entries_chunk::Part::Header(header)) => header,
+        _ => return Err(Status::invalid_argument("first chunk must be a header")),
+    };
+
+    // Two reasons to want nothing to do with the body. Both still read
+    // it to the end -- see `drain` below.
+    let refusal = if header.term < current_term {
+        Some("the leader's term is behind this node's")
+    } else if header.entries_bytes > MAX_APPEND_ENTRIES_BYTES as u64 {
+        Some("the declared batch size is over this node's limit")
+    } else {
+        None
+    };
+
+    // Trusting the declared size to size the buffer would make a single
+    // header an out-of-memory button, so the allocation is bounded by
+    // what this node was willing to accept in the first place.
+    let mut body = if refusal.is_some() {
+        Vec::new()
+    } else {
+        Vec::with_capacity(header.entries_bytes.min(MAX_APPEND_ENTRIES_BYTES as u64) as usize)
+    };
+    let mut refusal = refusal;
+
+    while let Some(chunk) = stream.next().await.transpose()? {
+        let Some(append_entries_chunk::Part::Entries(fragment)) = chunk.part else {
+            return Err(Status::invalid_argument(
+                "every chunk after the header must be an entries fragment",
+            ));
+        };
+        if refusal.is_some() {
+            // Draining, not collecting: the rest of the stream costs
+            // bandwidth but nothing else.
+            continue;
+        }
+        // The header's byte count is a claim; this is the fact.
+        if body.len() + fragment.len() > MAX_APPEND_ENTRIES_BYTES {
+            refusal = Some("the batch is over this node's size limit");
+            body = Vec::new();
+            continue;
+        }
+        body.extend_from_slice(&fragment);
+    }
+
+    if let Some(why) = refusal {
+        return Ok(Reassembled::Refused(why));
+    }
+    if body.len() as u64 != header.entries_bytes {
+        return Err(Status::invalid_argument(
+            "the stream carried a different number of bytes than its header declared",
+        ));
+    }
+
+    let entries = EntryBatch::decode(&body[..])
+        .map_err(|e| Status::invalid_argument(format!("undecodable entry batch: {e}")))?
+        .entries;
+
+    Ok(Reassembled::Request(Box::new(AppendEntriesRequest {
+        term: header.term,
+        leader_id: header.leader_id,
+        prev_log_index: header.prev_log_index,
+        prev_log_term: header.prev_log_term,
+        entries,
+        leader_commit: header.leader_commit,
+        compact_seq: header.compact_seq,
+    })))
+}
+
 #[tonic::async_trait]
 impl RaftPeer for RaftPeerService {
+    /// Reassembles the stream and hands the result inward unchanged --
+    /// the term check, the log matching and the append all still happen
+    /// on the event loop, exactly as they did when this was unary.
+    ///
+    /// A refusal is answered with an ordinary `AppendEntriesResponse`
+    /// carrying this node's term, never a `Status`. That is load-bearing
+    /// rather than stylistic: a response is how a leader on a stale term
+    /// learns to step down (`Event::response_term`), and an error
+    /// returned while the leader is still writing its request body
+    /// surfaces to it as a transport failure, which it would retry
+    /// forever without ever seeing the term that should have stopped it.
     async fn append_entries(
         &self,
-        request: Request<AppendEntriesRequest>,
+        request: Request<tonic::Streaming<AppendEntriesChunk>>,
     ) -> Result<Response<AppendEntriesResponse>, Status> {
-        let resp = self
-            .peer_handle
-            .append_entries(request.into_inner())
-            .await
-            .map_err(raft_err)?;
-        Ok(Response::new(resp))
+        let current_term = self.peer_handle.current_term();
+        match reassemble_append_entries(request.into_inner(), current_term).await? {
+            Reassembled::Request(req) => {
+                let resp = self
+                    .peer_handle
+                    .append_entries(*req)
+                    .await
+                    .map_err(raft_err)?;
+                Ok(Response::new(resp))
+            }
+            Reassembled::Refused(why) => {
+                log::warn!("refused an append_entries stream: {why}");
+                Ok(Response::new(AppendEntriesResponse {
+                    // Read again rather than reusing `current_term`: the
+                    // event loop may have moved on while the body was
+                    // being drained, and a leader deserves the freshest
+                    // term this node can give it.
+                    term: self.peer_handle.current_term(),
+                    success: false,
+                    match_index: 0,
+                    conflict_index: None,
+                    conflict_term: None,
+                }))
+            }
+        }
     }
 
     async fn request_vote(
@@ -851,26 +986,44 @@ impl RaftPeer for RaftPeerService {
             _ => return Err(Status::invalid_argument("first chunk must be a header")),
         };
 
-        // Reassemble the raw byte stream produced by `export_snapshot`.
-        // This buffers the whole snapshot in memory before handing it
-        // onward -- fine for getting the plumbing working, but a fully
-        // streaming version (a sync `Read` fed by this async loop through
-        // a channel, run inside `spawn_blocking`) would avoid that if
-        // snapshots get large enough for it to matter.
-        let mut buf = Vec::new();
-        while let Some(chunk) = stream.message().await? {
-            match chunk.part {
-                Some(snapshot_chunk::Part::Data(data)) => buf.extend_from_slice(&data),
-                _ => return Err(Status::invalid_argument("expected a data chunk")),
-            }
-        }
+        // The chunks go straight through to `install_snapshot` as they
+        // arrive, rather than being assembled first. A snapshot is the
+        // cluster's entire applied state, so "buffer it, then install
+        // it" has no size at which it stays reasonable -- what is held
+        // here is `CHUNK_BACKLOG` chunks, whatever the snapshot weighs.
+        //
+        // The install and the pump have to run at the same time: the
+        // install blocks waiting for chunks that only the pump can
+        // deliver, and the pump finishes only once the stream is done.
+        let (tx, rx) = tokio::sync::mpsc::channel(crate::store::CHUNK_BACKLOG);
+        let install = self.peer_handle.install_snapshot(header, ChunkReader::new(rx));
 
-        let resp = self
-            .peer_handle
-            .install_snapshot(header, buf)
-            .await
-            .map_err(raft_err)?;
-        Ok(Response::new(resp))
+        let pump = async move {
+            let mut giving_up = false;
+            while let Some(chunk) = stream.message().await? {
+                let Some(snapshot_chunk::Part::Data(data)) = chunk.part else {
+                    return Err(Status::invalid_argument("expected a data chunk"));
+                };
+                if giving_up {
+                    continue;
+                }
+                // A closed channel means the state machine refused this
+                // snapshot -- a stale term, most likely -- and dropped
+                // the reader. Keep reading the stream to its end anyway:
+                // answering while the sender is still writing its
+                // request body reaches it as a transport error rather
+                // than the response carrying the term that should make
+                // it stand down.
+                if tx.send(data.to_vec()).await.is_err() {
+                    giving_up = true;
+                }
+            }
+            Ok::<(), Status>(())
+        };
+
+        let (installed, pumped) = tokio::join!(install, pump);
+        pumped?;
+        Ok(Response::new(installed.map_err(raft_err)?))
     }
 }
 

@@ -139,7 +139,13 @@ pub async fn serve(
     // its module doc); `client_handle` is what `Bootstrap` goes through.
     let kv_service = KvService::new(Store::new(Arc::clone(&log)), identity, client_handle);
     spawn_transaction_sweeper(kv_service.locks(), cancel.clone());
-    let kv_server = KvServer::new(kv_service);
+    // A whole transaction may be a single value, so one `BufferWrite`
+    // can legitimately be as large as `MAX_TRANSACTION_BYTES`. Without
+    // this, tonic's 4MB default would refuse it -- and refuse it in the
+    // transport, where the transaction size limit has no say and no way
+    // to explain itself.
+    let kv_server = KvServer::new(kv_service)
+        .max_decoding_message_size(txn::MAX_TRANSACTION_BYTES + MESSAGE_FRAMING_SLACK);
     let raft_peer_server = RaftPeerServer::new(RaftPeerService::new(peer_handle));
 
     if uninitialized {
@@ -171,6 +177,17 @@ pub async fn serve(
     };
     let peer_server = async {
         let result = Server::builder()
+            // Matches the peer clients (see `raft::PeerConnections`):
+            // without it, h2's default 65535-byte window caps
+            // replication throughput at `window / round trip` however
+            // the batch is chunked.
+            .http2_adaptive_window(Some(true))
+            // An `AppendEntries` stream buffers up to
+            // `MAX_APPEND_ENTRIES_BYTES` here before any of it reaches
+            // the event loop, so how many may be in flight at once is
+            // the other half of that limit -- and this port is where an
+            // unauthenticated peer would push on it.
+            .max_concurrent_streams(Some(MAX_CONCURRENT_PEER_STREAMS))
             .add_service(raft_peer_server)
             .serve_with_shutdown(peer_addr, cancel.cancelled())
             .await;
@@ -190,6 +207,22 @@ pub async fn serve(
     peer_result?;
     Ok(())
 }
+
+/// Room left over a payload limit for the protobuf framing around it --
+/// field tags, length prefixes, and the rest of the message's own
+/// fields. Generous: being a little over is free, and being under means
+/// refusing a request the payload limit says is fine.
+const MESSAGE_FRAMING_SLACK: usize = 1024 * 1024;
+
+/// How many peer RPCs may be in flight against this node at once.
+///
+/// Each concurrent `AppendEntries` can hold `MAX_APPEND_ENTRIES_BYTES`
+/// of reassembly buffer, so this and that constant together are the real
+/// ceiling on what inbound replication can make this node allocate.
+/// Comfortably above anything a legitimate cluster does -- a peer runs
+/// one replication stream and one lease probe against each other node --
+/// and far below "unbounded".
+const MAX_CONCURRENT_PEER_STREAMS: u32 = 64;
 
 /// How often abandoned transactions are reclaimed, and how long an
 /// aborted one's record of *why* it died outlives it.

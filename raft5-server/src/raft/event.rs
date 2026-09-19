@@ -45,14 +45,20 @@ pub enum Event {
         from: String,
         resp: GetLeaseResponse,
     },
-    /// `data` is the full byte stream `RaftLog::export_snapshot` produced
-    /// (magic/version/seq/term header included) -- `grpc::RaftPeerService`
-    /// reassembles it from the wire but doesn't touch storage itself, so
-    /// the term check and the actual install both happen here, same as
-    /// every other inbound RPC.
+    /// `body` yields the byte stream `RaftLog::export_snapshot` produced
+    /// (magic/version/seq/term header included) as it arrives off the
+    /// wire -- `grpc::RaftPeerService` pumps the gRPC chunks into it but
+    /// doesn't touch storage itself, so the term check and the actual
+    /// install both happen here, same as every other inbound RPC.
+    ///
+    /// A reader rather than a `Vec<u8>` because a snapshot is the whole
+    /// applied state of the cluster and there is no size at which
+    /// holding all of it in memory becomes the right idea. Dropping this
+    /// event without reading it -- which is what rejecting on term does
+    /// -- closes the channel and tells the sender to stop.
     InstallSnapshot {
         header: SnapshotHeader,
-        data: Vec<u8>,
+        body: crate::store::ChunkReader,
         respond_to: oneshot::Sender<InstallSnapshotResponse>,
     },
     /// The leader's own snapshot-send task reporting back what happened,

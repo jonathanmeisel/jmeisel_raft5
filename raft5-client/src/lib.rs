@@ -50,6 +50,14 @@ use routing::{Kv, Router};
 /// change still committing -- resolves well inside this on a healthy
 /// cluster; past it, something is actually wrong and a caller waiting on
 /// a key/value store deserves to hear about it.
+///
+/// Note what this costs a large transaction's commit, which has to
+/// replicate to a majority and be applied inside it: a commit that runs
+/// out of deadline comes back as [`Error::InDoubt`], the one outcome a
+/// caller must never replay. "Too slow" therefore becomes
+/// "unrecoverable", not "try again" -- so if the cluster's transaction
+/// size limit ever grows much past its current few megabytes, this
+/// wants growing with it.
 const DEADLINE: Duration = Duration::from_secs(10);
 
 /// How long to wait before re-sending a request that was refused for a

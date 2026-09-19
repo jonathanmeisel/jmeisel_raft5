@@ -69,11 +69,20 @@ use std::time::{Duration, Instant};
 /// server will not honour, and silently giving it a shorter lease than it
 /// asked for would let it act on that assumption anyway.
 ///
-/// Short, because a transaction's locks block ordinary writes to the same
-/// keys for as long as they are held, and `raft5_lock` -- built on those
-/// ordinary writes -- gives up a lock lease after a second of failed
-/// refreshes.
-pub const MAX_TRANSACTION_TTL: Duration = Duration::from_secs(5);
+/// Pulled in two directions. A transaction's locks block ordinary writes
+/// to the same keys for as long as they are held, and `raft5_lock` --
+/// built on those ordinary writes -- gives up a lock lease after a
+/// second of failed refreshes, which argues for short. But a
+/// `MAX_TRANSACTION_BYTES` transaction is uploaded as many `BufferWrite`
+/// calls that must *all* land before this expires, or the locks go and
+/// the work is wasted; at 10 MiB, five seconds would demand a sustained
+/// 2 MB/s with nothing to spare. Fifteen sets that floor around
+/// 700 KB/s, which is a bar any usable link clears.
+///
+/// So the two constants are related: raising `MAX_TRANSACTION_BYTES`
+/// without raising this makes large transactions fail by timing out
+/// mid-upload, for reasons that look nothing like their actual cause.
+pub const MAX_TRANSACTION_TTL: Duration = Duration::from_secs(15);
 
 /// How many transactions may be open on this node at once. Creating one
 /// is a client asking the server to allocate memory and hold locks, so
@@ -82,17 +91,49 @@ pub const MAX_TRANSACTION_TTL: Duration = Duration::from_secs(5);
 /// runs out.
 pub const MAX_OPEN_TRANSACTIONS: usize = 1024;
 
-/// How many keys one transaction may buffer, and how many bytes.
+/// How much one transaction may buffer.
 ///
-/// These are not tidiness. A transaction commits as a single log entry,
-/// which replicates inside a single `AppendEntries` message, which tonic
-/// will refuse to decode past its 4MB default. An entry too large to
+/// This is not tidiness, and it is not really about memory. A
+/// transaction commits as a single log entry, and an entry too large to
 /// replicate never commits -- and, because it is already in the log and
 /// the leader keeps re-proposing it, nothing after it ever commits
 /// either. The only safe place to refuse it is here, before anything
-/// reaches the log at all.
-pub const MAX_TRANSACTION_KEYS: usize = 256;
-pub const MAX_TRANSACTION_BYTES: usize = 1024 * 1024;
+/// reaches the log at all. `raft`'s cap chain is the other end of that
+/// argument: everything downstream is sized so that a transaction this
+/// large always replicates, and a static assert there enforces it.
+///
+/// Counted in raw key and value bytes, which is a little under what the
+/// entry actually costs on disk and on the wire; the headroom between
+/// this and `raft::MAX_ENTRY_BYTES` is what covers the difference.
+///
+/// There is deliberately no separate limit on the number of keys. Bytes
+/// are what cost memory and wire time, `entry_size` charges every key an
+/// overhead so a great many tiny ones still add up, and a second limit
+/// would only be another number to explain without bounding anything
+/// this one doesn't.
+pub const MAX_TRANSACTION_BYTES: usize = 10 * 1024 * 1024;
+
+/// How much *every* open transaction on this node may buffer between
+/// them.
+///
+/// The per-transaction cap alone bounds nothing useful: multiplied by
+/// `MAX_OPEN_TRANSACTIONS` it permits gigabytes, all of it held on the
+/// leader before a single byte has been proposed. This is the number
+/// that actually decides how much memory a client can make this node
+/// hold.
+///
+/// It is not the whole story: a leader is also buffering in-flight
+/// replication (roughly `MAX_REPLICATION_BATCH_BYTES` per peer, twice
+/// over between the encoded batch and the entries it came from) and a
+/// follower its reassembly buffer, none of which is counted here.
+/// Budget for something like this plus a few hundred megabytes, not for
+/// this alone.
+pub const MAX_BUFFERED_BYTES_NODE_WIDE: usize = 256 * 1024 * 1024;
+
+/// Charged per buffered key on top of its bytes, so that a transaction
+/// of a million empty keys is not free. Roughly what a key costs in map
+/// overhead here plus framing in the entry it becomes.
+const PER_KEY_OVERHEAD: usize = 64;
 
 /// Opaque, server-generated, and random rather than sequential so that a
 /// client holding a stale id cannot address a transaction that isn't
@@ -210,6 +251,11 @@ struct Shared {
     term: Option<u64>,
     txns: HashMap<TxnId, Txn>,
     locks: HashMap<Vec<u8>, LockState>,
+    /// The sum of `buffered_bytes` over every transaction still holding
+    /// its buffer, against `MAX_BUFFERED_BYTES_NODE_WIDE`. Maintained by
+    /// `buffer_write` and `forget_buffer`, which are the only two places
+    /// a transaction's buffer grows or goes away.
+    buffered_total: usize,
 }
 
 impl Shared {
@@ -373,6 +419,24 @@ impl Shared {
         for key in held {
             self.release(&key, Owner::Txn(id));
         }
+        // Whatever it buffered will never be written now, so it stops
+        // counting against the node's budget immediately -- the
+        // tombstone left behind is a reason, not a payload.
+        self.forget_buffer(id);
+    }
+
+    /// Give up a transaction's buffered writes and the budget they held.
+    ///
+    /// Idempotent, and the only place besides `buffer_write` that moves
+    /// `buffered_total`, so the two stay in step by there being nowhere
+    /// else for them to drift.
+    fn forget_buffer(&mut self, id: TxnId) {
+        let Some(txn) = self.txns.get_mut(&id) else {
+            return;
+        };
+        self.buffered_total = self.buffered_total.saturating_sub(txn.buffered_bytes);
+        txn.buffered_bytes = 0;
+        txn.writes.clear();
     }
 
     /// Release everything `id` holds without changing its state -- for a
@@ -385,6 +449,7 @@ impl Shared {
         for key in held {
             self.release(&key, Owner::Txn(id));
         }
+        self.forget_buffer(id);
     }
 }
 
@@ -426,6 +491,7 @@ impl Locks {
         shared.epoch += 1;
         shared.txns.clear();
         shared.locks.clear();
+        shared.buffered_total = 0;
     }
 
     /// Reclaim expired transactions and the locks they still hold.
@@ -551,19 +617,30 @@ impl Locks {
     ) -> Result<(), Refused> {
         self.with_open(id, |shared| {
             let txn = &shared.txns[&id];
+            // Rewriting a key this transaction already buffered replaces
+            // that value rather than adding to it, so the old one comes
+            // back out of both budgets.
             let previous = txn.writes.get(key).map(|v| entry_size(key, v.as_deref()));
             let size = entry_size(key, value.as_deref());
-            let projected = txn.buffered_bytes + size - previous.unwrap_or(0);
-            let keys = txn.writes.len() + usize::from(previous.is_none());
-            if keys > MAX_TRANSACTION_KEYS {
-                return Err(Refused::TooMuch("the transaction has too many keys"));
-            }
+            let delta = size as isize - previous.unwrap_or(0) as isize;
+            let projected = txn.buffered_bytes.saturating_add_signed(delta);
+            let projected_node_wide = shared.buffered_total.saturating_add_signed(delta);
+
             if projected > MAX_TRANSACTION_BYTES {
                 return Err(Refused::TooMuch("the transaction has buffered too much"));
+            }
+            // Checked separately, and worth a distinct message: this one
+            // is not about the caller's own transaction being too big,
+            // and shrinking it may not help.
+            if projected_node_wide > MAX_BUFFERED_BYTES_NODE_WIDE {
+                return Err(Refused::TooMuch(
+                    "this node is already holding as much buffered transaction data as it will",
+                ));
             }
 
             shared.acquire(key, Owner::Txn(id), Mode::Write, Instant::now())?;
 
+            shared.buffered_total = projected_node_wide;
             let txn = shared
                 .txns
                 .get_mut(&id)
@@ -649,6 +726,13 @@ impl Locks {
         self.lock().locks.contains_key(key)
     }
 
+    /// What every open transaction is holding between them, against
+    /// `MAX_BUFFERED_BYTES_NODE_WIDE`.
+    #[cfg(test)]
+    pub(crate) fn buffered_total(&self) -> usize {
+        self.lock().buffered_total
+    }
+
     #[cfg(test)]
     pub(crate) fn open_count(&self) -> usize {
         self.lock()
@@ -664,7 +748,7 @@ impl Locks {
 /// log entry, and being approximately right well below the real ceiling
 /// is worth more than being exactly right at it.
 fn entry_size(key: &[u8], value: Option<&[u8]>) -> usize {
-    key.len() + value.map_or(0, <[u8]>::len)
+    key.len() + value.map_or(0, <[u8]>::len) + PER_KEY_OVERHEAD
 }
 
 /// One plain write's exclusive claim on a key, released on drop.

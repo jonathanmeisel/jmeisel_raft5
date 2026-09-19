@@ -9,12 +9,25 @@ fn open_temp() -> (RaftLog, std::path::PathBuf) {
     (log, path)
 }
 
+/// A unique directory suffix.
+///
+/// A nanosecond timestamp alone isn't reliable under parallel test
+/// execution -- two tests starting at nearly the same instant can land
+/// on the same value (clock resolution, scheduling) and then collide on
+/// the same directory, which surfaces as `Db(Locked)` from whichever
+/// one opens second. A process-wide counter on top guarantees
+/// uniqueness regardless. Same reasoning, and the same fix, as
+/// `raft::test_support::open_temp_log`.
 fn rand_suffix() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_nanos() as u64
+        .as_nanos() as u64;
+    nanos.wrapping_mul(1024) ^ COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 fn cleanup(path: &std::path::Path) {
@@ -872,5 +885,125 @@ fn a_snapshot_never_captures_an_entry_half_applied() {
     );
 
     cleanup(&path);
+    cleanup(&dest_path);
+}
+
+/// Guards the `serde_bytes` attributes on this module's byte-string
+/// fields, which nothing else can catch: without them serde encodes a
+/// `Vec<u8>` as a sequence of `u8` and makes one serializer call per
+/// byte, which is ~50 MB/s instead of ~2 GB/s -- and produces *byte-for-
+/// byte identical output*, so no round-trip or format test notices.
+///
+/// A coarse threshold on purpose. 32 MiB inside 300ms is a floor of
+/// about 110 MB/s, which is comfortably under what the fixed code does
+/// on any machine that can run this suite (a few GB/s here, so ~20x
+/// headroom) and comfortably over what the per-byte path manages.
+#[test]
+fn large_values_are_encoded_as_bytes_rather_than_byte_by_byte() {
+    const SIZE: usize = 32 * 1024 * 1024;
+    const BUDGET: std::time::Duration = std::time::Duration::from_millis(300);
+
+    let payload = EntryPayload::Write(vec![Mutation::new(*b"k", Some(vec![0xABu8; SIZE]))]);
+
+    let started = std::time::Instant::now();
+    let encoded = encode_log_entry(1, &payload).unwrap();
+    let encode_took = started.elapsed();
+
+    let started = std::time::Instant::now();
+    let decoded = decode_log_entry(&encoded).unwrap();
+    let decode_took = started.elapsed();
+
+    assert_eq!(decoded.payload, payload, "the fast path must still round-trip");
+    assert!(
+        encode_took < BUDGET && decode_took < BUDGET,
+        "encoding {SIZE} bytes took {encode_took:?} and decoding took {decode_took:?}, \
+         both budgeted at {BUDGET:?} -- has a `#[serde(with = \"serde_bytes\")]` gone \
+         missing from `Mutation` or `EntryPayload`?"
+    );
+}
+
+/// A snapshot moves through a *bounded* channel, so neither end ever
+/// holds all of it.
+///
+/// This is the property, and it is the test: the channel holds
+/// `CHUNK_BACKLOG` chunks and the snapshot here is several times that.
+/// An implementation that collected the export before installing it --
+/// which is what this used to do, on both ends -- cannot get past a full
+/// channel, so it would hang here rather than fail an assertion.
+#[test]
+fn a_snapshot_streams_through_a_bounded_channel_rather_than_being_buffered() {
+    use crate::store::{CHUNK_BACKLOG, ChunkReader, ChunkWriter};
+    use std::io::Write;
+
+    let (source, source_path) = open_temp();
+    // Comfortably more than the channel can hold at once.
+    const KEYS: usize = 64;
+    const VALUE_BYTES: usize = 64 * 1024;
+    for i in 0..KEYS {
+        source
+            .append(1, format!("k{i}").as_bytes(), Some(&vec![i as u8; VALUE_BYTES]))
+            .unwrap();
+    }
+    source.apply_committed(KEYS as u64).unwrap();
+
+    let (tx, rx) = tokio::sync::mpsc::channel(CHUNK_BACKLOG);
+    let source = std::sync::Arc::new(source);
+    let exporting = std::thread::spawn({
+        let source = std::sync::Arc::clone(&source);
+        move || {
+            let mut writer = ChunkWriter::new(tx);
+            let meta = source.export_snapshot(&mut writer).unwrap();
+            writer.flush().unwrap();
+            meta
+        }
+    });
+
+    // Installing here, on this thread, while the export runs on that
+    // one. Neither can finish without the other making room.
+    let (dest, dest_path) = open_temp();
+    let installed = dest.install_snapshot(&mut ChunkReader::new(rx)).unwrap();
+    let exported = exporting.join().expect("the exporter should not have panicked");
+
+    assert_eq!(exported.entry_count, KEYS as u64);
+    assert_eq!(installed.entry_count, exported.entry_count);
+    assert_eq!(installed.last_included_seq, exported.last_included_seq);
+    for i in 0..KEYS {
+        assert_eq!(
+            dest.get_latest(format!("k{i}").as_bytes()).unwrap(),
+            Some((KEYS as u64, vec![i as u8; VALUE_BYTES])),
+            "key {i} did not survive the streamed transfer"
+        );
+    }
+
+    cleanup(&source_path);
+    cleanup(&dest_path);
+}
+
+/// The producer giving up has to reach the consumer as end-of-stream,
+/// not as a silent truncation: a snapshot cut short must fail to parse
+/// rather than install as a smaller, plausible-looking one.
+#[test]
+fn a_snapshot_cut_short_is_refused_rather_than_half_installed() {
+    use crate::store::ChunkReader;
+
+    let (source, source_path) = open_temp();
+    source.append(1, b"k", Some(b"v")).unwrap();
+    source.apply_committed(1).unwrap();
+    let mut whole = Vec::new();
+    source.export_snapshot(&mut whole).unwrap();
+
+    // Everything but the last few bytes: a key/value record that stops
+    // partway through.
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    tx.try_send(whole[..whole.len() - 3].to_vec()).unwrap();
+    drop(tx);
+
+    let (dest, dest_path) = open_temp();
+    assert!(
+        dest.install_snapshot(&mut ChunkReader::new(rx)).is_err(),
+        "a truncated snapshot must not install"
+    );
+
+    cleanup(&source_path);
     cleanup(&dest_path);
 }

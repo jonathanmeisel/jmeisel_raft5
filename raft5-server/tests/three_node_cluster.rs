@@ -163,3 +163,60 @@ async fn a_transaction_does_not_survive_the_death_of_its_leader() {
     // ...and it is writable again, so no lock outlived the leader.
     write(&survivor.client(), b"k", Some(b"after")).await;
 }
+
+/// The ceiling this whole change exists to raise. A batch past tonic's
+/// 4 MB default decode limit used to be refused in the transport --
+/// silently, and forever, because a leader retries an entry it has
+/// already appended and nothing after it can commit until it lands.
+///
+/// Several large values rather than one, so chunk boundaries fall inside
+/// a value as well as between them.
+#[tokio::test]
+async fn a_transaction_larger_than_one_grpc_message_replicates_to_every_node() {
+    let (n1, n2, n3) = three_node_cluster("big").await;
+    let c1 = n1.client();
+
+    // Enough to be decisively past the 4 MB message ceiling and to span
+    // several 1 MiB wire chunks, and no more: the payload is written
+    // three times over (leader plus two followers), and a bigger one
+    // starves the rest of the suite rather than proving anything more.
+    const VALUES: usize = 5;
+    const VALUE_BYTES: usize = 1024 * 1024;
+    // Committed in the same transaction as the big values, so it lands
+    // in the same entry at the same seq. Waiting on *it* is what lets
+    // this test avoid re-reading megabytes every 20ms while a follower
+    // catches up -- and it only works because of the property under
+    // test: one transaction is one entry, so a node that has the
+    // sentinel has all of it.
+    const SENTINEL: &[u8] = b"big-sentinel";
+
+    let txn = begin(&c1, std::time::Duration::from_secs(15)).await;
+    for i in 0..VALUES {
+        // Distinct bytes per key, so a value arriving at the wrong key
+        // (or a chunk landing in the wrong place) is caught rather than
+        // hidden by every value being identical.
+        let value = vec![u8::try_from(i).unwrap(); VALUE_BYTES];
+        buffer_write(&c1, &txn, format!("big{i}").as_bytes(), Some(&value)).await;
+    }
+    buffer_write(&c1, &txn, SENTINEL, Some(b"landed")).await;
+    let seq = commit(&c1, &txn)
+        .await
+        .expect("a transaction past the old message ceiling should now commit");
+
+    for node in [&n1, &n2, &n3] {
+        let client = node.client();
+        assert_eventually_reads(&client, SENTINEL, b"landed", seq).await;
+        // The sentinel is there, so by construction the rest of the
+        // entry is too -- read each value exactly once and check it.
+        for i in 0..VALUES {
+            let expected = vec![u8::try_from(i).unwrap(); VALUE_BYTES];
+            let got = read(&client, format!("big{i}").as_bytes()).await;
+            assert!(
+                got.as_deref() == Some(&expected[..]),
+                "node {} has {} bytes for key big{i}, expected {VALUE_BYTES}",
+                node.id,
+                got.map_or(0, |v| v.len())
+            );
+        }
+    }
+}

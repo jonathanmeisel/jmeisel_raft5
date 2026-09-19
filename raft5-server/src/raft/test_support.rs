@@ -213,6 +213,26 @@ pub(crate) fn write_entry(
     }
 }
 
+/// A `ChunkReader` already holding `bytes`, for tests that have a whole
+/// snapshot in hand and just want to hand it to `install_snapshot`.
+///
+/// The channel is sized to the number of chunks and the sender dropped
+/// straight away, so nothing blocks: production fills this channel from
+/// a live gRPC stream instead.
+pub(crate) fn reader_over(bytes: Vec<u8>) -> crate::store::ChunkReader {
+    let chunks: Vec<Vec<u8>> = if bytes.is_empty() {
+        Vec::new()
+    } else {
+        bytes.chunks(64 * 1024).map(<[u8]>::to_vec).collect()
+    };
+    let (tx, rx) = tokio::sync::mpsc::channel(chunks.len() + 1);
+    for chunk in chunks {
+        tx.try_send(chunk).expect("the channel was sized for these");
+    }
+    drop(tx);
+    crate::store::ChunkReader::new(rx)
+}
+
 /// Binds an ephemeral local port and immediately releases it, for
 /// handing a real address to a peer/server pair before either exists.
 /// Small race (something else could grab the port before we rebind

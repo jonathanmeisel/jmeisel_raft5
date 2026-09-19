@@ -101,13 +101,25 @@ impl raft5::common::LogEntry {
     /// consumes a seq, satisfies log matching, and silently drops every
     /// key a transaction was carrying.
     pub fn payload(&self) -> Result<EntryPayload, UnknownEntry> {
+        self.clone().into_payload()
+    }
+
+    /// `payload`, consuming the entry.
+    ///
+    /// Worth having as well as the borrowing one: this runs once per
+    /// entry in the follower's append loop, and `payload` has to clone
+    /// every `KeyValue` to build its result. For an entry carrying a
+    /// whole transaction that clone is the entry all over again, on the
+    /// hot path, for no reason -- the caller is finished with the
+    /// original either way.
+    pub fn into_payload(self) -> Result<EntryPayload, UnknownEntry> {
         match raft5::common::EntryKind::try_from(self.kind) {
             Ok(raft5::common::EntryKind::Write) => Ok(EntryPayload::Write(
-                self.writes.iter().cloned().map(Into::into).collect(),
+                self.writes.into_iter().map(Into::into).collect(),
             )),
             Ok(raft5::common::EntryKind::Noop) => Ok(EntryPayload::NoOp),
             Ok(raft5::common::EntryKind::Config) => Ok(EntryPayload::Config(
-                self.config.clone().unwrap_or_default(),
+                self.config.unwrap_or_default(),
             )),
             Ok(raft5::common::EntryKind::Unspecified) | Err(_) => Err(UnknownEntry),
         }

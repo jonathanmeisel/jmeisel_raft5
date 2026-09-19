@@ -769,7 +769,7 @@ async fn install_snapshot_applies_state_and_advances_watermarks() {
                 last_included_index: meta.last_included_seq,
                 last_included_term: meta.last_included_term,
             },
-            buf,
+            reader_over(buf),
         )
         .await
         .unwrap();
@@ -815,7 +815,7 @@ async fn install_snapshot_rejects_a_stale_term_and_does_not_touch_storage() {
                 last_included_index: 10,
                 last_included_term: 1,
             },
-            vec![],
+            reader_over(Vec::new()),
         )
         .await
         .unwrap();

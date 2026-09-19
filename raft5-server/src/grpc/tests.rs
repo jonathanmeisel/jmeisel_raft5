@@ -614,8 +614,18 @@ async fn bootstrap_refuses_when_the_named_node_is_someone_else() {
 /// `RaftPeerService` is wired to a *running* state machine, not just
 /// that `raft::RaftPeerHandle` works in isolation (covered separately
 /// in `raft`'s own unit tests).
+///
+/// Over a real socket, because `AppendEntries` is a streaming RPC and
+/// `tonic::Streaming` has no public constructor -- the only way to hand
+/// the service one is to have tonic build it from an actual connection.
+/// That also makes this the one test that exercises the chunking and
+/// reassembly together, end to end; `reassemble_append_entries`'s own
+/// rules are tested directly below.
 #[tokio::test]
 async fn append_entries_and_request_vote_reach_the_running_state_machine() {
+    use crate::pb::raft5::raft::raft_peer_client::RaftPeerClient;
+    use crate::pb::raft5::raft::raft_peer_server::RaftPeerServer;
+
     let (log, path) = open_temp();
     let raft::NodeHandles {
         common,
@@ -630,10 +640,25 @@ async fn append_entries_and_request_vote_reach_the_running_state_machine() {
     .unwrap();
     tokio::spawn(raft::run(common));
 
+    let addr = crate::raft::test_support::free_local_addr();
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(RaftPeerServer::new(RaftPeerService::new(
+                peer_handle.clone(),
+            )))
+            .serve(addr),
+    );
     let svc = RaftPeerService::new(peer_handle);
 
-    let append_resp = svc
-        .append_entries(Request::new(AppendEntriesRequest {
+    let mut client = loop {
+        match RaftPeerClient::connect(format!("http://{addr}")).await {
+            Ok(client) => break client,
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+        }
+    };
+
+    let append_resp = client
+        .append_entries(crate::raft::append_entries_stream(AppendEntriesRequest {
             term: 7,
             leader_id: "leader-1".to_string(),
             prev_log_index: 0,
@@ -878,4 +903,184 @@ async fn a_committed_transaction_makes_every_key_visible_at_one_seq() {
     assert_eq!((a.seq, b.seq), (seq, seq), "one entry, so one seq for both keys");
 
     cleanup(&path);
+}
+
+// --- append_entries stream reassembly ---------------------------------
+
+use crate::pb::raft5::raft::{AppendEntriesChunk, AppendEntriesHeader, append_entries_chunk};
+
+fn header_chunk(term: u64, entries_bytes: u64) -> AppendEntriesChunk {
+    AppendEntriesChunk {
+        part: Some(append_entries_chunk::Part::Header(AppendEntriesHeader {
+            term,
+            leader_id: "leader-1".to_string(),
+            prev_log_index: 0,
+            prev_log_term: 0,
+            leader_commit: 0,
+            compact_seq: 0,
+            entries_bytes,
+        })),
+    }
+}
+
+fn fragment(bytes: Vec<u8>) -> AppendEntriesChunk {
+    AppendEntriesChunk {
+        part: Some(append_entries_chunk::Part::Entries(bytes.into())),
+    }
+}
+
+async fn reassemble(
+    chunks: Vec<AppendEntriesChunk>,
+    current_term: u64,
+) -> Result<Reassembled, Status> {
+    reassemble_append_entries(tokio_stream::iter(chunks.into_iter().map(Ok)), current_term).await
+}
+
+/// The round trip the wire depends on: whatever the leader chunked has
+/// to come back as the request it chunked, mutations and all.
+#[tokio::test]
+async fn a_chunked_request_reassembles_into_exactly_what_was_sent() {
+    let original = AppendEntriesRequest {
+        term: 4,
+        leader_id: "leader-1".to_string(),
+        prev_log_index: 9,
+        prev_log_term: 3,
+        entries: vec![crate::raft::test_support::write_entry(
+            10,
+            4,
+            vec![
+                (b"a".to_vec(), Some(b"1".to_vec())),
+                (b"b".to_vec(), None),
+            ],
+        )],
+        leader_commit: 7,
+        compact_seq: 2,
+    };
+
+    let chunks: Vec<_> = tokio_stream::StreamExt::collect::<Vec<_>>(
+        crate::raft::append_entries_stream(original.clone()),
+    )
+    .await;
+
+    match reassemble(chunks, 4).await.unwrap() {
+        Reassembled::Request(req) => assert_eq!(*req, original),
+        Reassembled::Refused(why) => panic!("should have reassembled, got {why:?}"),
+    }
+}
+
+/// A batch large enough to span several chunks still arrives whole --
+/// the case the whole change exists for.
+#[tokio::test]
+async fn a_batch_spanning_many_chunks_reassembles_whole() {
+    let value = vec![7u8; 3 * 1024 * 1024];
+    let original = AppendEntriesRequest {
+        term: 1,
+        leader_id: "leader-1".to_string(),
+        prev_log_index: 0,
+        prev_log_term: 0,
+        entries: vec![crate::raft::test_support::write_entry(
+            1,
+            1,
+            vec![(b"big".to_vec(), Some(value.clone()))],
+        )],
+        leader_commit: 0,
+        compact_seq: 0,
+    };
+
+    let chunks: Vec<_> = tokio_stream::StreamExt::collect::<Vec<_>>(
+        crate::raft::append_entries_stream(original.clone()),
+    )
+    .await;
+    assert!(
+        chunks.len() > 3,
+        "a 3MiB batch should have taken several chunks, got {}",
+        chunks.len()
+    );
+
+    match reassemble(chunks, 1).await.unwrap() {
+        Reassembled::Request(req) => {
+            assert_eq!(req.entries[0].writes[0].value.as_deref(), Some(&value[..]));
+        }
+        Reassembled::Refused(why) => panic!("should have reassembled, got {why:?}"),
+    }
+}
+
+/// The header carries the term, so it has to arrive before anything can
+/// be decided about the body. A stream that opens with a fragment is
+/// malformed, not merely unwelcome.
+#[tokio::test]
+async fn a_stream_must_open_with_a_header() {
+    let status = reassemble(vec![fragment(vec![1, 2, 3])], 1)
+        .await
+        .expect_err("a body-first stream is malformed");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    let status = reassemble(Vec::new(), 1)
+        .await
+        .expect_err("an empty stream is malformed");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+}
+
+/// A leader behind this node's term is refused without its body being
+/// read -- but it is *refused*, with a normal response carrying the
+/// term, not errored. An error would reach the leader as a transport
+/// failure, and it would retry forever instead of stepping down.
+#[tokio::test]
+async fn a_stale_leaders_stream_is_refused_rather_than_errored() {
+    let chunks = vec![header_chunk(3, 4), fragment(vec![0; 4])];
+    match reassemble(chunks, 9).await.unwrap() {
+        Reassembled::Refused(_) => {}
+        Reassembled::Request(_) => panic!("a stale term must not be accepted"),
+    }
+}
+
+/// The declared size is the sender's claim, and believing it enough to
+/// size a buffer would make one header an out-of-memory button. Refused
+/// on the claim alone, without allocating against it.
+#[tokio::test]
+async fn an_absurd_declared_size_is_refused_without_allocating_it() {
+    let chunks = vec![header_chunk(1, u64::MAX)];
+    match reassemble(chunks, 1).await.unwrap() {
+        Reassembled::Refused(_) => {}
+        Reassembled::Request(_) => panic!("an over-limit declaration must be refused"),
+    }
+}
+
+/// ...and a sender that under-declares and then keeps sending is caught
+/// on what actually arrives, which is the number that costs memory.
+#[tokio::test]
+async fn a_body_over_the_limit_is_refused_however_it_was_declared() {
+    let mut chunks = vec![header_chunk(1, 1)];
+    let chunk_bytes = vec![0u8; 1024 * 1024];
+    for _ in 0..(MAX_APPEND_ENTRIES_BYTES / chunk_bytes.len() + 2) {
+        chunks.push(fragment(chunk_bytes.clone()));
+    }
+    match reassemble(chunks, 1).await.unwrap() {
+        Reassembled::Refused(_) => {}
+        Reassembled::Request(_) => panic!("an over-limit body must be refused"),
+    }
+}
+
+/// A body that disagrees with its header is a broken sender rather than
+/// a policy refusal, so it is an error: there is nothing sensible to
+/// answer, and retrying the same bytes cannot help.
+#[tokio::test]
+async fn a_body_that_disagrees_with_its_header_is_rejected() {
+    let chunks = vec![header_chunk(1, 100), fragment(vec![0; 4])];
+    let status = reassemble(chunks, 1)
+        .await
+        .expect_err("a short body should be rejected");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+}
+
+/// Anything after the header must be a fragment. A second header would
+/// mean two requests sharing one stream, which this protocol does not
+/// have a meaning for.
+#[tokio::test]
+async fn a_second_header_mid_stream_is_rejected() {
+    let chunks = vec![header_chunk(1, 0), header_chunk(1, 0)];
+    let status = reassemble(chunks, 1)
+        .await
+        .expect_err("two headers on one stream is malformed");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
 }

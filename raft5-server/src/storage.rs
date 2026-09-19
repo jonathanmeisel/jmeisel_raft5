@@ -170,9 +170,19 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 /// One key's change within a `Write` entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mutation {
+    // `serde_bytes`, on every byte-string field in this module, and not
+    // optional. Serde's stock `Vec<u8>` impl is a *sequence of u8*, so
+    // it makes one serializer call per byte: correct, compact under
+    // postcard, and about 50 MB/s. `serde_bytes` makes it one
+    // `serialize_bytes` call and a memcpy instead. The difference does
+    // not show up on small values and dominates completely on large
+    // ones -- a few megabytes of transaction was spending entire
+    // CPU-seconds here.
+    #[serde(with = "serde_bytes")]
     pub key: Vec<u8>,
     /// `None` is a delete: a tombstone in `log`, and an outright removal
     /// from `latest` when it applies.
+    #[serde(with = "serde_bytes")]
     pub value: Option<Vec<u8>>,
 }
 
@@ -213,7 +223,7 @@ pub enum EntryPayload {
     /// A cluster configuration, encoded. Unlike every other payload, this
     /// one takes effect when it is *appended* rather than when it
     /// commits -- see `current_config`.
-    Config(Vec<u8>),
+    Config(#[serde(with = "serde_bytes")] Vec<u8>),
 }
 
 impl EntryPayload {
@@ -244,6 +254,17 @@ pub struct LogEntry {
     pub payload: EntryPayload,
 }
 
+/// What `entries_in_range_capped` read, and whether it stopped early.
+///
+/// `truncated` is not an error: it says "there is more, right now", which
+/// is what lets a caller replicating a backlog send the next batch
+/// immediately instead of waiting out a heartbeat interval first.
+#[derive(Debug)]
+pub struct CappedEntries {
+    pub entries: Vec<LogEntry>,
+    pub truncated: bool,
+}
+
 /// Append-only, gap-free, per-key-compactable log on top of `fjall`.
 pub struct RaftLog {
     db: Database,
@@ -258,6 +279,16 @@ pub struct RaftLog {
 impl RaftLog {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let db = Database::builder(path).open()?;
+        // Default `KeyspaceCreateOptions`, including its 64 MiB
+        // `max_memtable_size`, which is comfortably above the largest
+        // entry that can exist (`raft::MAX_ENTRY_BYTES`). That is worth
+        // knowing rather than assuming: an entry larger than the
+        // memtable would force a rotation by itself, and enough of those
+        // in a row reach fjall's write-halt loop, which sleeps the
+        // calling thread -- here, a blocking-pool worker the event loop
+        // is awaiting. Raising `MAX_ENTRY_BYTES` past this means sizing
+        // these keyspaces deliberately (or turning on KV separation,
+        // which is the feature actually meant for large values).
         let log = db.keyspace(CF_LOG, KeyspaceCreateOptions::default)?;
         let latest = db.keyspace(CF_LATEST, KeyspaceCreateOptions::default)?;
         let meta = db.keyspace(CF_META, KeyspaceCreateOptions::default)?;
@@ -511,18 +542,49 @@ impl RaftLog {
     /// the range that isn't present (compacted away) is silently skipped —
     /// see the module-level note on why that's safe for log-matching.
     pub fn entries_in_range(&self, start: u64, end: u64) -> Result<Vec<LogEntry>> {
-        let mut out = Vec::new();
+        Ok(self.entries_in_range_capped(start, end, usize::MAX)?.entries)
+    }
+
+    /// `entries_in_range`, stopping once the entries read total more than
+    /// `max_bytes` — measured in stored row bytes, which is what the
+    /// caller is really budgeting (a row is within framing overhead of
+    /// what it costs to send).
+    ///
+    /// **Always returns at least one entry**, however large it is, so that
+    /// a single oversized entry can still make progress rather than
+    /// wedging replication behind a budget it can never fit into. That
+    /// makes the budget a soft one, and puts the hard ceiling somewhere
+    /// else: nothing that exceeds `MAX_ENTRY_BYTES` may reach the log in
+    /// the first place. See the cap chain in `raft`.
+    pub fn entries_in_range_capped(
+        &self,
+        start: u64,
+        end: u64,
+        max_bytes: usize,
+    ) -> Result<CappedEntries> {
+        let mut entries = Vec::new();
+        let mut bytes = 0usize;
+        let mut truncated = false;
+
         for item in self.log.range(be_bytes(start)..be_bytes(end)) {
             let (k, v) = item.into_inner()?;
+            // Would this entry take us past the budget? Stop before
+            // decoding it -- unless nothing has been read yet, in which
+            // case take it however large it is.
+            if !entries.is_empty() && bytes.saturating_add(v.len()) > max_bytes {
+                truncated = true;
+                break;
+            }
             let seq = from_be_bytes(&k)?;
+            bytes = bytes.saturating_add(v.len());
             let entry = decode_log_entry(&v)?;
-            out.push(LogEntry {
+            entries.push(LogEntry {
                 seq,
                 term: entry.term,
                 payload: entry.payload,
             });
         }
-        Ok(out)
+        Ok(CappedEntries { entries, truncated })
     }
 
     /// The seq and term of the most recent log entry, falling back to the

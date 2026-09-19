@@ -57,12 +57,7 @@ impl RaftLog {
     /// point and nothing beyond it, and the leader will replicate any
     /// later config entry as an ordinary entry right after.
     pub fn export_snapshot<W: Write>(&self, writer: &mut W) -> Result<SnapshotMeta> {
-        let last_included_seq = read_applied_seq(&self.meta)?;
-        let last_included_term = if last_included_seq == 0 {
-            0
-        } else {
-            self.term_at(last_included_seq)?.unwrap_or(0)
-        };
+        let (last_included_seq, last_included_term) = self.snapshot_boundary()?;
         let config = self.config_at(last_included_seq)?.unwrap_or_default();
 
         writer.write_all(SNAPSHOT_MAGIC)?;
@@ -92,6 +87,31 @@ impl RaftLog {
             last_included_term,
             entry_count,
         })
+    }
+
+    /// The seq and term an export taken right now would be bounded by:
+    /// what `apply_committed` has reached, and the term at that point.
+    ///
+    /// Split out so a caller streaming an export can describe it to its
+    /// peer *before* producing it -- the Raft-level header has to go out
+    /// first, and waiting for the export to finish in order to fill it
+    /// in is precisely the buffer-it-all behaviour streaming removes.
+    ///
+    /// An export started moments later can therefore contain slightly
+    /// *more* than this describes, if `apply_committed` advanced in
+    /// between. That is safe and was already true (the `latest`
+    /// iteration is pinned when it starts, not when the header is
+    /// written): the boundary only ever understates the body, so the
+    /// receiver sets its watermarks low and the leader replicates the
+    /// difference as ordinary entries.
+    pub fn snapshot_boundary(&self) -> Result<(u64, u64)> {
+        let last_included_seq = read_applied_seq(&self.meta)?;
+        let last_included_term = if last_included_seq == 0 {
+            0
+        } else {
+            self.term_at(last_included_seq)?.unwrap_or(0)
+        };
+        Ok((last_included_seq, last_included_term))
     }
 
     /// Install a snapshot produced by `export_snapshot`, replacing all

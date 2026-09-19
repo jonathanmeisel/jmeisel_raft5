@@ -67,10 +67,29 @@ pub(super) fn decode_log_entry(bytes: &[u8]) -> Result<StoredEntry> {
     Ok(postcard::from_bytes(bytes)?)
 }
 
+/// A `latest` row, for writing. Borrows its value, and carries the
+/// `serde_bytes` attribute that keeps it a memcpy rather than a
+/// per-byte loop -- see `storage::Mutation` for why that matters.
+#[derive(Serialize)]
+struct LatestRef<'a> {
+    seq: u64,
+    #[serde(with = "serde_bytes")]
+    value: &'a [u8],
+}
+
+/// The same row, for reading. Same field order, so the two agree.
+#[derive(Deserialize)]
+struct Latest {
+    seq: u64,
+    #[serde(with = "serde_bytes")]
+    value: Vec<u8>,
+}
+
 pub(super) fn encode_latest_value(seq: u64, value: &[u8]) -> Result<Vec<u8>> {
-    Ok(postcard::to_allocvec(&(seq, value))?)
+    Ok(postcard::to_allocvec(&LatestRef { seq, value })?)
 }
 
 pub(super) fn decode_latest_value(bytes: &[u8]) -> Result<(u64, Vec<u8>)> {
-    Ok(postcard::from_bytes(bytes)?)
+    let row: Latest = postcard::from_bytes(bytes)?;
+    Ok((row.seq, row.value))
 }

@@ -361,13 +361,13 @@ impl RaftPeerHandle {
     pub async fn install_snapshot(
         &self,
         header: SnapshotHeader,
-        data: Vec<u8>,
+        body: crate::store::ChunkReader,
     ) -> Result<InstallSnapshotResponse, RaftError> {
         let (respond_to, rx) = oneshot::channel();
         self.event_tx
             .send(Event::InstallSnapshot {
                 header,
-                data,
+                body,
                 respond_to,
             })
             .await
@@ -382,6 +382,21 @@ impl RaftPeerHandle {
     /// can actually fail the way a channel send could) and needs no
     /// `.await`, which is itself part of the point: the type signature
     /// makes "this can never block on the event loop" visible.
+    /// This node's current term, read straight off the watch channel
+    /// rather than through the event loop -- same fast path, and for the
+    /// same reason, as `get_lease` below.
+    ///
+    /// Only safe to *reject* on: the value is a lower bound on the real
+    /// term (the event loop may have advanced past it but never behind
+    /// it), so anything this says is stale is genuinely stale, while
+    /// anything it accepts still has to be checked properly on the event
+    /// loop. `grpc::RaftPeerService` uses it to avoid reading a large
+    /// `AppendEntries` body from a leader that has already been
+    /// superseded.
+    pub fn current_term(&self) -> u64 {
+        *self.term_rx.borrow()
+    }
+
     pub fn get_lease(&self, req: GetLeaseRequest) -> GetLeaseResponse {
         if !matches!(&*self.role_rx.borrow(), RoleHandle::Follower(_)) {
             // Only a follower "recognizes" a leader via lease -- anyone

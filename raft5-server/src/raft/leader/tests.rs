@@ -785,13 +785,13 @@ fn build_replication_step_returns_snapshot_when_prev_log_index_is_compacted() {
 
     // next_index = 4 -> prev_log_index = 3, exactly the floor -- still
     // answerable, so this is an ordinary AppendEntries.
-    let step = build_replication_step_sync(&log, 4, "leader-1".to_string(), 1, 0, 0).unwrap();
-    assert!(matches!(step, ReplicationStep::AppendEntries(_)));
+    let step = step_for(&log, 4);
+    assert!(matches!(step, ReplicationStep::AppendEntries { .. }));
 
     // next_index = 3 -> prev_log_index = 2, strictly below the floor --
     // `term_at` can't answer for it, so this must fall back to a
     // snapshot instead of guessing.
-    let step = build_replication_step_sync(&log, 3, "leader-1".to_string(), 1, 0, 0).unwrap();
+    let step = step_for(&log, 3);
     assert!(matches!(step, ReplicationStep::Snapshot));
 
     cleanup(&path);
@@ -800,8 +800,7 @@ fn build_replication_step_returns_snapshot_when_prev_log_index_is_compacted() {
 /// Regression test for a gap the `term_at`-based check alone misses:
 /// `prev_log_index == 0` (a peer replaying from scratch) never calls
 /// `term_at` at all, so if the early entries it would need have
-/// *also* been compacted away, only the `entries_in_range` length
-/// check catches it.
+/// *also* been compacted away, only the contiguity check catches it.
 #[test]
 fn build_replication_step_returns_snapshot_when_replaying_from_scratch_hits_a_gap() {
     let (log, path) = open_temp_log();
@@ -812,8 +811,120 @@ fn build_replication_step_returns_snapshot_when_replaying_from_scratch_hits_a_ga
     log.apply_committed(5).unwrap();
     log.compact(4).unwrap();
 
-    let step = build_replication_step_sync(&log, 1, "leader-1".to_string(), 1, 0, 0).unwrap();
+    let step = step_for(&log, 1);
     assert!(matches!(step, ReplicationStep::Snapshot));
+
+    cleanup(&path);
+}
+
+/// An ordinary replication step, with the arguments a test never varies
+/// filled in. `heartbeat_only` is false: these tests are about what the
+/// builder decides to *send*, which is the case a probe round skips.
+fn step_for(log: &RaftLog, next_index: u64) -> ReplicationStep {
+    build_replication_step_sync(log, next_index, "leader-1".to_string(), 1, 0, 0, false).unwrap()
+}
+
+/// The batch is bounded by bytes, not by how far behind a peer happens
+/// to be. A short batch must still be a *contiguous prefix* starting at
+/// `next_index`, or the follower would be replayed with holes in its
+/// history -- and it must say there is more, so the caller comes
+/// straight back instead of sleeping between rounds.
+#[test]
+fn build_replication_step_stops_at_the_byte_budget_and_says_there_is_more() {
+    let (log, path) = open_temp_log();
+    // Each entry is comfortably over a megabyte, so a handful of them
+    // exceed any sane budget without the test having to know it.
+    let big = vec![0u8; 2 * 1024 * 1024];
+    for i in 1..=16u64 {
+        log.append(1, format!("k{i}").as_bytes(), Some(&big)).unwrap();
+    }
+
+    let ReplicationStep::AppendEntries { req, more_to_send } = step_for(&log, 1) else {
+        panic!("a log with no compaction should replicate, not snapshot");
+    };
+    assert!(
+        more_to_send,
+        "a batch cut short by the budget has to report that there is more"
+    );
+    assert!(
+        req.entries.len() < 16,
+        "the budget should have cut this batch short, got all {} entries",
+        req.entries.len()
+    );
+    assert!(!req.entries.is_empty(), "a budget must never stall progress entirely");
+    for (i, entry) in req.entries.iter().enumerate() {
+        assert_eq!(
+            entry.seq,
+            i as u64 + 1,
+            "a truncated batch must still be a contiguous prefix from next_index"
+        );
+    }
+
+    // Picking up where that left off eventually drains the log, and the
+    // last batch says so.
+    let next = req.entries.len() as u64 + 1;
+    let ReplicationStep::AppendEntries { req, .. } = step_for(&log, next) else {
+        panic!("the rest of the log should replicate normally");
+    };
+    assert_eq!(req.entries[0].seq, next);
+
+    cleanup(&path);
+}
+
+/// The escape hatch: one entry larger than the whole budget still has to
+/// be sent, or it could never replicate, never commit, and block
+/// everything behind it forever. This is why nothing larger than
+/// `MAX_ENTRY_BYTES` is allowed into the log in the first place.
+#[test]
+fn build_replication_step_always_sends_at_least_one_entry() {
+    let (log, path) = open_temp_log();
+    let huge = vec![0u8; MAX_REPLICATION_BATCH_BYTES + 1];
+    log.append(1, b"huge", Some(&huge)).unwrap();
+    log.append(1, b"after", Some(b"v")).unwrap();
+
+    let ReplicationStep::AppendEntries { req, more_to_send } = step_for(&log, 1) else {
+        panic!("an uncompacted log should replicate, not snapshot");
+    };
+    assert_eq!(
+        req.entries.len(),
+        1,
+        "an oversized entry goes on its own, but it does go"
+    );
+    assert_eq!(req.entries[0].seq, 1);
+    assert!(more_to_send);
+
+    cleanup(&path);
+}
+
+/// The case the old length check covered implicitly and a naive
+/// contiguity check would miss: every entry in the range is compacted
+/// away while `last_entry` still answers from the floor. Sending that as
+/// an empty batch reads as a heartbeat, so the follower replies
+/// `success` at the index it already had, `next_index` never moves, and
+/// the peer spins every tick with no progress and no snapshot.
+#[test]
+fn build_replication_step_returns_snapshot_when_the_whole_range_is_compacted() {
+    let (log, path) = open_temp_log();
+    for i in 1..=5u64 {
+        log.append(1, format!("k{i}").as_bytes(), Some(b"v"))
+            .unwrap();
+    }
+    log.apply_committed(5).unwrap();
+    // Compacts everything: `log` is empty, but `last_entry` still
+    // reports seq 5 from the floor.
+    log.compact(6).unwrap();
+    assert_eq!(log.last_entry().unwrap().map(|(seq, _)| seq), Some(5));
+    assert!(log.entries_in_range(1, 6).unwrap().is_empty());
+
+    // next_index = 1 is the one that reaches this branch: prev_log_index
+    // is 0, so the `term_at` check above is skipped entirely, and
+    // `next_index <= last_index` holds because the floor says 5 -- so it
+    // fetches, and gets nothing.
+    let step = step_for(&log, 1);
+    assert!(
+        matches!(step, ReplicationStep::Snapshot),
+        "a peer whose entries are all gone needs a snapshot, not a heartbeat"
+    );
 
     cleanup(&path);
 }

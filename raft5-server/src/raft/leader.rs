@@ -6,10 +6,13 @@ use super::*;
 // `GetLeaseRequest` is only ever *sent*, and only by a leader, so unlike
 // the rest of the peer protocol it isn't part of `Event` and doesn't come
 // in through `super::*`.
-use crate::pb::raft5::raft::{GetLeaseRequest, SnapshotChunk, snapshot_chunk};
+use crate::pb::raft5::raft::{
+    AppendEntriesChunk, AppendEntriesHeader, EntryBatch, GetLeaseRequest, SnapshotChunk,
+    append_entries_chunk, snapshot_chunk,
+};
 
 mod lease;
-mod replication;
+pub(super) mod replication;
 
 use lease::spawn_lease_prober;
 use log::info;

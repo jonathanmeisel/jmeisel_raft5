@@ -51,7 +51,7 @@ fn apply_append_entries_sync(
     log: &RaftLog,
     prev_log_index: u64,
     prev_log_term: u64,
-    entries: &[LogEntry],
+    entries: &mut Vec<LogEntry>,
 ) -> storage::Result<AppendOutcome> {
     if prev_log_index > 0 {
         match log.term_at(prev_log_index)? {
@@ -83,6 +83,7 @@ fn apply_append_entries_sync(
 
     let mut match_index = prev_log_index;
     let mut config_may_have_changed = false;
+    let mut appended_from = None;
     for (i, entry) in entries.iter().enumerate() {
         match log.term_at(entry.seq)? {
             // Already present with the same term -- by the Log Matching
@@ -104,30 +105,40 @@ fn apply_append_entries_sync(
                     config_may_have_changed = true;
                 }
                 config_may_have_changed |= entries[i..].iter().any(LogEntry::is_config);
-                for fresh in &entries[i..] {
-                    // `append_payload`, not `append`: the payload comes
-                    // from the leader and has to be preserved verbatim --
-                    // its kind *and* every mutation it carries -- or our
-                    // copy of the log stops matching theirs. An entry we
-                    // cannot decode is refused rather than guessed at;
-                    // see `pb::UnknownEntry`.
-                    let payload = fresh
-                        .payload()
-                        .map_err(|_| StorageError::Corrupt("replicated log entry has an unrecognized kind"))?;
-                    debug_assert_eq!(
-                        payload.mutation_count(),
-                        fresh.writes.len(),
-                        "a replicated entry lost mutations on the way into the log"
-                    );
-                    let seq = log.append_payload(fresh.term, &payload)?;
-                    debug_assert_eq!(
-                        seq, fresh.seq,
-                        "follower's log position drifted from the leader's indexing"
-                    );
-                    match_index = seq;
-                }
+                // Where the rest of the batch starts. Appended below
+                // rather than here so the entries can be *moved* into
+                // the log: an entry carrying a whole transaction is
+                // large, and `payload()` would clone every mutation of
+                // it on a path that is about to drop the original.
+                appended_from = Some(i);
                 break;
             }
+        }
+    }
+
+    if let Some(from) = appended_from {
+        for fresh in entries.drain(from..) {
+            // `append_payload`, not `append`: the payload comes from the
+            // leader and has to be preserved verbatim -- its kind *and*
+            // every mutation it carries -- or our copy of the log stops
+            // matching theirs. An entry we cannot decode is refused
+            // rather than guessed at; see `pb::UnknownEntry`.
+            let (expected_seq, expected_term, expected_writes) =
+                (fresh.seq, fresh.term, fresh.writes.len());
+            let payload = fresh.into_payload().map_err(|_| {
+                StorageError::Corrupt("replicated log entry has an unrecognized kind")
+            })?;
+            debug_assert_eq!(
+                payload.mutation_count(),
+                expected_writes,
+                "a replicated entry lost mutations on the way into the log"
+            );
+            let seq = log.append_payload(expected_term, &payload)?;
+            debug_assert_eq!(
+                seq, expected_seq,
+                "follower's log position drifted from the leader's indexing"
+            );
+            match_index = seq;
         }
     }
 
@@ -379,15 +390,20 @@ impl Follower {
     /// entries matched, and by this point the caller has already confirmed
     /// `req.term` is at least as current as ours, so the hint is trusted).
     /// Panics on a storage failure -- see the module doc.
-    async fn apply_append_entries(&mut self, req: &AppendEntriesRequest) -> AppendOutcome {
+    async fn apply_append_entries(&mut self, req: &mut AppendEntriesRequest) -> AppendOutcome {
         let prev_log_index = req.prev_log_index;
         let prev_log_term = req.prev_log_term;
-        let entries = req.entries.clone();
+        // Taken, not cloned. The entries have to move onto the blocking
+        // pool either way, and for a batch carrying a transaction the
+        // clone is a second copy of the whole thing for nothing -- the
+        // request has no further use for them. `req` keeps the scalars
+        // the caller still reads below.
+        let mut entries = std::mem::take(&mut req.entries);
         let outcome = self
             .common
             .store
             .expect("apply append entries to storage", move |log| {
-                apply_append_entries_sync(log, prev_log_index, prev_log_term, &entries)
+                apply_append_entries_sync(log, prev_log_index, prev_log_term, &mut entries)
             })
             .await;
 
@@ -415,7 +431,7 @@ impl Follower {
 
     async fn handle_event(&mut self, event: Event) -> Transition {
         match event {
-            Event::AppendEntries { req, respond_to } => {
+            Event::AppendEntries { mut req, respond_to } => {
                 if req.term < self.common.current_term {
                     let _ = respond_to.send(AppendEntriesResponse {
                         term: self.common.current_term,
@@ -434,7 +450,7 @@ impl Follower {
                     .publish_role(follower_handle(&self.common, self.leader_hint.clone()));
                 self.renew_lease();
 
-                let outcome = self.apply_append_entries(&req).await;
+                let outcome = self.apply_append_entries(&mut req).await;
                 let _ = respond_to.send(AppendEntriesResponse {
                     term: self.common.current_term,
                     success: outcome.success,
@@ -452,7 +468,7 @@ impl Follower {
             }
             Event::InstallSnapshot {
                 header,
-                data,
+                mut body,
                 respond_to,
             } => {
                 if header.term < self.common.current_term {
@@ -469,11 +485,13 @@ impl Follower {
                     .publish_role(follower_handle(&self.common, self.leader_hint.clone()));
                 self.renew_lease();
 
+                // `body` is consumed here, on the blocking pool, as the
+                // chunks arrive -- the sender is still pumping them in
+                // while this runs. Rejecting above instead drops it
+                // unread, which closes the channel and stops the pump.
                 self.common
                     .store
-                    .expect("install snapshot", move |log| {
-                        log.install_snapshot(&mut data.as_slice())
-                    })
+                    .expect("install snapshot", move |log| log.install_snapshot(&mut body))
                     .await;
 
                 // A snapshot only ever contains already-committed state

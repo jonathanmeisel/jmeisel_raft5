@@ -333,21 +333,96 @@ fn an_over_long_lifetime_is_refused_rather_than_shortened() {
 #[test]
 fn a_transaction_that_buffers_too_much_is_refused_before_it_can_commit() {
     let locks = locks();
-    let t = txn(&locks);
 
-    for i in 0..MAX_TRANSACTION_KEYS {
-        locks.buffer_write(t, format!("k{i}").as_bytes(), Some(b"v".to_vec())).unwrap();
-    }
-    assert!(matches!(
-        locks.buffer_write(t, b"one-too-many", Some(b"v".to_vec())),
-        Err(Refused::TooMuch(_))
-    ));
-
-    let big = locks.create(1, Duration::from_secs(1), fresh_id()).unwrap();
+    // One oversized value.
+    let big = txn(&locks);
     assert!(matches!(
         locks.buffer_write(big, b"k", Some(vec![0u8; MAX_TRANSACTION_BYTES + 1])),
         Err(Refused::TooMuch(_))
     ));
+
+    // ...and the same ceiling reached a megabyte at a time, which is
+    // the shape a real transaction actually has.
+    let many = txn(&locks);
+    let chunk = vec![0u8; 1024 * 1024];
+    let refused = (0..)
+        .find_map(|i| locks.buffer_write(many, format!("k{i}").as_bytes(), Some(chunk.clone())).err());
+    assert!(matches!(refused, Some(Refused::TooMuch(_))));
+}
+
+/// There is no separate limit on key *count*, so a great many tiny keys
+/// have to be stopped by the byte cap alone -- which they only are
+/// because `entry_size` charges each key an overhead on top of its
+/// bytes. Without that, empty keys would be free and unbounded.
+#[test]
+fn a_transaction_of_countless_tiny_keys_is_still_bounded() {
+    let locks = locks();
+    let t = txn(&locks);
+
+    let refused =
+        (0..1_000_000).find_map(|i| locks.buffer_write(t, format!("k{i}").as_bytes(), None).err());
+    assert!(
+        matches!(refused, Some(Refused::TooMuch(_))),
+        "keys with no value at all must still count against the budget"
+    );
+}
+
+/// The per-transaction cap bounds one client; this bounds the node.
+/// Without it, `MAX_OPEN_TRANSACTIONS` transactions at the per-
+/// transaction ceiling would be gigabytes, all held on the leader before
+/// anything has been proposed.
+#[test]
+fn the_node_wide_budget_bounds_what_every_transaction_holds_together() {
+    let locks = locks();
+    let chunk = vec![0u8; 1024 * 1024];
+
+    // Fill the node budget across many transactions, each well under
+    // its own limit.
+    let mut refused = None;
+    'outer: for _ in 0..(MAX_BUFFERED_BYTES_NODE_WIDE / MAX_TRANSACTION_BYTES + 2) {
+        let t = txn(&locks);
+        for i in 0..(MAX_TRANSACTION_BYTES / chunk.len()) {
+            if let Err(e) = locks.buffer_write(t, format!("{t:?}-{i}").as_bytes(), Some(chunk.clone()))
+            {
+                refused = Some(e);
+                break 'outer;
+            }
+        }
+    }
+    assert!(
+        matches!(refused, Some(Refused::TooMuch(_))),
+        "the node-wide budget should have stopped this before memory did"
+    );
+}
+
+/// A transaction that goes away gives its budget back, or the node-wide
+/// limit would be a one-way ratchet that eventually refuses everything.
+#[test]
+fn a_finished_transaction_returns_its_budget_to_the_node() {
+    let locks = locks();
+    let chunk = vec![0u8; 1024 * 1024];
+
+    // Do the same work repeatedly, far more times than the node-wide
+    // budget would allow if it were never released.
+    for round in 0..(MAX_BUFFERED_BYTES_NODE_WIDE / MAX_TRANSACTION_BYTES + 4) {
+        let t = txn(&locks);
+        for i in 0..8 {
+            locks
+                .buffer_write(t, format!("r{round}-{i}").as_bytes(), Some(chunk.clone()))
+                .expect("each round's budget should have been returned by the last");
+        }
+        locks.discard(t);
+    }
+
+    // The same holds for a transaction that was aborted rather than
+    // dropped: it will never be written, so it stops counting at once.
+    let doomed = txn(&locks);
+    locks.buffer_write(doomed, b"k", Some(chunk.clone())).unwrap();
+    let older = locks.create(1, Duration::from_secs(1), fresh_id()).unwrap();
+    // Not actually older -- take the key by expiry instead.
+    locks.discard(older);
+    locks.sweep(Instant::now() + Duration::from_secs(60), Duration::ZERO);
+    assert_eq!(locks.buffered_total(), 0);
 }
 
 /// Rewriting a key a transaction has already buffered replaces the value
