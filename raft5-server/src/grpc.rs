@@ -20,8 +20,9 @@
 //! whole of a read-modify-write be one atomic thing instead of two round
 //! trips with a race between them.
 //!
-//! Both `commit` and `transactional_read` establish the same two things
-//! before answering: this leader's `latest` must be complete
+//! Both `commit` and the transactional reads (`transactional_read` for
+//! one key, `transactional_scan` for a range of them) establish the same
+//! two things before answering: this leader's `latest` must be complete
 //! (`LeaderHandle::await_caught_up`), since `latest` reflects only
 //! *applied* entries and a fresh leader may still be catching up on a
 //! log tail it inherited; and it must still hold a quorum of leases
@@ -47,15 +48,16 @@ use crate::pb::raft5::client::{
     AddServerRequest, BootstrapRequest, CommitTransactionRequest, CommitTransactionResponse,
     ConfigChangeResponse, CreateTransactionRequest, CreateTransactionResponse,
     DropTransactionRequest, DropTransactionResponse, GetConfigRequest, GetConfigResponse,
-    NotLeader, RaftError as PbRaftError, ReadOk, ReadRequest, ReadResponse, RemoveServerRequest,
-    TransactionAborted, WriteRequest, WriteResponse, commit_transaction_response,
-    config_change_response, create_transaction_response, drop_transaction_response, raft_error,
+    GetKeysOk, GetKeysRequest, GetKeysResponse, NotLeader, RaftError as PbRaftError, ReadOk,
+    ReadRequest, ReadResponse, RemoveServerRequest, TransactionAborted, WriteRequest,
+    WriteResponse, commit_transaction_response, config_change_response,
+    create_transaction_response, drop_transaction_response, get_keys_response, raft_error,
     read_response, transaction_aborted, write_response,
 };
 use crate::pb::raft5::cluster::{ClusterConfig, ClusterMember};
 use crate::pb::raft5::raft::raft_peer_server::RaftPeer;
 use crate::pb::raft5::raft::{
-    AppendEntriesChunk, AppendEntriesResponse, AppendEntriesRequest, EntryBatch, GetLeaseRequest,
+    AppendEntriesChunk, AppendEntriesRequest, AppendEntriesResponse, EntryBatch, GetLeaseRequest,
     GetLeaseResponse, InstallSnapshotResponse, RequestVoteRequest, RequestVoteResponse,
     SnapshotChunk, append_entries_chunk, snapshot_chunk,
 };
@@ -65,9 +67,22 @@ use crate::raft::{
 };
 use crate::storage::Mutation;
 use crate::storage::{RaftLog, StorageError};
-use crate::store::Store;
 use crate::store::ChunkReader;
-use crate::txn::{AbortReason, Locks, Refused, TxnId};
+use crate::store::Store;
+use crate::txn::{AbortReason, BufferedKeys, Locks, Refused, TxnId};
+
+/// How many keys `GetKeys` returns when the caller doesn't say.
+const DEFAULT_MAX_KEYS: u32 = 10;
+
+/// The most keys one `GetKeys` will return.
+///
+/// Inside a transaction this is also a cap on how many read locks one
+/// call can take, which is the reason it isn't larger: every key a scan
+/// hands back is held until that transaction ends, so an unbounded scan
+/// would let one caller make an arbitrary stretch of the keyspace
+/// unwritable. Outside a transaction it is just a bound on the work and
+/// the response size.
+const MAX_KEYS_PER_SCAN: u32 = 1024;
 
 /// A transaction's refusal as the client protocol carries it.
 ///
@@ -321,6 +336,109 @@ impl KvService {
         Ok(ReadOk { seq, value })
     }
 
+    /// One pass of a key scan: up to `limit` keys at or after `start`,
+    /// with `buffered` -- this transaction's own uncommitted changes, or
+    /// empty outside one -- folded in.
+    ///
+    /// Returns the keys and whether the scan stopped early because it
+    /// filled up, which is what tells a caller there is another batch.
+    async fn scan(
+        &self,
+        start: Vec<u8>,
+        limit: usize,
+        buffered: &BufferedKeys,
+    ) -> Result<(Vec<Vec<u8>>, bool), StorageError> {
+        // A key this transaction has deleted doesn't exist as far as it
+        // is concerned, so the scan skips it rather than returning it
+        // and filtering after -- which would shorten the batch for a
+        // reason the caller can't see.
+        let deleted: std::collections::HashSet<Vec<u8>> = buffered
+            .iter()
+            .filter(|(_, is_delete)| *is_delete)
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        // One more than asked for, so "there is another batch" is
+        // something this saw rather than something the caller infers
+        // from a count -- see `GetKeysOk.has_more`.
+        let want = limit.saturating_add(1);
+        let committed = {
+            let start = start.clone();
+            self.store
+                .run(move |log| log.scan_latest(&start, want, |key| deleted.contains(key)))
+                .await?
+        };
+
+        // Buffered writes make keys appear that the store has never
+        // heard of. Merging them in can only add, so taking the first
+        // `limit` of the union is the same answer a merge of the two
+        // full streams would give.
+        let mut keys: Vec<Vec<u8>> = committed;
+        keys.extend(
+            buffered
+                .iter()
+                .filter(|(key, is_delete)| !*is_delete && key.as_slice() >= start.as_slice())
+                .map(|(key, _)| key.clone()),
+        );
+        keys.sort_unstable();
+        keys.dedup();
+
+        let has_more = keys.len() > limit;
+        keys.truncate(limit);
+        Ok((keys, has_more))
+    }
+
+    /// A transactional key scan: find the keys, lock them, then look
+    /// again.
+    ///
+    /// The second pass is what makes this a read rather than a guess.
+    /// A single-key read locks first and reads after, which a scan
+    /// cannot do -- it doesn't know which keys to lock until it has
+    /// looked. So it looks, locks what it found, and looks again: by
+    /// then nobody else can change any of those keys, and the second
+    /// answer is one this transaction can hold to. A key that vanished
+    /// in between is simply gone (we hold its lock and it isn't there);
+    /// one that appeared is a phantom this returns nothing about, since
+    /// these are per-key locks and the range itself is not held.
+    async fn transactional_scan(
+        &self,
+        id: TxnId,
+        start: Vec<u8>,
+        limit: usize,
+    ) -> Result<(Vec<Vec<u8>>, bool), TxnError> {
+        let leader = self.transaction_leader(id)?;
+        leader.await_caught_up().await?;
+        if !leader.has_read_quorum() {
+            return Err(RaftError::NotLeader { leader_hint: None }.into());
+        }
+
+        let buffered = self.locks.buffered_from(id, &start)?;
+
+        let (candidates, _) = self
+            .scan(start.clone(), limit, &buffered)
+            .await
+            .map_err(|e| TxnError::Raft(RaftError::Storage(e)))?;
+        self.locks.read_many(id, &candidates)?;
+
+        let (keys, has_more) = self
+            .scan(start, limit, &buffered)
+            .await
+            .map_err(|e| TxnError::Raft(RaftError::Storage(e)))?;
+
+        // Only what the locks above actually cover. Anything else the
+        // second pass turned up arrived after this transaction looked,
+        // and handing it back unlocked would be exactly the unprotected
+        // data under a transaction's name that the lock table exists to
+        // prevent.
+        let locked: std::collections::HashSet<&[u8]> =
+            candidates.iter().map(Vec::as_slice).collect();
+        let keys = keys
+            .into_iter()
+            .filter(|key| locked.contains(key.as_slice()))
+            .collect();
+        Ok((keys, has_more))
+    }
+
     /// Commit everything a transaction buffered, as one entry.
     ///
     /// The append runs in a task of its own owning the transaction's
@@ -359,9 +477,7 @@ impl KvService {
             leader.append_writes(mutations).await
         })
         .await
-        .map_err(|e| {
-            TxnError::Internal(Status::internal(format!("the commit task failed: {e}")))
-        })?
+        .map_err(|e| TxnError::Internal(Status::internal(format!("the commit task failed: {e}"))))?
         .map_err(Into::into)
     }
 
@@ -416,9 +532,11 @@ impl Kv for KvService {
         // leader handle is fetched only for the term check inside
         // `transaction_leader` -- a transaction cannot be added to from
         // anywhere but the leader that created it.
-        let result = self
-            .transaction_leader(id)
-            .and_then(|_| self.locks.buffer_write(id, &req.key, req.value).map_err(Into::into));
+        let result = self.transaction_leader(id).and_then(|_| {
+            self.locks
+                .buffer_write(id, &req.key, req.value)
+                .map_err(Into::into)
+        });
 
         Ok(Response::new(WriteResponse {
             result: Some(match result {
@@ -474,6 +592,53 @@ impl Kv for KvService {
 
         Ok(Response::new(ReadResponse {
             result: Some(read_response::Result::Ok(ok)),
+        }))
+    }
+
+    async fn get_keys(
+        &self,
+        request: Request<GetKeysRequest>,
+    ) -> Result<Response<GetKeysResponse>, Status> {
+        let req = request.into_inner();
+
+        // Refused rather than shortened, so a caller paging in batches
+        // of N finds out it isn't getting N instead of silently getting
+        // a different shape of answer than it asked for.
+        if req.max_keys > MAX_KEYS_PER_SCAN {
+            return Err(Status::resource_exhausted(
+                "that is more keys than this server will scan in one call",
+            ));
+        }
+        let limit = match req.max_keys {
+            0 => DEFAULT_MAX_KEYS,
+            n => n,
+        } as usize;
+
+        if let Some(id) = &req.transaction_id {
+            let id = txn_id(id)?;
+            let result = self.transactional_scan(id, req.start_key, limit).await;
+            return Ok(Response::new(GetKeysResponse {
+                result: Some(match result {
+                    Ok((keys, has_more)) => get_keys_response::Result::Ok(GetKeysOk {
+                        keys,
+                        has_more,
+                    }),
+                    Err(e) => get_keys_response::Result::Error(txn_error(e)?),
+                }),
+            }));
+        }
+
+        // Outside a transaction, the same terms as `read`: local state,
+        // no locks, whoever received it. There is nothing to merge --
+        // no transaction means no buffered writes -- and no second pass,
+        // since there are no locks for one to be taken under.
+        let (keys, has_more) = self
+            .scan(req.start_key, limit, &BufferedKeys::new())
+            .await
+            .map_err(storage_err)?;
+
+        Ok(Response::new(GetKeysResponse {
+            result: Some(get_keys_response::Result::Ok(GetKeysOk { keys, has_more })),
         }))
     }
 
@@ -701,7 +866,10 @@ enum Reassembled {
 /// `current_term` is a lower bound on this node's term, used only to
 /// refuse early. Everything that gets past it is still checked on the
 /// event loop, which is where §5.1 actually lives.
-async fn reassemble_append_entries<S>(mut stream: S, current_term: u64) -> Result<Reassembled, Status>
+async fn reassemble_append_entries<S>(
+    mut stream: S,
+    current_term: u64,
+) -> Result<Reassembled, Status>
 where
     S: futures_core::Stream<Item = Result<AppendEntriesChunk, Status>> + Unpin,
 {
@@ -878,7 +1046,9 @@ impl RaftPeer for RaftPeerService {
         // install blocks waiting for chunks that only the pump can
         // deliver, and the pump finishes only once the stream is done.
         let (tx, rx) = tokio::sync::mpsc::channel(crate::store::CHUNK_BACKLOG);
-        let install = self.peer_handle.install_snapshot(header, ChunkReader::new(rx));
+        let install = self
+            .peer_handle
+            .install_snapshot(header, ChunkReader::new(rx));
 
         let pump = async move {
             let mut giving_up = false;

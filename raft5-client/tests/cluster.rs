@@ -639,3 +639,172 @@ async fn dropping_the_handle_releases_the_transactions_locks() {
         Some(&b"after"[..])
     );
 }
+
+// --- key iteration ----------------------------------------------------
+
+/// The iterator's whole job: hand back every key in order, fetching
+/// batches as it goes, so the caller never sees the paging.
+#[tokio::test]
+async fn a_key_iterator_walks_every_key_in_order() {
+    let n1 = TestNode::start("keys1");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "keys1").await;
+
+    for i in 0..25 {
+        client
+            .write(format!("k{i:02}").as_bytes(), Some(b"v"))
+            .await
+            .unwrap();
+    }
+
+    // A batch size that divides the keyspace several times over, so the
+    // walk genuinely spans batches rather than fitting in one.
+    let keys = client
+        .key_iterator(b"")
+        .batch_size(4)
+        .collect()
+        .await
+        .unwrap();
+
+    let expected: Vec<Vec<u8>> = (0..25).map(|i| format!("k{i:02}").into_bytes()).collect();
+    assert_eq!(keys, expected, "paging must cover the keyspace exactly once");
+}
+
+/// Starting mid-keyspace starts there, inclusively, and an empty stretch
+/// simply ends immediately.
+#[tokio::test]
+async fn a_key_iterator_starts_where_it_is_told_and_stops_at_the_end() {
+    let n1 = TestNode::start("keys2");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "keys2").await;
+
+    for key in [&b"apple"[..], b"banana", b"cherry"] {
+        client.write(key, Some(b"v")).await.unwrap();
+    }
+
+    let keys = client.key_iterator(b"banana").collect().await.unwrap();
+    assert_eq!(keys, vec![b"banana".to_vec(), b"cherry".to_vec()]);
+
+    let past_the_end = client.key_iterator(b"z").collect().await.unwrap();
+    assert!(past_the_end.is_empty());
+}
+
+/// A deleted key is not a key. The iterator walks what has a value, so
+/// a delete removes it from the walk like any other read.
+#[tokio::test]
+async fn a_key_iterator_skips_deleted_keys() {
+    let n1 = TestNode::start("keys3");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "keys3").await;
+
+    for key in [&b"a"[..], b"b", b"c"] {
+        client.write(key, Some(b"v")).await.unwrap();
+    }
+    client.write(b"b", None).await.unwrap();
+
+    let keys = client.key_iterator(b"").collect().await.unwrap();
+    assert_eq!(keys, vec![b"a".to_vec(), b"c".to_vec()]);
+}
+
+/// Inside a transaction the walk sees the transaction's own buffered
+/// changes, and every key it hands over is locked -- so a
+/// read-modify-write over "whatever is in this range" is possible at
+/// all.
+#[tokio::test]
+async fn a_transactional_key_iterator_sees_its_own_writes_and_holds_what_it_returns() {
+    let n1 = TestNode::start("keys4");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "keys4").await;
+
+    client.write(b"a", Some(b"1")).await.unwrap();
+    client.write(b"c", Some(b"3")).await.unwrap();
+
+    let txn = client.transaction(Duration::from_secs(5)).await.unwrap();
+    txn.write(b"b", Some(b"2")).await.unwrap();
+    txn.write(b"c", None).await.unwrap();
+
+    let keys = txn.key_iterator(b"").batch_size(2).collect().await.unwrap();
+    assert_eq!(
+        keys,
+        vec![b"a".to_vec(), b"b".to_vec()],
+        "its own buffered write is there and its own buffered delete is gone"
+    );
+
+    // `a` came back from the walk, so the transaction holds it: a
+    // younger writer is refused rather than slipping in underneath.
+    let contender = client.transaction(Duration::from_secs(5)).await.unwrap();
+    match contender.write(b"a", Some(b"stolen")).await {
+        Err(Error::Aborted { reason, key }) => {
+            assert_eq!(reason, raft5_client::AbortReason::LockConflict);
+            assert_eq!(key.as_deref(), Some(&b"a"[..]));
+        }
+        other => panic!("expected the scan's lock to hold the key, got {other:?}"),
+    }
+
+    txn.abort().await.unwrap();
+}
+
+/// A walk that stops early stops fetching. Only the batches actually
+/// needed are paid for -- which, inside a transaction, also means only
+/// those keys are locked.
+#[tokio::test]
+async fn a_key_iterator_stopped_early_does_not_fetch_the_rest() {
+    let n1 = TestNode::start("keys5");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "keys5").await;
+
+    for i in 0..20 {
+        client
+            .write(format!("k{i:02}").as_bytes(), Some(b"v"))
+            .await
+            .unwrap();
+    }
+
+    let txn = client.transaction(Duration::from_secs(5)).await.unwrap();
+    let mut keys = txn.key_iterator(b"").batch_size(2);
+    assert_eq!(keys.next().await.unwrap(), Some(b"k00".to_vec()));
+    assert_eq!(keys.next().await.unwrap(), Some(b"k01".to_vec()));
+    drop(keys);
+
+    // Nothing past the first batch was ever asked for, so nothing past
+    // it is held: another transaction can still take those keys.
+    let other = client.transaction(Duration::from_secs(5)).await.unwrap();
+    other.write(b"k19", Some(b"free")).await.unwrap();
+    other.commit().await.unwrap();
+
+    txn.abort().await.unwrap();
+}
+
+/// The batch boundary, at the one shape of key that could break it.
+/// Continuing a walk appends a zero byte to the last key seen, so a key
+/// that *is* the previous one plus a zero byte -- or any other prefix
+/// relationship -- has to land in the next batch rather than be skipped
+/// or repeated.
+#[tokio::test]
+async fn a_key_iterator_pages_correctly_across_keys_that_prefix_each_other() {
+    let n1 = TestNode::start("keys6");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "keys6").await;
+
+    // In ascending byte order: "k" < "k\0" < "k\0\0" < "ka".
+    let expected: Vec<Vec<u8>> = vec![
+        b"k".to_vec(),
+        b"k\x00".to_vec(),
+        b"k\x00\x00".to_vec(),
+        b"ka".to_vec(),
+    ];
+    for key in &expected {
+        client.write(key, Some(b"v")).await.unwrap();
+    }
+
+    // One key per batch, so every one of those boundaries is crossed by
+    // the zero-byte continuation rather than skipped over inside a
+    // batch.
+    let keys = client
+        .key_iterator(b"")
+        .batch_size(1)
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(keys, expected);
+}

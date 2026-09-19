@@ -399,3 +399,90 @@ fn discarding_an_unknown_transaction_is_not_an_error() {
     locks.discard(t);
     locks.discard(fresh_id());
 }
+
+// --- bulk reads and the buffer view, for key scans --------------------
+
+/// `read_many` is `read` for a whole batch: every key ends up in the
+/// read set and held, so a scan's keys are as protected as a single
+/// read's.
+#[test]
+fn read_many_locks_every_key_it_is_given() {
+    let locks = locks();
+    let scanner = txn(&locks);
+
+    assert_eq!(
+        locks.read_many(scanner, &[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]),
+        Ok(())
+    );
+    for key in [&b"a"[..], b"b", b"c"] {
+        assert!(locks.is_locked(key));
+    }
+
+    // Held against a writer that can't displace this one: younger, so
+    // it is refused rather than wounding its way in.
+    let younger = txn(&locks);
+    assert_eq!(
+        conflict(locks.buffer_write(younger, b"b", Some(b"v".to_vec()))),
+        b"b".to_vec()
+    );
+}
+
+/// A refusal part-way leaves what it already took. Those locks are in
+/// the read set now and are given up when the transaction ends -- and
+/// handing one back early could not undo a wounding it took to get.
+#[test]
+fn read_many_keeps_the_locks_it_took_before_being_refused() {
+    let locks = locks();
+    let older = txn(&locks);
+    let younger = txn(&locks);
+    locks.buffer_write(older, b"b", Some(b"v".to_vec())).unwrap();
+
+    assert_eq!(
+        conflict(locks.read_many(younger, &[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()])),
+        b"b".to_vec()
+    );
+    assert!(locks.is_locked(b"a"), "the key it got before the refusal is still held");
+    assert!(!locks.is_locked(b"c"), "and it never reached the one after");
+}
+
+/// A key this transaction has already written is skipped: it holds the
+/// stronger exclusive lock, and taking a shared one on top would be a
+/// silent downgrade.
+#[test]
+fn read_many_leaves_a_key_this_transaction_already_wrote_alone() {
+    let locks = locks();
+    let t = txn(&locks);
+    locks.buffer_write(t, b"k", Some(b"mine".to_vec())).unwrap();
+
+    assert_eq!(locks.read_many(t, &[b"k".to_vec()]), Ok(()));
+
+    // Still exclusive: another transaction cannot read it.
+    let other = txn(&locks);
+    assert_eq!(conflict(locks.read(other, b"k")), b"k".to_vec());
+}
+
+/// What a scan needs to fold in its own uncommitted changes: the
+/// buffered keys from a point on, in order, each marked as a write or a
+/// delete.
+#[test]
+fn buffered_from_reports_the_buffered_keys_in_order() {
+    let locks = locks();
+    let t = txn(&locks);
+    locks.buffer_write(t, b"c", Some(b"3".to_vec())).unwrap();
+    locks.buffer_write(t, b"a", Some(b"1".to_vec())).unwrap();
+    locks.buffer_write(t, b"b", None).unwrap();
+
+    assert_eq!(
+        locks.buffered_from(t, b""),
+        Ok(vec![
+            (b"a".to_vec(), false),
+            (b"b".to_vec(), true),
+            (b"c".to_vec(), false),
+        ])
+    );
+    assert_eq!(
+        locks.buffered_from(t, b"b"),
+        Ok(vec![(b"b".to_vec(), true), (b"c".to_vec(), false)]),
+        "a scan starting mid-keyspace is not told about what is behind it"
+    );
+}

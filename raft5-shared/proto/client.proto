@@ -23,6 +23,12 @@ service Kv {
   // node received it.
   rpc Read(ReadRequest) returns (ReadResponse);
 
+  // Walk the keys that currently have a value, in order, starting at
+  // `start_key`. Consistency follows Read exactly: inside a transaction
+  // every key handed back is read-locked, outside one it is a
+  // possibly-stale local read.
+  rpc GetKeys(GetKeysRequest) returns (GetKeysResponse);
+
   // Cluster membership changes, one server at a time (single-server
   // change, not joint consensus -- simpler to reason about; joint
   // consensus for atomic multi-member changes can come later if needed).
@@ -164,6 +170,52 @@ message ReadResponse {
 message ReadOk {
   uint64 seq = 1;
   optional bytes value = 2; // unset = key doesn't currently exist
+}
+
+message GetKeysRequest {
+  // Where to start, inclusive. Empty starts at the first key there is.
+  // A caller continuing a walk passes the last key it saw with a single
+  // zero byte appended, which is the next key there could be.
+  bytes start_key = 1;
+  // How many keys to return at most. 0 means the server's default (10).
+  // A request for more than the server is willing to scan in one call
+  // is refused rather than quietly shortened, for the same reason an
+  // over-long transaction lifetime is: a caller told "yes" would
+  // otherwise page as though it had a batch size it did not get.
+  uint32 max_keys = 2;
+  // Walk as part of this transaction: every key returned joins its read
+  // set, exactly as Read does, and keys it has buffered writes for are
+  // reflected -- a buffered write makes a key appear, a buffered delete
+  // makes it disappear.
+  //
+  // Note what this does and does not promise. Every key handed back is
+  // locked, so none of them can change while the transaction lives. The
+  // *range* is not locked: these are per-key locks, not predicate
+  // locks, so a key that did not exist when the walk passed its
+  // position can still be created by someone else. A transaction that
+  // must not miss such a key cannot get that guarantee from here.
+  //
+  // Unset is a possibly-stale read, on the same terms as Read.
+  optional bytes transaction_id = 3;
+}
+
+message GetKeysResponse {
+  oneof result {
+    GetKeysOk ok = 1;
+    RaftError error = 2;
+  }
+}
+
+message GetKeysOk {
+  // In ascending order, starting at or after `start_key`. Only keys
+  // that currently have a value: a deleted key is simply not here.
+  repeated bytes keys = 1;
+  // Whether the scan stopped because it hit `max_keys` rather than
+  // because it ran out of keys. Carried explicitly instead of being
+  // inferred from `keys.len() < max_keys`, which a transaction's
+  // buffered deletes can make wrong -- they can shorten a batch that
+  // was not the last one.
+  bool has_more = 2;
 }
 
 message AddServerRequest {

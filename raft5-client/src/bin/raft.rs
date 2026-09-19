@@ -138,6 +138,22 @@ async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
             let [key] = fixed_args(args, "read <key>")?;
             print_read(client.read(key.as_bytes()).await);
         }
+        "keys" => {
+            let start = match args {
+                [] => "",
+                [start] => start.as_str(),
+                _ => return Err("usage: keys [start_key]".to_string()),
+            };
+            match client.key_iterator(start.as_bytes()).collect().await {
+                Ok(keys) if keys.is_empty() => println!("(no keys)"),
+                Ok(keys) => {
+                    for key in keys {
+                        println!("{}", String::from_utf8_lossy(&key));
+                    }
+                }
+                Err(e) => println!("error: {e}"),
+            }
+        }
         "add_server" => {
             let [client_address] = fixed_args(args, "add_server <client_address>")?;
             match client.add_server(client_address).await {
@@ -204,6 +220,7 @@ fn print_help() {
             "read <key>                       read from whichever node is currently connected,",
             "                                  without confirming it still leads -- so it may",
             "                                  miss a write that just returned",
+            "keys [start_key]                list every key from <start_key> on, stale like `read`",
             "add_server <client_addr>         add a server as a learner, by its client address",
             "remove_server <id>               remove a server",
             "bootstrap <id>                   form a single-node cluster around <id>",

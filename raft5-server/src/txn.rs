@@ -140,6 +140,10 @@ pub type TxnId = [u8; 16];
 /// What a transaction buffered, in key order. `None` is a delete.
 pub type BufferedWrites = Vec<(Vec<u8>, Option<Vec<u8>>)>;
 
+/// Which keys a transaction has buffered, in order, and whether each is
+/// a delete. Values omitted -- see `Locks::buffered_from`.
+pub type BufferedKeys = Vec<(Vec<u8>, bool)>;
+
 /// What kind of access a request wants, and what a lock grants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -555,6 +559,57 @@ impl Locks {
                 .reads
                 .insert(key.to_vec());
             Ok(None)
+        })
+    }
+
+    /// Take read locks on every one of `keys` for `id` and record them
+    /// in the read set -- `read`, in bulk, for a key scan.
+    ///
+    /// Not atomic, and deliberately so: a refusal part-way leaves the
+    /// locks already taken in place. They belong to the read set now,
+    /// and the transaction gives them up when it ends like any other.
+    /// Unwinding them would be wrong as well as pointless -- this
+    /// transaction may have *wounded* someone to get one, and handing it
+    /// back would not undo that.
+    ///
+    /// A key this transaction has already buffered a write for is
+    /// skipped: it holds the stronger exclusive lock on it already, and
+    /// `read` skips the same case for the same reason.
+    pub fn read_many(&self, id: TxnId, keys: &[Vec<u8>]) -> Result<(), Refused> {
+        let now = Instant::now();
+        self.with_open(id, |shared| {
+            for key in keys {
+                if shared.txns[&id].writes.contains_key(key) {
+                    continue;
+                }
+                shared.acquire(key, id, Mode::Read, now)?;
+                shared
+                    .txns
+                    .get_mut(&id)
+                    .expect("an open transaction cannot vanish under its own read")
+                    .reads
+                    .insert(key.clone());
+            }
+            Ok(())
+        })
+    }
+
+    /// Which keys at or after `start` this transaction has buffered, and
+    /// whether each is a delete -- what a key scan needs to fold its own
+    /// uncommitted changes into what the store says.
+    ///
+    /// Keys only, no values, so the cost is the transaction's key count
+    /// rather than its megabytes. Every buffered key from `start` on,
+    /// not a bounded prefix of them: a scan has to know about *every*
+    /// delete it might walk past, or it would hand back a key this
+    /// transaction has already removed.
+    pub fn buffered_from(&self, id: TxnId, start: &[u8]) -> Result<BufferedKeys, Refused> {
+        self.with_open(id, |shared| {
+            Ok(shared.txns[&id]
+                .writes
+                .range(start.to_vec()..)
+                .map(|(key, value)| (key.clone(), value.is_none()))
+                .collect())
         })
     }
 

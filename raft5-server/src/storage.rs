@@ -72,11 +72,11 @@
 //! memtables, and a point read runs at `SeqNo::MAX`, so a reader on
 //! another thread can catch a batch halfway through.
 //!
-//! That is fine here, and no barrier is needed, because nothing reads
-//! more than one key of `latest` in one operation. `get_latest` reads a
-//! single key, which has no "half" to see. `export_snapshot` iterates the
-//! whole keyspace, but `Keyspace::iter` opens a snapshot nonce and reads
-//! at that instant, so it is already pinned to one point in time.
+//! That is fine here, and no barrier is needed. `get_latest` reads a
+//! single key, which has no "half" to see. `export_snapshot` and
+//! `scan_latest` walk many, but `Keyspace::iter`/`range` open a snapshot
+//! nonce and read at that instant, so both are already pinned to one
+//! point in time.
 //!
 //! What this does mean is that two *separate* reads straddling a commit
 //! see two different points in time -- read `a`, then read `b`, and the
@@ -460,6 +460,42 @@ impl RaftLog {
             Some(bytes) => Ok(Some(decode_latest_value(&bytes)?)),
             None => Ok(None),
         }
+    }
+
+    /// Up to `limit` committed keys at or after `start`, in ascending
+    /// order, skipping any key `skip` rejects.
+    ///
+    /// `skip` is how a transaction's buffered deletes are honoured
+    /// without teaching storage what a transaction is: a key the caller
+    /// has already deleted doesn't exist as far as it is concerned, and
+    /// skipping it here rather than filtering afterwards is what keeps a
+    /// full batch full.
+    ///
+    /// Keys only. The values are the caller's business to fetch (or
+    /// not), and a scan that carried them would make the size of a batch
+    /// a property of the data rather than of `limit`.
+    ///
+    /// `Keyspace::range` pins a snapshot nonce, so this walks one point
+    /// in time even while `apply_committed` is writing -- the same
+    /// guarantee `export_snapshot` relies on, and the reason a scan
+    /// can't catch a multi-key entry half-applied.
+    pub fn scan_latest(
+        &self,
+        start: &[u8],
+        limit: usize,
+        skip: impl Fn(&[u8]) -> bool,
+    ) -> Result<Vec<Vec<u8>>> {
+        let mut keys = Vec::new();
+        for item in self.latest.range(start.to_vec()..) {
+            if keys.len() == limit {
+                break;
+            }
+            let (key, _value) = item.into_inner()?;
+            if !skip(&key) {
+                keys.push(key.to_vec());
+            }
+        }
+        Ok(keys)
     }
 
     /// Applies every committed log entry not yet reflected in `latest`, up

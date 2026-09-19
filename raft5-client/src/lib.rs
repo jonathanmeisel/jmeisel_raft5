@@ -40,10 +40,10 @@ use tonic::Status;
 use raft5_shared::raft5::client::{
     AddServerRequest, BootstrapRequest, CommitTransactionRequest, CommitTransactionResponse,
     ConfigChangeResponse, CreateTransactionRequest, CreateTransactionResponse,
-    DropTransactionRequest, RaftError as PbRaftError, ReadRequest, ReadResponse,
-    RemoveServerRequest, WriteRequest, WriteResponse, commit_transaction_response,
-    config_change_response, create_transaction_response, raft_error, read_response,
-    transaction_aborted, write_response,
+    DropTransactionRequest, GetKeysRequest, GetKeysResponse, RaftError as PbRaftError,
+    ReadRequest, ReadResponse, RemoveServerRequest, WriteRequest, WriteResponse,
+    commit_transaction_response, config_change_response, create_transaction_response,
+    get_keys_response, raft_error, read_response, transaction_aborted, write_response,
 };
 
 use routing::{Kv, Router};
@@ -79,6 +79,12 @@ const CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 /// end, and holding the key any longer than that would only block
 /// whoever wants it next if this client stalls mid-write.
 const IMPLICIT_TXN_TTL: Duration = Duration::from_secs(2);
+
+/// How many keys a [`KeyIterator`] fetches per round trip unless told
+/// otherwise. Small enough that walking a handful of keys doesn't drag
+/// back a page of them, large enough that walking a lot doesn't cost a
+/// round trip each.
+pub const DEFAULT_KEY_BATCH: u32 = 64;
 
 #[derive(Debug)]
 pub enum Error {
@@ -414,6 +420,46 @@ impl Client {
         self.read_inner(key, None).await
     }
 
+    /// Walks every key that currently has a value, in order, from
+    /// `start_key` on. Pass an empty slice to start at the beginning.
+    ///
+    /// Outside a transaction, like [`read`], this is stale: each batch
+    /// is a local read of whichever node answered, and keys written
+    /// since may be missing. [`Transaction::key_iterator`] is the
+    /// current one.
+    ///
+    /// ```no_run
+    /// # async fn f(client: raft5_client::Client) -> Result<(), raft5_client::Error> {
+    /// let mut keys = client.key_iterator(b"user:");
+    /// while let Some(key) = keys.next().await? {
+    ///     println!("{}", String::from_utf8_lossy(&key));
+    /// }
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// [`read`]: Client::read
+    pub fn key_iterator(&self, start_key: &[u8]) -> KeyIterator {
+        KeyIterator::new(self.clone(), None, start_key)
+    }
+
+    async fn get_keys_batch(
+        &self,
+        start_key: Vec<u8>,
+        max_keys: u32,
+        transaction_id: Option<Vec<u8>>,
+    ) -> Result<(Vec<Vec<u8>>, bool), Error> {
+        let request = GetKeysRequest {
+            start_key,
+            max_keys,
+            transaction_id,
+        };
+        self.call(|mut kv: Kv| {
+            let request = request.clone();
+            async move { kv.get_keys(request).await.map(get_keys_reply) }
+        })
+        .await
+    }
+
     async fn read_inner(
         &self,
         key: &[u8],
@@ -656,6 +702,14 @@ fn write_reply(resp: tonic::Response<WriteResponse>) -> Reply<()> {
     }
 }
 
+fn get_keys_reply(resp: tonic::Response<GetKeysResponse>) -> Reply<(Vec<Vec<u8>>, bool)> {
+    match resp.into_inner().result {
+        Some(get_keys_response::Result::Ok(ok)) => Reply::Ok((ok.keys, ok.has_more)),
+        Some(get_keys_response::Result::Error(e)) => Reply::from_error(e),
+        None => empty_response(),
+    }
+}
+
 fn read_reply(resp: tonic::Response<ReadResponse>) -> Reply<ReadResult> {
     match resp.into_inner().result {
         Some(read_response::Result::Ok(ok)) => Reply::Ok(ReadResult {
@@ -744,6 +798,25 @@ impl Transaction {
     /// write has no sequence number yet.
     pub async fn read(&self, key: &[u8]) -> Result<ReadResult, Error> {
         self.client.read_inner(key, Some(self.id.clone())).await
+    }
+
+    /// Walks every key that currently has a value, in order, from
+    /// `start_key` on, as part of this transaction.
+    ///
+    /// Every key it hands back joins the read set and is held against
+    /// conflicting writes until the transaction finishes, exactly as
+    /// [`read`] does -- and what this transaction has buffered is
+    /// reflected, so a key it wrote appears and one it deleted does not.
+    ///
+    /// The *range* is not locked, only the keys. These are per-key
+    /// locks, so a key that didn't exist when the walk passed its
+    /// position can still be created by someone else -- a phantom. A
+    /// transaction that must not miss such a key cannot get that
+    /// guarantee here.
+    ///
+    /// [`read`]: Transaction::read
+    pub fn key_iterator(&self, start_key: &[u8]) -> KeyIterator {
+        KeyIterator::new(self.client.clone(), Some(self.id.clone()), start_key)
     }
 
     /// Buffers a write to `key` (or a delete, if `value` is `None`) and
@@ -844,5 +917,108 @@ impl Drop for Transaction {
                 let _ = Self::send_drop(&client, id).await;
             });
         }
+    }
+}
+
+/// Walks a cluster's keys in order, a batch at a time.
+///
+/// Built by [`Client::key_iterator`] (a stale walk) or
+/// [`Transaction::key_iterator`] (one whose keys are locked as they are
+/// handed over). Not a [`std::iter::Iterator`]: every batch is a round
+/// trip, so advancing has to be awaited.
+///
+/// The cost is one RPC per [`batch_size`] keys rather than one per key.
+/// Keys already fetched are handed out from memory, and the next batch
+/// is asked for only when the last one runs out -- so a caller that
+/// stops early never pays for the rest.
+///
+/// [`batch_size`]: KeyIterator::batch_size
+pub struct KeyIterator {
+    client: Client,
+    transaction_id: Option<Vec<u8>>,
+    /// Where the next batch starts, inclusive. `None` once the cluster
+    /// has said there is nothing after what we have.
+    next_start: Option<Vec<u8>>,
+    batch_size: u32,
+    /// The current batch, reversed so that taking the next key is a
+    /// `pop` off the end rather than a shift off the front.
+    buffer: Vec<Vec<u8>>,
+}
+
+impl KeyIterator {
+    fn new(client: Client, transaction_id: Option<Vec<u8>>, start_key: &[u8]) -> Self {
+        Self {
+            client,
+            transaction_id,
+            next_start: Some(start_key.to_vec()),
+            batch_size: DEFAULT_KEY_BATCH,
+            buffer: Vec::new(),
+        }
+    }
+
+    /// How many keys to fetch per round trip. Defaults to
+    /// [`DEFAULT_KEY_BATCH`]; a server that won't scan this many in one
+    /// call refuses rather than shortening it, so the error surfaces
+    /// here rather than as a quietly smaller batch.
+    #[must_use]
+    pub fn batch_size(mut self, keys: u32) -> Self {
+        self.batch_size = keys;
+        self
+    }
+
+    /// The next key, or `None` at the end of the keyspace.
+    ///
+    /// Answered from the buffer when it can be; otherwise this is where
+    /// the round trip happens. Inside a transaction, that round trip is
+    /// also where the next batch's keys are locked, so this is a point
+    /// at which the transaction can be aborted -- see [`Error::Aborted`].
+    pub async fn next(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        loop {
+            if let Some(key) = self.buffer.pop() {
+                return Ok(Some(key));
+            }
+            let Some(start) = self.next_start.take() else {
+                return Ok(None);
+            };
+
+            let (mut keys, has_more) = self
+                .client
+                .get_keys_batch(start, self.batch_size, self.transaction_id.clone())
+                .await?;
+
+            // The next batch starts just past the last key of this one.
+            // A single zero byte appended is the smallest key that can
+            // sort after it, so nothing between the two can be skipped
+            // -- there is nothing between them.
+            if has_more && let Some(last) = keys.last() {
+                let mut next = last.clone();
+                next.push(0);
+                self.next_start = Some(next);
+            }
+
+            // An empty batch with `has_more` set can't happen, but if it
+            // did, `next_start` would be unchanged and this would spin.
+            // The loop only goes round again on a non-empty batch.
+            if keys.is_empty() {
+                return Ok(None);
+            }
+            keys.reverse();
+            self.buffer = keys;
+        }
+    }
+
+    /// Everything from here to the end of the keyspace, in order.
+    ///
+    /// Convenient for a keyspace known to be small; for one that isn't,
+    /// prefer [`next`] and stop when you have what you need, since this
+    /// keeps going -- and, inside a transaction, keeps locking.
+    ///
+    /// [`next`]: KeyIterator::next
+    pub async fn collect(mut self) -> Result<Vec<Vec<u8>>, Error> {
+        let mut all = Vec::new();
+        while let Some(key) = self.next().await? {
+            all.push(key);
+        }
+        Ok(all)
     }
 }

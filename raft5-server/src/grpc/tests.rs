@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use super::*;
 use crate::pb::raft5::client::{
-    CommitTransactionRequest, CreateTransactionRequest, DropTransactionRequest,
-    commit_transaction_response, create_transaction_response, raft_error, read_response,
-    transaction_aborted, write_response,
+    CommitTransactionRequest, CreateTransactionRequest, DropTransactionRequest, GetKeysRequest,
+    commit_transaction_response, create_transaction_response, get_keys_response, raft_error,
+    read_response, transaction_aborted, write_response,
 };
 use crate::raft::{self, RoleHandle};
 use tokio::sync::watch;
@@ -795,6 +795,262 @@ async fn a_committed_transaction_makes_every_key_visible_at_one_seq() {
     let b = read(&svc, b"b").await;
     assert_eq!((a.value.as_deref(), b.value.as_deref()), (Some(&b"2"[..]), Some(&b"3"[..])));
     assert_eq!((a.seq, b.seq), (seq, seq), "one entry, so one seq for both keys");
+
+    cleanup(&path);
+}
+
+// --- key scans --------------------------------------------------------
+
+/// A scan, the way a client makes one.
+async fn get_keys(
+    svc: &KvService,
+    start: &[u8],
+    max_keys: u32,
+    txn: Option<&[u8]>,
+) -> (Vec<Vec<u8>>, bool) {
+    let result = svc
+        .get_keys(Request::new(GetKeysRequest {
+            start_key: start.to_vec(),
+            max_keys,
+            transaction_id: txn.map(<[u8]>::to_vec),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .result;
+    match result {
+        Some(get_keys_response::Result::Ok(ok)) => (ok.keys, ok.has_more),
+        other => panic!("expected a successful scan, got {other:?}"),
+    }
+}
+
+fn as_strings(keys: &[Vec<u8>]) -> Vec<String> {
+    keys.iter()
+        .map(|k| String::from_utf8_lossy(k).into_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_scan_walks_keys_in_order_from_where_it_is_told() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "scan").await;
+    for key in [&b"b"[..], b"d", b"a", b"c"] {
+        write(&svc, key, Some(b"v")).await;
+    }
+
+    let (keys, has_more) = get_keys(&svc, b"", 10, None).await;
+    assert_eq!(as_strings(&keys), ["a", "b", "c", "d"]);
+    assert!(!has_more, "four keys asked of a store holding four is the end");
+
+    let (keys, _) = get_keys(&svc, b"c", 10, None).await;
+    assert_eq!(
+        as_strings(&keys),
+        ["c", "d"],
+        "start_key is inclusive, and nothing before it comes back"
+    );
+
+    cleanup(&path);
+}
+
+/// `has_more` is what says whether to ask again, and appending a zero
+/// byte to the last key is how the next batch starts just past it --
+/// the paging contract `raft5_client::KeyIterator` is built on.
+#[tokio::test]
+async fn a_scan_pages_through_every_key_without_skipping_or_repeating() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "scan").await;
+    for i in 0..7 {
+        write(&svc, format!("k{i}").as_bytes(), Some(b"v")).await;
+    }
+
+    let mut seen = Vec::new();
+    let mut start = Vec::new();
+    loop {
+        let (keys, has_more) = get_keys(&svc, &start, 2, None).await;
+        assert!(keys.len() <= 2, "a batch never exceeds max_keys");
+        let last = keys.last().cloned();
+        seen.extend(keys);
+        match (has_more, last) {
+            (true, Some(last)) => {
+                start = last;
+                start.push(0);
+            }
+            _ => break,
+        }
+    }
+
+    assert_eq!(
+        as_strings(&seen),
+        ["k0", "k1", "k2", "k3", "k4", "k5", "k6"],
+        "paging must cover the keyspace exactly once"
+    );
+
+    cleanup(&path);
+}
+
+/// Zero means the server's default rather than zero keys -- a proto3
+/// scalar cannot tell "unset" from "0", so the default has to be what
+/// the absent value means.
+#[tokio::test]
+async fn a_scan_with_no_max_uses_the_default() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "scan").await;
+    for i in 0..15 {
+        write(&svc, format!("k{i:02}").as_bytes(), Some(b"v")).await;
+    }
+
+    let (keys, has_more) = get_keys(&svc, b"", 0, None).await;
+    assert_eq!(keys.len(), DEFAULT_MAX_KEYS as usize);
+    assert!(has_more);
+
+    cleanup(&path);
+}
+
+/// Refused rather than quietly shortened, for the same reason an
+/// over-long transaction lifetime is: a caller paging in batches of N
+/// should not be told yes and handed something else.
+#[tokio::test]
+async fn a_scan_of_absurdly_many_keys_is_refused_rather_than_shortened() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "scan").await;
+
+    let status = svc
+        .get_keys(Request::new(GetKeysRequest {
+            start_key: Vec::new(),
+            max_keys: MAX_KEYS_PER_SCAN + 1,
+            transaction_id: None,
+        }))
+        .await
+        .expect_err("an over-large batch should be refused");
+    assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+
+    cleanup(&path);
+}
+
+/// A deleted key is simply not there -- the same collapsing of "deleted"
+/// and "never written" that a read does.
+#[tokio::test]
+async fn a_scan_does_not_return_a_deleted_key() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "scan").await;
+    write(&svc, b"a", Some(b"v")).await;
+    write(&svc, b"b", Some(b"v")).await;
+    write(&svc, b"b", None).await;
+
+    let (keys, _) = get_keys(&svc, b"", 10, None).await;
+    assert_eq!(as_strings(&keys), ["a"]);
+
+    cleanup(&path);
+}
+
+/// A transaction sees its own uncommitted changes, the same way a read
+/// does: a key it has written is there even though the store has never
+/// heard of it, and one it has deleted is gone even though the store
+/// still has it.
+#[tokio::test]
+async fn a_transactional_scan_reflects_what_the_transaction_buffered() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "scan").await;
+    write(&svc, b"a", Some(b"1")).await;
+    write(&svc, b"c", Some(b"3")).await;
+
+    let txn = begin_txn(&svc, 5000).await;
+    buffer(&svc, &txn, b"b", Some(b"2")).await;
+    buffer(&svc, &txn, b"c", None).await;
+
+    let (keys, _) = get_keys(&svc, b"", 10, Some(&txn)).await;
+    assert_eq!(
+        as_strings(&keys),
+        ["a", "b"],
+        "the buffered write appears and the buffered delete does not"
+    );
+
+    // And nobody outside it sees any of that until it commits.
+    let (keys, _) = get_keys(&svc, b"", 10, None).await;
+    assert_eq!(as_strings(&keys), ["a", "c"]);
+
+    cleanup(&path);
+}
+
+/// A buffered delete shortens the batch it falls in without that
+/// meaning the walk is over -- which is exactly why `has_more` is
+/// reported rather than inferred from `keys.len() < max_keys`.
+#[tokio::test]
+async fn a_batch_shortened_by_a_buffered_delete_still_says_there_is_more() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "scan").await;
+    for key in [&b"a"[..], b"b", b"c", b"d"] {
+        write(&svc, key, Some(b"v")).await;
+    }
+
+    let txn = begin_txn(&svc, 5000).await;
+    buffer(&svc, &txn, b"a", None).await;
+
+    let (keys, has_more) = get_keys(&svc, b"", 2, Some(&txn)).await;
+    assert_eq!(as_strings(&keys), ["b", "c"]);
+    assert!(has_more, "d is still out there");
+
+    cleanup(&path);
+}
+
+/// The point of doing this inside a transaction: every key handed back
+/// is locked, so nobody else can change it for as long as the
+/// transaction lives.
+#[tokio::test]
+async fn a_transactional_scan_locks_every_key_it_returns() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "scan").await;
+    write(&svc, b"a", Some(b"1")).await;
+    write(&svc, b"b", Some(b"2")).await;
+
+    let scanner = begin_txn(&svc, 5000).await;
+    let (keys, _) = get_keys(&svc, b"", 10, Some(&scanner)).await;
+    assert_eq!(as_strings(&keys), ["a", "b"]);
+
+    // Younger, so it cannot wound its way past the read locks -- it is
+    // refused, naming the key it wanted.
+    let younger = begin_txn(&svc, 5000).await;
+    match buffer(&svc, &younger, b"b", Some(b"mine")).await {
+        write_response::Result::Error(PbRaftError {
+            kind: Some(raft_error::Kind::Aborted(a)),
+        }) => {
+            assert_eq!(a.reason, transaction_aborted::Reason::LockConflict as i32);
+            assert_eq!(a.key.as_deref(), Some(&b"b"[..]));
+        }
+        other => panic!("expected a lock conflict over a scanned key, got {other:?}"),
+    }
+
+    cleanup(&path);
+}
+
+/// A scan outside a transaction is served by whoever receives it, with
+/// no leader check -- the same bargain the plain read makes.
+#[tokio::test]
+async fn a_scan_outside_a_transaction_is_served_without_a_leader() {
+    let (log, path) = open_temp();
+    let (svc, _role_rx) = kv_service(log, "bystander");
+
+    let (keys, has_more) = get_keys(&svc, b"", 10, None).await;
+    assert!(keys.is_empty() && !has_more);
+
+    // One inside a transaction is not: this node has neither the
+    // transaction nor a lock table to protect it.
+    let result = svc
+        .get_keys(Request::new(GetKeysRequest {
+            start_key: Vec::new(),
+            max_keys: 10,
+            transaction_id: Some(vec![0u8; 16]),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .result;
+    match result {
+        Some(get_keys_response::Result::Error(e)) => {
+            assert!(matches!(e.kind, Some(raft_error::Kind::NotLeader(_))));
+        }
+        other => panic!("expected NotLeader, got {other:?}"),
+    }
 
     cleanup(&path);
 }
