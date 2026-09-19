@@ -1029,18 +1029,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "raft5-lock"
-version = "0.1.0"
-dependencies = [
- "env_logger",
- "log",
- "raft5-client",
- "raft5-server",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
 name = "raft5-server"
 version = "0.1.0"
 dependencies = [
