@@ -1,43 +1,34 @@
 //! Where a request goes, and what the client remembers between calls.
 //!
-//! Only the leader can serve a write, a membership change, or a
-//! linearizable read, and a node that isn't the leader answers
-//! `NotLeader` rather than forwarding (Raft §6.2) -- so finding the
-//! leader, and not having to find it again for every call, is the
-//! client's job. `Router` is that job: it holds every client API address
-//! it knows of, the `server_id` -> address map that turns a
-//! `NotLeader.leader_hint` into somewhere to dial, and the connection to
-//! whoever it last saw leading.
+//! Only the leader can serve anything transactional -- which is to say
+//! every write and every read that has to be current -- or a membership
+//! change, and a node that isn't the leader answers `NotLeader` rather
+//! than forwarding (Raft §6.2). So finding the leader, and not having to
+//! find it again for every call, is the client's job. `Router` is that
+//! job: it holds every client API address it knows of, the `server_id`
+//! -> address map that turns a `NotLeader.leader_hint` into somewhere to
+//! dial, and the connection to whoever it last saw leading.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use log::{debug, warn};
-use tonic::Status;
 use tonic::transport::{Channel, Endpoint};
 
 use raft5_shared::raft5::client::kv_client::KvClient;
-use raft5_shared::raft5::client::{GetConfigRequest, ReadRequest, read_response};
+use raft5_shared::raft5::client::GetConfigRequest;
 use raft5_shared::raft5::cluster::ClusterMember;
 
 use crate::Error;
 
 pub(crate) type Kv = KvClient<Channel>;
 
-/// How long a single discovery RPC -- a `GetConfig`, a leader probe --
-/// may take before the scan gives up on that node and moves on. A node
-/// that is merely down refuses immediately; one that is black-holing
-/// packets would otherwise stall the scan for as long as the call has
-/// left.
+/// How long a single discovery `GetConfig` may take before the scan
+/// gives up on that node and moves on. A node that is merely down
+/// refuses immediately; one that is black-holing packets would otherwise
+/// stall the scan for as long as the call has left.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
-
-/// The key the leader probe reads. Its contents are irrelevant and it is
-/// never written: what the probe asks is not "what is this value" but
-/// "are you the leader, and do you still hold a read quorum", and a
-/// linearizable read succeeding at all is the answer (see
-/// `grpc::KvService::read` -- no one else will serve one).
-const PROBE_KEY: &[u8] = b"__raft5_client_leader_probe__";
 
 /// One node's client API: how to reach it, and what to call it.
 #[derive(Clone)]
@@ -166,20 +157,32 @@ impl Router {
     /// which is not worth failing a call over. Returns whether a
     /// configuration was adopted.
     pub(crate) async fn refresh_config(&self, kv: &Kv) -> bool {
+        self.ask(kv).await.is_some_and(|(adopted, _)| adopted)
+    }
+
+    /// One `GetConfig`: adopt whatever membership it carries, and report
+    /// `(adopted, is_leader)`. `None` is a node that didn't answer.
+    ///
+    /// Both halves come from the one call because a scan wants both --
+    /// a node that says it isn't the leader has still just told us where
+    /// the rest of the cluster is, which is often how the leader is
+    /// found at all.
+    async fn ask(&self, kv: &Kv) -> Option<(bool, bool)> {
         let mut kv = kv.clone();
-        let members =
+        let resp =
             match tokio::time::timeout(PROBE_TIMEOUT, kv.get_config(GetConfigRequest {})).await {
-                Ok(Ok(resp)) => resp.into_inner().members,
+                Ok(Ok(resp)) => resp.into_inner(),
                 Ok(Err(status)) => {
                     debug!("GetConfig refused: {status}");
-                    return false;
+                    return None;
                 }
                 Err(_) => {
                     debug!("GetConfig timed out");
-                    return false;
+                    return None;
                 }
             };
-        self.adopt(members)
+        let is_leader = resp.is_leader;
+        Some((self.adopt(resp.members), is_leader))
     }
 
     /// Replaces what we know about the cluster with what the cluster
@@ -227,11 +230,18 @@ impl Router {
         true
     }
 
-    /// Finds the leader by asking every node we know of, in turn, to
-    /// serve a linearizable read. Only a leader that still holds a read
-    /// quorum will, so an answer is proof of leadership rather than a
-    /// guess -- a deposed leader that hasn't noticed yet fails the same
-    /// probe a follower does.
+    /// Finds the leader by asking every node we know of, in turn, for the
+    /// cluster configuration, and taking the one whose answer says
+    /// `is_leader`. Only a caught-up leader still holding a read quorum
+    /// sets it, so it is proof of leadership rather than a guess -- a
+    /// deposed leader that hasn't noticed yet says false, same as a
+    /// follower.
+    ///
+    /// The same answer carries the membership, which is why every node
+    /// reached is worth asking even once it is clear it isn't the leader:
+    /// a client seeded with a single follower has no other way to learn
+    /// where the rest of the cluster -- the leader included -- can be
+    /// reached.
     async fn discover(&self) -> Result<Leader, Error> {
         let mut tried: Vec<String> = Vec::new();
         let mut last: Option<String> = None;
@@ -240,16 +250,10 @@ impl Router {
             tried.push(node.key.clone());
             let kv = node.connect();
 
-            // Ask for the configuration before probing, even though this
-            // node may well not be the leader: a client seeded with a
-            // single follower has no other way to learn where the rest of
-            // the cluster -- the leader included -- can be reached.
-            self.refresh_config(&kv).await;
-
-            match probe(&kv).await {
-                Ok(true) => return Ok(self.remember(&node)),
-                Ok(false) => last = Some(format!("{} is not the leader", node.key)),
-                Err(status) => last = Some(format!("{}: {status}", node.key)),
+            match self.ask(&kv).await {
+                Some((_, true)) => return Ok(self.remember(&node)),
+                Some((_, false)) => last = Some(format!("{} is not the leader", node.key)),
+                None => last = Some(format!("{} did not answer", node.key)),
             }
         }
 
@@ -280,24 +284,6 @@ impl Router {
         self.state.lock().unwrap().leader = Some(leader.clone());
         leader
     }
-}
-
-/// Whether this node answered a linearizable read -- see `PROBE_KEY`.
-async fn probe(kv: &Kv) -> Result<bool, Status> {
-    let mut kv = kv.clone();
-    let request = ReadRequest {
-        key: PROBE_KEY.to_vec(),
-        linearizable: true,
-        transaction_id: None,
-    };
-    let resp = match tokio::time::timeout(PROBE_TIMEOUT, kv.read(request)).await {
-        Ok(resp) => resp?,
-        Err(_) => return Err(Status::deadline_exceeded("leader probe timed out")),
-    };
-    Ok(matches!(
-        resp.into_inner().result,
-        Some(read_response::Result::Ok(_))
-    ))
 }
 
 #[cfg(test)]

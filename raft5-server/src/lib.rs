@@ -160,7 +160,7 @@ pub async fn serve(
     // `serve_with_shutdown` rather than `serve`: on cancellation tonic
     // stops accepting and then lets the requests already in flight finish,
     // instead of dropping them mid-response. They can finish -- even one
-    // parked in `LeaderHandle::append_log` waiting on a commit that will
+    // parked in `LeaderHandle::append_writes` waiting on a commit that will
     // now never come -- because `raft::run` below drops `Common` as it
     // exits, which closes the channels those handlers are waiting on.
     //

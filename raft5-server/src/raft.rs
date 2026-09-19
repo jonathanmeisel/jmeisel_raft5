@@ -20,10 +20,10 @@
 //! module, same as if the code hadn't moved; the split is purely about file
 //! size, not encapsulation.
 //!
-//! `LeaderHandle::append_log` is the one piece of the public API that does
+//! `LeaderHandle::append_writes` is the one piece of the public API that does
 //! *not* go through the event loop: `storage::RaftLog::append` is already
 //! safe to call concurrently, and waiting for a commit is just watching a
-//! channel, so many concurrent client requests can sit in `append_log`
+//! channel, so many concurrent client requests can sit in `append_writes`
 //! without serializing on (or blocking) the state machine's own loop.
 //!
 //! `RaftPeerHandle` is the mirror image for *inbound* RPCs: unlike
@@ -594,7 +594,7 @@ pub struct Common {
     /// How far `RaftLog::apply_committed` has actually brought `latest`
     /// up to date -- published by `spawn_storage_maintenance_task` only
     /// *after* that call returns, deliberately never touched anywhere
-    /// else. This is what `LeaderHandle::append_log` waits on (see its
+    /// else. This is what `LeaderHandle::append_writes` waits on (see its
     /// doc): `commit_tx` alone only says an entry is safely replicated,
     /// not that `latest` reflects it yet, since the maintenance task is
     /// an independent `watch` subscriber with no ordering relationship to
@@ -926,7 +926,7 @@ enum Next {
 /// keeps the common case simple rather than relying on that clamp to
 /// silently paper over bad ordering). `applied_tx` is published as its
 /// own step, right after `apply_committed` returns and *before* `compact`
-/// even runs -- `LeaderHandle::append_log` needs to know `latest` itself
+/// even runs -- `LeaderHandle::append_writes` needs to know `latest` itself
 /// is caught up, not merely that `compact` was also attempted, and
 /// separating the two means a slow/failing `compact` call can never delay
 /// that signal. Reacting to both `commit_tx` and `compact_tx` (rather

@@ -253,40 +253,17 @@ pub async fn add_server(client: &Arc<Client>, node: &TestNode) {
 /// the resulting single-node election has finished. Returns the seq the
 /// write committed at.
 ///
-/// Every write is conditional, so this reads the key first to find the
-/// version to write against, exactly as `raft5_client::Client::update`
-/// does; a write that loses that race is retried along with everything
-/// else.
+/// A transaction is the only way to write, so this opens one of its own
+/// around the single key, exactly as `raft5_client::Client::write` does;
+/// an attempt that loses the key to a contending transaction is retried
+/// along with everything else.
 pub async fn write(client: &Arc<Client>, key: &[u8], value: Option<&[u8]>) -> u64 {
-    let mut client = (**client).clone();
     let until = deadline();
     loop {
-        let current = client
-            .read(ReadRequest {
-                key: key.to_vec(),
-                linearizable: false,
-                transaction_id: None,
-            })
-            .await
-            .expect("read RPC failed")
-            .into_inner();
-        // Seq 0 -- what a key with no value reads as -- is also the
-        // precondition for writing one that isn't there.
-        let previous_seq = match current.result {
-            Some(read_response::Result::Ok(ok)) => ok.seq,
-            other => panic!("expected a successful read, got {other:?}"),
-        };
-
-        let resp = client
-            .write(WriteRequest {
-                key: key.to_vec(),
-                value: value.map(<[u8]>::to_vec),
-                previous_seq: Some(previous_seq),
-            })
-            .await
-            .expect("write RPC failed");
-        match resp.into_inner().result {
-            Some(write_response::Result::Seq(seq)) => return seq,
+        let id = begin(client, Duration::from_secs(2)).await;
+        txn_write(client, &id, key, value).await;
+        match commit(client, &id).await {
+            Ok(seq) => return seq,
             other => {
                 assert!(
                     Instant::now() < until,
@@ -324,23 +301,23 @@ pub async fn begin(client: &Arc<Client>, ttl: Duration) -> Vec<u8> {
     }
 }
 
-/// Buffers one write into `id`, asserting it was accepted.
-pub async fn buffer_write(client: &Arc<Client>, id: &[u8], key: &[u8], value: Option<&[u8]>) {
-    use raft5_shared::raft5::client::{BufferWriteRequest, buffer_write_response};
-
+/// Buffers one write into `id`, asserting it was accepted. Named for
+/// the transaction rather than after the RPC, to keep it apart from
+/// `write` above -- which is a whole transaction of its own.
+pub async fn txn_write(client: &Arc<Client>, id: &[u8], key: &[u8], value: Option<&[u8]>) {
     let mut client = (**client).clone();
     let resp = client
-        .buffer_write(BufferWriteRequest {
+        .write(WriteRequest {
             transaction_id: id.to_vec(),
             key: key.to_vec(),
             value: value.map(<[u8]>::to_vec),
         })
         .await
-        .expect("buffer_write should reach the node")
+        .expect("write should reach the node")
         .into_inner();
     assert!(
-        matches!(resp.result, Some(buffer_write_response::Result::Ok(true))),
-        "buffer_write was refused: {:?}",
+        matches!(resp.result, Some(write_response::Result::Ok(true))),
+        "write was refused: {:?}",
         resp.result
     );
 }
@@ -372,7 +349,6 @@ pub async fn read(client: &Arc<Client>, key: &[u8]) -> Option<Vec<u8>> {
     let resp = client
         .read(ReadRequest {
             key: key.to_vec(),
-            linearizable: false,
             transaction_id: None,
         })
         .await
@@ -431,7 +407,6 @@ pub async fn assert_eventually_reads(client: &Arc<Client>, key: &[u8], value: &[
         let resp = client
             .read(ReadRequest {
                 key: key.to_vec(),
-                linearizable: false,
                 transaction_id: None,
             })
             .await
@@ -451,36 +426,25 @@ pub async fn assert_eventually_reads(client: &Arc<Client>, key: &[u8], value: &[
     }
 }
 
-/// Finds the cluster's current leader among `nodes`, by attempting a
-/// linearizable read against each of them in turn and retrying the whole
-/// set until one succeeds. A linearizable read succeeding at all is
-/// proof the answering node holds a live read quorum right now (see
-/// `grpc::KvService::read`), not merely that it was first to answer --
-/// so this doubles as leader discovery backed by an actual quorum check,
-/// not just a guess at which node to send further requests to.
+/// Finds the cluster's current leader among `nodes`, by asking each of
+/// them in turn for its configuration and retrying the whole set until
+/// one says `is_leader`. Only a node that has caught up on what it
+/// inherited and still holds a live read quorum says so (see
+/// `grpc::KvService::get_config`), so this is leader discovery backed by
+/// an actual quorum check, not a guess at which node to send further
+/// requests to.
 ///
 /// Nodes that are down (`shut_down`, so their client is gone) are
 /// skipped rather than treated as a failure -- same as one that's merely
 /// lost the leadership race this round.
 pub async fn find_leader<'a>(nodes: &[&'a TestNode]) -> &'a TestNode {
-    // The key itself is irrelevant -- linearizability, not this specific
-    // key's data, is what proves the answering node is genuinely leading.
-    const PROBE_KEY: &[u8] = b"__raft5_test_find_leader_probe__";
-
     let until = deadline();
     loop {
         for &node in nodes {
             if let Some(client) = &node.client {
                 let mut client = (**client).clone();
-                let resp = client
-                    .read(ReadRequest {
-                        key: PROBE_KEY.to_vec(),
-                        linearizable: true,
-                        transaction_id: None,
-                    })
-                    .await;
-                if let Ok(resp) = resp
-                    && matches!(resp.into_inner().result, Some(read_response::Result::Ok(_)))
+                if let Ok(resp) = client.get_config(GetConfigRequest {}).await
+                    && resp.into_inner().is_leader
                 {
                     return node;
                 }

@@ -162,42 +162,6 @@ fn a_committing_transaction_is_not_wounded_by_an_older_one() {
     );
 }
 
-/// A plain single-key write is in the table too, for the same reason and
-/// with the same immunity: its entry may already be on its way to the
-/// log.
-#[test]
-fn a_plain_write_holds_a_key_against_transactions_and_is_never_wounded() {
-    let locks = locks();
-    let t = txn(&locks);
-    let guard = locks.claim(b"k").expect("the key starts unclaimed");
-
-    assert_eq!(conflict(locks.read(t, b"k")), b"k".to_vec());
-    assert_eq!(
-        conflict(locks.buffer_write(t, b"k", Some(b"v".to_vec()))),
-        b"k".to_vec()
-    );
-    assert_eq!(locks.state_of(t), Some(TxnState::Open), "the transaction is refused, not aborted");
-
-    drop(guard);
-    assert_eq!(locks.read(t, b"k"), Ok(None));
-}
-
-/// And the reverse: a transaction's lock -- even a shared one -- keeps a
-/// plain write out, which is what stops a bare write changing a key a
-/// transaction has already read.
-#[test]
-fn a_transactions_read_lock_keeps_a_plain_write_out() {
-    let locks = locks();
-    let t = txn(&locks);
-    locks.read(t, b"k").unwrap();
-
-    assert!(matches!(locks.claim(b"k"), Err(Refused::Conflict { .. })));
-    assert!(locks.claim(b"elsewhere").is_ok(), "a lock is per key, not on the whole store");
-
-    locks.discard(t);
-    assert!(locks.claim(b"k").is_ok());
-}
-
 /// An expired transaction holds nothing, and finds out the moment it asks
 /// for anything. Released on the *conflict* path rather than by a
 /// sweeper, so the key comes free as soon as somebody wants it.
@@ -259,30 +223,13 @@ fn a_change_of_leader_term_discards_every_transaction() {
 
     assert_eq!(locks.state_of(t), None);
     assert!(!locks.is_locked(b"k"));
-    assert!(locks.claim(b"k").is_ok(), "the key is free for the new term");
-}
-
-/// The epoch check, and the race it exists for: a plain write's claim can
-/// outlive the term it was taken in, because the guard is held until the
-/// entry resolves. Releasing it must not remove a lock that somebody
-/// else has since taken on the same key.
-#[test]
-fn a_claim_released_after_a_term_change_does_not_disturb_the_new_holder() {
-    let locks = locks();
-    let stale = locks.claim(b"k").expect("the key starts unclaimed");
-
-    locks.observe_term(Some(2));
 
     let fresh = txn(&locks);
-    locks.buffer_write(fresh, b"k", Some(b"v".to_vec())).unwrap();
-
-    drop(stale);
-
-    assert!(
-        locks.is_locked(b"k"),
-        "a release from the previous term must not free the new holder's key"
+    assert_eq!(
+        locks.buffer_write(fresh, b"k", Some(b"v".to_vec())),
+        Ok(()),
+        "the key is free for the new term"
     );
-    assert_eq!(locks.state_of(fresh), Some(TxnState::Open));
 }
 
 /// Committing hands back exactly what was buffered, in key order, and

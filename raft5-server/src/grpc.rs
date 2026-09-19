@@ -2,7 +2,7 @@
 //! into `storage::RaftLog`.
 //!
 //! `KvService` is the client-facing half. Everything that changes state
-//! -- writes, membership changes, and a linearizable read -- requires
+//! -- writes, membership changes, and a transactional read -- requires
 //! this node to be the leader, and a node that isn't answers `NotLeader`
 //! with whatever leader hint it has rather than forwarding (Raft §6.2),
 //! so the client retries against the leader directly and exactly one node
@@ -10,18 +10,23 @@
 //! guarantee, so it is served locally by whoever receives it. `Bootstrap`
 //! is the other: by definition it targets a node with no leader at all.
 //!
-//! Every write is conditional: it names the sequence number the key must
-//! currently be at, and is refused with `WriteConflict` if it isn't.
-//! That is what makes a read-modify-write possible over a protocol where
-//! a client's read and its write are two separate round trips. Two
-//! things have to hold for that check to mean anything, and
-//! `conditional_write` below establishes both before it appends: this
-//! leader's `latest` must be complete (`LeaderHandle::await_caught_up`),
-//! and no other write to the same key may be in flight
-//! (`KvService::claim`). Between an entry being appended and being
-//! applied, `latest` still answers for the version that entry replaces,
-//! and a precondition checked against it then would be checked against
-//! a value that is already gone.
+//! Every write goes through a transaction. `write` buffers a key into
+//! one and appends nothing; `commit` turns everything a transaction
+//! buffered into a single log entry. There is no second write path with
+//! its own locking and its own failure modes to keep in agreement with
+//! this one -- a single-key write is a transaction of one key. What
+//! protects a transaction's reads is `crate::txn`'s lock table rather
+//! than a precondition on a sequence number, which is what lets the
+//! whole of a read-modify-write be one atomic thing instead of two round
+//! trips with a race between them.
+//!
+//! Both `commit` and `transactional_read` establish the same two things
+//! before answering: this leader's `latest` must be complete
+//! (`LeaderHandle::await_caught_up`), since `latest` reflects only
+//! *applied* entries and a fresh leader may still be catching up on a
+//! log tail it inherited; and it must still hold a quorum of leases
+//! (`LeaderHandle::has_read_quorum`), or it may have been deposed
+//! without knowing it yet.
 //!
 //! `RaftPeerService` is the peer-facing half, served on a separate port
 //! since the two have different network exposure. It forwards every call
@@ -39,14 +44,13 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::pb::raft5::client::kv_server::Kv;
 use crate::pb::raft5::client::{
-    AddServerRequest, BootstrapRequest, BufferWriteRequest, BufferWriteResponse,
-    CommitTransactionRequest, CommitTransactionResponse, ConfigChangeResponse,
-    CreateTransactionRequest, CreateTransactionResponse, DropTransactionRequest,
-    DropTransactionResponse, GetConfigRequest, GetConfigResponse, NotLeader,
-    RaftError as PbRaftError, ReadOk, ReadRequest, ReadResponse, RemoveServerRequest,
-    TransactionAborted, WriteConflict, WriteRequest, WriteResponse, buffer_write_response,
-    commit_transaction_response, config_change_response, create_transaction_response,
-    drop_transaction_response, raft_error, read_response, transaction_aborted, write_response,
+    AddServerRequest, BootstrapRequest, CommitTransactionRequest, CommitTransactionResponse,
+    ConfigChangeResponse, CreateTransactionRequest, CreateTransactionResponse,
+    DropTransactionRequest, DropTransactionResponse, GetConfigRequest, GetConfigResponse,
+    NotLeader, RaftError as PbRaftError, ReadOk, ReadRequest, ReadResponse, RemoveServerRequest,
+    TransactionAborted, WriteRequest, WriteResponse, commit_transaction_response,
+    config_change_response, create_transaction_response, drop_transaction_response, raft_error,
+    read_response, transaction_aborted, write_response,
 };
 use crate::pb::raft5::cluster::{ClusterConfig, ClusterMember};
 use crate::pb::raft5::raft::raft_peer_server::RaftPeer;
@@ -63,7 +67,7 @@ use crate::storage::Mutation;
 use crate::storage::{RaftLog, StorageError};
 use crate::store::Store;
 use crate::store::ChunkReader;
-use crate::txn::{AbortReason, BareGuard, Locks, Refused, TxnId};
+use crate::txn::{AbortReason, Locks, Refused, TxnId};
 
 /// A transaction's refusal as the client protocol carries it.
 ///
@@ -210,38 +214,6 @@ fn not_leader_response(e: RaftError) -> Result<Response<ConfigChangeResponse>, S
     }))
 }
 
-/// Why a write didn't happen. `RaftError` covers everything the state
-/// machine can refuse; the rest is specific to a conditional write and
-/// never reaches the state machine at all.
-enum WriteError {
-    Raft(RaftError),
-    /// The precondition didn't hold. `Some(seq)` is what the key is
-    /// actually at (0 for no value); `None` means another write to the
-    /// same key is still in flight, so there is nothing settled to
-    /// report yet.
-    Conflict(Option<u64>),
-    Internal(Status),
-}
-
-impl From<RaftError> for WriteError {
-    fn from(e: RaftError) -> Self {
-        Self::Raft(e)
-    }
-}
-
-/// `WriteError` as the client protocol carries it -- `client_err` for
-/// the state machine's half, and a conflict is an ordinary answer rather
-/// than an error, since it says something specific about the key.
-fn write_err(e: WriteError) -> Result<PbRaftError, Status> {
-    match e {
-        WriteError::Raft(e) => client_err(e),
-        WriteError::Conflict(actual_seq) => Ok(PbRaftError {
-            kind: Some(raft_error::Kind::Conflict(WriteConflict { actual_seq })),
-        }),
-        WriteError::Internal(status) => Err(status),
-    }
-}
-
 /// The leader handle for this node, or the error to hand back to the
 /// client instead. Every write and every membership change goes through
 /// here: a follower answers `NotLeader` with whatever hint it has rather
@@ -263,11 +235,7 @@ pub struct KvService {
     /// it is called and where its peers should dial it.
     identity: ClusterMember,
     client_handle: ClientHandle,
-    /// Who holds what, and every open transaction. See `crate::txn`: a
-    /// plain write's claim on a key and a transaction's locks are the
-    /// same table, because a write that could bypass a transaction's
-    /// locks would make its read set a record of something no longer
-    /// true.
+    /// Who holds what, and every open transaction. See `crate::txn`.
     locks: Locks,
 }
 
@@ -302,61 +270,6 @@ impl KvService {
         leader
     }
 
-    /// Claims `key` for one plain write, or reports the conflict.
-    fn claim(&self, key: &[u8]) -> Result<BareGuard, WriteError> {
-        self.locks.claim(key).map_err(|_| {
-            // Nothing settled can be said about a key somebody else is
-            // holding: their write may land, or their transaction may
-            // abort. Re-sending shortly may well succeed, which is
-            // exactly what `Conflict(None)` means.
-            WriteError::Conflict(None)
-        })
-    }
-
-    /// Checks a write's precondition and, if it holds, appends it.
-    ///
-    /// The append runs in a task of its own that owns the key's claim,
-    /// so that the claim is released when the *entry* resolves rather
-    /// than when this call does. A client that disconnects mid-write
-    /// leaves an entry that may still commit, and releasing its key at
-    /// that point would let the next write's precondition be checked
-    /// against a `latest` that is about to change.
-    async fn conditional_write(&self, req: WriteRequest) -> Result<u64, WriteError> {
-        let leader = self.leader()?;
-        // The precondition is checked against `latest`, so a leader that
-        // may still be missing entries has no business checking it.
-        // Before the claim rather than after, so that a leader still
-        // catching up isn't holding keys no one can write while it does.
-        leader.await_caught_up().await?;
-
-        // Claimed before the precondition is read, so that two writes
-        // racing here cannot both find the key at the version each is
-        // about to supersede.
-        let guard = self.claim(&req.key)?;
-
-        let key = req.key.clone();
-        let actual = self
-            .store
-            .run(move |log| log.get_latest(&key))
-            .await
-            .map_err(|e| WriteError::Raft(RaftError::Storage(e)))?
-            // Seq 0 is never assigned, so it doubles as "this key has no
-            // value" -- the same sentinel `read` hands back, which is
-            // what lets a client echo a seq it read straight back here.
-            .map_or(0, |(seq, _)| seq);
-        if actual != req.previous_seq.unwrap_or(0) {
-            return Err(WriteError::Conflict(Some(actual)));
-        }
-
-        tokio::spawn(async move {
-            let _guard = guard;
-            leader.append_log(&req.key, req.value.as_deref()).await
-        })
-        .await
-        .map_err(|e| WriteError::Internal(Status::internal(format!("the write task failed: {e}"))))?
-        .map_err(WriteError::Raft)
-    }
-
     /// A transaction's leader: this node, and only if it is still the
     /// one the transaction was created under.
     ///
@@ -375,9 +288,8 @@ impl KvService {
 
     /// A transactional read: take the shared lock, then answer.
     ///
-    /// `require_leader` and `await_caught_up` come *before* the lock, the
-    /// same ordering and for the same reason as `conditional_write` --
-    /// a leader still catching up should not be holding keys nobody can
+    /// `require_leader` and `await_caught_up` come *before* the lock: a
+    /// leader still catching up should not be holding keys nobody can
     /// write while it does it.
     async fn transactional_read(&self, id: TxnId, key: &[u8]) -> Result<ReadOk, TxnError> {
         let leader = self.transaction_leader(id)?;
@@ -397,10 +309,10 @@ impl KvService {
 
         // `seq` always describes committed state, even when the value
         // doesn't: a buffered write has no sequence number yet, because
-        // nothing has been appended. So a buffered read's seq is not a
-        // valid `previous_seq` for a write outside this transaction --
-        // though inside one it is moot, since the lock is what a
-        // transaction uses instead of a precondition.
+        // nothing has been appended. Reading back one's own buffered
+        // write therefore gives the new value at the old key's seq,
+        // which is the honest answer -- the seq this write will land at
+        // does not exist until the commit assigns one.
         let seq = committed.as_ref().map_or(0, |(seq, _)| *seq);
         let value = match buffered {
             Some(buffered) => buffered,
@@ -413,11 +325,10 @@ impl KvService {
     ///
     /// The append runs in a task of its own owning the transaction's
     /// locks, so they are released when the *entry* resolves rather than
-    /// when this call does -- the same discipline as `conditional_write`,
-    /// and more load-bearing here. A client that disconnects mid-commit
-    /// would otherwise leave the transaction stuck part-way, and a
-    /// part-way transaction is deliberately exempt from expiry: its
-    /// keys would stay unwritable for the rest of the term.
+    /// when this call does. A client that disconnects mid-commit would
+    /// otherwise leave the transaction stuck part-way, and a part-way
+    /// transaction is deliberately exempt from expiry: its keys would
+    /// stay unwritable for the rest of the term.
     async fn commit(&self, id: TxnId) -> Result<u64, TxnError> {
         let leader = self.transaction_leader(id)?;
         let (writes, guard) = self.locks.begin_commit(id, leader.term())?;
@@ -498,15 +409,21 @@ impl Kv for KvService {
         &self,
         request: Request<WriteRequest>,
     ) -> Result<Response<WriteResponse>, Status> {
-        let result = self.conditional_write(request.into_inner()).await;
+        let req = request.into_inner();
+        let id = txn_id(&req.transaction_id)?;
+
+        // Purely in-memory: nothing reaches the log until `commit`. The
+        // leader handle is fetched only for the term check inside
+        // `transaction_leader` -- a transaction cannot be added to from
+        // anywhere but the leader that created it.
+        let result = self
+            .transaction_leader(id)
+            .and_then(|_| self.locks.buffer_write(id, &req.key, req.value).map_err(Into::into));
 
         Ok(Response::new(WriteResponse {
             result: Some(match result {
-                // `append_log` returns only once the entry has committed
-                // *and* been applied, so the moment a client sees this
-                // seq, a read on this node reflects it.
-                Ok(seq) => write_response::Result::Seq(seq),
-                Err(e) => write_response::Result::Error(write_err(e)?),
+                Ok(()) => write_response::Result::Ok(true),
+                Err(e) => write_response::Result::Error(txn_error(e)?),
             }),
         }))
     }
@@ -514,20 +431,12 @@ impl Kv for KvService {
     async fn read(&self, request: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {
         let req = request.into_inner();
 
-        // A transactional read is a different thing: it takes a lock,
-        // and it can be answered from what the transaction itself has
-        // buffered. It also cannot be stale -- a stale read is served by
-        // whichever node received it, and a node that isn't the leader
-        // has neither this transaction nor a lock table to protect it,
-        // so it would hand back unprotected data under a transaction's
-        // name. That is a malformed request rather than a refusal.
+        // A transactional read is a different thing: it takes a lock, it
+        // can be answered from what the transaction itself has buffered,
+        // and it is linearizable -- only this transaction's own leader,
+        // still holding a read quorum, will serve one.
         if let Some(id) = &req.transaction_id {
             let id = txn_id(id)?;
-            if !req.linearizable {
-                return Err(Status::invalid_argument(
-                    "a transactional read cannot be stale; set linearizable",
-                ));
-            }
             let result = self.transactional_read(id, &req.key).await;
             return Ok(Response::new(ReadResponse {
                 result: Some(match result {
@@ -537,30 +446,11 @@ impl Kv for KvService {
             }));
         }
 
-        // A linearizable read has to come from a leader that still holds
-        // a quorum of leases: without one it may have been deposed
-        // already and simply not know it yet, and would answer from state
-        // a newer leader has moved past. It also has to come from one
-        // that has caught up on the log it inherited, or it would answer
-        // from a gap in the other direction -- a write it has committed
-        // but not yet applied. A stale read asks for none of that and is
-        // served locally by whoever received it.
-        if req.linearizable {
-            let held = match self.leader() {
-                Ok(leader) => match leader.await_caught_up().await {
-                    Ok(()) if leader.has_read_quorum() => Ok(()),
-                    Ok(()) => Err(RaftError::NotLeader { leader_hint: None }),
-                    Err(e) => Err(e),
-                },
-                Err(e) => Err(e),
-            };
-            if let Err(e) = held {
-                return Ok(Response::new(ReadResponse {
-                    result: Some(read_response::Result::Error(client_err(e)?)),
-                }));
-            }
-        }
-
+        // Outside a transaction, a read asks for no guarantee at all: it
+        // is answered from local state by whoever received it, leader or
+        // not, with no read-quorum round and no wait to catch up. So it
+        // can be behind -- by a write still replicating on the leader,
+        // or by however far this node has fallen behind.
         let found = self
             .store
             .run(move |log| log.get_latest(&req.key))
@@ -609,25 +499,6 @@ impl Kv for KvService {
             result: Some(match result {
                 Ok(id) => create_transaction_response::Result::TransactionId(id.to_vec()),
                 Err(e) => create_transaction_response::Result::Error(txn_error(e)?),
-            }),
-        }))
-    }
-
-    async fn buffer_write(
-        &self,
-        request: Request<BufferWriteRequest>,
-    ) -> Result<Response<BufferWriteResponse>, Status> {
-        let req = request.into_inner();
-        let id = txn_id(&req.transaction_id)?;
-
-        let result = self
-            .transaction_leader(id)
-            .and_then(|_| self.locks.buffer_write(id, &req.key, req.value).map_err(Into::into));
-
-        Ok(Response::new(BufferWriteResponse {
-            result: Some(match result {
-                Ok(()) => buffer_write_response::Result::Ok(true),
-                Err(e) => buffer_write_response::Result::Error(txn_error(e)?),
             }),
         }))
     }
@@ -779,9 +650,20 @@ impl Kv for KvService {
     ) -> Result<Response<GetConfigResponse>, Status> {
         let members = self.get_config_internal().await.map_err(storage_err)?;
 
+        // Both checks are non-blocking on purpose. `is_caught_up` is the
+        // same question `await_caught_up` waits for an answer to, asked
+        // rather than waited on: a client scanning for the leader wants
+        // this node's membership either way, and a leader still applying
+        // the tail it inherited should say "not yet" now instead of
+        // holding the scan up until it is.
+        let is_leader = self
+            .leader()
+            .is_ok_and(|leader| leader.is_caught_up() && leader.has_read_quorum());
+
         Ok(Response::new(GetConfigResponse {
             identity: Some(self.identity.clone()),
             members,
+            is_leader,
         }))
     }
 }

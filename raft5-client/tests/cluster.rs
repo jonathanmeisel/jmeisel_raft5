@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio_util::sync::CancellationToken;
 
-use raft5_client::{Client, Update};
+use raft5_client::{Client, Error, ReadResult};
 
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -176,20 +176,21 @@ async fn a_seed_that_leaves_the_cluster_is_dropped() {
     );
 }
 
-/// The read-modify-write the store cannot do on its own: the closure
-/// sees what the key holds and what it returns is written back, so a
-/// counter can be incremented without ever reading a value someone else
-/// has already replaced.
+/// The read-modify-write the store cannot do on its own. A transaction
+/// reads the counter, writes one more than that, and commits; nobody
+/// else can write the key between the read and the commit, so no
+/// increment is ever computed from a value that has already been
+/// replaced.
 #[tokio::test]
-async fn update_reads_modifies_and_writes() {
+async fn a_transaction_reads_modifies_and_writes() {
     let n1 = TestNode::start("n1");
     let client = Client::new([n1.url()]).unwrap();
     bootstrap(&client, "n1").await;
 
     for expected in ["1", "2", "3"] {
-        client.update(b"hits", increment).await.unwrap();
+        increment(&client).await.unwrap();
         assert_eq!(
-            client.read(b"hits").await.unwrap().value.as_deref(),
+            fresh(&client, b"hits").await.value.as_deref(),
             Some(expected.as_bytes())
         );
     }
@@ -197,10 +198,10 @@ async fn update_reads_modifies_and_writes() {
 
 /// The point of all of it. Every one of these increments reads a value
 /// that another task is racing to replace; a single lost update -- one
-/// write landing on top of a version it never saw -- and the total
-/// comes up short.
+/// write landing on top of a version it never saw -- and the total comes
+/// up short.
 #[tokio::test]
-async fn concurrent_updates_do_not_lose_writes() {
+async fn concurrent_increments_do_not_lose_writes() {
     const TASKS: u64 = 4;
     const PER_TASK: u64 = 5;
 
@@ -215,11 +216,12 @@ async fn concurrent_updates_do_not_lose_writes() {
             for _ in 0..PER_TASK {
                 // Deciding what to do about a lost race is the caller's
                 // job, and with four writers on one key it happens
-                // often: here, simply go round again.
+                // often: here, simply go round again. Safe because an
+                // aborted transaction wrote nothing.
                 loop {
-                    match client.update(b"hits", increment).await {
+                    match increment(&client).await {
                         Ok(_) => break,
-                        Err(raft5_client::Error::Conflict { .. }) => continue,
+                        Err(Error::Aborted { .. }) => continue,
                         Err(e) => panic!("increment failed: {e}"),
                     }
                 }
@@ -227,10 +229,10 @@ async fn concurrent_updates_do_not_lose_writes() {
         }));
     }
     for task in tasks {
-        task.await.expect("an updating task panicked");
+        task.await.expect("an incrementing task panicked");
     }
 
-    let total = client.read(b"hits").await.unwrap();
+    let total = fresh(&client, b"hits").await;
     assert_eq!(
         total.value.as_deref(),
         Some((TASKS * PER_TASK).to_string().as_bytes()),
@@ -238,89 +240,75 @@ async fn concurrent_updates_do_not_lose_writes() {
     );
 }
 
-/// A closure that declines to change anything writes nothing, and the
-/// seq it gets back is the one the key was already at.
+/// A transaction that buffers nothing writes nothing, and commits at
+/// seq 0 -- there was no entry, so there is no sequence number to name.
 #[tokio::test]
-async fn a_noop_update_writes_nothing() {
+async fn a_transaction_that_buffers_nothing_writes_nothing() {
     let n1 = TestNode::start("n1");
     let client = Client::new([n1.url()]).unwrap();
     bootstrap(&client, "n1").await;
     client.write(b"k", Some(b"before")).await.unwrap();
-    let before = client.read(b"k").await.unwrap();
+    let before = fresh(&client, b"k").await;
 
-    let seq = client.update(b"k", |_| Update::Noop).await.unwrap();
-    assert_eq!(seq, before.seq);
-    assert_eq!(client.read(b"k").await.unwrap(), before);
+    let txn = client.transaction(Duration::from_secs(2)).await.unwrap();
+    txn.read(b"k").await.unwrap();
+    assert_eq!(txn.commit().await.unwrap(), 0);
+
+    assert_eq!(fresh(&client, b"k").await, before);
 }
 
-/// Writing no value deletes the key, so the same call that updates a
-/// value can also decide it should no longer exist.
+/// Writing no value deletes the key, so the same transaction that
+/// updates a value can also decide it should no longer exist.
 #[tokio::test]
-async fn an_update_returning_nothing_deletes_the_key() {
+async fn a_transactional_write_of_nothing_deletes_the_key() {
     let n1 = TestNode::start("n1");
     let client = Client::new([n1.url()]).unwrap();
     bootstrap(&client, "n1").await;
     client.write(b"k", Some(b"v")).await.unwrap();
 
-    client.update(b"k", |_| Update::Write(None)).await.unwrap();
-    assert_eq!(client.read(b"k").await.unwrap().value, None);
+    let txn = client.transaction(Duration::from_secs(2)).await.unwrap();
+    txn.read(b"k").await.unwrap();
+    txn.write(b"k", None).await.unwrap();
+    txn.commit().await.unwrap();
+
+    assert_eq!(fresh(&client, b"k").await.value, None);
 }
 
-/// A key that is rewritten under the client on every single attempt is
-/// not a race it can win by trying harder, so it stops and says so
-/// rather than looping forever.
-// Multi-threaded so the closure can block on a write of its own: the
-// update API is deliberately synchronous, and this is the one test that
-// needs to do something asynchronous from inside it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_update_that_never_wins_gives_up() {
-    let n1 = TestNode::start("n1");
-    let client = Client::new([n1.url()]).unwrap();
-    let interloper = Client::new([n1.url()]).unwrap();
-    bootstrap(&client, "n1").await;
-    client.write(b"k", Some(b"0")).await.unwrap();
-
-    let attempts = std::sync::atomic::AtomicU64::new(0);
-    let err = client
-        .update(b"k", |current| {
-            // Runs *after* the read this attempt will be validated
-            // against, so every attempt is doomed before it is sent.
-            let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(interloper.write(b"k", Some(n.to_string().as_bytes())))
-            })
-            .unwrap();
-            Update::Write(current.map(<[u8]>::to_vec))
-        })
-        .await
-        .unwrap_err();
-
-    assert!(
-        matches!(err, raft5_client::Error::Conflict { .. }),
-        "expected to give up with a conflict, got {err}"
-    );
-    assert_eq!(
-        attempts.load(std::sync::atomic::Ordering::SeqCst),
-        raft5_client::MAX_UPDATE_ATTEMPTS as u64,
-        "it should have used every attempt before giving up"
-    );
-}
-
-/// Parses the counter `key` currently holds (absent counts as zero) and
-/// hands back one more than that.
-fn increment(current: Option<&[u8]>) -> Update {
+/// Reads the counter `key` holds (absent counts as zero) and commits one
+/// more than that, in a single transaction.
+async fn increment(client: &Client) -> Result<u64, Error> {
+    let txn = client.transaction(Duration::from_secs(2)).await?;
+    let current = txn.read(b"hits").await?;
     let n: u64 = current
-        .map(|bytes| std::str::from_utf8(bytes).unwrap().parse().unwrap())
+        .value
+        .map(|bytes| String::from_utf8(bytes).unwrap().parse().unwrap())
         .unwrap_or(0);
-    Update::Write(Some((n + 1).to_string().into_bytes()))
+    txn.write(b"hits", Some((n + 1).to_string().as_bytes())).await?;
+    txn.commit().await
+}
+
+/// A read guaranteed to reflect every write that has already returned.
+///
+/// `Client::read` is deliberately a stale local read, so asserting a
+/// value straight after writing it has to go through a transaction --
+/// which is the only linearizable read the protocol has. Aborted rather
+/// than committed: it buffered nothing, so there is nothing to write,
+/// and aborting hands the lock back now instead of at the deadline.
+async fn fresh(client: &Client, key: &[u8]) -> ReadResult {
+    let txn = client
+        .transaction(Duration::from_secs(2))
+        .await
+        .expect("opening a transaction for a current read");
+    let result = txn.read(key).await.expect("a transactional read");
+    txn.abort().await.expect("aborting a read-only transaction");
+    result
 }
 
 // --- transactions -----------------------------------------------------
 
-/// The thing `update` cannot do: two keys changing at one moment. Both
-/// land at the same sequence number, which is what "together" means here
-/// -- one log entry, one apply.
+/// Two keys changing at one moment. Both land at the same sequence
+/// number, which is what "together" means here -- one log entry, one
+/// apply.
 #[tokio::test]
 async fn a_transaction_commits_every_key_at_one_seq() {
     let n1 = TestNode::start("txn1");
@@ -333,8 +321,8 @@ async fn a_transaction_commits_every_key_at_one_seq() {
     let txn = client.transaction(Duration::from_secs(2)).await.unwrap();
     assert_eq!(txn.read(b"alice").await.unwrap().value.as_deref(), Some(&b"10"[..]));
     assert_eq!(txn.read(b"bob").await.unwrap().value.as_deref(), Some(&b"10"[..]));
-    txn.buffer_write(b"alice", Some(b"9")).await.unwrap();
-    txn.buffer_write(b"bob", Some(b"11")).await.unwrap();
+    txn.write(b"alice", Some(b"9")).await.unwrap();
+    txn.write(b"bob", Some(b"11")).await.unwrap();
     let seq = txn.commit().await.unwrap();
 
     let alice = client.read(b"alice").await.unwrap();
@@ -360,7 +348,7 @@ async fn a_dropped_transaction_writes_nothing_and_frees_its_keys() {
     client.write(b"k", Some(b"original")).await.unwrap();
 
     let txn = client.transaction(Duration::from_secs(2)).await.unwrap();
-    txn.buffer_write(b"k", Some(b"never")).await.unwrap();
+    txn.write(b"k", Some(b"never")).await.unwrap();
     txn.abort().await.unwrap();
 
     assert_eq!(
@@ -383,13 +371,13 @@ async fn a_transaction_reads_back_its_own_buffered_writes() {
     let committed = client.write(b"k", Some(b"committed")).await.unwrap();
 
     let txn = client.transaction(Duration::from_secs(2)).await.unwrap();
-    txn.buffer_write(b"k", Some(b"buffered")).await.unwrap();
+    txn.write(b"k", Some(b"buffered")).await.unwrap();
     let read = txn.read(b"k").await.unwrap();
     assert_eq!(read.value.as_deref(), Some(&b"buffered"[..]));
     assert_eq!(read.seq, committed, "seq describes committed state, not the buffer");
 
     // A buffered delete reads back as absent, the same way.
-    txn.buffer_write(b"k", None).await.unwrap();
+    txn.write(b"k", None).await.unwrap();
     assert_eq!(txn.read(b"k").await.unwrap().value, None);
 
     // ...and none of that is visible to anyone else until it commits.
@@ -446,13 +434,13 @@ async fn an_older_transaction_wounds_a_younger_one_holding_its_key() {
     let older = client.transaction(Duration::from_secs(5)).await.unwrap();
     let younger = client.transaction(Duration::from_secs(5)).await.unwrap();
 
-    younger.buffer_write(b"k", Some(b"theirs")).await.unwrap();
+    younger.write(b"k", Some(b"theirs")).await.unwrap();
     older
-        .buffer_write(b"k", Some(b"mine"))
+        .write(b"k", Some(b"mine"))
         .await
         .expect("the older transaction takes the key");
 
-    match younger.buffer_write(b"other", Some(b"v")).await {
+    match younger.write(b"other", Some(b"v")).await {
         Err(raft5_client::Error::Aborted { reason, .. }) => {
             assert_eq!(reason, raft5_client::AbortReason::Wounded);
         }
@@ -478,7 +466,7 @@ async fn a_transaction_past_its_deadline_cannot_commit() {
     client.write(b"k", Some(b"original")).await.unwrap();
 
     let txn = client.transaction(Duration::from_millis(50)).await.unwrap();
-    txn.buffer_write(b"k", Some(b"too late")).await.unwrap();
+    txn.write(b"k", Some(b"too late")).await.unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     match txn.commit().await {
@@ -519,8 +507,9 @@ async fn a_read_only_transaction_commits_at_no_sequence_number() {
 
 /// The concurrency property the whole feature exists for: many
 /// transactions doing read-modify-write over the *same pair* of keys,
-/// with their sum checked at the end. Interleaving reads and writes on
-/// two keys is exactly what `update` cannot make safe.
+/// with their sum checked at the end. Two independent single-key writes
+/// could not make this safe: there would be no moment at which both had
+/// happened and nothing else had come between.
 #[tokio::test]
 async fn concurrent_transactions_keep_two_keys_consistent() {
     let n1 = TestNode::start("txn8");
@@ -566,9 +555,9 @@ async fn transfer_one(client: &Client) -> Result<(), raft5_client::Error> {
     let txn = client.transaction(Duration::from_secs(5)).await?;
     let a: i64 = parse(txn.read(b"a").await?.value.as_deref());
     let b: i64 = parse(txn.read(b"b").await?.value.as_deref());
-    txn.buffer_write(b"a", Some((a - 1).to_string().as_bytes()))
+    txn.write(b"a", Some((a - 1).to_string().as_bytes()))
         .await?;
-    txn.buffer_write(b"b", Some((b + 1).to_string().as_bytes()))
+    txn.write(b"b", Some((b + 1).to_string().as_bytes()))
         .await?;
     txn.commit().await.map(|_| ())
 }

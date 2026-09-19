@@ -17,10 +17,10 @@
 //! conflicting ways therefore cannot interleave, which is what makes the
 //! result serializable.
 //!
-//! An ordinary single-key `Write` takes an exclusive lock here too, as
-//! `Owner::Bare`. It has to: a write that bypassed the table could change
-//! a key out from under a transaction that had read it, and the read set
-//! would be a record of something that was no longer true.
+//! Every holder is a transaction, because a transaction is the only way
+//! to write anything (see `client.proto`). Nothing can change a key out
+//! from under a transaction that has read it, so a read set is always a
+//! record of something still true.
 //!
 //! # Conflicts: nothing ever waits
 //!
@@ -36,30 +36,27 @@
 //! while a younger one is refused. Ages come from `Txn::priority`, a
 //! counter, so they are a total order with no ties.
 //!
-//! Some holders are never wounded, all for one reason: their write may
+//! One kind of holder is never wounded, for one reason: its writes may
 //! already be in the raft log, and an appended entry cannot be recalled.
-//! A transaction that has begun committing, and any `Owner::Bare` holder,
-//! are immune. A bare write never wounds anything either -- it keeps the
-//! fail-fast behaviour it has always had, and its client already retries.
+//! A transaction that has begun committing is therefore immune.
 //!
-//! What that guarantees is worth stating exactly, because it is less than
-//! "no transaction ever starves": the *oldest* open transaction is never
-//! refused by another transaction, since it wounds them all. It can still
-//! be refused by a bare write or by a committing transaction, but both of
-//! those finish in bounded time -- one append plus its apply -- so a
-//! retry makes progress. Every other transaction gets there by becoming
-//! the oldest, which it does simply by outliving the ones ahead of it.
+//! What that guarantees: the *oldest* open transaction is never refused
+//! by another open transaction, since it wounds them all. It can still be
+//! refused by one already committing, but that finishes in bounded time
+//! -- one append plus its apply -- so a retry makes progress. Every other
+//! transaction gets there by becoming the oldest, which it does simply by
+//! outliving the ones ahead of it.
 //!
 //! # Deadlines
 //!
 //! Every transaction carries one, and a transaction past it holds
 //! nothing: the next request to collide with one of its locks releases
 //! them on the spot (`acquire` below), rather than waiting for a sweeper
-//! tick. That matters more than it looks -- `raft5_lock`'s refresh gives
-//! an attempt 400ms before it counts as failed, so lock-release latency
-//! measured in sweeper periods would be a correctness problem for the
-//! crate built on top of this one. The sweeper is only a reclaimer of
-//! memory for transactions nobody happens to collide with.
+//! tick. Lock-release latency measured in sweeper periods would show up
+//! as unexplained stalls on a contended key, when what is actually
+//! holding it is a transaction that died some time ago. The sweeper is
+//! only a reclaimer of memory for transactions nobody happens to collide
+//! with.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -69,11 +66,11 @@ use std::time::{Duration, Instant};
 /// server will not honour, and silently giving it a shorter lease than it
 /// asked for would let it act on that assumption anyway.
 ///
-/// Pulled in two directions. A transaction's locks block ordinary writes
-/// to the same keys for as long as they are held, and `raft5_lock` --
-/// built on those ordinary writes -- gives up a lock lease after a
-/// second of failed refreshes, which argues for short. But a
-/// `MAX_TRANSACTION_BYTES` transaction is uploaded as many `BufferWrite`
+/// Pulled in two directions. A transaction's locks block everyone else
+/// from the same keys for as long as they are held, and every write in
+/// the system is a transaction, so a long cap means a stuck client can
+/// make a hot key unwritable for that long. But a
+/// `MAX_TRANSACTION_BYTES` transaction is uploaded as many `Write`
 /// calls that must *all* land before this expires, or the locks go and
 /// the work is wasted; at 10 MiB, five seconds would demand a sustained
 /// 2 MB/s with nothing to spare. Fifteen sets that floor around
@@ -143,15 +140,6 @@ pub type TxnId = [u8; 16];
 /// What a transaction buffered, in key order. `None` is a delete.
 pub type BufferedWrites = Vec<(Vec<u8>, Option<Vec<u8>>)>;
 
-/// Who holds a lock.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Owner {
-    Txn(TxnId),
-    /// A plain single-key `Write` RPC. Has no age and is never wounded --
-    /// see the module doc.
-    Bare(u64),
-}
-
 /// What kind of access a request wants, and what a lock grants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -172,8 +160,8 @@ enum LockState {
     /// Read-then-write is the commonest shape a transaction has. With a
     /// set, acquiring twice is idempotent, "only me" is exactly
     /// `holders == {me}`, and releasing cannot leak a phantom holder.
-    Read { holders: HashSet<Owner> },
-    Write { owner: Owner },
+    Read { holders: HashSet<TxnId> },
+    Write { owner: TxnId },
 }
 
 /// Why a transaction is no longer usable. Kept on the transaction rather
@@ -239,13 +227,7 @@ pub enum Refused {
 /// small shared maps.
 #[derive(Debug, Default)]
 struct Shared {
-    /// Bumped whenever this node stops being the leader it was. Every
-    /// lock release is checked against the epoch it was taken in, so a
-    /// release arriving late from a previous term cannot remove a lock
-    /// that now belongs to someone else.
-    epoch: u64,
     next_priority: u64,
-    next_bare_id: u64,
     /// The leader term the table currently reflects, so a change can be
     /// noticed. `None` before this node has led at all.
     term: Option<u64>,
@@ -262,11 +244,10 @@ impl Shared {
     /// Grant `owner` `mode` on `key`, or say why not.
     ///
     /// The single place `locks` is ever inserted into, and the only place
-    /// the conflict rules live. Every caller -- transactional read,
-    /// buffered write, plain write -- comes through here, so there is one
-    /// description of what conflicts with what rather than three that
-    /// have to agree.
-    fn acquire(&mut self, key: &[u8], owner: Owner, mode: Mode, now: Instant) -> Result<(), Refused> {
+    /// the conflict rules live. Both callers -- transactional read and
+    /// buffered write -- come through here, so there is one description
+    /// of what conflicts with what rather than two that have to agree.
+    fn acquire(&mut self, key: &[u8], owner: TxnId, mode: Mode, now: Instant) -> Result<(), Refused> {
         loop {
             let blockers = self.blockers(key, owner, mode);
             if blockers.is_empty() {
@@ -278,10 +259,8 @@ impl Shared {
             // wounding it doesn't depend on who is asking.
             let mut released_any = false;
             for blocker in &blockers {
-                if let Owner::Txn(id) = blocker
-                    && self.is_expired_open(*id, now)
-                {
-                    self.abort(*id, AbortReason::Expired);
+                if self.is_expired_open(*blocker, now) {
+                    self.abort(*blocker, AbortReason::Expired);
                     released_any = true;
                 }
             }
@@ -289,16 +268,13 @@ impl Shared {
                 continue;
             }
 
-            // Wound: only a transaction wounds, and only one older than
-            // every holder still in its way.
-            if let Owner::Txn(me) = owner
-                && let Some(mine) = self.txns.get(&me).map(|t| t.priority)
+            // Wound: only a transaction older than every holder still in
+            // its way.
+            if let Some(mine) = self.txns.get(&owner).map(|t| t.priority)
                 && blockers.iter().all(|b| self.is_woundable(*b, mine))
             {
                 for blocker in &blockers {
-                    if let Owner::Txn(id) = blocker {
-                        self.abort(*id, AbortReason::Wounded);
-                    }
+                    self.abort(*blocker, AbortReason::Wounded);
                 }
                 continue;
             }
@@ -311,7 +287,7 @@ impl Shared {
     /// wanting `mode`. The requester is never its own blocker: a
     /// transaction re-reading a key it has read, or rewriting a key it
     /// has written, is not in conflict with itself.
-    fn blockers(&self, key: &[u8], owner: Owner, mode: Mode) -> Vec<Owner> {
+    fn blockers(&self, key: &[u8], owner: TxnId, mode: Mode) -> Vec<TxnId> {
         match (self.locks.get(key), mode) {
             (None, _) => Vec::new(),
             // Shared against shared: no conflict, whoever else holds it.
@@ -334,7 +310,7 @@ impl Shared {
     /// Record the grant. Only ever called with no blockers, so replacing
     /// a shared lock with an exclusive one here is the upgrade -- by then
     /// the requester is provably its only holder.
-    fn install(&mut self, key: &[u8], owner: Owner, mode: Mode) {
+    fn install(&mut self, key: &[u8], owner: TxnId, mode: Mode) {
         match mode {
             Mode::Read => match self.locks.get_mut(key) {
                 Some(LockState::Read { holders }) => {
@@ -363,11 +339,11 @@ impl Shared {
     /// Drop `owner`'s hold on `key`, if it still has one.
     ///
     /// The only place `locks` is ever removed from. Every release goes
-    /// through here -- a guard's drop, a commit, an abort, the sweeper --
-    /// because the owner check is what makes a *late* release safe: a
-    /// release that just removed the key would happily delete a lock
-    /// somebody else has since taken.
-    fn release(&mut self, key: &[u8], owner: Owner) {
+    /// through here -- a commit, an abort, the sweeper -- because the
+    /// owner check is what makes a *late* release safe: a release that
+    /// just removed the key would happily delete a lock somebody else
+    /// has since taken.
+    fn release(&mut self, key: &[u8], owner: TxnId) {
         let Some(state) = self.locks.get_mut(key) else {
             return;
         };
@@ -390,16 +366,11 @@ impl Shared {
     }
 
     /// Whether `blocker` can be pushed out of the way by a transaction of
-    /// age `mine`. See the module doc for why `Committing` and `Bare` are
-    /// immune.
-    fn is_woundable(&self, blocker: Owner, mine: u64) -> bool {
-        match blocker {
-            Owner::Bare(_) => false,
-            Owner::Txn(id) => self
-                .txns
-                .get(&id)
-                .is_some_and(|t| t.state == TxnState::Open && t.priority > mine),
-        }
+    /// age `mine`. See the module doc for why `Committing` is immune.
+    fn is_woundable(&self, blocker: TxnId, mine: u64) -> bool {
+        self.txns
+            .get(&blocker)
+            .is_some_and(|t| t.state == TxnState::Open && t.priority > mine)
     }
 
     /// Mark a transaction unusable and give up everything it held.
@@ -417,7 +388,7 @@ impl Shared {
         txn.state = TxnState::Aborted(reason);
         let held: Vec<Vec<u8>> = txn.reads.iter().chain(txn.writes.keys()).cloned().collect();
         for key in held {
-            self.release(&key, Owner::Txn(id));
+            self.release(&key, id);
         }
         // Whatever it buffered will never be written now, so it stops
         // counting against the node's budget immediately -- the
@@ -447,7 +418,7 @@ impl Shared {
         };
         let held: Vec<Vec<u8>> = txn.reads.iter().chain(txn.writes.keys()).cloned().collect();
         for key in held {
-            self.release(&key, Owner::Txn(id));
+            self.release(&key, id);
         }
         self.forget_buffer(id);
     }
@@ -478,17 +449,16 @@ impl Locks {
     /// keeping the locks would only make keys unwritable on behalf of
     /// transactions that can never commit.
     ///
-    /// Bumping `epoch` is what makes this safe to do while work is still
-    /// in flight: a lock released after the wipe is checked against the
-    /// epoch it was taken in and quietly does nothing, instead of
-    /// removing a lock that now belongs to somebody else.
+    /// Safe to do while a commit is still in flight: its `CommitGuard`
+    /// releases through `discard`, which finds the transaction already
+    /// gone from `txns` and does nothing, rather than removing locks
+    /// that now belong to somebody else.
     pub fn observe_term(&self, term: Option<u64>) {
         let mut shared = self.lock();
         if shared.term == term {
             return;
         }
         shared.term = term;
-        shared.epoch += 1;
         shared.txns.clear();
         shared.locks.clear();
         shared.buffered_total = 0;
@@ -516,25 +486,6 @@ impl Locks {
         shared
             .txns
             .retain(|_, t| t.state == TxnState::Open || t.deadline + tombstone_grace > now);
-    }
-
-    /// Claim `key` for one plain single-key write, or say why not.
-    ///
-    /// The guard releases the claim when it is dropped, which the caller
-    /// arranges to happen when the *entry* resolves rather than when the
-    /// request does -- see `grpc::KvService::conditional_write`.
-    pub fn claim(&self, key: &[u8]) -> Result<BareGuard, Refused> {
-        let mut shared = self.lock();
-        let id = shared.next_bare_id;
-        shared.next_bare_id += 1;
-        let owner = Owner::Bare(id);
-        shared.acquire(key, owner, Mode::Write, Instant::now())?;
-        Ok(BareGuard {
-            locks: self.clone(),
-            epoch: shared.epoch,
-            key: key.to_vec(),
-            owner,
-        })
     }
 
     /// Open a transaction under leader term `term`, returning its id.
@@ -593,7 +544,7 @@ impl Locks {
             if let Some(buffered) = shared.txns[&id].writes.get(key) {
                 return Ok(Some(buffered.clone()));
             }
-            shared.acquire(key, Owner::Txn(id), Mode::Read, Instant::now())?;
+            shared.acquire(key, id, Mode::Read, Instant::now())?;
             // `acquire` can wound *this* transaction only if it is
             // younger than a holder, in which case it returned an error
             // above; so the entry is still here and still open.
@@ -638,7 +589,7 @@ impl Locks {
                 ));
             }
 
-            shared.acquire(key, Owner::Txn(id), Mode::Write, Instant::now())?;
+            shared.acquire(key, id, Mode::Write, Instant::now())?;
 
             shared.buffered_total = projected_node_wide;
             let txn = shared
@@ -749,31 +700,6 @@ impl Locks {
 /// is worth more than being exactly right at it.
 fn entry_size(key: &[u8], value: Option<&[u8]>) -> usize {
     key.len() + value.map_or(0, <[u8]>::len) + PER_KEY_OVERHEAD
-}
-
-/// One plain write's exclusive claim on a key, released on drop.
-///
-/// Held from before the write's precondition is read until its entry has
-/// been applied -- see `grpc`'s module doc for why that whole span
-/// matters.
-pub struct BareGuard {
-    locks: Locks,
-    /// The epoch the claim was taken in. A release from a previous epoch
-    /// does nothing: the table it belonged to is gone, and the key may
-    /// since have been claimed by somebody else.
-    epoch: u64,
-    key: Vec<u8>,
-    owner: Owner,
-}
-
-impl Drop for BareGuard {
-    fn drop(&mut self) {
-        let mut shared = self.locks.lock();
-        if shared.epoch != self.epoch {
-            return;
-        }
-        shared.release(&self.key, self.owner);
-    }
 }
 
 /// A committing transaction's locks, released when the commit resolves

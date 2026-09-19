@@ -1,17 +1,17 @@
 //! End-to-end integration test: three real nodes (each a full
 //! `raft5_server::run` instance, listening on real localhost sockets),
 //! formed into a cluster via the client gRPC API alone -- bootstrap plus
-//! two `AddServer` calls, no internal shortcuts. A write through the
-//! leader is only reported back once committed and applied (see
-//! `raft::LeaderHandle::append_log`), so awaiting the `Write` RPC *is*
-//! waiting for commitment; the read that follows confirms the value is
-//! actually there, both on the leader and, once replication catches up,
-//! on the other two nodes.
+//! two `AddServer` calls, no internal shortcuts. A write is a
+//! transaction, and its commit is only reported back once the entry has
+//! been committed and applied (see `raft::LeaderHandle::append_writes`),
+//! so awaiting `CommitTransaction` *is* waiting for commitment; the read
+//! that follows confirms the value is actually there, both on the leader
+//! and, once replication catches up, on the other two nodes.
 
 mod common;
 
 use common::{
-    TestNode, add_server, assert_eventually_reads, begin, bootstrap, buffer_write, commit,
+    TestNode, add_server, assert_eventually_reads, begin, bootstrap, txn_write, commit,
     find_leader, read, wait_until_voter, write,
 };
 
@@ -45,7 +45,7 @@ async fn write_through_a_three_node_cluster_commits_and_reads_back() {
     let c1 = n1.client();
 
     // `write` only returns once the entry has committed *and* been
-    // applied (see `raft::LeaderHandle::append_log`) -- there is nothing
+    // applied (see `raft::LeaderHandle::append_writes`) -- there is nothing
     // further to wait on here.
     let seq = write(&c1, b"hello", Some(b"world")).await;
 
@@ -122,8 +122,8 @@ async fn a_transaction_replicates_all_of_its_keys_at_one_seq() {
     write(&c1, b"bob", Some(b"10")).await;
 
     let txn = begin(&c1, std::time::Duration::from_secs(5)).await;
-    buffer_write(&c1, &txn, b"alice", Some(b"9")).await;
-    buffer_write(&c1, &txn, b"bob", Some(b"11")).await;
+    txn_write(&c1, &txn, b"alice", Some(b"9")).await;
+    txn_write(&c1, &txn, b"bob", Some(b"11")).await;
     let seq = commit(&c1, &txn).await.expect("the transaction should commit");
 
     // Committed *and* applied by the time commit returns, so the leader
@@ -151,7 +151,7 @@ async fn a_transaction_does_not_survive_the_death_of_its_leader() {
     write(&c1, b"k", Some(b"original")).await;
 
     let txn = begin(&c1, std::time::Duration::from_secs(5)).await;
-    buffer_write(&c1, &txn, b"k", Some(b"never")).await;
+    txn_write(&c1, &txn, b"k", Some(b"never")).await;
 
     n1.shut_down().await;
 
@@ -196,9 +196,9 @@ async fn a_transaction_larger_than_one_grpc_message_replicates_to_every_node() {
         // (or a chunk landing in the wrong place) is caught rather than
         // hidden by every value being identical.
         let value = vec![u8::try_from(i).unwrap(); VALUE_BYTES];
-        buffer_write(&c1, &txn, format!("big{i}").as_bytes(), Some(&value)).await;
+        txn_write(&c1, &txn, format!("big{i}").as_bytes(), Some(&value)).await;
     }
-    buffer_write(&c1, &txn, SENTINEL, Some(b"landed")).await;
+    txn_write(&c1, &txn, SENTINEL, Some(b"landed")).await;
     let seq = commit(&c1, &txn)
         .await
         .expect("a transaction past the old message ceiling should now commit");

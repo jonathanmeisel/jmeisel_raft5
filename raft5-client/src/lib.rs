@@ -3,7 +3,9 @@
 //! [`Client`] wraps the `Kv` service (`client.proto`) so that a caller
 //! writes `client.write(key, value)` and gets an answer, rather than
 //! having to know which of the cluster's nodes is currently able to give
-//! one. Three things stand between those two:
+//! one -- or that the write is a transaction underneath, since the
+//! cluster has no other way to write. Three things stand between those
+//! two:
 //!
 //! * **Only the leader can serve most requests**, and a node that isn't
 //!   the leader says so rather than forwarding (Raft §6.2). Every such
@@ -12,9 +14,10 @@
 //!   since a redirect is not a failure.
 //! * **The leader changes.** With no hint to follow (a cluster mid
 //!   election, a configuration older than the current leader), the
-//!   client finds it by asking each node it knows of for a *linearizable*
-//!   read: only a leader still holding a read quorum will answer one, so
-//!   an answer is proof rather than a guess.
+//!   client finds it by asking each node it knows of for the cluster
+//!   configuration and seeing which one says `is_leader` -- which only a
+//!   caught-up leader still holding a read quorum does, so it is proof
+//!   rather than a guess.
 //! * **The membership changes.** A client is constructed from seed
 //!   addresses, but the cluster is the authority on who its members are,
 //!   so the client periodically re-reads the configuration from whoever
@@ -35,12 +38,12 @@ use std::time::{Duration, Instant};
 use tonic::Status;
 
 use raft5_shared::raft5::client::{
-    AddServerRequest, BootstrapRequest, BufferWriteRequest, BufferWriteResponse,
-    CommitTransactionRequest, CommitTransactionResponse, ConfigChangeResponse,
-    CreateTransactionRequest, CreateTransactionResponse, DropTransactionRequest,
-    RaftError as PbRaftError, ReadRequest, ReadResponse, RemoveServerRequest, WriteRequest,
-    WriteResponse, buffer_write_response, commit_transaction_response, config_change_response,
-    create_transaction_response, raft_error, read_response, transaction_aborted, write_response,
+    AddServerRequest, BootstrapRequest, CommitTransactionRequest, CommitTransactionResponse,
+    ConfigChangeResponse, CreateTransactionRequest, CreateTransactionResponse,
+    DropTransactionRequest, RaftError as PbRaftError, ReadRequest, ReadResponse,
+    RemoveServerRequest, WriteRequest, WriteResponse, commit_transaction_response,
+    config_change_response, create_transaction_response, raft_error, read_response,
+    transaction_aborted, write_response,
 };
 
 use routing::{Kv, Router};
@@ -70,12 +73,12 @@ const RETRY_DELAY: Duration = Duration::from_millis(20);
 /// to be leading.
 const CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
-/// How many times [`Client::update`] re-reads and re-runs its closure
-/// after losing a race for the key. Each attempt is a fresh read of a
-/// value someone else just wrote, so losing several in a row means real
-/// contention on that one key rather than bad luck, and the caller is
-/// better placed than this library to decide what to do about it.
-pub const MAX_UPDATE_ATTEMPTS: usize = 5;
+/// The lifetime [`Client::write`] asks for on the transaction it opens
+/// behind the caller's back. Short, because that transaction is never
+/// waiting on anything a caller does: it is three round trips end to
+/// end, and holding the key any longer than that would only block
+/// whoever wants it next if this client stalls mid-write.
+const IMPLICIT_TXN_TTL: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub enum Error {
@@ -99,12 +102,6 @@ pub enum Error {
     /// refused outright. The text is the last refusal or transport
     /// failure seen.
     Unavailable(String),
-    /// The key was written by someone else between this client reading
-    /// it and writing it back, so nothing was written. `actual_seq` is
-    /// what the key is at instead (0 if it has no value). From
-    /// [`Client::update`] this means the key stayed contended for every
-    /// attempt.
-    Conflict { actual_seq: u64 },
     /// The transaction is over and nothing it buffered was written.
     ///
     /// Not retried by this library, because the retry isn't the request
@@ -132,8 +129,8 @@ pub enum Error {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AbortReason {
     /// A key was held by someone this transaction couldn't displace: an
-    /// older transaction, one already committing, or a plain write in
-    /// flight. Worth retrying -- the holder will finish.
+    /// older transaction, or one already committing. Worth retrying --
+    /// the holder will finish.
     LockConflict,
     /// Its deadline passed before it committed. A longer one, or less
     /// work between opening it and committing, would help.
@@ -202,26 +199,11 @@ impl std::fmt::Display for Error {
                 "the commit reached the log at seq {seq} and then the leader changed; \
                  whether it committed is unknown, so it must not be replayed"
             ),
-            Self::Conflict { actual_seq } => {
-                write!(
-                    f,
-                    "the key changed under this write; it is at seq {actual_seq}"
-                )
-            }
         }
     }
 }
 
 impl std::error::Error for Error {}
-
-/// What a [`Client::update`] closure decides to do with the key.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Update {
-    /// Write this value, or delete the key if it is `None`.
-    Write(Option<Vec<u8>>),
-    /// Leave the key alone; nothing is written.
-    Noop,
-}
 
 /// What a key currently holds. `seq` is the sequence number the value
 /// was written at; a key that has never been written (or has been
@@ -244,11 +226,6 @@ enum Reply<T> {
     /// yet, a membership change still in flight, a leader that hasn't
     /// yet committed an entry from its own term.
     Unavailable(String),
-    /// A write whose precondition didn't hold. `Some(seq)` is what the
-    /// key is actually at, which no amount of retrying will change --
-    /// only re-reading and deciding again will. `None` means another
-    /// write to the key is still in flight, which is transient.
-    Conflict(Option<u64>),
     /// The transaction is over. Not retried here: what would have to be
     /// retried is the whole transaction, which only its caller can
     /// replay.
@@ -263,10 +240,7 @@ impl<T> Reply<T> {
             Some(raft_error::Kind::NotLeader(not_leader)) => {
                 Self::NotLeader(not_leader.leader_hint)
             }
-            Some(raft_error::Kind::Unavailable(why) | raft_error::Kind::Timeout(why)) => {
-                Self::Unavailable(why)
-            }
-            Some(raft_error::Kind::Conflict(conflict)) => Self::Conflict(conflict.actual_seq),
+            Some(raft_error::Kind::Unavailable(why)) => Self::Unavailable(why),
             Some(raft_error::Kind::Aborted(aborted)) => {
                 match transaction_aborted::Reason::try_from(aborted.reason) {
                     // Split out before anything else can touch it: this
@@ -327,96 +301,61 @@ impl Client {
     /// Writes `value` to `key`, or deletes `key` if `value` is `None`,
     /// whatever it currently holds, returning the sequence number it
     /// committed at. Returns only once the write has been committed
-    /// *and* applied, so a read that follows it reflects it.
+    /// *and* applied, so a transactional read that follows it reflects
+    /// it.
     ///
-    /// Every write the cluster accepts is conditional (see
-    /// [`update`], which this is the degenerate case of), so an
-    /// unconditional overwrite is a read and a write: under contention
-    /// it may lose the race and try again.
+    /// A transaction is the cluster's only way to write, so this opens
+    /// one of its own, buffers the key, and commits -- three round trips
+    /// rather than one. [`transaction`] is the same machinery with the
+    /// steps left to the caller, and is what to reach for when more than
+    /// one key is involved or the value depends on what was read.
+    ///
+    /// Losing a key to a contending transaction is not a failure here:
+    /// an aborted transaction wrote nothing, so this simply opens
+    /// another and tries again until [`DEADLINE`]. [`Error::InDoubt`] is
+    /// the exception and is never retried.
     ///
     /// A write interrupted by a lost connection may be retried after it
     /// has already committed, since nothing tells the client which of the
     /// two happened. The retry rewrites the same key with the same value,
     /// so the only trace of it is a second sequence number.
     ///
-    /// [`update`]: Client::update
+    /// [`transaction`]: Client::transaction
     pub async fn write(&self, key: &[u8], value: Option<&[u8]>) -> Result<u64, Error> {
         let deadline = Instant::now() + DEADLINE;
         loop {
-            match self.update(key, |_| Update::Write(value.map(<[u8]>::to_vec))).await {
-                // Unlike a real update there is nothing here to
-                // reconsider -- the value doesn't depend on what the key
-                // held -- so losing the race just means going round
-                // again, to the same deadline the rest of the client
-                // works to.
-                Err(Error::Conflict { .. }) if Instant::now() < deadline => {}
+            match self.write_once(key, value).await {
+                // Nothing here needs reconsidering -- the value doesn't
+                // depend on what the key held -- so a lost key just
+                // means going round again, to the same deadline the rest
+                // of the client works to.
+                Err(Error::Aborted { .. }) if Instant::now() < deadline => {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
                 other => return other,
             }
         }
     }
 
-    /// Reads `key`, hands what it holds to `f`, and does what `f` returns
-    /// -- [`Update::Write`] writes the value back (`Write(None)` deletes
-    /// the key), [`Update::Noop`] writes nothing -- but only if nothing else
-    /// wrote the key in between. This is the read-modify-write the store
-    /// itself cannot do: a counter increment, an entry appended to a
-    /// list, a flag flipped only if it was where the caller last saw it.
-    ///
-    /// Losing that race is not a failure: the value is re-read, `f` runs
-    /// again on what is there now, and the write is retried, up to
-    /// [`MAX_UPDATE_ATTEMPTS`] times. So `f` may run more than once and
-    /// should compute rather than act -- anything it does besides
-    /// returning a value will happen again on the next attempt. Its
-    /// argument is `None` when the key currently has no value. On
-    /// `Noop` the returned sequence number is the one the key was read
-    /// at (0 if it has no value).
-    ///
-    /// ```no_run
-    /// # async fn f(client: raft5_client::Client) -> Result<(), raft5_client::Error> {
-    /// client
-    ///     .update(b"hits", |current| {
-    ///         let n: u64 = current
-    ///             .and_then(|bytes| std::str::from_utf8(bytes).ok()?.parse().ok())
-    ///             .unwrap_or(0);
-    ///         raft5_client::Update::Write(Some((n + 1).to_string().into_bytes()))
-    ///     })
-    ///     .await?;
-    /// # Ok(()) }
-    /// ```
-    pub async fn update<F>(&self, key: &[u8], mut f: F) -> Result<u64, Error>
-    where
-        F: FnMut(Option<&[u8]>) -> Update,
-    {
-        let mut last_conflict = 0;
-        for _ in 0..MAX_UPDATE_ATTEMPTS {
-            let current = self.read(key).await?;
-            let next = match f(current.value.as_deref()) {
-                Update::Write(next) => next,
-                Update::Noop => return Ok(current.seq),
-            };
-            // Seq 0 is the cluster's own "this key has no value", so the
-            // seq a read hands back is the precondition, unchanged,
-            // whether or not the key was there.
-            match self.write_at(key, next.as_deref(), current.seq).await {
-                Err(Error::Conflict { actual_seq }) => last_conflict = actual_seq,
-                other => return other,
-            }
-        }
-        Err(Error::Conflict {
-            actual_seq: last_conflict,
-        })
+    /// One attempt at [`write`](Client::write): open a transaction, buffer the
+    /// one key, commit. A failure anywhere leaves `Transaction`'s `Drop`
+    /// to give the locks back rather than waiting for the deadline.
+    async fn write_once(&self, key: &[u8], value: Option<&[u8]>) -> Result<u64, Error> {
+        let txn = self.transaction(IMPLICIT_TXN_TTL).await?;
+        txn.write(key, value).await?;
+        txn.commit().await
     }
 
     /// Opens a transaction: reads and writes across any number of keys
     /// that commit together, or not at all.
     ///
-    /// This is what [`update`] cannot do. `update` is a compare-and-swap
-    /// on one key, and two of them are two independent writes -- there is
-    /// no moment at which both have happened and nothing else has come
-    /// between. A transaction reads what it needs, buffers the changes,
+    /// This is the only way to write, and the only way to read something
+    /// guaranteed current -- [`read`] outside a transaction may be
+    /// stale. A transaction reads what it needs, buffers the changes,
     /// and commits them as a single raft entry: every key lands at one
-    /// sequence number, and nobody else can write a key it has touched in
-    /// the meantime.
+    /// sequence number, nobody else can write a key it has touched in
+    /// the meantime, and a read it made is still true when it commits.
+    /// That is what makes a read-modify-write possible.
     ///
     /// `ttl` is how long the cluster will hold its locks. Choose it by
     /// how long the work between opening and committing actually takes,
@@ -433,14 +372,14 @@ impl Client {
     /// let txn = client.transaction(Duration::from_secs(1)).await?;
     /// let alice = txn.read(b"alice").await?;
     /// let bob = txn.read(b"bob").await?;
-    /// txn.buffer_write(b"alice", Some(b"9")).await?;
-    /// txn.buffer_write(b"bob", Some(b"11")).await?;
+    /// txn.write(b"alice", Some(b"9")).await?;
+    /// txn.write(b"bob", Some(b"11")).await?;
     /// txn.commit().await?;
     /// # let _ = (alice, bob);
     /// # Ok(()) }
     /// ```
     ///
-    /// [`update`]: Client::update
+    /// [`read`]: Client::read
     pub async fn transaction(&self, ttl: Duration) -> Result<Transaction, Error> {
         let request = CreateTransactionRequest {
             ttl_ms: u64::try_from(ttl.as_millis())
@@ -461,54 +400,27 @@ impl Client {
         })
     }
 
-    /// One conditional write: applied only if `key` is still at
-    /// `previous_seq` (0 meaning it has no value).
-    async fn write_at(
-        &self,
-        key: &[u8],
-        value: Option<&[u8]>,
-        previous_seq: u64,
-    ) -> Result<u64, Error> {
-        let request = WriteRequest {
-            key: key.to_vec(),
-            value: value.map(<[u8]>::to_vec),
-            previous_seq: Some(previous_seq),
-        };
-        self.call(|mut kv: Kv| {
-            let request = request.clone();
-            async move { kv.write(request).await.map(write_reply) }
-        })
-        .await
-    }
-
-    /// Reads `key` linearizably: the answer reflects every write that
-    /// completed before this call began. Served by the leader, and only
-    /// while it can still prove it is one.
-    pub async fn read(&self, key: &[u8]) -> Result<ReadResult, Error> {
-        self.read_at(key, true).await
-    }
-
     /// Reads `key` from whichever node the client is currently talking
-    /// to, without checking that it still leads. Cheaper -- no
-    /// read-quorum round -- at the price of possibly missing recent
-    /// writes.
-    pub async fn read_stale(&self, key: &[u8]) -> Result<ReadResult, Error> {
-        self.read_at(key, false).await
-    }
-
-    async fn read_at(&self, key: &[u8], linearizable: bool) -> Result<ReadResult, Error> {
-        self.read_inner(key, linearizable, None).await
+    /// to, without checking that it still leads. Cheap -- one round trip
+    /// and no read-quorum round -- at the price of possibly missing
+    /// recent writes, including ones this client itself just made.
+    ///
+    /// For a read that is guaranteed current, open a [`transaction`] and
+    /// read inside it: that is what takes the lock and proves the node
+    /// answering is still the leader.
+    ///
+    /// [`transaction`]: Client::transaction
+    pub async fn read(&self, key: &[u8]) -> Result<ReadResult, Error> {
+        self.read_inner(key, None).await
     }
 
     async fn read_inner(
         &self,
         key: &[u8],
-        linearizable: bool,
         transaction_id: Option<Vec<u8>>,
     ) -> Result<ReadResult, Error> {
         let request = ReadRequest {
             key: key.to_vec(),
-            linearizable,
             transaction_id,
         };
         self.call(|mut kv: Kv| {
@@ -651,19 +563,6 @@ impl Client {
                         // The leader is the right node; the cluster just
                         // isn't ready to answer yet. Keep the connection.
                         Ok(Ok(Reply::Unavailable(why))) => last = Some(why),
-                        // Nothing to decide: the key is at a version this
-                        // write wasn't written against, and re-sending it
-                        // unchanged can only be refused again. Whoever
-                        // built the request has to look again.
-                        Ok(Ok(Reply::Conflict(Some(actual_seq)))) => {
-                            return Err(Error::Conflict { actual_seq });
-                        }
-                        // A conflict with a write still in flight, on the
-                        // other hand, says nothing about the key yet --
-                        // it resolves on its own once that one lands.
-                        Ok(Ok(Reply::Conflict(None))) => {
-                            last = Some(format!("{} has this key mid-write", leader.key));
-                        }
                         // Neither of these is this loop's to retry. An
                         // aborted transaction has to be replayed whole,
                         // reads included, which only its caller can do;
@@ -749,9 +648,9 @@ fn spawn_config_refresh(router: Weak<Router>) {
     });
 }
 
-fn write_reply(resp: tonic::Response<WriteResponse>) -> Reply<u64> {
+fn write_reply(resp: tonic::Response<WriteResponse>) -> Reply<()> {
     match resp.into_inner().result {
-        Some(write_response::Result::Seq(seq)) => Reply::Ok(seq),
+        Some(write_response::Result::Ok(_)) => Reply::Ok(()),
         Some(write_response::Result::Error(e)) => Reply::from_error(e),
         None => empty_response(),
     }
@@ -772,14 +671,6 @@ fn create_transaction_reply(resp: tonic::Response<CreateTransactionResponse>) ->
     match resp.into_inner().result {
         Some(create_transaction_response::Result::TransactionId(id)) => Reply::Ok(id),
         Some(create_transaction_response::Result::Error(e)) => Reply::from_error(e),
-        None => Reply::Unavailable("the node answered without a result".to_string()),
-    }
-}
-
-fn buffer_write_reply(resp: tonic::Response<BufferWriteResponse>) -> Reply<()> {
-    match resp.into_inner().result {
-        Some(buffer_write_response::Result::Ok(_)) => Reply::Ok(()),
-        Some(buffer_write_response::Result::Error(e)) => Reply::from_error(e),
         None => Reply::Unavailable("the node answered without a result".to_string()),
     }
 }
@@ -852,21 +743,21 @@ impl Transaction {
     /// always describes *committed* state even then, since a buffered
     /// write has no sequence number yet.
     pub async fn read(&self, key: &[u8]) -> Result<ReadResult, Error> {
-        self.client
-            .read_inner(key, true, Some(self.id.clone()))
-            .await
+        self.client.read_inner(key, Some(self.id.clone())).await
     }
 
     /// Buffers a write to `key` (or a delete, if `value` is `None`) and
     /// takes the key exclusively.
     ///
-    /// Nothing is written here. The value is held on the leader until
-    /// [`commit`], which is what lets every key in the transaction land
-    /// at the same moment.
+    /// Nothing is written here, which is why there is no sequence number
+    /// to return. The value is held on the leader until [`commit`],
+    /// which is what lets every key in the transaction land at the same
+    /// moment -- and is where the one sequence number for all of them
+    /// comes from.
     ///
     /// [`commit`]: Transaction::commit
-    pub async fn buffer_write(&self, key: &[u8], value: Option<&[u8]>) -> Result<(), Error> {
-        let request = BufferWriteRequest {
+    pub async fn write(&self, key: &[u8], value: Option<&[u8]>) -> Result<(), Error> {
+        let request = WriteRequest {
             transaction_id: self.id.clone(),
             key: key.to_vec(),
             value: value.map(<[u8]>::to_vec),
@@ -874,7 +765,7 @@ impl Transaction {
         self.client
             .call(|mut kv: Kv| {
                 let request = request.clone();
-                async move { kv.buffer_write(request).await.map(buffer_write_reply) }
+                async move { kv.write(request).await.map(write_reply) }
             })
             .await
     }
@@ -886,8 +777,10 @@ impl Transaction {
     /// writes commits at 0: there was nothing to append, so there is no
     /// sequence number to name.
     ///
-    /// Returns only once the entry has committed *and* been applied, so
-    /// a read that follows reflects every key of it.
+    /// Returns only once the entry has committed *and* been applied on
+    /// the leader, so a transactional read that follows reflects every
+    /// key of it. A plain [`Client::read`] may not: it can be answered
+    /// by a node this entry hasn't reached yet.
     pub async fn commit(mut self) -> Result<u64, Error> {
         let request = CommitTransactionRequest {
             transaction_id: self.id.clone(),

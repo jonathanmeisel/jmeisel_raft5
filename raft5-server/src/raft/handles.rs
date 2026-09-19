@@ -27,12 +27,11 @@ use super::{ConfigChange, Event, LEASE_DURATION, RaftError};
 /// Why an append didn't finish, split by the one distinction a caller
 /// can't recover without: whether the entry reached the log.
 ///
-/// `append_log`'s callers have never needed it -- a single-key write
-/// that may or may not have landed can simply be re-sent, since rewriting
-/// the same value costs nothing but a second sequence number. A
-/// transaction cannot: replaying a read-modify-write that already applied
-/// applies it twice. So the two cases are told apart here rather than at
-/// each call site.
+/// A transaction's commit needs it: replaying a read-modify-write that
+/// already applied applies it twice, so "nothing was written" and "I can
+/// no longer tell you what happened to it" cannot be collapsed into one
+/// failure. Since a transaction is the only way anything is written,
+/// every real append comes back through here.
 #[derive(Debug)]
 pub enum AppendError {
     /// Nothing was appended. Safe to retry, here or on the new leader.
@@ -143,22 +142,22 @@ impl fmt::Debug for RoleHandle {
 pub struct LeaderHandle {
     pub(super) store: Store,
     pub(super) term: u64,
-    /// For `propose_config`, which -- unlike `append_log` -- can't just
+    /// For `propose_config`, which -- unlike `append_writes` -- can't just
     /// write to the log directly: the guards a membership change needs
     /// live on the event loop (see `leader::Leader::propose_config`).
     pub(super) event_tx: mpsc::Sender<Event>,
     /// How far `RaftLog::apply_committed` has actually brought `latest`
-    /// up to date -- *not* `commit_tx` directly. `append_log` needs to
+    /// up to date -- *not* `commit_tx` directly. `append_writes` needs to
     /// know `latest` itself reflects the entry, not just that it's been
     /// replicated to a majority: `commit_tx` and this are two independent
     /// `watch` subscriptions off of `spawn_storage_maintenance_task`, and
     /// `watch` gives no ordering guarantee between separate subscribers
     /// waking up on the same update. Waiting on `commit_tx` directly here
-    /// would let `append_log` return before the maintenance task has
+    /// would let `append_writes` return before the maintenance task has
     /// actually run `apply_committed` for this seq, so a caller that
     /// immediately reads afterward could see stale or missing data.
     pub(super) applied_rx: watch::Receiver<u64>,
-    /// Used to detect a step-down while waiting in `append_log`, so a
+    /// Used to detect a step-down while waiting in `append_writes`, so a
     /// caller doesn't hang forever on an entry that will never commit
     /// (e.g. because it gets truncated by a new leader instead).
     ///
@@ -177,13 +176,19 @@ pub struct LeaderHandle {
 }
 
 impl LeaderHandle {
-    /// Append a one-key entry and wait until it's committed (replicated
-    /// to a majority) *and* actually applied to `latest` before returning
-    /// -- see `applied_rx`'s doc on why waiting for commit alone isn't
-    /// enough.
+    /// Append a one-key entry, as `append_writes` does for many.
     ///
-    /// Flattens `AppendError`, because a single-key write that may or may
-    /// not have landed can just be re-sent; see that type's doc.
+    /// Test-only: every real write arrives as a transaction, so nothing
+    /// in the service reaches the log one key at a time. It survives
+    /// because most of what is worth testing about the append path --
+    /// that it waits for *applied* and not merely committed, that it
+    /// gives up when the term changes -- has nothing to do with how many
+    /// keys are in the entry, and one key is the smaller thing to say.
+    ///
+    /// Flattens `AppendError`: a test that has lost leadership mid-append
+    /// has already failed, so the in-doubt/not-appended distinction
+    /// `append_writes` draws has nothing to tell it.
+    #[cfg(test)]
     pub async fn append_log(&self, key: &[u8], value: Option<&[u8]>) -> Result<u64, RaftError> {
         self.append_writes(vec![Mutation::new(key.to_vec(), value.map(<[u8]>::to_vec))])
             .await
@@ -192,12 +197,13 @@ impl LeaderHandle {
 
     /// Append `writes` as *one* entry -- one seq, committed together and
     /// applied to `latest` together -- and wait until it has been. This
-    /// is how a transaction commits.
+    /// is how a transaction commits, which is to say it is how anything
+    /// is ever written.
     ///
     /// The return distinguishes "nothing was written" from "something was
     /// written and I can no longer tell you what happened to it", which
-    /// a transaction's caller has to know and a single-key write's does
-    /// not. See `AppendError`.
+    /// a transaction's caller has to know: the first is safe to replay
+    /// and the second is not. See `AppendError`.
     pub async fn append_writes(&self, writes: Vec<Mutation>) -> Result<u64, AppendError> {
         let term = self.term;
         let seq = self
@@ -277,6 +283,19 @@ impl LeaderHandle {
     /// the module doc.
     pub fn has_read_quorum(&self) -> bool {
         *self.read_quorum_rx.borrow()
+    }
+
+    /// What `await_caught_up` waits for, asked rather than waited on.
+    ///
+    /// For a caller that has something useful to do with "not yet" --
+    /// `grpc::KvService::get_config`, which reports leadership to a
+    /// client scanning for the leader and should answer either way
+    /// rather than hold the scan up. Anything that is about to *answer*
+    /// from `latest` wants `await_caught_up` instead: the wait usually
+    /// ends within a heartbeat of the election, and refusing would only
+    /// make the caller sleep and ask again.
+    pub fn is_caught_up(&self) -> bool {
+        *self.applied_rx.borrow() >= self.noop_seq
     }
 
     /// Waits until `latest` reflects every write that any previous
