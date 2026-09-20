@@ -167,6 +167,50 @@ pub(crate) fn append_entries_stream(req: AppendEntriesRequest) -> impl Stream<It
     tokio_stream::iter(std::iter::once(header).chain(body))
 }
 
+/// Reads the log and builds the next step for `next_index`, on the
+/// blocking pool.
+///
+/// Reports how long that took, which is worth knowing separately from
+/// the round trip that follows: it is the part of a replication round
+/// that is pure leader-side work, and so the part any scheme that
+/// overlaps rounds could hope to hide.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_step(
+    store: &Store,
+    next_index: u64,
+    leader_id: &str,
+    term: u64,
+    leader_commit: u64,
+    compact_seq: u64,
+    heartbeat_only: bool,
+) -> ReplicationStep {
+    let leader_id = leader_id.to_string();
+    let started = Instant::now();
+    let step = store
+        .expect("read the log for replication", move |log| {
+            build_replication_step_sync(
+                log,
+                next_index,
+                leader_id,
+                term,
+                leader_commit,
+                compact_seq,
+                heartbeat_only,
+            )
+        })
+        .await;
+    if let ReplicationStep::AppendEntries { req, .. } = &step
+        && !req.entries.is_empty()
+    {
+        tracing::info!(
+            entry_count = req.entries.len(),
+            prepare_ms = started.elapsed().as_millis(),
+            "prepared a batch"
+        );
+    }
+    step
+}
+
 /// Sends one `AppendEntries` to `peer` as a chunked stream, with the
 /// generous `APPEND_ENTRIES_RPC_TIMEOUT` covering the whole transfer
 /// (this one can legitimately take a while -- see that constant's doc).
@@ -181,11 +225,39 @@ async fn append_entries_to_peer(
     conns: &PeerConnections,
 ) -> Option<AppendEntriesResponse> {
     let mut client = conns.client(peer)?;
-    let attempt = client.append_entries(append_entries_stream(req));
-    match tokio::time::timeout(APPEND_ENTRIES_RPC_TIMEOUT, attempt).await {
+    // How big a batch this round actually carries, alongside what the
+    // round trip costs. A persistently low `entry_count` under load says
+    // entries are reaching this task one at a time, so every one of them
+    // pays a full round trip and a separate append on the far side.
+    let entry_count = req.entries.len();
+    let entry_bytes: usize = req.entries.iter().map(prost::Message::encoded_len).sum();
+    // Split deliberately: `append_entries_stream` protobuf-encodes the
+    // whole batch into one buffer up front, so this is CPU on the
+    // leader, once per peer. Pipelining would hide waiting, not this --
+    // knowing which half dominates is what says whether pipelining is
+    // worth building.
+    let encode_started = Instant::now();
+    let stream = append_entries_stream(req);
+    let encode_ms = encode_started.elapsed().as_millis();
+
+    let started = Instant::now();
+    let attempt = client.append_entries(stream);
+    let answer = match tokio::time::timeout(APPEND_ENTRIES_RPC_TIMEOUT, attempt).await {
         Ok(Ok(resp)) => Some(resp.into_inner()),
         _ => None,
+    };
+    if entry_count > 0 {
+        tracing::info!(
+            peer = %peer.id,
+            entry_count,
+            entry_bytes,
+            encode_ms,
+            rpc_ms = started.elapsed().as_millis(),
+            ok = answer.is_some(),
+            "replicated a batch"
+        );
     }
+    answer
 }
 
 /// Exports the current state (on the blocking pool -- fjall's export is
@@ -338,21 +410,18 @@ pub(super) fn spawn_replication(
             let compact_seq = *compact_rx.borrow_and_update();
             log_rx.borrow_and_update();
             let next_index_before = next_index;
-            let leader_id_for_step = leader_id.clone();
             let heartbeat_only = !confirmed;
-            let step = store
-                .expect("read the log for replication", move |log| {
-                    build_replication_step_sync(
-                        log,
-                        next_index,
-                        leader_id_for_step,
-                        term,
-                        leader_commit,
-                        compact_seq,
-                        heartbeat_only,
-                    )
-                })
-                .await;
+
+            let step = prepare_step(
+                &store,
+                next_index,
+                &leader_id,
+                term,
+                leader_commit,
+                compact_seq,
+                heartbeat_only,
+            )
+            .await;
 
             // Set when a round did all it could for now, so the wait
             // below can be skipped while a backlog is still draining.

@@ -1005,6 +1005,7 @@ fn spawn_storage_maintenance_task(
             let commit_seq = *commit_rx.borrow();
             let compact_seq = *compact_rx.borrow();
 
+            let apply_started = Instant::now();
             match store.run(move |log| log.apply_committed(commit_seq)).await {
                 Ok(()) => {
                     // Only ever moves forward -- `commit_seq` is itself
@@ -1030,9 +1031,25 @@ fn spawn_storage_maintenance_task(
                 }
             }
 
+            let apply_ms = apply_started.elapsed().as_millis();
+
+            let compact_started = Instant::now();
             if let Err(e) = store.run(move |log| log.compact(compact_seq)).await {
                 warn!("compact to seq {compact_seq} failed: {e}");
             }
+
+            // Both halves of the cycle, because a commit waiting to be
+            // applied is queued behind whatever the previous cycle was
+            // still doing -- including its compaction, which nothing
+            // else waits for. A large `compact_ms` next to a small
+            // `apply_ms` is what "compaction is delaying commits" would
+            // actually look like.
+            info!(
+                applied_to = commit_seq,
+                apply_ms,
+                compact_ms = compact_started.elapsed().as_millis(),
+                "storage maintenance cycle"
+            );
         }
     })
 }

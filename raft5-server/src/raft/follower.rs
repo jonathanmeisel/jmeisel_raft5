@@ -399,6 +399,12 @@ impl Follower {
         // request has no further use for them. `req` keeps the scalars
         // the caller still reads below.
         let mut entries = std::mem::take(&mut req.entries);
+        // What this batch costs to take, and how much of a batch it
+        // actually is -- the follower's share of the round trip the
+        // leader is blocked on, measured where it is actually paid.
+        let entry_count = entries.len();
+        let entry_bytes: usize = entries.iter().map(prost::Message::encoded_len).sum();
+        let started = Instant::now();
         let outcome = self
             .common
             .store
@@ -406,6 +412,14 @@ impl Follower {
                 apply_append_entries_sync(log, prev_log_index, prev_log_term, &mut entries)
             })
             .await;
+        if entry_count > 0 {
+            info!(
+                entry_count,
+                entry_bytes,
+                append_ms = started.elapsed().as_millis(),
+                "follower appended a batch"
+            );
+        }
 
         if outcome.success {
             self.common
