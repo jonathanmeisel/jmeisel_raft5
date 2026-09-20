@@ -33,6 +33,7 @@ fn test_leader(noop_seq: u64) -> TestLeader {
         role_rx,
         read_quorum_rx,
         noop_seq,
+        log_tx: Arc::new(watch::channel(0).0),
     };
     // Published over the very channel it holds a receiver for -- the
     // same self-reference a real leader has (see `RoleHandle::Stopped`

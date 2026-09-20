@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use log::warn;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Channel;
 
@@ -60,7 +59,10 @@ impl TestNode {
         // tests run on their own threads by default), and `init` panics
         // on a second call. Ignoring the error is fine either way -- the
         // first call to succeed is the one whose filter/format wins.
-        let _ = env_logger::try_init();
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_test_writer()
+            .try_init();
 
         let mut node = Self {
             id: id.to_string(),
@@ -107,7 +109,7 @@ impl TestNode {
                 cancel_clone,
             );
             if let Err(e) = node.await {
-                warn!("node {id} exited with an error: {e}");
+                tracing::warn!("node {id} exited with an error: {e}");
             }
         });
         self.running = Some(RunningNode { cancel, task });

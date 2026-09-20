@@ -3,7 +3,7 @@
 //! election if it hasn't heard from a leader in time. See the parent
 //! module's doc for how roles fit together generally.
 
-use log::info;
+use tracing::info;
 
 use super::*;
 use crate::storage::StorageError;

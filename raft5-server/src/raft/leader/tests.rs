@@ -1101,3 +1101,120 @@ async fn leader_sends_a_real_snapshot_to_a_peer_that_has_fallen_behind_compactio
     cleanup(&path_a);
     cleanup(&path_b);
 }
+
+/// Replication is woken by the log and the commit watermark rather than
+/// polled on a `HEARTBEAT` timer: an entry appended at an arbitrary moment
+/// reaches the peer, and the resulting commit index reaches it too,
+/// without waiting out a tick. On a poll-based loop each of those costs up
+/// to `HEARTBEAT`, so 20 sequential writes could not finish this fast.
+#[tokio::test]
+async fn replication_is_woken_by_new_entries_rather_than_polled() {
+    use crate::grpc::RaftPeerService;
+    use crate::pb::raft5::raft::raft_peer_server::RaftPeerServer;
+
+    let addr_a = free_local_addr();
+    let addr_b = free_local_addr();
+
+    let (log_a, path_a) = open_temp_log();
+    let (log_b, path_b) = open_temp_log();
+
+    let NodeHandles {
+        common: common_a,
+        role_rx: mut role_rx_a,
+        peer_handle: peer_handle_a,
+        commit_rx: mut commit_rx_a,
+        ..
+    } = Common::new_seeded(
+        "node-a".to_string(),
+        vec![PeerInfo {
+            id: "node-b".to_string(),
+            address: format!("http://{addr_b}"),
+        }],
+        Arc::clone(&log_a),
+        CancellationToken::new(),
+    )
+    .unwrap();
+    let NodeHandles {
+        common: common_b,
+        role_rx: mut role_rx_b,
+        peer_handle: peer_handle_b,
+        commit_rx: mut commit_rx_b,
+        ..
+    } = Common::new_seeded(
+        "node-b".to_string(),
+        vec![PeerInfo {
+            id: "node-a".to_string(),
+            address: format!("http://{addr_a}"),
+        }],
+        Arc::clone(&log_b),
+        CancellationToken::new(),
+    )
+    .unwrap();
+
+    tokio::spawn(run(common_a));
+    tokio::spawn(run(common_b));
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(RaftPeerServer::new(RaftPeerService::new(peer_handle_a)))
+            .serve(addr_a),
+    );
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(RaftPeerServer::new(RaftPeerService::new(peer_handle_b)))
+            .serve(addr_b),
+    );
+
+    tokio::select! {
+        _ = wait_for_role(&mut role_rx_a, |r| matches!(r, RoleHandle::Leader(_))) => {}
+        _ = wait_for_role(&mut role_rx_b, |r| matches!(r, RoleHandle::Leader(_))) => {}
+    }
+    let leader = if matches!(&*role_rx_a.borrow(), RoleHandle::Leader(_)) {
+        expect_leader_handle(&role_rx_a.borrow())
+    } else {
+        expect_leader_handle(&role_rx_b.borrow())
+    };
+    // Past the election's settling-in: the no-op has committed everywhere
+    // that matters, so what is measured below is steady state.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !leader.has_read_quorum() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("leader should gain read quorum");
+
+    const WRITES: u32 = 20;
+    let started = Instant::now();
+    let mut last_seq = 0;
+    for i in 0..WRITES {
+        // Lands at a different phase of any timer each time.
+        tokio::time::sleep(Duration::from_millis(u64::from(i % 7) * 3)).await;
+        last_seq = leader
+            .append_log(format!("k{i}").as_bytes(), Some(b"v"))
+            .await
+            .expect("append_log");
+    }
+    let sleeping: u64 = (0..WRITES).map(|i| u64::from(i % 7) * 3).sum();
+    let in_writes = started.elapsed() - Duration::from_millis(sleeping);
+    assert!(
+        in_writes < HEARTBEAT * WRITES / 4,
+        "{WRITES} writes took {in_writes:?} of commit wait; a loop that polls every \
+         {HEARTBEAT:?} would average at least {:?} per write",
+        HEARTBEAT / 2
+    );
+
+    // Both nodes learn the commit index promptly, the follower included --
+    // it only hears it via `leader_commit` on an `AppendEntries`.
+    for rx in [&mut commit_rx_a, &mut commit_rx_b] {
+        tokio::time::timeout(HEARTBEAT / 2, async {
+            while *rx.borrow_and_update() < last_seq {
+                rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the commit index should reach every node without waiting for a tick");
+    }
+
+    cleanup(&path_a);
+    cleanup(&path_b);
+}

@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::{mpsc, oneshot, watch};
+use tracing::instrument;
 
 use crate::pb::raft5::cluster::ClusterConfig;
 use crate::pb::raft5::raft::{
@@ -173,6 +174,9 @@ pub struct LeaderHandle {
     /// `applied_rx` says whether `latest` is complete -- see
     /// `await_caught_up`.
     pub(super) noop_seq: u64,
+    /// Told about every entry `append_writes` puts in the log, since that
+    /// path never passes through the event loop -- see `Common::log_tx`.
+    pub(super) log_tx: Arc<watch::Sender<u64>>,
 }
 
 impl LeaderHandle {
@@ -204,19 +208,45 @@ impl LeaderHandle {
     /// written and I can no longer tell you what happened to it", which
     /// a transaction's caller has to know: the first is safe to replay
     /// and the second is not. See `AppendError`.
+    ///
+    /// Carries two timings as span fields: `log_append_ms` (the on-disk
+    /// append) and `commit_wait_ms` (replication plus applying to
+    /// `latest`, combined -- see `await_applied`). Both are computed by
+    /// hand rather than left to `tracing`'s own busy/idle span
+    /// accounting, because both suspend across a boundary -- a
+    /// `spawn_blocking` for the append, a `watch` channel for the wait --
+    /// where the real work happens while this task's span reads as
+    /// idle. Busy/idle timing would report close to zero for exactly the
+    /// durations these fields exist to show.
+    #[instrument(skip(self, writes), fields(log_append_ms, commit_wait_ms))]
     pub async fn append_writes(&self, writes: Vec<Mutation>) -> Result<u64, AppendError> {
         let term = self.term;
+
+        let append_start = Instant::now();
         let seq = self
             .store
             .run(move |log| log.append_writes(term, writes))
             .await
             .map_err(|e| AppendError::NotAppended(RaftError::Storage(e)))?;
+        super::notify_appended(&self.log_tx, seq);
+        let log_append_ms = append_start.elapsed().as_millis();
+        tracing::Span::current().record("log_append_ms", log_append_ms);
 
         // Past this line the entry exists in the log, so every remaining
         // way out is in doubt rather than a clean failure.
-        self.await_applied(seq)
-            .await
-            .map_err(|source| AppendError::InDoubt { seq, source })
+        let wait_start = Instant::now();
+        let result = self.await_applied(seq).await;
+        let commit_wait_ms = wait_start.elapsed().as_millis();
+        tracing::Span::current().record("commit_wait_ms", commit_wait_ms);
+
+        // `#[instrument]` alone never prints anything -- `record` only
+        // attaches these to the span for a consumer that reads span
+        // fields directly (an OTLP exporter, say). An event is what
+        // makes them show up in this crate's own text log, nested under
+        // this span exactly where they belong.
+        tracing::info!(log_append_ms, commit_wait_ms, "entry committed");
+
+        result.map_err(|source| AppendError::InDoubt { seq, source })
     }
 
     /// Propose a single-server membership change and wait until it

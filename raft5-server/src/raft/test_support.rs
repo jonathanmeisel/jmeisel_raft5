@@ -8,7 +8,10 @@ pub(crate) fn open_temp_log() -> (Arc<RaftLog>, std::path::PathBuf) {
     // through here, all in the same process, and `init` panics on a
     // second call. Ignoring the error is fine either way -- the first
     // call to succeed is the one whose filter/format wins.
-    let _ = env_logger::try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
 
     // A nanosecond timestamp alone isn't a reliable unique suffix under
     // parallel test execution -- two tests starting at nearly the same

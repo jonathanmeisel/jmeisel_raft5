@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
-use log::info;
+use tracing::info;
 
 use raft5_server::serve;
 use tokio_util::sync::CancellationToken;
@@ -55,7 +55,16 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), raft5_server::Error> {
-    env_logger::init();
+    // `tower_http` gets its own directive: its RPC spans are the whole
+    // point of this crate's tracing setup, but they log under its own
+    // target rather than `raft5_server`, so a bare `raft5_server=info`
+    // here would silently drop every one of them.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "raft5_server=info,tower_http=info".into()),
+        )
+        .init();
     let args = Args::parse();
     let cancel = CancellationToken::new();
     let node = serve(

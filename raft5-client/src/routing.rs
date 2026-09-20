@@ -19,6 +19,7 @@ use tonic::transport::{Channel, Endpoint};
 use raft5_shared::raft5::client::kv_client::KvClient;
 use raft5_shared::raft5::client::GetConfigRequest;
 use raft5_shared::raft5::cluster::ClusterMember;
+use raft5_shared::MAX_KV_MESSAGE_BYTES;
 
 use crate::Error;
 
@@ -53,8 +54,13 @@ impl Node {
     /// Never blocks: `connect_lazy` performs no I/O, it only describes
     /// how to reach the node. The channel dials on first use and re-dials
     /// by itself after a failure.
+    ///
+    /// The decoding limit is raised because a read can return a value as
+    /// large as a whole transaction; tonic's 4 MiB default would refuse
+    /// it. Encoding is unlimited by default, so sending needs nothing.
     pub(crate) fn connect(&self) -> Kv {
         KvClient::new(self.endpoint.clone().connect_lazy())
+            .max_decoding_message_size(MAX_KV_MESSAGE_BYTES)
     }
 }
 

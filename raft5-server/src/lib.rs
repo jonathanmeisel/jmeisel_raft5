@@ -27,9 +27,10 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
-use log::info;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer};
+use tracing::{info, Level};
 
 use grpc::{KvService, RaftPeerService};
 use pb::raft5::client::kv_server::KvServer;
@@ -145,7 +146,7 @@ pub async fn serve(
     // transport, where the transaction size limit has no say and no way
     // to explain itself.
     let kv_server = KvServer::new(kv_service)
-        .max_decoding_message_size(txn::MAX_TRANSACTION_BYTES + MESSAGE_FRAMING_SLACK);
+        .max_decoding_message_size(raft5_shared::MAX_KV_MESSAGE_BYTES);
     let raft_peer_server = RaftPeerServer::new(RaftPeerService::new(peer_handle));
 
     if uninitialized {
@@ -169,6 +170,7 @@ pub async fn serve(
     // a half-reachable one behind.
     let client_server = async {
         let result = Server::builder()
+            .layer(trace_layer())
             .add_service(kv_server)
             .serve_with_shutdown(client_addr, cancel.cancelled())
             .await;
@@ -177,6 +179,7 @@ pub async fn serve(
     };
     let peer_server = async {
         let result = Server::builder()
+            .layer(trace_layer())
             // Matches the peer clients (see `raft::PeerConnections`):
             // without it, h2's default 65535-byte window caps
             // replication throughput at `window / round trip` however
@@ -208,11 +211,23 @@ pub async fn serve(
     Ok(())
 }
 
-/// Room left over a payload limit for the protobuf framing around it --
-/// field tags, length prefixes, and the rest of the message's own
-/// fields. Generous: being a little over is free, and being under means
-/// refusing a request the payload limit says is fine.
-const MESSAGE_FRAMING_SLACK: usize = 1024 * 1024;
+/// One span per RPC, on both the client and peer services, recording its
+/// method, latency, and outcome. Success/failure is read from the
+/// `grpc-status` trailer rather than the HTTP status (which for gRPC is
+/// almost always 200 regardless of the RPC's outcome), so an application
+/// error here is a real error, not a false "ok".
+///
+/// Logged at `INFO` -- and failures at `WARN`, so they stand out from
+/// ordinary traffic -- to match the level the rest of this crate's
+/// logging defaults to (see `main`'s `EnvFilter`).
+fn trace_layer()
+-> TraceLayer<tower_http::classify::SharedClassifier<tower_http::classify::GrpcErrorsAsFailures>>
+{
+    TraceLayer::new_for_grpc()
+        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+        .on_response(DefaultOnResponse::new().level(Level::INFO))
+        .on_failure(DefaultOnFailure::new().level(Level::WARN))
+}
 
 /// How many peer RPCs may be in flight against this node at once.
 ///

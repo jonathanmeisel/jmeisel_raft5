@@ -5,7 +5,7 @@
 //! `CampaignKind`, rather than maintaining two near-identical copies. See
 //! the parent module's doc for how pre-vote fits into the bigger picture.
 
-use log::info;
+use tracing::info;
 
 use super::*;
 

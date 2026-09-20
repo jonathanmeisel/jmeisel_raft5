@@ -15,7 +15,7 @@ mod lease;
 pub(super) mod replication;
 
 use lease::spawn_lease_prober;
-use log::info;
+use tracing::info;
 use replication::spawn_replication;
 
 /// Periodically pushes `Event::LeaderTick` -- see the variant's doc for why
@@ -107,6 +107,7 @@ impl Leader {
                 .expect("append the leader no-op", move |log| log.append_noop(term))
                 .await
         };
+        common.notify_appended(noop_seq);
 
         let applied_rx = common.applied_tx.subscribe();
         let role_rx = common.role_tx.subscribe();
@@ -119,6 +120,7 @@ impl Leader {
             role_rx,
             read_quorum_rx,
             noop_seq,
+            log_tx: Arc::clone(&common.log_tx),
         }));
 
         let tick_timer = spawn_leader_tick(common.cancel_token(), common.event_tx.clone());
@@ -322,6 +324,7 @@ impl Leader {
             .run(move |log| log.append_config(term, &bytes))
             .await
             .map_err(RaftError::Storage)?;
+        self.common.notify_appended(seq);
 
         self.pending_config_seq = Some(seq);
         // In force as of now -- so start replicating to (or stop
@@ -444,6 +447,7 @@ impl Leader {
                         self.common.current_term,
                         self.common.store.clone(),
                         Arc::clone(&self.common.peer_conns),
+                        self.common.log_tx.subscribe(),
                         self.common.commit_tx.subscribe(),
                         self.common.compact_tx.subscribe(),
                         self.common.event_tx.clone(),

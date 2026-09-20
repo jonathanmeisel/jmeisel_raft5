@@ -170,7 +170,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use log::{info, warn};
+use tracing::{info, warn};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -225,6 +225,13 @@ use task::{send_event, until_cancelled};
 /// hardcoded for now.
 pub(crate) const HEARTBEAT_MS: u64 = 50;
 const HEARTBEAT: Duration = Duration::from_millis(HEARTBEAT_MS);
+
+/// How long a caught-up replication task waits with nothing to do before
+/// sending its peer an empty `AppendEntries` anyway. Not a liveness
+/// heartbeat -- leases do that -- but a safety net: replication otherwise
+/// only runs when the log or a watermark changes, so a follower that
+/// silently restarted would go unnoticed until the next write.
+const IDLE_REPLICATION_INTERVAL: Duration = Duration::from_millis(HEARTBEAT_MS * 10);
 
 /// How long a granted lease (see `RaftPeerHandle::get_lease`) stays valid,
 /// on both sides: how long a follower keeps refusing other vote requests
@@ -413,6 +420,18 @@ fn spawn_election_timer(
     })
 }
 
+/// See `Common::notify_appended`. A free function so `LeaderHandle` can
+/// call it with just the sender.
+fn notify_appended(log_tx: &watch::Sender<u64>, seq: u64) {
+    log_tx.send_if_modified(|latest| {
+        let advanced = seq > *latest;
+        if advanced {
+            *latest = seq;
+        }
+        advanced
+    });
+}
+
 /// This node's own `(last_log_index, last_log_term)`, needed both to fill
 /// in a `RequestVoteRequest` we're sending and to evaluate the §5.4.1
 /// up-to-date check on one we've received. `(0, 0)` for an empty log,
@@ -584,6 +603,13 @@ pub struct Common {
     /// `Common` rather than inside `Leader`.
     commit_tx: watch::Sender<u64>,
 
+    /// Highest seq this leader has appended to its own log. Replication
+    /// tasks wait on it so a new entry goes out immediately instead of on
+    /// the next timer tick. Only the leader-side append sites publish
+    /// here; `Arc`-wrapped so `LeaderHandle` (which appends client writes
+    /// without going through the event loop) can publish too.
+    log_tx: Arc<watch::Sender<u64>>,
+
     /// Highest seq known replicated to *every* peer, not just a majority --
     /// safe to compact below regardless of role: a leader computes it from
     /// `Leader::peer_match_index`, a follower just adopts whatever value
@@ -682,6 +708,8 @@ impl Common {
 
         let (commit_tx, commit_rx) = watch::channel(0);
         let (compact_tx, compact_rx) = watch::channel(0);
+        let (log_tx, _log_rx) = watch::channel(0);
+        let log_tx = Arc::new(log_tx);
         // The initial receiver is discarded -- `Common` hands out fresh
         // ones later via `applied_tx.subscribe()` (once per `Leader::new`),
         // which works regardless of whether any earlier receiver is still
@@ -720,6 +748,7 @@ impl Common {
             lease_expires_at_tx,
             lease_expires_at_rx,
             commit_tx,
+            log_tx,
             compact_tx,
             applied_tx,
             event_rx,
@@ -734,6 +763,13 @@ impl Common {
             commit_rx,
             compact_rx,
         })
+    }
+
+    /// Publishes that entries up to `seq` now exist in this leader's log,
+    /// waking replication. Keeps the max: concurrent client appends can
+    /// finish in either order.
+    fn notify_appended(&self, seq: u64) {
+        notify_appended(&self.log_tx, seq);
     }
 
     /// Advances `commit_tx` to `new_value` if that's higher than what's

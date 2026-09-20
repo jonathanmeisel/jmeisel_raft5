@@ -96,7 +96,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use fjall::{Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch};
+use fjall::{Database, Keyspace, KeyspaceCreateOptions, KvSeparationOptions, OwnedWriteBatch};
 use serde::{Deserialize, Serialize};
 
 mod codec;
@@ -287,10 +287,18 @@ impl RaftLog {
         // in a row reach fjall's write-halt loop, which sleeps the
         // calling thread -- here, a blocking-pool worker the event loop
         // is awaiting. Raising `MAX_ENTRY_BYTES` past this means sizing
-        // these keyspaces deliberately (or turning on KV separation,
-        // which is the feature actually meant for large values).
-        let log = db.keyspace(CF_LOG, KeyspaceCreateOptions::default)?;
-        let latest = db.keyspace(CF_LATEST, KeyspaceCreateOptions::default)?;
+        // these keyspaces deliberately.
+        //
+        // `log` and `latest` hold the large values, so they use KV
+        // separation: values past the threshold live in blob files
+        // instead of being rewritten by every compaction. `meta` holds
+        // a handful of tiny values and has nothing to separate.
+        let separated = || {
+            KeyspaceCreateOptions::default()
+                .with_kv_separation(Some(KvSeparationOptions::default()))
+        };
+        let log = db.keyspace(CF_LOG, separated)?;
+        let latest = db.keyspace(CF_LATEST, separated)?;
         let meta = db.keyspace(CF_META, KeyspaceCreateOptions::default)?;
         let next_seq = Self::recover_next_seq(&log, &meta)?;
 

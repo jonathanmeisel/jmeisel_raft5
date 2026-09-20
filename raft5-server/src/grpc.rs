@@ -42,6 +42,7 @@ use prost::Message;
 use raft5_shared::raft5::client::kv_client::KvClient;
 use tonic::transport::Endpoint;
 use tonic::{Request, Response, Status, Streaming};
+use tracing::Instrument;
 
 use crate::pb::raft5::client::kv_server::Kv;
 use crate::pb::raft5::client::{
@@ -472,10 +473,18 @@ impl KvService {
             .map(|(key, value)| Mutation { key, value })
             .collect();
 
-        tokio::spawn(async move {
-            let _guard = guard;
-            leader.append_writes(mutations).await
-        })
+        // `.instrument(..)`: a span doesn't cross `tokio::spawn` on its
+        // own any more than it crosses `spawn_blocking` -- without this,
+        // `append_writes`'s span would show up as a disconnected root
+        // instead of nested under this RPC's.
+        let span = tracing::Span::current();
+        tokio::spawn(
+            async move {
+                let _guard = guard;
+                leader.append_writes(mutations).await
+            }
+            .instrument(span),
+        )
         .await
         .map_err(|e| TxnError::Internal(Status::internal(format!("the commit task failed: {e}"))))?
         .map_err(Into::into)
@@ -977,7 +986,7 @@ impl RaftPeer for RaftPeerService {
                 Ok(Response::new(resp))
             }
             Reassembled::Refused(why) => {
-                log::warn!("refused an append_entries stream: {why}");
+                tracing::warn!("refused an append_entries stream: {why}");
                 Ok(Response::new(AppendEntriesResponse {
                     // Read again rather than reusing `current_term`: the
                     // event loop may have moved on while the body was

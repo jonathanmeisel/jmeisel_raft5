@@ -7,7 +7,7 @@
 //! aggregated on the event loop like any other inbound message.
 
 use bytes::Bytes;
-use log::error;
+use tracing::error;
 use prost::Message;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
@@ -283,14 +283,20 @@ async fn send_snapshot_to_peer(
     }
 }
 
-/// Repeatedly sends `AppendEntries` to `peer` (a heartbeat if there's
-/// nothing new to send), tracking `next_index` locally: advances past
-/// whatever the peer just accepted, or backs it up using the
-/// follower's §5.3 conflict hints on rejection. Every response is
-/// forwarded as `Event::AppendEntriesResponse` so match_index
-/// aggregation and term step-downs happen on the event loop, not in
-/// this task -- a connect/RPC failure or timeout just gets silently
-/// retried next tick, same policy as `Candidate`'s vote requests.
+/// Sends `AppendEntries` to `peer` whenever there is something to tell
+/// it, tracking `next_index` locally: advances past whatever the peer
+/// just accepted, or backs it up using the follower's §5.3 conflict
+/// hints on rejection. Every response is forwarded as
+/// `Event::AppendEntriesResponse` so match_index aggregation and term
+/// step-downs happen on the event loop, not in this task.
+///
+/// "Something to tell it" is a new log entry (`log_rx`) or a moved
+/// commit/compact watermark (`commit_rx`/`compact_rx`, which ride along
+/// on `AppendEntries`) -- the task sleeps until one of them changes. It
+/// is deliberately *not* a heartbeat: leader liveness is the lease
+/// prober's job. A connect/RPC failure or timeout is retried every
+/// `HEARTBEAT`, and a caught-up peer is still contacted every
+/// `IDLE_REPLICATION_INTERVAL` so a silently restarted one is noticed.
 // Each parameter is an independent piece of context this task owns for
 // its whole lifetime (or a channel it reads/writes) -- there's no
 // natural subgroup to bundle into a struct that wouldn't just move the
@@ -303,8 +309,9 @@ pub(super) fn spawn_replication(
     term: u64,
     store: Store,
     conns: Arc<PeerConnections>,
-    commit_rx: watch::Receiver<u64>,
-    compact_rx: watch::Receiver<u64>,
+    mut log_rx: watch::Receiver<u64>,
+    mut commit_rx: watch::Receiver<u64>,
+    mut compact_rx: watch::Receiver<u64>,
     event_tx: mpsc::Sender<Event>,
 ) -> Task {
     Task::spawn(cancel, move |cancel| async move {
@@ -324,8 +331,13 @@ pub(super) fn spawn_replication(
         let mut failing_since = Instant::now();
 
         while !cancel.is_cancelled() {
-            let leader_commit = *commit_rx.borrow();
-            let compact_seq = *compact_rx.borrow();
+            // Marked seen *before* the log is read, so a change landing
+            // while this round is in flight wakes the wait below rather
+            // than being lost.
+            let leader_commit = *commit_rx.borrow_and_update();
+            let compact_seq = *compact_rx.borrow_and_update();
+            log_rx.borrow_and_update();
+            let next_index_before = next_index;
             let leader_id_for_step = leader_id.clone();
             let heartbeat_only = !confirmed;
             let step = store
@@ -342,9 +354,13 @@ pub(super) fn spawn_replication(
                 })
                 .await;
 
-            // Set when a round did all it could for now, so the sleep
+            // Set when a round did all it could for now, so the wait
             // below can be skipped while a backlog is still draining.
             let mut more_to_send = false;
+            // Set when the peer couldn't be reached or made no progress,
+            // so the wait below is a short retry timer rather than a wait
+            // for something new -- nothing new is coming to fix this.
+            let mut retry_soon = false;
 
             match step {
                 ReplicationStep::AppendEntries { req, more_to_send: more } => {
@@ -368,6 +384,7 @@ pub(super) fn spawn_replication(
                             consecutive_failures = 0;
                         }
                         None => {
+                            retry_soon = true;
                             if consecutive_failures == 0 {
                                 failing_since = Instant::now();
                             }
@@ -394,6 +411,16 @@ pub(super) fn spawn_replication(
                             // as-is, just occasionally one extra round
                             // trip than strictly necessary.
                             next_index = conflict_index.max(1);
+                        }
+                        // A rejection that moved `next_index` is worth
+                        // retrying at once; one that didn't would just
+                        // be rejected again.
+                        if !resp.success {
+                            if next_index != next_index_before {
+                                more_to_send = true;
+                            } else {
+                                retry_soon = true;
+                            }
                         }
                         // A term bump is handled on the event loop
                         // (which steps this whole role down, stopping
@@ -428,6 +455,7 @@ pub(super) fn spawn_replication(
                         next_index = last_included_seq + 1;
                         confirmed = true;
                         consecutive_failures = 0;
+                        more_to_send = true;
                         if !send_event(
                             &cancel,
                             &event_tx,
@@ -441,6 +469,8 @@ pub(super) fn spawn_replication(
                         {
                             return;
                         }
+                    } else {
+                        retry_soon = true;
                     }
                 }
             }
@@ -454,10 +484,21 @@ pub(super) fn spawn_replication(
             if more_to_send {
                 continue;
             }
-            if until_cancelled(&cancel, tokio::time::sleep(HEARTBEAT))
-                .await
-                .is_none()
-            {
+            let woke = until_cancelled(&cancel, async {
+                if retry_soon {
+                    tokio::time::sleep(HEARTBEAT).await;
+                    return true;
+                }
+                // A closed channel means the node is shutting down.
+                tokio::select! {
+                    r = log_rx.changed() => r.is_ok(),
+                    r = commit_rx.changed() => r.is_ok(),
+                    r = compact_rx.changed() => r.is_ok(),
+                    _ = tokio::time::sleep(IDLE_REPLICATION_INTERVAL) => true,
+                }
+            })
+            .await;
+            if woke != Some(true) {
                 return;
             }
         }

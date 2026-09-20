@@ -108,7 +108,7 @@ pub const MAX_OPEN_TRANSACTIONS: usize = 1024;
 /// overhead so a great many tiny ones still add up, and a second limit
 /// would only be another number to explain without bounding anything
 /// this one doesn't.
-pub const MAX_TRANSACTION_BYTES: usize = 10 * 1024 * 1024;
+pub const MAX_TRANSACTION_BYTES: usize = raft5_shared::MAX_TRANSACTION_BYTES;
 
 /// How much *every* open transaction on this node may buffer between
 /// them.
