@@ -32,6 +32,10 @@ service Kv {
   // Cluster membership changes, one server at a time (single-server
   // change, not joint consensus -- simpler to reason about; joint
   // consensus for atomic multi-member changes can come later if needed).
+  //
+  // Administrators only, on a cluster that keeps accounts: these are the
+  // most destructive calls this service has, and removing the wrong
+  // server can cost a cluster its quorum.
   rpc AddServer(AddServerRequest) returns (ConfigChangeResponse);
   rpc RemoveServer(RemoveServerRequest) returns (ConfigChangeResponse);
 
@@ -73,6 +77,35 @@ service Kv {
   rpc CreateTransaction(CreateTransactionRequest) returns (CreateTransactionResponse);
   rpc CommitTransaction(CommitTransactionRequest) returns (CommitTransactionResponse);
   rpc DropTransaction(DropTransactionRequest) returns (DropTransactionResponse);
+
+  // Authentication.
+  //
+  // Opt-in: a node started without a signing secret answers all three of
+  // these with AUTH_DISABLED and demands a token from nobody, which is
+  // the cluster exactly as it behaved before any of this existed.
+  //
+  // When it is on, every other RPC on this service needs a token. The
+  // two exceptions are below and above: Login, which is what issues one,
+  // and GetConfig, because a client has to be able to find the leader
+  // before it has anywhere to send a login.
+
+  // Exchange a username and password for a token.
+  //
+  // Answered only by the leader. The account is read linearizably, so a
+  // user deleted a moment ago cannot still log in by reaching a follower
+  // that hasn't heard about it -- the failure worth preventing, since a
+  // token handed out here is good until it expires.
+  //
+  // `password` is plaintext on the wire. Until this API is behind TLS,
+  // anyone who can see the traffic can see it.
+  rpc Login(LoginRequest) returns (LoginResponse);
+
+  // Add and remove accounts. Admin only, and the caller's admin rights
+  // are re-read from the store on each call rather than taken from the
+  // token -- a right baked into a token could not be taken back before
+  // that token expired.
+  rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
+  rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse);
 }
 
 // Carried in every response so a client can find the real leader without a
@@ -241,6 +274,10 @@ message ConfigChangeResponse {
   oneof result {
     bool ok = 1;
     RaftError error = 2;
+    // Membership changes are administrators-only, so this carries the
+    // same NOT_ADMIN a CreateUser would -- one error type for "you may
+    // not do this", whichever call it was.
+    AuthError auth_error = 3;
   }
 }
 
@@ -309,5 +346,82 @@ message DropTransactionResponse {
   oneof result {
     bool ok = 1;
     RaftError error = 2;
+  }
+}
+
+// Why an authenticated request was not served -- as distinct from the
+// token itself being bad, which never reaches these RPCs.
+//
+// Carried in-band beside RaftError rather than as a gRPC status, for the
+// same reason a lock conflict is: these are answers, not failures to
+// answer, and a client that retried them would spend its whole deadline
+// arriving back here. An UNAUTHENTICATED status means one specific thing
+// instead -- the token was missing, forged, or expired -- and is raised
+// by the node's auth layer before any handler runs.
+message AuthError {
+  enum Kind {
+    UNSPECIFIED = 0;
+    // The username or the password was wrong. Which of the two is
+    // deliberately not said: naming the username as the valid half is
+    // handing over half a credential.
+    BAD_CREDENTIALS = 1;
+    ALREADY_EXISTS = 2;
+    NO_SUCH_USER = 3;
+    // The caller is who they say they are, and is not an admin.
+    NOT_ADMIN = 4;
+    // This node was started without a signing secret, so it has no
+    // accounts to consult and nothing to sign a token with.
+    AUTH_DISABLED = 5;
+  }
+  Kind kind = 1;
+  string detail = 2;
+}
+
+message LoginRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message LoginOk {
+  string token = 1;
+  // When the token stops being accepted, in seconds since the epoch.
+  // Carried explicitly so that a client never has to parse a JWT to know
+  // when to log in again.
+  int64 expires_unix = 2;
+}
+
+message LoginResponse {
+  oneof result {
+    LoginOk ok = 1;
+    RaftError error = 2;
+    AuthError auth_error = 3;
+  }
+}
+
+message CreateUserRequest {
+  string username = 1;
+  string password = 2;
+  // Whether this account may itself add and remove accounts.
+  bool is_admin = 3;
+}
+
+message CreateUserResponse {
+  oneof result {
+    // The sequence number the account record was written at.
+    uint64 seq = 1;
+    RaftError error = 2;
+    AuthError auth_error = 3;
+  }
+}
+
+message DeleteUserRequest {
+  string username = 1;
+}
+
+message DeleteUserResponse {
+  oneof result {
+    uint64 seq = 1;
+    RaftError error = 2;
+    AuthError auth_error = 3;
   }
 }

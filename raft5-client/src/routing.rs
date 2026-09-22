@@ -10,10 +10,13 @@
 //! dial, and the connection to whoever it last saw leading.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use log::{debug, warn};
+use tonic::Status;
+use tonic::service::Interceptor;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, Endpoint};
 
 use raft5_shared::raft5::client::kv_client::KvClient;
@@ -23,7 +26,44 @@ use raft5_shared::MAX_KV_MESSAGE_BYTES;
 
 use crate::Error;
 
-pub(crate) type Kv = KvClient<Channel>;
+pub(crate) type Kv = KvClient<InterceptedService<Channel, BearerToken>>;
+
+/// The session token, shared by every connection this client holds.
+///
+/// One handle behind an `Arc`, cloned into each `Node`, so that logging
+/// in reaches connections built *before* the login as well as after --
+/// the cached leader connection above all, which deliberately outlives
+/// individual calls. Storing the token on the `Client` instead would
+/// leave that cached connection sending the old one, or none.
+#[derive(Clone, Default)]
+pub(crate) struct BearerToken(Arc<Mutex<Option<String>>>);
+
+impl BearerToken {
+    pub(crate) fn set(&self, token: Option<String>) {
+        *self.0.lock().unwrap() = token;
+    }
+
+    pub(crate) fn is_set(&self) -> bool {
+        self.0.lock().unwrap().is_some()
+    }
+}
+
+impl Interceptor for BearerToken {
+    fn call(&mut self, mut request: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
+        // No token is not an error here. A client that has not logged in
+        // is perfectly able to call `GetConfig` and `Login`, and against
+        // a cluster with no secret it can call everything -- so what to
+        // do about a missing token is the server's to decide, not this.
+        let Some(token) = self.0.lock().unwrap().clone() else {
+            return Ok(request);
+        };
+        let value = format!("Bearer {token}")
+            .parse()
+            .map_err(|_| Status::invalid_argument("the session token is not a usable header"))?;
+        request.metadata_mut().insert("authorization", value);
+        Ok(request)
+    }
+}
 
 /// How long a single discovery `GetConfig` may take before the scan
 /// gives up on that node and moves on. A node that is merely down
@@ -39,15 +79,17 @@ pub(crate) struct Node {
     /// configuration's -- is recognized as one node rather than two.
     pub(crate) key: String,
     endpoint: Endpoint,
+    token: BearerToken,
 }
 
 impl Node {
-    fn new(address: &str) -> Result<Self, Error> {
+    fn new(address: &str, token: BearerToken) -> Result<Self, Error> {
         let endpoint = Endpoint::from_shared(address.to_string())
             .map_err(|_| Error::InvalidAddress(address.to_string()))?;
         Ok(Self {
             key: endpoint.uri().to_string(),
             endpoint,
+            token,
         })
     }
 
@@ -59,8 +101,11 @@ impl Node {
     /// large as a whole transaction; tonic's 4 MiB default would refuse
     /// it. Encoding is unlimited by default, so sending needs nothing.
     pub(crate) fn connect(&self) -> Kv {
-        KvClient::new(self.endpoint.clone().connect_lazy())
-            .max_decoding_message_size(MAX_KV_MESSAGE_BYTES)
+        KvClient::new(InterceptedService::new(
+            self.endpoint.clone().connect_lazy(),
+            self.token.clone(),
+        ))
+        .max_decoding_message_size(MAX_KV_MESSAGE_BYTES)
     }
 }
 
@@ -73,6 +118,10 @@ pub(crate) struct Leader {
 
 pub(crate) struct Router {
     state: Mutex<State>,
+    /// Held outside `state` because the interceptor reads it on every
+    /// request, from inside the connection, with no way to reach this
+    /// lock.
+    token: BearerToken,
 }
 
 struct State {
@@ -86,13 +135,19 @@ struct State {
     /// Held between calls, so the common case -- the leader hasn't
     /// changed since last time -- dials nothing.
     leader: Option<Leader>,
+    /// What to log in again with when a token expires mid-session.
+    /// `None` for a client that was handed a token directly, or has
+    /// never logged in: there is then nothing to retry with, and an
+    /// expiry is simply reported.
+    credentials: Option<(String, String)>,
 }
 
 impl Router {
     pub(crate) fn new(seeds: impl IntoIterator<Item = impl AsRef<str>>) -> Result<Self, Error> {
+        let token = BearerToken::default();
         let endpoints = seeds
             .into_iter()
-            .map(|s| Node::new(s.as_ref()))
+            .map(|s| Node::new(s.as_ref(), token.clone()))
             .collect::<Result<Vec<_>, _>>()?;
         if endpoints.is_empty() {
             return Err(Error::NoSeeds);
@@ -102,8 +157,36 @@ impl Router {
                 endpoints,
                 by_id: HashMap::new(),
                 leader: None,
+                credentials: None,
             }),
+            token,
         })
+    }
+
+    /// Starts using `token` on every connection, existing ones included.
+    pub(crate) fn set_token(&self, token: Option<String>) {
+        self.token.set(token);
+    }
+
+    pub(crate) fn has_token(&self) -> bool {
+        self.token.is_set()
+    }
+
+    pub(crate) fn set_credentials(&self, credentials: Option<(String, String)>) {
+        self.state.lock().unwrap().credentials = credentials;
+    }
+
+    pub(crate) fn credentials(&self) -> Option<(String, String)> {
+        self.state.lock().unwrap().credentials.clone()
+    }
+
+    pub(crate) fn username(&self) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .credentials
+            .as_ref()
+            .map(|(username, _)| username.clone())
     }
 
     /// A connection to whoever should serve the next request: the node
@@ -209,7 +292,7 @@ impl Router {
         let mut endpoints = Vec::new();
         let mut by_id = HashMap::new();
         for member in members {
-            match Node::new(&member.client_address) {
+            match Node::new(&member.client_address, self.token.clone()) {
                 Ok(node) => {
                     endpoints.push(node.clone());
                     by_id.insert(member.server_id, node);

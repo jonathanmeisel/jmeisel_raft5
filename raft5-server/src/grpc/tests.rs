@@ -3,9 +3,11 @@ use std::sync::Arc;
 use super::*;
 use crate::pb::raft5::client::{
     CommitTransactionRequest, CreateTransactionRequest, DropTransactionRequest, GetKeysRequest,
-    commit_transaction_response, create_transaction_response, get_keys_response, raft_error,
+    auth_error, commit_transaction_response, config_change_response, create_transaction_response,
+    create_user_response, delete_user_response, get_keys_response, login_response, raft_error,
     read_response, transaction_aborted, write_response,
 };
+use crate::auth::{AuthConfig, AuthContext, InitialAdmin};
 use crate::raft::{self, RoleHandle};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -106,10 +108,32 @@ async fn read(svc: &KvService, key: &[u8]) -> ReadOk {
 /// single-node cluster and has won its election -- i.e. one that can
 /// actually serve a write.
 async fn leader_kv_service(log: Arc<RaftLog>, node_id: &str) -> KvService {
-    let (svc, mut role_rx) = kv_service(log, node_id);
-    svc.bootstrap(Request::new(BootstrapRequest::default()))
-        .await
-        .unwrap();
+    leader_kv_service_with_auth(log, node_id, None).await
+}
+
+/// `leader_kv_service`, for a node that keeps accounts.
+async fn leader_kv_service_with_auth(
+    log: Arc<RaftLog>,
+    node_id: &str,
+    auth: Option<AuthConfig>,
+) -> KvService {
+    let (svc, mut role_rx) = kv_service_with_auth(log, node_id, auth);
+    // On a node that keeps accounts, bootstrapping is done by the
+    // administrator it was started with -- exactly the identity the auth
+    // layer would put here from that operator's token. Bootstrap then
+    // writes that administrator into the log, so the cluster comes up
+    // with one account already in it.
+    let mut request = Request::new(BootstrapRequest::default());
+    if let Some(admin) = svc
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.initial_admin.as_ref())
+    {
+        request.extensions_mut().insert(AuthContext {
+            username: admin.username.clone(),
+        });
+    }
+    svc.bootstrap(request).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while !matches!(&*role_rx.borrow(), RoleHandle::Leader(_)) {
             role_rx.changed().await.unwrap();
@@ -130,6 +154,15 @@ async fn leader_kv_service(log: Arc<RaftLog>, node_id: &str) -> KvService {
 /// A `KvService` on top of a running state machine, plus the handles
 /// a test needs to watch it.
 fn kv_service(log: Arc<RaftLog>, node_id: &str) -> (KvService, watch::Receiver<RoleHandle>) {
+    kv_service_with_auth(log, node_id, None)
+}
+
+/// `kv_service`, for a node that keeps accounts.
+fn kv_service_with_auth(
+    log: Arc<RaftLog>,
+    node_id: &str,
+    auth: Option<AuthConfig>,
+) -> (KvService, watch::Receiver<RoleHandle>) {
     let raft::NodeHandles {
         common, role_rx, ..
     } = raft::Common::new(
@@ -147,7 +180,7 @@ fn kv_service(log: Arc<RaftLog>, node_id: &str) -> (KvService, watch::Receiver<R
         voting: true,
     };
     (
-        KvService::new(Store::new(log), identity, client_handle),
+        KvService::new(Store::new(log), identity, client_handle, auth),
         role_rx,
     )
 }
@@ -179,7 +212,7 @@ async fn spawn_reachable_kv_service(
         client_address: format!("http://{addr}"),
         voting: true,
     };
-    let svc = KvService::new(Store::new(log), identity, client_handle);
+    let svc = KvService::new(Store::new(log), identity, client_handle, None);
 
     let cancel = CancellationToken::new();
     let shutdown = cancel.clone();
@@ -1233,4 +1266,621 @@ async fn a_second_header_mid_stream_is_rejected() {
         .await
         .expect_err("two headers on one stream is malformed");
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
+}
+
+// --- the reserved keyspace --------------------------------------------
+//
+// `crate::keyspace` carves a prefix out of the key space for the
+// cluster's own state -- user accounts, today. These cover the four
+// points where the client API has to refuse to address it. The server's
+// own writes must still reach it, so each test that needs a reserved key
+// present seeds one through `append_directly`, which is the path
+// `CreateUser` will take.
+
+/// Puts a key into the store the way the server's own writes do: at the
+/// leader handle, below the gRPC boundary where reserved keys are
+/// refused.
+async fn append_directly(svc: &KvService, key: &[u8], value: &[u8]) -> u64 {
+    svc.leader()
+        .expect("the test service leads")
+        .append_writes(vec![Mutation::new(key, Some(value))])
+        .await
+        .expect("a direct append should commit")
+}
+
+/// The privilege-escalation guard. A client that could buffer this write
+/// could write its own account record and set `is_admin` on it.
+#[tokio::test]
+async fn write_refuses_a_reserved_key() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+    let txn = begin_txn(&svc, 5000).await;
+
+    let status = svc
+        .write(Request::new(WriteRequest {
+            transaction_id: txn,
+            key: crate::keyspace::user_key("alice"),
+            value: Some(b"forged".to_vec()),
+        }))
+        .await
+        .expect_err("a reserved key should be refused");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    cleanup(&path);
+}
+
+/// Both branches: refused rather than answered as absent, because a
+/// password hash handed back is one to attack offline.
+#[tokio::test]
+async fn read_refuses_a_reserved_key_transactional_or_not() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+    let key = crate::keyspace::user_key("alice");
+    append_directly(&svc, &key, b"hash").await;
+
+    let txn = begin_txn(&svc, 5000).await;
+    for transaction_id in [None, Some(txn)] {
+        let status = svc
+            .read(Request::new(ReadRequest {
+                key: key.clone(),
+                transaction_id,
+            }))
+            .await
+            .expect_err("a reserved key should be refused");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn get_keys_refuses_a_reserved_start_key() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+
+    let status = svc
+        .get_keys(Request::new(GetKeysRequest {
+            start_key: vec![crate::keyspace::RESERVED],
+            max_keys: 10,
+            transaction_id: None,
+        }))
+        .await
+        .expect_err("a reserved start key should be refused");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    cleanup(&path);
+}
+
+/// A walk from the very beginning starts at the empty key, which sorts
+/// below the whole reserved range -- so this is the scan that would
+/// reveal every account record if the filter were missing.
+#[tokio::test]
+async fn get_keys_does_not_reveal_reserved_keys() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+
+    append_directly(&svc, &crate::keyspace::user_key("alice"), b"hash").await;
+    append_directly(&svc, &crate::keyspace::user_key("bob"), b"hash").await;
+    write(&svc, b"visible", Some(b"v")).await;
+
+    let (keys, has_more) = get_keys(&svc, b"", 10, None).await;
+    assert_eq!(as_strings(&keys), vec!["visible"]);
+    assert!(!has_more);
+    assert!(
+        !keys.iter().any(|key| is_reserved(key)),
+        "a scan must never hand back a reserved key"
+    );
+
+    cleanup(&path);
+}
+
+/// Reserved keys are skipped inside the scan rather than filtered out of
+/// its result, so they must not consume any of the caller's batch. A
+/// client asking for three keys gets three, however many account records
+/// happen to sort before them.
+#[tokio::test]
+async fn reserved_keys_do_not_shorten_a_batch_or_confuse_has_more() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+
+    for name in ["alice", "bob", "carol"] {
+        append_directly(&svc, &crate::keyspace::user_key(name), b"hash").await;
+    }
+    for key in [b"k1", b"k2", b"k3"] {
+        write(&svc, key, Some(b"v")).await;
+    }
+
+    // Exactly as many keys as there are: a full batch, and nothing after
+    // it.
+    let (keys, has_more) = get_keys(&svc, b"", 3, None).await;
+    assert_eq!(as_strings(&keys), vec!["k1", "k2", "k3"]);
+    assert!(
+        !has_more,
+        "three keys asked for and three that exist is the end of the walk"
+    );
+
+    // One fewer than there are, so `has_more` has to notice the third --
+    // past three reserved keys that don't count towards it.
+    let (keys, has_more) = get_keys(&svc, b"", 2, None).await;
+    assert_eq!(as_strings(&keys), vec!["k1", "k2"]);
+    assert!(has_more, "there is a third key to come");
+
+    cleanup(&path);
+}
+
+// --- accounts and tokens ----------------------------------------------
+//
+// The auth layer itself is not in the picture here: these drive the
+// handlers directly, supplying the caller's identity the way that layer
+// will. What they cover is everything underneath it -- who may do what,
+// what the store ends up holding, and the one window where a node has no
+// accounts to consult.
+
+const TEST_SECRET: &[u8] = b"a secret shared by every node in this test";
+
+fn auth_config(initial_admin: Option<InitialAdmin>) -> Option<AuthConfig> {
+    Some(AuthConfig::new(
+        TEST_SECRET,
+        std::time::Duration::from_secs(3600),
+        initial_admin,
+    ))
+}
+
+async fn startup_admin(username: &str, password: &str) -> InitialAdmin {
+    InitialAdmin {
+        username: username.to_string(),
+        password_hash: crate::auth::hash_password(password.to_string())
+            .await
+            .expect("hashing should work"),
+    }
+}
+
+/// A node that keeps accounts, bootstrapped by `root`, who is left in
+/// the store as its administrator with the password `hunter42`.
+async fn authenticated_service(log: Arc<RaftLog>, node_id: &str) -> KvService {
+    let admin = startup_admin("root", "hunter42").await;
+    leader_kv_service_with_auth(log, node_id, auth_config(Some(admin))).await
+}
+
+/// A request carrying a verified identity, as the auth layer leaves it.
+fn as_user<T>(caller: &str, message: T) -> Request<T> {
+    let mut request = Request::new(message);
+    request.extensions_mut().insert(AuthContext {
+        username: caller.to_string(),
+    });
+    request
+}
+
+async fn login(svc: &KvService, username: &str, password: &str) -> login_response::Result {
+    svc.login(Request::new(LoginRequest {
+        username: username.to_string(),
+        password: password.to_string(),
+    }))
+    .await
+    .unwrap()
+    .into_inner()
+    .result
+    .expect("a login always answers")
+}
+
+async fn create_user(
+    svc: &KvService,
+    caller: &str,
+    username: &str,
+    password: &str,
+    is_admin: bool,
+) -> create_user_response::Result {
+    svc.create_user(as_user(
+        caller,
+        CreateUserRequest {
+            username: username.to_string(),
+            password: password.to_string(),
+            is_admin,
+        },
+    ))
+    .await
+    .unwrap()
+    .into_inner()
+    .result
+    .expect("create_user always answers")
+}
+
+async fn delete_user(svc: &KvService, caller: &str, username: &str) -> delete_user_response::Result {
+    svc.delete_user(as_user(
+        caller,
+        DeleteUserRequest {
+            username: username.to_string(),
+        },
+    ))
+    .await
+    .unwrap()
+    .into_inner()
+    .result
+    .expect("delete_user always answers")
+}
+
+fn auth_kind(error: &PbAuthError) -> auth_error::Kind {
+    auth_error::Kind::try_from(error.kind).expect("a kind this build knows")
+}
+
+fn login_refusal(result: login_response::Result) -> auth_error::Kind {
+    match result {
+        login_response::Result::AuthError(e) => auth_kind(&e),
+        other => panic!("expected the login to be refused, got {other:?}"),
+    }
+}
+
+fn login_token(result: login_response::Result) -> String {
+    match result {
+        login_response::Result::Ok(ok) => ok.token,
+        other => panic!("expected the login to succeed, got {other:?}"),
+    }
+}
+
+fn create_refusal(result: create_user_response::Result) -> auth_error::Kind {
+    match result {
+        create_user_response::Result::AuthError(e) => auth_kind(&e),
+        other => panic!("expected the account not to be created, got {other:?}"),
+    }
+}
+
+fn delete_refusal(result: delete_user_response::Result) -> auth_error::Kind {
+    match result {
+        delete_user_response::Result::AuthError(e) => auth_kind(&e),
+        other => panic!("expected the account not to be removed, got {other:?}"),
+    }
+}
+
+fn created_seq(result: create_user_response::Result) -> u64 {
+    match result {
+        create_user_response::Result::Seq(seq) => seq,
+        other => panic!("expected the account to be created, got {other:?}"),
+    }
+}
+
+/// With no secret there is nothing to sign a token with and no accounts
+/// to consult, so all three say so rather than half-working.
+#[tokio::test]
+async fn the_account_rpcs_report_themselves_disabled_without_a_secret() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+
+    assert_eq!(
+        login_refusal(login(&svc, "alice", "hunter42").await),
+        auth_error::Kind::AuthDisabled
+    );
+    assert_eq!(
+        create_refusal(create_user(&svc, "root", "alice", "hunter42", false).await),
+        auth_error::Kind::AuthDisabled
+    );
+    assert_eq!(
+        delete_refusal(delete_user(&svc, "root", "alice").await),
+        auth_error::Kind::AuthDisabled
+    );
+
+    cleanup(&path);
+}
+
+/// The window the startup administrator exists for. A node that has
+/// never been bootstrapped has no accounts and no leader to read them
+/// from, yet `Bootstrap` needs a token like everything else -- so the
+/// operator has to be able to authenticate against something.
+#[tokio::test]
+async fn the_startup_admin_can_log_in_before_the_node_is_bootstrapped() {
+    let (log, path) = open_temp();
+    let admin = startup_admin("root", "hunter42").await;
+    let (svc, _role_rx) = kv_service_with_auth(log, "kv-test", auth_config(Some(admin)));
+
+    assert!(
+        !login_token(login(&svc, "root", "hunter42").await).is_empty(),
+        "an unbootstrapped node has no leader but can still sign"
+    );
+    assert_eq!(
+        login_refusal(login(&svc, "root", "the wrong one").await),
+        auth_error::Kind::BadCredentials
+    );
+    assert_eq!(
+        login_refusal(login(&svc, "someone-else", "hunter42").await),
+        auth_error::Kind::BadCredentials,
+        "the startup password belongs to one username only"
+    );
+
+    cleanup(&path);
+}
+
+/// Bootstrapping is what turns the startup administrator from a flag
+/// into an account, so that the cluster comes up with someone who can
+/// administer it.
+#[tokio::test]
+async fn bootstrapping_writes_the_startup_admin_into_the_store() {
+    let (log, path) = open_temp();
+    let svc = authenticated_service(log, "kv-test").await;
+
+    assert!(
+        !login_token(login(&svc, "root", "hunter42").await).is_empty(),
+        "root should now be a stored account"
+    );
+    // And a stored one: it can do what only a stored administrator can.
+    created_seq(create_user(&svc, "root", "alice", "correct horse", false).await);
+
+    cleanup(&path);
+}
+
+/// And the flag itself goes inert. It is gated on the node having a
+/// configuration rather than on the account being absent, so removing
+/// the administrator cannot quietly re-arm the password this node was
+/// started with.
+///
+/// The other face of that: this is also how a cluster can be locked out
+/// of itself. Deleting the last administrator is unrecoverable.
+#[tokio::test]
+async fn the_startup_password_does_not_come_back_when_the_account_is_removed() {
+    let (log, path) = open_temp();
+    let svc = authenticated_service(log, "kv-test").await;
+    created_seq(create_user(&svc, "root", "other", "hunter42", true).await);
+
+    delete_user(&svc, "other", "root").await;
+    assert_eq!(
+        login_refusal(login(&svc, "root", "hunter42").await),
+        auth_error::Kind::BadCredentials,
+        "the startup password must not come back"
+    );
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn an_administrator_can_create_an_account_that_can_then_log_in() {
+    let (log, path) = open_temp();
+    let svc = authenticated_service(log, "kv-test").await;
+
+    assert!(created_seq(create_user(&svc, "root", "alice", "correct horse", false).await) > 0);
+    assert!(!login_token(login(&svc, "alice", "correct horse").await).is_empty());
+    assert_eq!(
+        login_refusal(login(&svc, "alice", "wrong").await),
+        auth_error::Kind::BadCredentials
+    );
+
+    cleanup(&path);
+}
+
+/// An account that does not exist and a password that is wrong get the
+/// same answer: saying which would confirm that a username is real, and
+/// a username is half of a credential.
+#[tokio::test]
+async fn an_unknown_account_and_a_wrong_password_are_refused_alike() {
+    let (log, path) = open_temp();
+    let svc = authenticated_service(log, "kv-test").await;
+
+    assert_eq!(
+        login_refusal(login(&svc, "root", "wrong").await),
+        login_refusal(login(&svc, "nobody-at-all", "wrong").await)
+    );
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn creating_an_account_that_already_exists_is_refused() {
+    let (log, path) = open_temp();
+    let svc = authenticated_service(log, "kv-test").await;
+
+    created_seq(create_user(&svc, "root", "alice", "one", false).await);
+    assert_eq!(
+        create_refusal(create_user(&svc, "root", "alice", "two", false).await),
+        auth_error::Kind::AlreadyExists
+    );
+    assert!(
+        !login_token(login(&svc, "alice", "one").await).is_empty(),
+        "the refused second attempt must not have overwritten the first"
+    );
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn a_deleted_account_can_no_longer_log_in() {
+    let (log, path) = open_temp();
+    let svc = authenticated_service(log, "kv-test").await;
+    created_seq(create_user(&svc, "root", "alice", "correct horse", false).await);
+
+    match delete_user(&svc, "root", "alice").await {
+        delete_user_response::Result::Seq(_) => {}
+        other => panic!("expected the account to be removed, got {other:?}"),
+    }
+    assert_eq!(
+        login_refusal(login(&svc, "alice", "correct horse").await),
+        auth_error::Kind::BadCredentials
+    );
+    assert_eq!(
+        delete_refusal(delete_user(&svc, "root", "alice").await),
+        auth_error::Kind::NoSuchUser
+    );
+
+    cleanup(&path);
+}
+
+/// Authenticating says who you are, not what you may do.
+#[tokio::test]
+async fn an_ordinary_account_may_not_manage_accounts() {
+    let (log, path) = open_temp();
+    let svc = authenticated_service(log, "kv-test").await;
+    created_seq(create_user(&svc, "root", "alice", "correct horse", false).await);
+
+    assert_eq!(
+        create_refusal(create_user(&svc, "alice", "mallory", "letmein", true).await),
+        auth_error::Kind::NotAdmin
+    );
+    assert_eq!(
+        delete_refusal(delete_user(&svc, "alice", "root").await),
+        auth_error::Kind::NotAdmin
+    );
+
+    cleanup(&path);
+}
+
+/// A token for an account that has since been deleted still verifies --
+/// nothing can un-issue one -- but it buys no administrative rights,
+/// because those are looked up on each call rather than asserted by the
+/// token.
+#[tokio::test]
+async fn a_deleted_administrator_no_longer_manages_accounts() {
+    let (log, path) = open_temp();
+    let svc = authenticated_service(log, "kv-test").await;
+    created_seq(create_user(&svc, "root", "other", "hunter42", true).await);
+
+    delete_user(&svc, "other", "root").await;
+    assert_eq!(
+        create_refusal(create_user(&svc, "root", "alice", "letmein", false).await),
+        auth_error::Kind::NotAdmin
+    );
+
+    cleanup(&path);
+}
+
+/// The handlers never take the caller's word for who they are: with no
+/// identity put there by the auth layer, there is no caller.
+#[tokio::test]
+async fn managing_accounts_without_a_verified_identity_is_refused() {
+    let (log, path) = open_temp();
+    let svc = authenticated_service(log, "kv-test").await;
+
+    let status = svc
+        .create_user(Request::new(CreateUserRequest {
+            username: "alice".to_string(),
+            password: "letmein".to_string(),
+            is_admin: true,
+        }))
+        .await
+        .expect_err("a request with no verified identity should be refused");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+    cleanup(&path);
+}
+
+/// Bootstrapping an authenticated node is the one call that cannot be
+/// authorized from the store, since there is nothing in it yet -- so it
+/// is authorized against the administrator the node was started with.
+#[tokio::test]
+async fn only_the_startup_admin_may_bootstrap_an_authenticated_node() {
+    let (log, path) = open_temp();
+    let admin = startup_admin("root", "hunter42").await;
+    let (svc, _role_rx) = kv_service_with_auth(log, "kv-test", auth_config(Some(admin)));
+
+    let status = svc
+        .bootstrap(as_user("mallory", BootstrapRequest::default()))
+        .await
+        .expect_err("someone else's token should not bootstrap this node");
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+
+    let status = svc
+        .bootstrap(Request::new(BootstrapRequest::default()))
+        .await
+        .expect_err("an unauthenticated bootstrap should be refused");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+    cleanup(&path);
+}
+
+/// The two halves meeting: an account is a key/value pair, and the
+/// client API cannot see it.
+#[tokio::test]
+async fn an_account_is_invisible_through_the_client_api() {
+    let (log, path) = open_temp();
+    let svc = authenticated_service(log, "kv-test").await;
+    created_seq(create_user(&svc, "root", "alice", "correct horse", false).await);
+    write(&svc, b"ordinary", Some(b"v")).await;
+
+    let (keys, _) = get_keys(&svc, b"", 100, None).await;
+    assert_eq!(as_strings(&keys), vec!["ordinary"]);
+
+    let status = svc
+        .read(Request::new(ReadRequest {
+            key: crate::keyspace::user_key("alice"),
+            transaction_id: None,
+        }))
+        .await
+        .expect_err("an account record is not readable");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    cleanup(&path);
+}
+
+/// Membership changes are the most destructive calls this service has --
+/// removing the wrong server can cost a cluster its quorum -- so holding
+/// a token is not enough for them either.
+#[tokio::test]
+async fn an_ordinary_account_may_not_change_cluster_membership() {
+    let (log, path) = open_temp();
+    let svc = authenticated_service(log, "kv-test").await;
+    created_seq(create_user(&svc, "root", "alice", "correct horse", false).await);
+
+    let refused = svc
+        .remove_server(as_user(
+            "alice",
+            RemoveServerRequest {
+                server_id: "kv-test".to_string(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .result
+        .expect("remove_server always answers");
+    match refused {
+        config_change_response::Result::AuthError(e) => {
+            assert_eq!(auth_kind(&e), auth_error::Kind::NotAdmin);
+        }
+        other => panic!("expected NOT_ADMIN, got {other:?}"),
+    }
+
+    let refused = svc
+        .add_server(as_user(
+            "alice",
+            AddServerRequest {
+                client_address: "http://127.0.0.1:1".to_string(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .result
+        .expect("add_server always answers");
+    match refused {
+        config_change_response::Result::AuthError(e) => {
+            assert_eq!(auth_kind(&e), auth_error::Kind::NotAdmin);
+        }
+        other => panic!("expected NOT_ADMIN, got {other:?}"),
+    }
+
+    cleanup(&path);
+}
+
+/// And the administrator still can -- the check turns away the wrong
+/// caller, not the call.
+#[tokio::test]
+async fn an_administrator_may_still_change_cluster_membership() {
+    let (log, path) = open_temp();
+    let svc = authenticated_service(log, "kv-test").await;
+
+    // Removing a server that isn't a member is refused on its merits,
+    // which is the point: it got past the admin check to be judged.
+    let answered = svc
+        .remove_server(as_user(
+            "root",
+            RemoveServerRequest {
+                server_id: "not-a-member".to_string(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .result
+        .expect("remove_server always answers");
+    assert!(
+        !matches!(answered, config_change_response::Result::AuthError(_)),
+        "an administrator should not be turned away, got {answered:?}"
+    );
+
+    cleanup(&path);
 }

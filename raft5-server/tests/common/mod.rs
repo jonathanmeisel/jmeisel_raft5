@@ -40,6 +40,10 @@ pub struct TestNode {
     pub client_addr: SocketAddr,
     pub peer_addr: SocketAddr,
     pub db_dir: PathBuf,
+    /// How this node signs and checks tokens, or `None` for a node that
+    /// keeps no accounts -- which is what every test that predates
+    /// authentication gets, and why they need no changes.
+    auth: Option<raft5_server::auth::AuthConfig>,
     running: Option<RunningNode>,
     /// Private: reached only through the `client()` accessor, so a test
     /// that reaches for this while the node is down gets a clear panic
@@ -54,6 +58,16 @@ struct RunningNode {
 
 impl TestNode {
     pub async fn new(id: &str) -> Self {
+        Self::start(id, None).await
+    }
+
+    /// A node that requires a token on every RPC but `Login` and
+    /// `GetConfig`.
+    pub async fn with_auth(id: &str, auth: raft5_server::auth::AuthConfig) -> Self {
+        Self::start(id, Some(auth)).await
+    }
+
+    async fn start(id: &str, auth: Option<raft5_server::auth::AuthConfig>) -> Self {
         // `try_init` rather than `init`: every test in the binary calls
         // this, all in the same process (possibly concurrently, since
         // tests run on their own threads by default), and `init` panics
@@ -69,6 +83,7 @@ impl TestNode {
             client_addr: free_local_addr(),
             peer_addr: free_local_addr(),
             db_dir: temp_db_dir(id),
+            auth,
             running: None,
             client: None,
         };
@@ -96,16 +111,20 @@ impl TestNode {
         let db_dir = self.db_dir.clone();
         let client_addr = self.client_addr;
         let peer_addr = self.peer_addr;
+        let auth = self.auth.clone();
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
         let task = tokio::spawn(async move {
-            let node = raft5_server::serve(
-                id.clone(),
-                &db_dir,
-                client_addr,
-                peer_addr,
-                None,
-                None,
+            let node = raft5_server::serve_config(
+                raft5_server::ServerConfig {
+                    id: id.clone(),
+                    db: db_dir,
+                    client_addr,
+                    peer_addr,
+                    advertise: None,
+                    advertise_client: None,
+                    auth,
+                },
                 cancel_clone,
             );
             if let Err(e) = node.await {

@@ -15,7 +15,9 @@
 //! storage call still holding the database lock. `raft::Task` is where
 //! that discipline is actually enforced.
 
+pub mod auth;
 pub mod grpc;
+pub mod keyspace;
 pub mod pb;
 pub mod raft;
 pub mod storage;
@@ -24,14 +26,16 @@ pub mod txn;
 
 use std::future::Future;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer};
+use tower_http::validate_request::ValidateRequestHeaderLayer;
 use tracing::{info, Level};
 
+use auth::{AuthConfig, RequireToken};
 use grpc::{KvService, RaftPeerService};
 use pb::raft5::client::kv_server::KvServer;
 use pb::raft5::cluster::ClusterMember;
@@ -104,10 +108,47 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 //     (node, cancel)
 // }
 
+/// How a node is configured. See [`serve_config`].
+///
+/// A struct rather than more parameters because the list was already at
+/// the length where a caller has to count commas, and because `auth`
+/// will not be the last thing added to it.
+pub struct ServerConfig {
+    /// This node's stable identity within the cluster. Must not change
+    /// across restarts: it is what every other node's log calls this
+    /// one.
+    pub id: String,
+    /// Directory holding this node's database (log, state, and
+    /// membership). Created if it doesn't exist.
+    pub db: PathBuf,
+    /// Address to serve the client API on.
+    pub client_addr: SocketAddr,
+    /// Address to serve the peer-to-peer Raft API on.
+    pub peer_addr: SocketAddr,
+    /// URL other nodes should dial to reach this node's peer API.
+    /// Defaults to `peer_addr`, which is wrong whenever that is a
+    /// wildcard bind (`0.0.0.0:...`) or behind NAT -- set it explicitly
+    /// then. Recorded in the cluster configuration at bootstrap.
+    pub advertise: Option<String>,
+    /// The same, for the client API -- what clients are handed when they
+    /// ask the cluster where its members are.
+    pub advertise_client: Option<String>,
+    /// How tokens are signed and checked.
+    ///
+    /// `None` leaves the client API open: no request needs a token and
+    /// the account RPCs all answer `AUTH_DISABLED`, which is how this
+    /// cluster behaved before authentication existed. See
+    /// [`crate::auth`].
+    pub auth: Option<AuthConfig>,
+}
+
 /// `run`, for a caller that already has a token to shut this node down
 /// with -- one shared with other nodes in the same process, say, or a
 /// child of some wider application-level token. `run` is this plus a
 /// freshly minted root token.
+///
+/// This is [`serve_config`] with authentication off; a node that should
+/// require tokens is started through that instead.
 pub async fn serve(
     id: String,
     db: &Path,
@@ -117,7 +158,33 @@ pub async fn serve(
     advertise_client: Option<String>,
     cancel: CancellationToken,
 ) -> Result<(), Error> {
-    let log = Arc::new(RaftLog::open(db)?);
+    serve_config(
+        ServerConfig {
+            id,
+            db: db.to_path_buf(),
+            client_addr,
+            peer_addr,
+            advertise,
+            advertise_client,
+            auth: None,
+        },
+        cancel,
+    )
+    .await
+}
+
+/// Runs one node to completion, as `config` describes it.
+pub async fn serve_config(config: ServerConfig, cancel: CancellationToken) -> Result<(), Error> {
+    let ServerConfig {
+        id,
+        db,
+        client_addr,
+        peer_addr,
+        advertise,
+        advertise_client,
+        auth,
+    } = config;
+    let log = Arc::new(RaftLog::open(&db)?);
     let identity = ClusterMember {
         server_id: id.clone(),
         address: advertise.unwrap_or_else(|| format!("http://{peer_addr}")),
@@ -138,7 +205,12 @@ pub async fn serve(
 
     // KvService's read/write path still bypasses the state machine (see
     // its module doc); `client_handle` is what `Bootstrap` goes through.
-    let kv_service = KvService::new(Store::new(Arc::clone(&log)), identity, client_handle);
+    let kv_service = KvService::new(
+        Store::new(Arc::clone(&log)),
+        identity,
+        client_handle,
+        auth.clone(),
+    );
     spawn_transaction_sweeper(kv_service.locks(), cancel.clone());
     // A whole transaction may be a single value, so one `BufferWrite`
     // can legitimately be as large as `MAX_TRANSACTION_BYTES`. Without
@@ -171,6 +243,11 @@ pub async fn serve(
     let client_server = async {
         let result = Server::builder()
             .layer(trace_layer())
+            // Inside the trace layer, so a request turned away for want
+            // of a token is still one of the spans this node logs --
+            // which is the only place an operator would see that
+            // happening at all.
+            .layer(ValidateRequestHeaderLayer::custom(RequireToken::new(auth)))
             .add_service(kv_server)
             .serve_with_shutdown(client_addr, cancel.cancelled())
             .await;

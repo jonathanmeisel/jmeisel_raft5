@@ -44,15 +44,20 @@ use tonic::transport::Endpoint;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::Instrument;
 
+use crate::auth::{AuthConfig, AuthContext, UserRecord};
+use crate::keyspace::is_reserved;
 use crate::pb::raft5::client::kv_server::Kv;
 use crate::pb::raft5::client::{
-    AddServerRequest, BootstrapRequest, CommitTransactionRequest, CommitTransactionResponse,
-    ConfigChangeResponse, CreateTransactionRequest, CreateTransactionResponse,
-    DropTransactionRequest, DropTransactionResponse, GetConfigRequest, GetConfigResponse,
-    GetKeysOk, GetKeysRequest, GetKeysResponse, NotLeader, RaftError as PbRaftError, ReadOk,
-    ReadRequest, ReadResponse, RemoveServerRequest, TransactionAborted, WriteRequest,
-    WriteResponse, commit_transaction_response, config_change_response,
-    create_transaction_response, drop_transaction_response, get_keys_response, raft_error,
+    AddServerRequest, AuthError as PbAuthError, BootstrapRequest, CommitTransactionRequest,
+    CommitTransactionResponse, ConfigChangeResponse, CreateTransactionRequest,
+    CreateTransactionResponse, CreateUserRequest, CreateUserResponse, DeleteUserRequest,
+    DeleteUserResponse, DropTransactionRequest, DropTransactionResponse, GetConfigRequest,
+    GetConfigResponse, GetKeysOk, GetKeysRequest, GetKeysResponse, LoginOk, LoginRequest,
+    LoginResponse,
+    NotLeader, RaftError as PbRaftError, ReadOk, ReadRequest, ReadResponse, RemoveServerRequest,
+    TransactionAborted, WriteRequest, WriteResponse, auth_error, commit_transaction_response,
+    config_change_response, create_transaction_response, create_user_response,
+    delete_user_response, drop_transaction_response, get_keys_response, login_response, raft_error,
     read_response, transaction_aborted, write_response,
 };
 use crate::pb::raft5::cluster::{ClusterConfig, ClusterMember};
@@ -84,6 +89,23 @@ const DEFAULT_MAX_KEYS: u32 = 10;
 /// unwritable. Outside a transaction it is just a bound on the work and
 /// the response size.
 const MAX_KEYS_PER_SCAN: u32 = 1024;
+
+/// How long an account write may hold its key.
+///
+/// Short, because nothing human is in the loop: the whole
+/// read-modify-write happens server side within one raft round trip, so
+/// this only bounds how long a wedged admin call leaves an account
+/// unwritable.
+const ADMIN_TXN_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long `Bootstrap` will wait for this node to start leading before
+/// giving up on writing the administrator it was started with.
+///
+/// Generous: a single-node cluster elects itself unopposed, so this is
+/// the cost of one election timeout and one no-op commit, not of
+/// agreement with anybody.
+const BOOTSTRAP_ADMIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const BOOTSTRAP_ADMIN_RETRY: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// A transaction's refusal as the client protocol carries it.
 ///
@@ -164,6 +186,82 @@ fn txn_error(e: TxnError) -> Result<PbRaftError, Status> {
     }
 }
 
+/// Why an authentication RPC did not do what it was asked.
+enum AuthFailure {
+    /// Something about the request or the account. Reported to the
+    /// caller in band, as an `AuthError`.
+    Refused(auth_error::Kind, String),
+    /// The cluster could not serve the request at all.
+    Cluster(TxnError),
+}
+
+impl From<TxnError> for AuthFailure {
+    fn from(e: TxnError) -> Self {
+        Self::Cluster(e)
+    }
+}
+
+impl From<RaftError> for AuthFailure {
+    fn from(e: RaftError) -> Self {
+        Self::Cluster(TxnError::Raft(e))
+    }
+}
+
+impl From<Refused> for AuthFailure {
+    fn from(r: Refused) -> Self {
+        Self::Cluster(TxnError::Refused(r))
+    }
+}
+
+impl From<Status> for AuthFailure {
+    fn from(s: Status) -> Self {
+        Self::Cluster(TxnError::Internal(s))
+    }
+}
+
+impl AuthFailure {
+    fn refused(kind: auth_error::Kind, detail: impl Into<String>) -> Self {
+        Self::Refused(kind, detail.into())
+    }
+
+    fn disabled() -> Self {
+        Self::refused(auth_error::Kind::AuthDisabled, AUTH_DISABLED)
+    }
+
+    /// One answer for "no such account" and "wrong password" alike.
+    /// Distinguishing them would confirm which usernames are real, and a
+    /// username is half of a credential.
+    fn bad_credentials() -> Self {
+        Self::refused(
+            auth_error::Kind::BadCredentials,
+            "the username or password was wrong",
+        )
+    }
+}
+
+/// Which of the two error shapes a response should carry.
+enum AuthReply {
+    Raft(PbRaftError),
+    Auth(PbAuthError),
+}
+
+/// An `AuthFailure` as the answer to a membership change.
+fn config_change_refusal(e: AuthFailure) -> Result<Response<ConfigChangeResponse>, Status> {
+    Ok(Response::new(ConfigChangeResponse {
+        result: Some(match auth_failure(e)? {
+            AuthReply::Raft(e) => config_change_response::Result::Error(e),
+            AuthReply::Auth(e) => config_change_response::Result::AuthError(e),
+        }),
+    }))
+}
+
+fn auth_failure(e: AuthFailure) -> Result<AuthReply, Status> {
+    Ok(match e {
+        AuthFailure::Refused(kind, detail) => AuthReply::Auth(auth_err(kind, detail)),
+        AuthFailure::Cluster(e) => AuthReply::Raft(txn_error(e)?),
+    })
+}
+
 /// A transaction id off the wire. Fixed-width, so anything else is a
 /// malformed request rather than a transaction that happens not to
 /// exist.
@@ -172,6 +270,42 @@ fn txn_id(bytes: &[u8]) -> Result<TxnId, Status> {
         .try_into()
         .map_err(|_| Status::invalid_argument("transaction_id must be 16 bytes"))
 }
+
+/// Refuses a client's attempt to address a key the cluster reserves for
+/// itself (`crate::keyspace`).
+///
+/// `invalid_argument` rather than `permission_denied`: no credential
+/// reaches these keys through this API, so the honest answer is that the
+/// key is not addressable here at all rather than that this caller may
+/// not have it. It is also already on the client's short list of
+/// permanent failures, so a caller learns this at once instead of after
+/// spending its whole retry deadline on an answer that will not change.
+fn reject_reserved(key: &[u8]) -> Result<(), Status> {
+    if is_reserved(key) {
+        return Err(Status::invalid_argument(
+            "that key is reserved for the cluster's own use",
+        ));
+    }
+    Ok(())
+}
+
+/// An `AuthError` as the client protocol carries it.
+///
+/// In-band beside `RaftError` rather than a `Status`, for the same
+/// reason a lock conflict is: every one of these is an answer, and a
+/// client that retried it would spend its whole deadline arriving back
+/// at the same one. A bad *token* is the opposite case and stays a
+/// `Status` -- see `crate::auth`.
+fn auth_err(kind: auth_error::Kind, detail: impl Into<String>) -> PbAuthError {
+    PbAuthError {
+        kind: kind as i32,
+        detail: detail.into(),
+    }
+}
+
+/// What every auth RPC answers on a node started without a secret.
+const AUTH_DISABLED: &str =
+    "this node was started without a signing secret, so it keeps no accounts";
 
 fn storage_err(e: StorageError) -> Status {
     Status::internal(e.to_string())
@@ -253,15 +387,27 @@ pub struct KvService {
     client_handle: ClientHandle,
     /// Who holds what, and every open transaction. See `crate::txn`.
     locks: Locks,
+    /// How tokens are signed and checked, or `None` on a node started
+    /// without a secret -- which is what leaves this API open. Every
+    /// authorization check reads as "allowed" when this is `None`, so
+    /// that the open case lives in one place rather than in each
+    /// handler. See `crate::auth`.
+    auth: Option<AuthConfig>,
 }
 
 impl KvService {
-    pub fn new(store: Store, identity: ClusterMember, client_handle: ClientHandle) -> Self {
+    pub fn new(
+        store: Store,
+        identity: ClusterMember,
+        client_handle: ClientHandle,
+        auth: Option<AuthConfig>,
+    ) -> Self {
         Self {
             store,
             identity,
             client_handle,
             locks: Locks::new(),
+            auth,
         }
     }
 
@@ -366,7 +512,17 @@ impl KvService {
         let committed = {
             let start = start.clone();
             self.store
-                .run(move |log| log.scan_latest(&start, want, |key| deleted.contains(key)))
+                .run(move |log| {
+                    // Folded into the skip closure rather than filtered
+                    // out of the result: a skipped key doesn't count
+                    // against `want`, so hiding the reserved range costs
+                    // the caller no batch length. Both callers -- the
+                    // transactional scan and the plain one -- come
+                    // through here, so this is the whole of `GetKeys`.
+                    log.scan_latest(&start, want, |key| {
+                        deleted.contains(key) || is_reserved(key)
+                    })
+                })
                 .await?
         };
 
@@ -378,7 +534,15 @@ impl KvService {
         keys.extend(
             buffered
                 .iter()
-                .filter(|(key, is_delete)| !*is_delete && key.as_slice() >= start.as_slice())
+                .filter(|(key, is_delete)| {
+                    // `is_reserved` is belt to `write`'s braces: a client
+                    // transaction is refused a reserved key at the RPC
+                    // boundary, so it should have none buffered. The
+                    // server's own transactions do, and none of them
+                    // scans -- but the cost of being sure is one
+                    // comparison.
+                    !*is_delete && key.as_slice() >= start.as_slice() && !is_reserved(key)
+                })
                 .map(|(key, _)| key.clone()),
         );
         keys.sort_unstable();
@@ -511,6 +675,304 @@ impl KvService {
         }))
     }
 
+    /// A read that reflects everything committed anywhere in the
+    /// cluster, without taking a lock.
+    ///
+    /// The same proof `transactional_read` rests on -- this node leads,
+    /// its `latest` is complete, and it still holds a quorum of leases
+    /// -- minus the lock, since nothing here belongs to a transaction
+    /// that would have to go on holding the key afterwards.
+    async fn linearizable_get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>, RaftError> {
+        let leader = self.leader()?;
+        leader.await_caught_up().await?;
+        if !leader.has_read_quorum() {
+            return Err(RaftError::NotLeader { leader_hint: None });
+        }
+        Ok(self
+            .store
+            .run(move |log| log.get_latest(&key))
+            .await
+            .map_err(RaftError::Storage)?
+            .map(|(_, value)| value))
+    }
+
+    /// The account record for `username`, read currently.
+    async fn load_user(&self, username: &str) -> Result<Option<UserRecord>, AuthFailure> {
+        match self
+            .linearizable_get(crate::keyspace::user_key(username))
+            .await?
+        {
+            Some(bytes) => Ok(Some(UserRecord::from_bytes(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Writes an account record, or removes it when `record` is `None`.
+    ///
+    /// A read-modify-write -- whether the account already exists decides
+    /// whether the call is allowed at all -- so the check and the write
+    /// have to be atomic against another admin doing the same thing at
+    /// the same moment. That is why this drives an ordinary transaction
+    /// instead of appending directly, and in turn why reserved keys are
+    /// refused at the RPC boundary rather than in `Locks`: the lock
+    /// table cannot tell this write from a client's, and must not.
+    ///
+    /// Nothing a client does can contend for these keys, since `write`
+    /// refuses them, so the only competition here is another admin call.
+    /// Two racing creations of one name resolve the way any two
+    /// transactions do, and the loser is told its transaction aborted.
+    ///
+    /// Clients and the server do share one thing, though: the open
+    /// transaction table. Enough concurrent client transactions to fill
+    /// `MAX_OPEN_TRANSACTIONS` will refuse this one too, surfacing as
+    /// `resource_exhausted`. Left as it is rather than given reserved
+    /// headroom, because an administrator retrying is a far smaller
+    /// problem than a second allocation rule to keep consistent with the
+    /// first.
+    async fn put_user(
+        &self,
+        username: &str,
+        record: Option<UserRecord>,
+    ) -> Result<u64, AuthFailure> {
+        let key = crate::keyspace::user_key(username);
+        let leader = self.leader()?;
+        leader.await_caught_up().await?;
+        let id = self
+            .locks
+            .create(leader.term(), ADMIN_TXN_TTL, crate::txn::fresh_id())?;
+
+        // Explicit rather than a `Drop` guard: discarding a transaction
+        // that already committed is a no-op, and the commit path itself
+        // hands its locks to the task doing the append, so there is
+        // nothing here that releasing early could cut short.
+        let result = self.write_user(id, &key, record).await;
+        self.locks.discard(id);
+        result
+    }
+
+    /// The body of `put_user`, inside its transaction.
+    async fn write_user(
+        &self,
+        id: TxnId,
+        key: &[u8],
+        record: Option<UserRecord>,
+    ) -> Result<u64, AuthFailure> {
+        let existing = self.transactional_read(id, key).await?.value;
+        match (&record, &existing) {
+            (Some(_), Some(_)) => {
+                return Err(AuthFailure::refused(
+                    auth_error::Kind::AlreadyExists,
+                    "that account already exists",
+                ));
+            }
+            (None, None) => {
+                return Err(AuthFailure::refused(
+                    auth_error::Kind::NoSuchUser,
+                    "there is no such account",
+                ));
+            }
+            _ => {}
+        }
+
+        let value = record.map(|record| record.to_bytes()).transpose()?;
+        self.locks.buffer_write(id, key, value)?;
+        Ok(self.commit(id).await?)
+    }
+
+    /// Checks that whoever sent this request is an administrator.
+    ///
+    /// The token says who they are; the store says what they may do.
+    /// Read fresh on every call rather than carried as a claim, because
+    /// a right baked into a token cannot be withdrawn until that token
+    /// expires. These calls are rare and already pay a raft round trip,
+    /// so the read costs nothing worth saving.
+    async fn require_admin(&self, extensions: &tonic::Extensions) -> Result<(), AuthFailure> {
+        // A node with no secret keeps no accounts, so there is nobody to
+        // be an administrator and nothing to check against. This is the
+        // one place the open case is decided: every caller of this is
+        // spared having to remember it, and there is a single line to
+        // read when asking what an unauthenticated cluster permits.
+        if self.auth.is_none() {
+            return Ok(());
+        }
+        // Missing only if the auth layer did not run. That is a
+        // misconfiguration rather than a forged request, but the safe
+        // reading of the two is the same.
+        let Some(context) = extensions.get::<AuthContext>() else {
+            return Err(Status::unauthenticated("this request carried no verified identity").into());
+        };
+        match self.load_user(&context.username).await? {
+            Some(user) if user.is_admin => Ok(()),
+            // Either not an admin, or an account deleted since its token
+            // was issued. Neither may proceed, and neither is told which
+            // it was.
+            // Deliberately not naming the operation: this guards
+            // account management and membership changes alike, and a
+            // message that named one of them would be wrong for the
+            // other.
+            _ => Err(AuthFailure::refused(
+                auth_error::Kind::NotAdmin,
+                "this account is not an administrator",
+            )),
+        }
+    }
+
+    async fn login_inner(&self, req: LoginRequest) -> Result<LoginOk, AuthFailure> {
+        let Some(auth) = self.auth.as_ref() else {
+            return Err(AuthFailure::disabled());
+        };
+        // A name that could never have been stored cannot match an
+        // account, and refusing it here keeps `user_key` to the shape it
+        // is sound for.
+        crate::keyspace::validate_username(&req.username)?;
+
+        let stored = self.password_hash_for(auth, &req.username).await?;
+        if !crate::auth::verify_password_or_dummy(req.password, stored).await? {
+            return Err(AuthFailure::bad_credentials());
+        }
+
+        let (token, expires_unix) = auth.issue(&req.username)?;
+        Ok(LoginOk {
+            token,
+            expires_unix,
+        })
+    }
+
+    /// What to check a login against: the stored account's hash, or --
+    /// on a node that is not yet part of any cluster -- the one this
+    /// node was started with.
+    ///
+    /// That fallback is what breaks the circle at the very beginning. A
+    /// fresh node has no accounts, and no leader to read them from, yet
+    /// `Bootstrap` needs a token like everything else; so the operator
+    /// has to be able to authenticate against something. It is gated on
+    /// the node having no configuration rather than on no account
+    /// existing, because the latter would quietly re-arm the startup
+    /// password the moment the last account was deleted. Once this node
+    /// has been bootstrapped or added to a cluster, the flag is inert
+    /// for good.
+    async fn password_hash_for(
+        &self,
+        auth: &AuthConfig,
+        username: &str,
+    ) -> Result<Option<String>, AuthFailure> {
+        let uninitialized = self
+            .store
+            .run(RaftLog::current_config)
+            .await
+            .map_err(|e| AuthFailure::from(RaftError::Storage(e)))?
+            .is_none();
+
+        if uninitialized {
+            return Ok(auth
+                .initial_admin
+                .as_ref()
+                .filter(|admin| admin.username == username)
+                .map(|admin| admin.password_hash.clone()));
+        }
+        Ok(self.load_user(username).await?.map(|user| user.password_hash))
+    }
+
+    /// Checks that whoever is bootstrapping this node is the
+    /// administrator it was started expecting.
+    ///
+    /// `require_admin` cannot be used here. It reads the store, and a
+    /// node with no cluster has no leader to read from -- which is the
+    /// very reason the startup administrator exists. So the check is
+    /// against that configured identity instead, which is also what
+    /// stops a token minted for some other cluster sharing this secret
+    /// from bootstrapping this node.
+    fn require_startup_admin(&self, extensions: &tonic::Extensions) -> Result<(), Status> {
+        let Some(auth) = self.auth.as_ref() else {
+            return Ok(());
+        };
+        let Some(context) = extensions.get::<AuthContext>() else {
+            return Err(Status::unauthenticated(
+                "this request carried no verified identity",
+            ));
+        };
+        match auth.initial_admin.as_ref() {
+            Some(admin) if admin.username == context.username => Ok(()),
+            _ => Err(Status::permission_denied(
+                "only the administrator this node was started with may bootstrap it",
+            )),
+        }
+    }
+
+    /// Writes that administrator into the log, once this node is
+    /// actually leading.
+    ///
+    /// `client_handle.bootstrap` only installs the configuration; the
+    /// node still has to win its (unopposed) election and commit its own
+    /// no-op before anything can be appended. Hence the wait rather than
+    /// an immediate append -- and hence `Bootstrap` answering only once
+    /// this has happened, so that "ok" means there is an administrator
+    /// rather than that there will shortly be one.
+    ///
+    /// Idempotent: a record already there is the end state this wants.
+    async fn write_startup_admin(&self) -> Result<(), Status> {
+        let Some(admin) = self
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.initial_admin.as_ref())
+        else {
+            return Ok(());
+        };
+        let record = UserRecord::new(admin.username.clone(), admin.password_hash.clone(), true);
+
+        let deadline = std::time::Instant::now() + BOOTSTRAP_ADMIN_TIMEOUT;
+        loop {
+            match self.put_user(&admin.username, Some(record.clone())).await {
+                Ok(_) => return Ok(()),
+                Err(AuthFailure::Refused(auth_error::Kind::AlreadyExists, _)) => return Ok(()),
+                Err(_) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(BOOTSTRAP_ADMIN_RETRY).await;
+                }
+                // The configuration is installed and this node is a
+                // cluster, but nobody can administer it: the startup
+                // password stops working the moment a configuration
+                // exists. Said plainly, because the way out is to
+                // discard this node's directory and bootstrap again.
+                Err(_) => {
+                    return Err(Status::internal(
+                        "this node was bootstrapped but its administrator could not be written, \
+                         so the cluster has no account that can manage it; discard this node's \
+                         database directory and bootstrap again",
+                    ));
+                }
+            }
+        }
+    }
+
+    async fn create_user_inner(
+        &self,
+        extensions: &tonic::Extensions,
+        req: CreateUserRequest,
+    ) -> Result<u64, AuthFailure> {
+        if self.auth.is_none() {
+            return Err(AuthFailure::disabled());
+        }
+        crate::keyspace::validate_username(&req.username)?;
+        self.require_admin(extensions).await?;
+
+        let password_hash = crate::auth::hash_password(req.password).await?;
+        let record = UserRecord::new(req.username.clone(), password_hash, req.is_admin);
+        self.put_user(&req.username, Some(record)).await
+    }
+
+    async fn delete_user_inner(
+        &self,
+        extensions: &tonic::Extensions,
+        req: DeleteUserRequest,
+    ) -> Result<u64, AuthFailure> {
+        if self.auth.is_none() {
+            return Err(AuthFailure::disabled());
+        }
+        crate::keyspace::validate_username(&req.username)?;
+        self.require_admin(extensions).await?;
+        self.put_user(&req.username, None).await
+    }
+
     async fn get_config_internal(&self) -> Result<Vec<ClusterMember>, StorageError> {
         let bytes = self.store.run(RaftLog::current_config).await?;
 
@@ -536,6 +998,10 @@ impl Kv for KvService {
     ) -> Result<Response<WriteResponse>, Status> {
         let req = request.into_inner();
         let id = txn_id(&req.transaction_id)?;
+        // The privilege-escalation guard. A client able to buffer a
+        // write to a reserved key could write its own account record,
+        // with `is_admin` set to whatever it liked.
+        reject_reserved(&req.key)?;
 
         // Purely in-memory: nothing reaches the log until `commit`. The
         // leader handle is fetched only for the term check inside
@@ -557,6 +1023,10 @@ impl Kv for KvService {
 
     async fn read(&self, request: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {
         let req = request.into_inner();
+        // Before the branch, so it covers the transactional read too.
+        // Refused rather than answered as absent: a password hash handed
+        // back is one to attack offline, at leisure.
+        reject_reserved(&req.key)?;
 
         // A transactional read is a different thing: it takes a lock, it
         // can be answered from what the transaction itself has buffered,
@@ -609,6 +1079,12 @@ impl Kv for KvService {
         request: Request<GetKeysRequest>,
     ) -> Result<Response<GetKeysResponse>, Status> {
         let req = request.into_inner();
+        // `scan` would skip the whole reserved range anyway, so this
+        // refusal protects nothing the filter doesn't. It is here to say
+        // where the boundary is: a caller starting a walk at the very
+        // beginning passes an empty key, which is not reserved, so
+        // nothing legitimate asks for this.
+        reject_reserved(&req.start_key)?;
 
         // Refused rather than shortened, so a caller paging in batches
         // of N finds out it isn't getting N instead of silently getting
@@ -715,7 +1191,7 @@ impl Kv for KvService {
         &self,
         request: Request<AddServerRequest>,
     ) -> Result<Response<ConfigChangeResponse>, Status> {
-        let req = request.into_inner();
+        let (_, extensions, req) = request.into_parts();
 
         // Checked before the round trip below, not just inside `propose`:
         // a follower has no business dialing the new server only to find
@@ -725,6 +1201,11 @@ impl Kv for KvService {
         // round trip.
         if let Err(e) = require_leader(&self.client_handle.role()) {
             return not_leader_response(e);
+        }
+        // And before it too: dialing the server named by a caller who
+        // may not do this is a side effect on that caller's say-so.
+        if let Err(e) = self.require_admin(&extensions).await {
+            return config_change_refusal(e);
         }
 
         // First, send an RPC to the new server to get its configuration.
@@ -782,7 +1263,10 @@ impl Kv for KvService {
         &self,
         request: Request<RemoveServerRequest>,
     ) -> Result<Response<ConfigChangeResponse>, Status> {
-        let req = request.into_inner();
+        let (_, extensions, req) = request.into_parts();
+        if let Err(e) = self.require_admin(&extensions).await {
+            return config_change_refusal(e);
+        }
         self.propose(ConfigChange::RemoveServer {
             server_id: req.server_id,
         })
@@ -793,13 +1277,14 @@ impl Kv for KvService {
         &self,
         request: Request<BootstrapRequest>,
     ) -> Result<Response<ConfigChangeResponse>, Status> {
-        let req = request.into_inner();
+        let (_, extensions, req) = request.into_parts();
         if !req.server_id.is_empty() && req.server_id != self.identity.server_id {
             return Err(Status::failed_precondition(format!(
                 "this node is {}, not {}",
                 self.identity.server_id, req.server_id
             )));
         }
+        self.require_startup_admin(&extensions)?;
 
         // A cluster of exactly one: the node is its own sole voter, so it
         // wins the next election unopposed and can then serve AddServer
@@ -812,6 +1297,10 @@ impl Kv for KvService {
             .bootstrap(config)
             .await
             .map_err(raft_err)?;
+        // Before answering, not after: the startup password stops
+        // working the instant a configuration exists, so an operator
+        // told "ok" needs the replacement to already be in the log.
+        self.write_startup_admin().await?;
 
         Ok(Response::new(ConfigChangeResponse {
             result: Some(config_change_response::Result::Ok(true)),
@@ -838,6 +1327,58 @@ impl Kv for KvService {
             identity: Some(self.identity.clone()),
             members,
             is_leader,
+        }))
+    }
+
+    async fn login(
+        &self,
+        request: Request<LoginRequest>,
+    ) -> Result<Response<LoginResponse>, Status> {
+        let result = self.login_inner(request.into_inner()).await;
+        Ok(Response::new(LoginResponse {
+            result: Some(match result {
+                Ok(ok) => login_response::Result::Ok(ok),
+                Err(e) => match auth_failure(e)? {
+                    AuthReply::Raft(e) => login_response::Result::Error(e),
+                    AuthReply::Auth(e) => login_response::Result::AuthError(e),
+                },
+            }),
+        }))
+    }
+
+    async fn create_user(
+        &self,
+        request: Request<CreateUserRequest>,
+    ) -> Result<Response<CreateUserResponse>, Status> {
+        // `into_parts` rather than `into_inner`: who the caller is lives
+        // in the extensions, put there by the auth layer.
+        let (_, extensions, req) = request.into_parts();
+        let result = self.create_user_inner(&extensions, req).await;
+        Ok(Response::new(CreateUserResponse {
+            result: Some(match result {
+                Ok(seq) => create_user_response::Result::Seq(seq),
+                Err(e) => match auth_failure(e)? {
+                    AuthReply::Raft(e) => create_user_response::Result::Error(e),
+                    AuthReply::Auth(e) => create_user_response::Result::AuthError(e),
+                },
+            }),
+        }))
+    }
+
+    async fn delete_user(
+        &self,
+        request: Request<DeleteUserRequest>,
+    ) -> Result<Response<DeleteUserResponse>, Status> {
+        let (_, extensions, req) = request.into_parts();
+        let result = self.delete_user_inner(&extensions, req).await;
+        Ok(Response::new(DeleteUserResponse {
+            result: Some(match result {
+                Ok(seq) => delete_user_response::Result::Seq(seq),
+                Err(e) => match auth_failure(e)? {
+                    AuthReply::Raft(e) => delete_user_response::Result::Error(e),
+                    AuthReply::Auth(e) => delete_user_response::Result::AuthError(e),
+                },
+            }),
         }))
     }
 }

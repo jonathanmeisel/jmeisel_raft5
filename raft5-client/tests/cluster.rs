@@ -26,6 +26,16 @@ struct TestNode {
 
 impl TestNode {
     fn start(id: &str) -> Self {
+        Self::start_with(id, None)
+    }
+
+    /// A node that requires a token on every RPC but `Login` and
+    /// `GetConfig`.
+    fn start_with_auth(id: &str, auth: raft5_server::auth::AuthConfig) -> Self {
+        Self::start_with(id, Some(auth))
+    }
+
+    fn start_with(id: &str, auth: Option<raft5_server::auth::AuthConfig>) -> Self {
         let _ = env_logger::try_init();
         let node = Self {
             id: id.to_string(),
@@ -39,13 +49,16 @@ impl TestNode {
         let (client_addr, peer_addr) = (node.client_addr, node.peer_addr);
         let cancel = node.cancel.clone();
         tokio::spawn(async move {
-            let server = raft5_server::serve(
-                server_id,
-                &db_dir,
-                client_addr,
-                peer_addr,
-                None,
-                None,
+            let server = raft5_server::serve_config(
+                raft5_server::ServerConfig {
+                    id: server_id,
+                    db: db_dir,
+                    client_addr,
+                    peer_addr,
+                    advertise: None,
+                    advertise_client: None,
+                    auth,
+                },
                 cancel,
             );
             if let Err(e) = server.await {
@@ -807,4 +820,218 @@ async fn a_key_iterator_pages_correctly_across_keys_that_prefix_each_other() {
         .await
         .unwrap();
     assert_eq!(keys, expected);
+}
+
+// --- authentication ---------------------------------------------------
+
+const TEST_SECRET: &[u8] = b"thirty-two bytes at the very least, and this is";
+
+async fn auth_config(admin: Option<(&str, &str)>) -> raft5_server::auth::AuthConfig {
+    let initial_admin = match admin {
+        Some((username, password)) => Some(raft5_server::auth::InitialAdmin {
+            username: username.to_string(),
+            password_hash: raft5_server::auth::hash_password(password.to_string())
+                .await
+                .expect("hashing should work"),
+        }),
+        None => None,
+    };
+    raft5_server::auth::AuthConfig::new(TEST_SECRET, Duration::from_secs(3600), initial_admin)
+}
+
+/// An authenticated cluster, from the client's side: log in before there
+/// is anything to log in to, bootstrap with that token, then use the
+/// account bootstrapping left behind.
+#[tokio::test]
+async fn a_client_can_log_in_bootstrap_and_then_work() {
+    let n1 = TestNode::start_with_auth("auth-c1", auth_config(Some(("root", "hunter42"))).await);
+    let client = Client::new([n1.url()]).unwrap();
+
+    assert!(!client.is_logged_in());
+    client.login("root", "hunter42").await.unwrap();
+    assert!(client.is_logged_in());
+
+    bootstrap(&client, "auth-c1").await;
+
+    // The token from before the cluster existed is still good, and the
+    // account bootstrapping wrote is what backs it from here on.
+    client.write(b"k", Some(b"v")).await.unwrap();
+    assert_eq!(client.read(b"k").await.unwrap().value, Some(b"v".to_vec()));
+
+    client
+        .create_user("alice", "correct horse", false)
+        .await
+        .unwrap();
+
+    let alice = Client::new([n1.url()]).unwrap();
+    alice.login("alice", "correct horse").await.unwrap();
+    assert_eq!(alice.read(b"k").await.unwrap().value, Some(b"v".to_vec()));
+}
+
+/// The regression that matters most for how this *feels*: an
+/// unauthenticated call has to fail at once. Retried to the ten-second
+/// deadline it would be reported as "the cluster could not serve the
+/// request", which is both wrong and the single most misleading thing
+/// this client could say.
+#[tokio::test]
+async fn a_call_without_a_token_fails_immediately_rather_than_retrying() {
+    let n1 = TestNode::start_with_auth("auth-c2", auth_config(Some(("root", "hunter42"))).await);
+    let client = Client::new([n1.url()]).unwrap();
+    // Bootstrap through a client that has logged in, so the cluster is
+    // usable and the only thing wrong below is the missing token.
+    let admin = Client::new([n1.url()]).unwrap();
+    admin.login("root", "hunter42").await.unwrap();
+    bootstrap(&admin, "auth-c2").await;
+
+    let started = Instant::now();
+    let error = client
+        .read(b"k")
+        .await
+        .expect_err("a read with no token should be refused");
+    assert!(
+        matches!(error, Error::Unauthenticated(_)),
+        "expected Unauthenticated, got {error:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "a refusal that cannot change should not be retried to the deadline; took {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn logging_in_with_the_wrong_password_is_refused_and_says_so() {
+    let n1 = TestNode::start_with_auth("auth-c3", auth_config(Some(("root", "hunter42"))).await);
+    let client = Client::new([n1.url()]).unwrap();
+
+    let error = client
+        .login("root", "not the password")
+        .await
+        .expect_err("the wrong password should be refused");
+    assert!(
+        matches!(
+            error,
+            Error::Denied {
+                reason: raft5_client::Denial::BadCredentials,
+                ..
+            }
+        ),
+        "expected BadCredentials, got {error:?}"
+    );
+    assert!(!client.is_logged_in());
+}
+
+/// Authenticating says who you are; the store says what you may do.
+#[tokio::test]
+async fn an_ordinary_account_is_refused_account_management() {
+    let n1 = TestNode::start_with_auth("auth-c4", auth_config(Some(("root", "hunter42"))).await);
+    let admin = Client::new([n1.url()]).unwrap();
+    admin.login("root", "hunter42").await.unwrap();
+    bootstrap(&admin, "auth-c4").await;
+    admin
+        .create_user("alice", "correct horse", false)
+        .await
+        .unwrap();
+
+    let alice = Client::new([n1.url()]).unwrap();
+    alice.login("alice", "correct horse").await.unwrap();
+
+    let error = alice
+        .create_user("mallory", "letmein", true)
+        .await
+        .expect_err("an ordinary account may not create accounts");
+    assert!(
+        matches!(
+            error,
+            Error::Denied {
+                reason: raft5_client::Denial::NotAdmin,
+                ..
+            }
+        ),
+        "expected NotAdmin, got {error:?}"
+    );
+}
+
+/// A cluster with no secret keeps no accounts, and says so rather than
+/// letting a caller believe they have logged in to something.
+#[tokio::test]
+async fn logging_in_to_a_cluster_without_a_secret_says_it_is_disabled() {
+    let n1 = TestNode::start("auth-c5");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "auth-c5").await;
+
+    let error = client
+        .login("root", "hunter42")
+        .await
+        .expect_err("there is nothing to log in to");
+    assert!(
+        matches!(
+            error,
+            Error::Denied {
+                reason: raft5_client::Denial::AuthDisabled,
+                ..
+            }
+        ),
+        "expected AuthDisabled, got {error:?}"
+    );
+
+    // And the cluster is perfectly usable without logging in.
+    client.write(b"k", Some(b"v")).await.unwrap();
+}
+
+/// Logging out is not just local bookkeeping: the connections this
+/// client already holds stop sending the token too.
+#[tokio::test]
+async fn logging_out_stops_existing_connections_using_the_token() {
+    let n1 = TestNode::start_with_auth("auth-c6", auth_config(Some(("root", "hunter42"))).await);
+    let client = Client::new([n1.url()]).unwrap();
+    client.login("root", "hunter42").await.unwrap();
+    bootstrap(&client, "auth-c6").await;
+    client.write(b"k", Some(b"v")).await.unwrap();
+
+    client.logout();
+    assert!(!client.is_logged_in());
+
+    let error = client
+        .read(b"k")
+        .await
+        .expect_err("after logging out there is no token to send");
+    assert!(
+        matches!(error, Error::Unauthenticated(_)),
+        "expected Unauthenticated, got {error:?}"
+    );
+}
+
+/// Membership changes are administrators-only, and the refusal reaches
+/// the client as the same `Denial::NotAdmin` a rejected `create_user`
+/// gives -- one error type for "you may not do this", whichever call it
+/// was.
+#[tokio::test]
+async fn an_ordinary_account_is_refused_membership_changes() {
+    let n1 = TestNode::start_with_auth("auth-c7", auth_config(Some(("root", "hunter42"))).await);
+    let admin = Client::new([n1.url()]).unwrap();
+    admin.login("root", "hunter42").await.unwrap();
+    bootstrap(&admin, "auth-c7").await;
+    admin
+        .create_user("alice", "correct horse", false)
+        .await
+        .unwrap();
+
+    let alice = Client::new([n1.url()]).unwrap();
+    alice.login("alice", "correct horse").await.unwrap();
+
+    let error = alice
+        .remove_server("auth-c7")
+        .await
+        .expect_err("an ordinary account may not change membership");
+    assert!(
+        matches!(
+            error,
+            Error::Denied {
+                reason: raft5_client::Denial::NotAdmin,
+                ..
+            }
+        ),
+        "expected NotAdmin, got {error:?}"
+    );
 }

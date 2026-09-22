@@ -5,7 +5,7 @@
 //! command onward reuses whatever leader and membership the first one
 //! already found.
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 use clap::Parser;
 
@@ -22,6 +22,43 @@ struct Args {
     /// taken to be `http://`.
     #[arg(long, value_delimiter = ',')]
     nodes: Vec<String>,
+
+    /// Log in as this user before the session starts. The password is
+    /// prompted for; it is never taken as an argument, where it would
+    /// end up in shell history and in the process list.
+    ///
+    /// Against a cluster started without a signing secret there is
+    /// nothing to log in to, and this is not needed.
+    #[arg(long)]
+    user: Option<String>,
+}
+
+/// Asks for a password, without echoing it when there is an echo to
+/// suppress.
+///
+/// `rpassword` reads from the terminal directly and fails outright if
+/// there isn't one, so a shell being driven by a script -- which is how
+/// these commands get tested -- needs the plain path instead. There is
+/// nothing to hide in that case anyway: the password is arriving down a
+/// pipe, not being typed where someone could read it.
+fn prompt_password(username: &str) -> Result<String, String> {
+    let prompt = format!("password for {username}: ");
+    if io::stdin().is_terminal() {
+        return rpassword::prompt_password(prompt)
+            .map_err(|e| format!("could not read a password: {e}"));
+    }
+    read_line(&prompt)
+}
+
+async fn log_in(client: &Client, username: &str) -> Result<(), String> {
+    let password = prompt_password(username)?;
+    match client.login(username, &password).await {
+        Ok(()) => {
+            println!("logged in as {username}");
+            Ok(())
+        }
+        Err(e) => Err(format!("could not log in: {e}")),
+    }
 }
 
 #[tokio::main]
@@ -51,6 +88,13 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    if let Some(username) = args.user.as_deref()
+        && let Err(e) = log_in(&client, username).await
+    {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
 
     println!(
         "raft5 client shell -- {} seed(s), type `help` for commands",
@@ -175,10 +219,66 @@ async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
                 Err(e) => println!("error: {e}"),
             }
         }
+        "login" => {
+            let username = match args {
+                [username] => username.clone(),
+                // Prompted rather than defaulted: whose session this is
+                // is not something to guess at.
+                [] => read_line("username: ")?,
+                _ => return Err("usage: login [username]".to_string()),
+            };
+            // The password is never a positional argument: `shell_words`
+            // would put it in this shell's history, where it would
+            // outlive the session.
+            if let Err(e) = log_in(client, &username).await {
+                println!("{e}");
+            }
+        }
+        "logout" => {
+            client.logout();
+            println!("logged out");
+        }
+        "whoami" => match (client.username(), client.is_logged_in()) {
+            (Some(username), _) => println!("{username}"),
+            (None, true) => println!("logged in with a token, which does not say who you are"),
+            (None, false) => println!("not logged in"),
+        },
+        "create_user" => {
+            let (username, is_admin) = match args {
+                [username] => (username.as_str(), false),
+                [username, flag] if flag == "--admin" => (username.as_str(), true),
+                _ => return Err("usage: create_user <username> [--admin]".to_string()),
+            };
+            let password = prompt_password(username)?;
+            match client.create_user(username, &password, is_admin).await {
+                Ok(seq) => println!("ok, seq={seq}"),
+                Err(e) => println!("error: {e}"),
+            }
+        }
+        "delete_user" => {
+            let [username] = fixed_args(args, "delete_user <username>")?;
+            print_seq(client.delete_user(username).await);
+        }
         other => println!("unknown command {other:?}; type `help` for a list"),
     }
 
     Ok(true)
+}
+
+/// Reads one line from stdin, for the arguments a command would rather
+/// ask for than have typed where they can be seen.
+fn read_line(prompt: &str) -> Result<String, String> {
+    print!("{prompt}");
+    io::stdout().flush().map_err(|e| e.to_string())?;
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| format!("could not read input: {e}"))?;
+    let line = line.trim().to_string();
+    if line.is_empty() {
+        return Err("nothing entered".to_string());
+    }
+    Ok(line)
 }
 
 /// Matches `args` against exactly `N` positional arguments, so each
@@ -225,6 +325,11 @@ fn print_help() {
             "remove_server <id>               remove a server",
             "bootstrap <id>                   form a single-node cluster around <id>",
             "endpoints                        list the client API addresses this client knows of",
+            "login [username]                 log in; the password is always prompted for",
+            "logout                           forget the token, on every connection this client holds",
+            "whoami                           show who this session is logged in as",
+            "create_user <name> [--admin]     create an account; administrators only",
+            "delete_user <name>               remove an account; administrators only",
             "help                             show this message",
             "quit                             end the session",
         ]

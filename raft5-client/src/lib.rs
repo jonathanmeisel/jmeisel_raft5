@@ -39,7 +39,9 @@ use tonic::Status;
 
 use raft5_shared::raft5::client::{
     AddServerRequest, BootstrapRequest, CommitTransactionRequest, CommitTransactionResponse,
-    ConfigChangeResponse, CreateTransactionRequest, CreateTransactionResponse,
+    ConfigChangeResponse, CreateTransactionRequest, CreateTransactionResponse, CreateUserRequest,
+    CreateUserResponse, DeleteUserRequest, DeleteUserResponse, LoginRequest, LoginResponse,
+    auth_error, create_user_response, delete_user_response, login_response,
     DropTransactionRequest, GetKeysRequest, GetKeysResponse, RaftError as PbRaftError,
     ReadRequest, ReadResponse, RemoveServerRequest, WriteRequest, WriteResponse,
     commit_transaction_response, config_change_response, create_transaction_response,
@@ -128,6 +130,72 @@ pub enum Error {
     /// read-modify-write that already applied applies it twice. Read the
     /// keys back and decide from what is actually there.
     InDoubt { seq: u64 },
+    /// The cluster would not accept who this client is: no token, or one
+    /// it did not sign, or one that has expired.
+    ///
+    /// Never retried. If the client has credentials from an earlier
+    /// [`login`](Client::login) it logs in again once and retries by
+    /// itself before reporting this, so seeing it means that failed too
+    /// -- or that there were no credentials to try.
+    Unauthenticated(String),
+    /// The cluster knows who this client is and will not let them do
+    /// this. Never retried: time does not grant permissions.
+    PermissionDenied(String),
+    /// An account request the cluster understood and refused. Never
+    /// retried, for the same reason -- a wrong password does not come
+    /// right on the second attempt.
+    Denied {
+        reason: Denial,
+        /// What the cluster said, for a human to read.
+        detail: String,
+    },
+}
+
+/// Why the cluster refused an account request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Denial {
+    /// The username or the password was wrong. Which of the two is not
+    /// disclosed, so this is the answer for an account that does not
+    /// exist as well.
+    BadCredentials,
+    /// An account by that name already exists.
+    AlreadyExists,
+    /// There is no account by that name to remove.
+    NoSuchUser,
+    /// The caller is not an administrator.
+    NotAdmin,
+    /// The cluster was started without a signing secret, so it keeps no
+    /// accounts and issues no tokens.
+    AuthDisabled,
+    /// A reason this version of the client does not know about.
+    Unknown,
+}
+
+impl std::fmt::Display for Denial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            Self::BadCredentials => "the username or password was wrong",
+            Self::AlreadyExists => "that account already exists",
+            Self::NoSuchUser => "there is no such account",
+            Self::NotAdmin => "that account is not an administrator",
+            Self::AuthDisabled => "this cluster keeps no accounts",
+            Self::Unknown => "the cluster refused",
+        };
+        f.write_str(text)
+    }
+}
+
+impl From<auth_error::Kind> for Denial {
+    fn from(kind: auth_error::Kind) -> Self {
+        match kind {
+            auth_error::Kind::BadCredentials => Self::BadCredentials,
+            auth_error::Kind::AlreadyExists => Self::AlreadyExists,
+            auth_error::Kind::NoSuchUser => Self::NoSuchUser,
+            auth_error::Kind::NotAdmin => Self::NotAdmin,
+            auth_error::Kind::AuthDisabled => Self::AuthDisabled,
+            auth_error::Kind::Unspecified => Self::Unknown,
+        }
+    }
 }
 
 /// Why a transaction ended without committing. Each of these means
@@ -205,6 +273,12 @@ impl std::fmt::Display for Error {
                 "the commit reached the log at seq {seq} and then the leader changed; \
                  whether it committed is unknown, so it must not be replayed"
             ),
+            Self::Unauthenticated(why) => {
+                write!(f, "the cluster did not accept this client's identity: {why}")
+            }
+            Self::PermissionDenied(why) => write!(f, "not permitted: {why}"),
+            Self::Denied { reason, detail } if detail.is_empty() => write!(f, "{reason}"),
+            Self::Denied { detail, .. } => f.write_str(detail),
         }
     }
 }
@@ -238,6 +312,9 @@ enum Reply<T> {
     Aborted { reason: AbortReason, key: Option<Vec<u8>> },
     /// The commit is in doubt. Retried by nobody, ever.
     InDoubt { seq: u64 },
+    /// An account request the cluster refused on its merits. Never
+    /// retried: the answer will not change.
+    Denied { reason: Denial, detail: String },
 }
 
 impl<T> Reply<T> {
@@ -538,12 +615,28 @@ impl Client {
             match kv.bootstrap(request.clone()).await {
                 Ok(resp) => match config_reply(resp) {
                     Reply::Ok(()) => return Ok(()),
+                    // The cluster's answer, not this node's mood, so
+                    // asking the next node would collect the same one.
+                    Reply::Denied { reason, detail } => {
+                        return Err(Error::Denied { reason, detail });
+                    }
                     // A membership change has no key and so no
                     // precondition, and it is not a transaction; every
                     // other variant is unreachable here, and each says
                     // the same thing anyway -- this node said no.
                     _ => last = Some(format!("{} refused to bootstrap", node.key)),
                 },
+                // Reported rather than folded into the "nobody could
+                // serve it" below: an operator whose token is missing or
+                // whose identity is not the one this node was started
+                // with needs to be told that, not told the cluster was
+                // busy. Same reasoning as in `call_inner`.
+                Err(status) if status.code() == tonic::Code::Unauthenticated => {
+                    return Err(Error::Unauthenticated(status.message().to_string()));
+                }
+                Err(status) if status.code() == tonic::Code::PermissionDenied => {
+                    return Err(Error::PermissionDenied(status.message().to_string()));
+                }
                 Err(status) => last = Some(format!("{}: {status}", node.key)),
             }
         }
@@ -568,6 +661,169 @@ impl Client {
         Ok(())
     }
 
+    /// Logs in, and uses the resulting token for everything this client
+    /// does from here on -- including connections it already holds, and
+    /// every clone of it.
+    ///
+    /// Against a cluster started without a signing secret this fails
+    /// with [`Denial::AuthDisabled`]: there is nothing to log in to.
+    ///
+    /// The credentials are kept in memory so that a token expiring
+    /// mid-session can be replaced without the caller noticing. For a
+    /// caller unwilling to hold a password for the life of the client,
+    /// [`login_with_token`] does the same job without that -- at the
+    /// cost of surfacing the expiry.
+    ///
+    /// [`login_with_token`]: Client::login_with_token
+    pub async fn login(&self, username: &str, password: &str) -> Result<(), Error> {
+        self.refresh_token(username, password).await?;
+        self.router
+            .set_credentials(Some((username.to_string(), password.to_string())));
+        Ok(())
+    }
+
+    /// Uses a token obtained elsewhere.
+    ///
+    /// Nothing is validated here -- the first request to carry it is
+    /// what finds out whether the cluster agrees. No credentials are
+    /// stored, so an expiry is reported as
+    /// [`Error::Unauthenticated`] rather than quietly replaced.
+    pub fn login_with_token(&self, token: String) {
+        self.router.set_token(Some(token));
+        self.router.set_credentials(None);
+    }
+
+    /// Forgets the token and any credentials held with it.
+    pub fn logout(&self) {
+        self.router.set_token(None);
+        self.router.set_credentials(None);
+    }
+
+    /// Whether this client currently holds a token. Says nothing about
+    /// whether the cluster still accepts it.
+    pub fn is_logged_in(&self) -> bool {
+        self.router.has_token()
+    }
+
+    /// Who this client logged in as, if it logged in.
+    ///
+    /// `None` for a client holding a token it was handed rather than one
+    /// it asked for: a token names its holder, but this client does not
+    /// read the tokens it carries.
+    pub fn username(&self) -> Option<String> {
+        self.router.username()
+    }
+
+    /// Creates an account. Administrators only.
+    ///
+    /// `is_admin` decides whether the new account may in turn manage
+    /// accounts. Returns the sequence number the account was written at.
+    pub async fn create_user(
+        &self,
+        username: &str,
+        password: &str,
+        is_admin: bool,
+    ) -> Result<u64, Error> {
+        let request = CreateUserRequest {
+            username: username.to_string(),
+            password: password.to_string(),
+            is_admin,
+        };
+        self.call(|mut kv: Kv| {
+            let request = request.clone();
+            async move { kv.create_user(request).await.map(create_user_reply) }
+        })
+        .await
+    }
+
+    /// Removes an account. Administrators only.
+    ///
+    /// A token already issued to that account goes on being accepted
+    /// until it expires -- nothing can un-issue one -- but it buys no
+    /// administrative rights from the moment the account is gone.
+    pub async fn delete_user(&self, username: &str) -> Result<u64, Error> {
+        let request = DeleteUserRequest {
+            username: username.to_string(),
+        };
+        self.call(|mut kv: Kv| {
+            let request = request.clone();
+            async move { kv.delete_user(request).await.map(delete_user_reply) }
+        })
+        .await
+    }
+
+    /// Gets a token and starts using it, without touching whatever
+    /// credentials are stored.
+    ///
+    /// `call_inner(.., false)`: `Login` is the one call that must not
+    /// answer an expired token by logging in again, which is what it is
+    /// in the middle of doing.
+    async fn refresh_token(&self, username: &str, password: &str) -> Result<(), Error> {
+        let request = LoginRequest {
+            username: username.to_string(),
+            password: password.to_string(),
+        };
+        let routed = self
+            .call_inner(
+                |mut kv: Kv| {
+                    let request = request.clone();
+                    async move { kv.login(request).await.map(login_reply) }
+                },
+                false,
+            )
+            .await;
+
+        let token = match routed {
+            Ok(token) => token,
+            // Nobody could be shown to be leading. For a cluster that
+            // has not been bootstrapped yet that is not a failure, it is
+            // the normal state -- and logging in is precisely what an
+            // operator has to do there, to get the token `Bootstrap`
+            // will ask for. A node with no configuration answers a login
+            // from the credentials it was started with and needs no
+            // leader to do it, so ask the nodes directly.
+            Err(Error::Unavailable(why)) => match self.login_directly(&request).await {
+                Ok(token) => token,
+                // Report the original complaint rather than the second
+                // one: "no leader" is the more useful of the two, and
+                // the direct attempt was the speculative one.
+                Err(Error::Unavailable(_)) => return Err(Error::Unavailable(why)),
+                Err(e) => return Err(e),
+            },
+            Err(e) => return Err(e),
+        };
+        self.router.set_token(Some(token));
+        Ok(())
+    }
+
+    /// One `Login` per known endpoint, in turn, with no leader routing.
+    ///
+    /// The fallback for a cluster with no leader to route to. Sent to
+    /// each node rather than one because this client's seeds may include
+    /// nodes that are not the one holding the startup credentials.
+    async fn login_directly(&self, request: &LoginRequest) -> Result<String, Error> {
+        let mut last: Option<String> = None;
+        for node in self.router.nodes() {
+            let mut kv = node.connect();
+            match kv.login(request.clone()).await {
+                Ok(resp) => match login_reply(resp) {
+                    Reply::Ok(token) => return Ok(token),
+                    // A refusal on the merits is the cluster's answer,
+                    // not this node's, so asking the next one would only
+                    // collect the same refusal again.
+                    Reply::Denied { reason, detail } => {
+                        return Err(Error::Denied { reason, detail });
+                    }
+                    _ => last = Some(format!("{} could not answer a login", node.key)),
+                },
+                Err(status) => last = Some(format!("{}: {status}", node.key)),
+            }
+        }
+        Err(Error::Unavailable(last.unwrap_or_else(|| {
+            "no cluster member answered a login".to_string()
+        })))
+    }
+
     /// Runs one RPC against the leader, following redirects and retrying
     /// transient refusals until [`DEADLINE`].
     async fn call<T, F, Fut>(&self, op: F) -> Result<T, Error>
@@ -575,9 +831,21 @@ impl Client {
         F: Fn(Kv) -> Fut,
         Fut: Future<Output = Result<Reply<T>, Status>>,
     {
+        self.call_inner(op, true).await
+    }
+
+    /// `call`, saying whether an expired token may be replaced by
+    /// logging in again. Only `Login` itself passes `false`, so that
+    /// answering an expiry cannot recurse into answering an expiry.
+    async fn call_inner<T, F, Fut>(&self, op: F, allow_relogin: bool) -> Result<T, Error>
+    where
+        F: Fn(Kv) -> Fut,
+        Fut: Future<Output = Result<Reply<T>, Status>>,
+    {
         let deadline = Instant::now() + DEADLINE;
         let mut hint: Option<String> = None;
         let mut last: Option<String> = None;
+        let mut relogged_in = false;
 
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -618,6 +886,42 @@ impl Client {
                             return Err(Error::Aborted { reason, key });
                         }
                         Ok(Ok(Reply::InDoubt { seq })) => return Err(Error::InDoubt { seq }),
+                        Ok(Ok(Reply::Denied { reason, detail })) => {
+                            return Err(Error::Denied { reason, detail });
+                        }
+                        // Before the `is_permanent` arm below, which
+                        // would otherwise turn these into `Rejected` and
+                        // lose the distinction.
+                        //
+                        // An expired token is the common case here, and
+                        // a client that knows what it logged in with can
+                        // simply get another. Once only: an identity the
+                        // cluster genuinely will not accept has to fail
+                        // rather than spin.
+                        Ok(Err(status)) if status.code() == tonic::Code::Unauthenticated => {
+                            if allow_relogin
+                                && !relogged_in
+                                && let Some((username, password)) = self.router.credentials()
+                            {
+                                relogged_in = true;
+                                // Boxed to break the type-level cycle:
+                                // this calls `refresh_token`, which
+                                // calls back into `call_inner`. It can
+                                // never recurse at runtime -- that call
+                                // passes `allow_relogin: false` -- but
+                                // the future's size would be infinite
+                                // without an indirection here.
+                                let again =
+                                    Box::pin(self.refresh_token(&username, &password)).await;
+                                if again.is_ok() {
+                                    continue;
+                                }
+                            }
+                            return Err(Error::Unauthenticated(status.message().to_string()));
+                        }
+                        Ok(Err(status)) if status.code() == tonic::Code::PermissionDenied => {
+                            return Err(Error::PermissionDenied(status.message().to_string()));
+                        }
                         // A refusal that time cannot fix. Retrying it
                         // would only spend the whole deadline arriving at
                         // the same answer, and then report it as though
@@ -652,6 +956,10 @@ impl Client {
 /// this node happened not to be able to serve it. Deliberately a short
 /// list: anything not named here is retried, because treating a
 /// transient failure as permanent is the worse mistake of the two.
+///
+/// `Unauthenticated` and `PermissionDenied` belong on that list too and
+/// are absent only because `call_inner` has already returned on both,
+/// with error types that say more than `Rejected` would.
 fn is_permanent(status: &Status) -> bool {
     matches!(
         status.code(),
@@ -729,6 +1037,44 @@ fn create_transaction_reply(resp: tonic::Response<CreateTransactionResponse>) ->
     }
 }
 
+fn login_reply(resp: tonic::Response<LoginResponse>) -> Reply<String> {
+    match resp.into_inner().result {
+        Some(login_response::Result::Ok(ok)) => Reply::Ok(ok.token),
+        Some(login_response::Result::Error(e)) => Reply::from_error(e),
+        Some(login_response::Result::AuthError(e)) => denied(e),
+        None => empty_response(),
+    }
+}
+
+fn create_user_reply(resp: tonic::Response<CreateUserResponse>) -> Reply<u64> {
+    match resp.into_inner().result {
+        Some(create_user_response::Result::Seq(seq)) => Reply::Ok(seq),
+        Some(create_user_response::Result::Error(e)) => Reply::from_error(e),
+        Some(create_user_response::Result::AuthError(e)) => denied(e),
+        None => empty_response(),
+    }
+}
+
+fn delete_user_reply(resp: tonic::Response<DeleteUserResponse>) -> Reply<u64> {
+    match resp.into_inner().result {
+        Some(delete_user_response::Result::Seq(seq)) => Reply::Ok(seq),
+        Some(delete_user_response::Result::Error(e)) => Reply::from_error(e),
+        Some(delete_user_response::Result::AuthError(e)) => denied(e),
+        None => empty_response(),
+    }
+}
+
+/// An `AuthError` off the wire. An unrecognized kind is still a refusal
+/// -- reported as such rather than retried, since a cluster that named a
+/// reason meant it.
+fn denied<T>(error: raft5_shared::raft5::client::AuthError) -> Reply<T> {
+    Reply::Denied {
+        reason: auth_error::Kind::try_from(error.kind)
+            .map_or(Denial::Unknown, Denial::from),
+        detail: error.detail,
+    }
+}
+
 fn commit_reply(resp: tonic::Response<CommitTransactionResponse>) -> Reply<u64> {
     match resp.into_inner().result {
         Some(commit_transaction_response::Result::Seq(seq)) => Reply::Ok(seq),
@@ -744,6 +1090,7 @@ fn config_reply(resp: tonic::Response<ConfigChangeResponse>) -> Reply<()> {
             Reply::Unavailable("the leader did not apply the change".to_string())
         }
         Some(config_change_response::Result::Error(e)) => Reply::from_error(e),
+        Some(config_change_response::Result::AuthError(e)) => denied(e),
         None => empty_response(),
     }
 }
