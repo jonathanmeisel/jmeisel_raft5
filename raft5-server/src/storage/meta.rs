@@ -34,6 +34,24 @@ pub(super) const META_VOTED_FOR: &[u8] = b"voted_for";
 /// no idea who its peers are.
 pub(super) const META_BASE_CONFIG: &[u8] = b"base_config";
 
+/// Whether `latest_seq` is known to agree with `latest`, key for key.
+///
+/// Not a watermark like everything else here -- it says nothing about how
+/// far anything has got. It is a flag on a *derived index*: cleared before
+/// anything that wipes `latest` out from under it, set again only by the
+/// commit that leaves the two in step. Its absence therefore means "these
+/// two may disagree", and `RaftLog::open` reads that as an instruction to
+/// rebuild the index from `latest`. A store written before `latest_seq`
+/// existed has never set it, which is why the same flag also drives the
+/// migration.
+pub(super) const META_LATEST_SEQ_BUILT: &[u8] = b"latest_seq_built";
+
+/// See `META_LATEST_SEQ_BUILT`. Absent reads as 0, which is `false` --
+/// exactly the answer a store that predates the index should give.
+pub(super) fn latest_seq_built(meta: &Keyspace) -> Result<bool> {
+    Ok(read_u64(meta, META_LATEST_SEQ_BUILT)? != 0)
+}
+
 /// The seq/term of the highest entry known to have existed but no
 /// longer physically present in `log`, updated by both
 /// `install_snapshot` (to the snapshot boundary) and `compact` (to the

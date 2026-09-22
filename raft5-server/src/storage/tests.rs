@@ -1007,3 +1007,230 @@ fn a_snapshot_cut_short_is_refused_rather_than_half_installed() {
     cleanup(&source_path);
     cleanup(&dest_path);
 }
+
+// --- the `latest_seq` index -------------------------------------------
+
+/// The invariant `latest_seq` exists to maintain: it holds a row for
+/// exactly the keys `latest` does, carrying exactly the seq encoded
+/// inside that key's `latest` row.
+///
+/// Checked in both directions on purpose. A missing index row makes
+/// `get_version` answer "no value" for a key that has one; a *stale* one
+/// left behind by a delete makes it answer with a seq for a key that no
+/// longer exists. Only walking both keyspaces catches both.
+fn assert_index_agrees(log: &RaftLog) {
+    for item in log.latest.iter() {
+        let (key, value) = item.into_inner().unwrap();
+        let expected = seq_of_latest_value(&value).unwrap();
+        let indexed = log
+            .get_version(&key)
+            .unwrap()
+            .unwrap_or_else(|| panic!("no index row for {:?}, which `latest` has", key));
+        assert_eq!(
+            indexed, expected,
+            "index disagrees with `latest` for {key:?}"
+        );
+    }
+
+    for item in log.latest_seq.iter() {
+        let key = item.key().unwrap();
+        assert!(
+            log.latest.contains_key(&key).unwrap(),
+            "index has a row for {key:?}, which `latest` does not"
+        );
+    }
+}
+
+#[test]
+fn get_version_reports_what_get_latest_reports() {
+    let (log, path) = open_temp();
+    log.append(1, b"a", Some(b"1")).unwrap();
+    let last = log.append(1, b"b", Some(b"2")).unwrap();
+    log.apply_committed(last).unwrap();
+
+    for key in [b"a".as_slice(), b"b".as_slice()] {
+        assert_eq!(
+            log.get_version(key).unwrap(),
+            log.get_latest(key).unwrap().map(|(seq, _)| seq)
+        );
+    }
+    assert_eq!(log.get_version(b"missing").unwrap(), None);
+
+    assert_index_agrees(&log);
+    cleanup(&path);
+}
+
+#[test]
+fn get_version_ignores_an_appended_but_uncommitted_write() {
+    // The same guarantee `append_does_not_touch_latest` pins, for the
+    // index: a write that could still be rolled back has no version.
+    let (log, path) = open_temp();
+    let seq = log.append(1, b"k", Some(b"v")).unwrap();
+    assert_eq!(log.get_version(b"k").unwrap(), None);
+
+    log.apply_committed(seq).unwrap();
+    assert_eq!(log.get_version(b"k").unwrap(), Some(seq));
+
+    assert_index_agrees(&log);
+    cleanup(&path);
+}
+
+#[test]
+fn a_committed_delete_removes_the_index_row_too() {
+    let (log, path) = open_temp();
+    let written = log.append(1, b"k", Some(b"v")).unwrap();
+    log.apply_committed(written).unwrap();
+    assert_eq!(log.get_version(b"k").unwrap(), Some(written));
+
+    let deleted = log.append(1, b"k", None).unwrap();
+    log.apply_committed(deleted).unwrap();
+
+    // Gone from both, not merely from `latest`. A row surviving here
+    // would report a version for a key that no longer has a value.
+    assert_eq!(log.get_version(b"k").unwrap(), None);
+    assert!(!log.latest_seq.contains_key(b"k").unwrap());
+
+    assert_index_agrees(&log);
+    cleanup(&path);
+}
+
+#[test]
+fn the_index_keeps_up_with_an_entry_larger_than_a_write_chunk() {
+    // The index doubles the batch operations per mutation, so the
+    // chunking boundary is the place it could plausibly come apart.
+    let (log, path) = open_temp();
+
+    let n = WRITE_CHUNK + 7;
+    let writes: Vec<_> = (0..n)
+        .map(|i| Mutation::new(format!("k{i}"), Some(format!("v{i}"))))
+        .collect();
+    let seq = log.append_writes(1, writes).unwrap();
+    log.apply_committed(seq).unwrap();
+
+    // Delete a scattering of them, again across a chunk boundary.
+    let deletes: Vec<_> = (0..n)
+        .step_by(3)
+        .map(|i| Mutation::new(format!("k{i}"), None::<Vec<u8>>))
+        .collect();
+    let deleted_seq = log.append_writes(1, deletes).unwrap();
+    log.apply_committed(deleted_seq).unwrap();
+
+    for i in [0, 1, n / 2, n - 1] {
+        let key = format!("k{i}");
+        assert_eq!(
+            log.get_version(key.as_bytes()).unwrap(),
+            log.get_latest(key.as_bytes()).unwrap().map(|(seq, _)| seq),
+            "key {i} of {n}"
+        );
+    }
+
+    assert_index_agrees(&log);
+    cleanup(&path);
+}
+
+#[test]
+fn install_snapshot_replaces_the_index_wholesale() {
+    let (source, source_path) = open_temp();
+    let last = source.append(1, b"x", Some(b"from-snapshot")).unwrap();
+    source.apply_committed(last).unwrap();
+    let mut buf = Vec::new();
+    source.export_snapshot(&mut buf).unwrap();
+
+    // The target has its own unrelated history, index rows and all.
+    let (target, target_path) = open_temp();
+    let stale = target.append(1, b"b", Some(b"old")).unwrap();
+    target.apply_committed(stale).unwrap();
+    assert_eq!(target.get_version(b"b").unwrap(), Some(stale));
+
+    let meta = target.install_snapshot(&mut buf.as_slice()).unwrap();
+
+    assert_eq!(target.get_version(b"b").unwrap(), None);
+    assert_eq!(
+        target.get_version(b"x").unwrap(),
+        Some(meta.last_included_seq)
+    );
+
+    assert_index_agrees(&target);
+    cleanup(&source_path);
+    cleanup(&target_path);
+}
+
+#[test]
+fn a_store_written_before_the_index_existed_backfills_it_on_open() {
+    let (log, path) = open_temp();
+    let a_seq = log.append(1, b"a", Some(b"1")).unwrap();
+    let b_seq = log.append(1, b"b", Some(b"2")).unwrap();
+    log.apply_committed(b_seq).unwrap();
+
+    // What a store written before `latest_seq` existed looks like: rows
+    // in `latest`, nothing in the index, and no marker claiming
+    // otherwise.
+    log.latest_seq.clear().unwrap();
+    let mut batch = log.db.batch();
+    batch.remove(&log.meta, META_LATEST_SEQ_BUILT);
+    batch.commit().unwrap();
+    assert_eq!(log.get_version(b"a").unwrap(), None);
+    drop(log);
+
+    // Each key comes back at the seq of the entry that wrote it, not at
+    // some single watermark -- a rebuild that stamped one seq across the
+    // store would pass a weaker assertion than this.
+    let reopened = RaftLog::open(&path).expect("reopen");
+    assert_eq!(reopened.get_version(b"a").unwrap(), Some(a_seq));
+    assert_eq!(reopened.get_version(b"b").unwrap(), Some(b_seq));
+    assert_ne!(a_seq, b_seq);
+    assert_index_agrees(&reopened);
+
+    cleanup(&path);
+}
+
+#[test]
+fn an_index_left_stale_by_a_half_finished_install_is_rebuilt() {
+    // The other direction of drift, and the one a merge-style rebuild
+    // would miss: a row for a key `latest` does not have. A crash
+    // between `install_snapshot`'s clears and its final commit leaves
+    // exactly this, which is why the marker goes down before the wipe.
+    let (log, path) = open_temp();
+    let seq = log.append(1, b"real", Some(b"v")).unwrap();
+    log.apply_committed(seq).unwrap();
+
+    let mut batch = log.db.batch();
+    batch.insert(&log.latest_seq, b"ghost".as_slice(), be_bytes(99));
+    batch.remove(&log.meta, META_LATEST_SEQ_BUILT);
+    batch.commit().unwrap();
+    assert_eq!(log.get_version(b"ghost").unwrap(), Some(99));
+    drop(log);
+
+    let reopened = RaftLog::open(&path).expect("reopen");
+    assert_eq!(reopened.get_version(b"ghost").unwrap(), None);
+    assert_eq!(reopened.get_version(b"real").unwrap(), Some(seq));
+    assert_index_agrees(&reopened);
+
+    cleanup(&path);
+}
+
+/// The efficiency claim, asserted structurally rather than by timing.
+///
+/// A value well past fjall's 1 KiB separation threshold lives in a blob
+/// file, and reading it back is what `get_version` exists to avoid. The
+/// index row is eight bytes, which is too small to hold a copy of that
+/// value by any encoding -- so answering from it cannot be reading it.
+/// `size_of` reports the stored size without fetching the blob, which is
+/// what makes this assertable at all.
+#[test]
+fn a_version_is_answered_from_a_row_too_small_to_hold_the_value() {
+    let (log, path) = open_temp();
+
+    let big = vec![b'x'; 4 * 1024 * 1024];
+    let seq = log.append(1, b"big", Some(&big)).unwrap();
+    log.apply_committed(seq).unwrap();
+
+    assert!(
+        log.latest.size_of(b"big").unwrap().unwrap() as usize >= big.len(),
+        "the value should be stored whole in `latest`"
+    );
+    assert_eq!(log.latest_seq.size_of(b"big").unwrap(), Some(8));
+    assert_eq!(log.get_version(b"big").unwrap(), Some(seq));
+
+    cleanup(&path);
+}

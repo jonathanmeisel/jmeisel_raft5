@@ -303,18 +303,24 @@ async fn increment(client: &Client) -> Result<u64, Error> {
 /// A read guaranteed to reflect every write that has already returned.
 ///
 /// `Client::read` is deliberately a stale local read, so asserting a
-/// value straight after writing it has to go through a transaction --
-/// which is the only linearizable read the protocol has. Aborted rather
-/// than committed: it buffered nothing, so there is nothing to write,
-/// and aborting hands the lock back now instead of at the deadline.
+/// value straight after writing it has to ask for more than that.
+/// `read_linearizable` is the cheapest way to: no transaction, no lock
+/// to hand back, just the leader proving it still leads before it
+/// answers. Nothing here needs the key held afterwards -- these are
+/// assertions, not read-modify-writes.
 async fn fresh(client: &Client, key: &[u8]) -> ReadResult {
-    let txn = client
-        .transaction(Duration::from_secs(2))
+    client
+        .read_linearizable(key)
         .await
-        .expect("opening a transaction for a current read");
-    let result = txn.read(key).await.expect("a transactional read");
-    txn.abort().await.expect("aborting a read-only transaction");
-    result
+        .expect("a linearizable read")
+}
+
+/// `fresh`, for the version alone.
+async fn fresh_version(client: &Client, key: &[u8]) -> u64 {
+    client
+        .get_version_linearizable(key)
+        .await
+        .expect("a linearizable get_version")
 }
 
 // --- transactions -----------------------------------------------------
@@ -1034,4 +1040,129 @@ async fn an_ordinary_account_is_refused_membership_changes() {
         ),
         "expected NotAdmin, got {error:?}"
     );
+}
+
+// --- versions ---------------------------------------------------------
+
+#[tokio::test]
+async fn get_version_tracks_writes_and_deletes() {
+    let n1 = TestNode::start("n1");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "n1").await;
+
+    // Nothing there yet: 0, the "no current value" sentinel.
+    assert_eq!(fresh_version(&client, b"k").await, 0);
+
+    let first = client.write(b"k", Some(b"v")).await.unwrap();
+    assert_eq!(fresh_version(&client, b"k").await, first);
+
+    // A second write moves it, and the version is what changed even
+    // though the caller never sees the value.
+    let second = client.write(b"k", Some(b"v2")).await.unwrap();
+    assert!(second > first);
+    assert_eq!(fresh_version(&client, b"k").await, second);
+
+    // A delete takes the version away with the value.
+    client.write(b"k", None).await.unwrap();
+    assert_eq!(fresh_version(&client, b"k").await, 0);
+}
+
+/// The version agrees with what a read of the same key reports, which is
+/// what makes it a substitute for one. Asserted on a large value,
+/// because that is the case the RPC exists for -- and the one where the
+/// two answers come from physically different places.
+#[tokio::test]
+async fn get_version_agrees_with_read_on_a_large_value() {
+    let n1 = TestNode::start("n1");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "n1").await;
+
+    let big = vec![b'x'; 2 * 1024 * 1024];
+    let seq = client.write(b"big", Some(&big)).await.unwrap();
+
+    let read = fresh(&client, b"big").await;
+    assert_eq!(read.seq, seq);
+    assert_eq!(read.value.map(|v| v.len()), Some(big.len()));
+    assert_eq!(fresh_version(&client, b"big").await, seq);
+}
+
+/// A linearizable read reflects a write that has already returned. The
+/// stale one is allowed to lag and so is not asserted about -- this pins
+/// the guarantee, not the absence of one.
+#[tokio::test]
+async fn a_linearizable_read_sees_a_write_that_has_returned() {
+    let n1 = TestNode::start("n1");
+    let n2 = TestNode::start("n2");
+    let n3 = TestNode::start("n3");
+
+    let admin = Client::new([n1.url()]).unwrap();
+    bootstrap(&admin, "n1").await;
+    admin.add_server(&n2.url()).await.unwrap();
+    admin.add_server(&n3.url()).await.unwrap();
+
+    let client = Client::new([n3.url()]).unwrap();
+    let seq = client.write(b"k", Some(b"v")).await.unwrap();
+
+    let read = client.read_linearizable(b"k").await.unwrap();
+    assert_eq!(read.seq, seq);
+    assert_eq!(read.value.as_deref(), Some(&b"v"[..]));
+    assert_eq!(client.get_version_linearizable(b"k").await.unwrap(), seq);
+}
+
+/// The shape the RPC exists for: check the version, decide, write, and
+/// have the commit fail if anyone touched the key in between. The read
+/// lock a transactional `get_version` takes is what makes that safe, so
+/// a later transaction must be refused the key rather than silently
+/// winning it.
+///
+/// The conflict is observed through a second *transaction*, not through
+/// `Client::write`: that retries an abort until its deadline, so against
+/// a held key it would simply wait the holder out and then succeed,
+/// which is the behaviour it is supposed to have and says nothing about
+/// whether the lock was ever taken.
+#[tokio::test]
+async fn a_transactional_get_version_locks_out_a_later_write() {
+    let n1 = TestNode::start("n1");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "n1").await;
+    let written = client.write(b"k", Some(b"v")).await.unwrap();
+
+    // The checker opens first, so it is the *older* transaction: a
+    // younger one that wants its key dies rather than wounding it.
+    let checker = client.transaction(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(checker.get_version(b"k").await.unwrap(), written);
+
+    let later = client.transaction(Duration::from_secs(5)).await.unwrap();
+    match later.write(b"k", Some(b"stolen")).await {
+        Err(Error::Aborted { .. }) => {}
+        other => panic!("a write against a held key should be refused, got {other:?}"),
+    }
+
+    // And the transaction that was holding it commits on the state it
+    // checked.
+    checker.write(b"k", Some(b"mine")).await.unwrap();
+    checker.commit().await.unwrap();
+    assert_eq!(
+        fresh(&client, b"k").await.value.as_deref(),
+        Some(&b"mine"[..])
+    );
+}
+
+/// A transaction asking about a key it has itself buffered gets the
+/// committed version, not a guess at the one its own write will land at
+/// -- that number does not exist until the commit assigns it.
+#[tokio::test]
+async fn a_transactional_get_version_reports_committed_state() {
+    let n1 = TestNode::start("n1");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "n1").await;
+    let committed = client.write(b"k", Some(b"v")).await.unwrap();
+
+    let txn = client.transaction(Duration::from_secs(2)).await.unwrap();
+    txn.write(b"k", Some(b"buffered")).await.unwrap();
+    assert_eq!(txn.get_version(b"k").await.unwrap(), committed);
+
+    let landed = txn.commit().await.unwrap();
+    assert!(landed > committed);
+    assert_eq!(fresh_version(&client, b"k").await, landed);
 }

@@ -1,8 +1,9 @@
 //! Raft log storage backed by `fjall`.
 //!
-//! Layout (three keyspaces):
+//! Layout (four keyspaces):
 //! - `log`:    seq (u64 BE)                -> encoded (term, payload) entry
 //! - `latest`: key                          -> encoded (seq, value) *committed* current state
+//! - `latest_seq`: key                      -> the seq of that key's `latest` row (u64 BE)
 //! - `meta`:   small set of fixed keys: the floor (`floor_seq`,
 //!   `floor_term`) — the seq/term of the highest entry no longer physically
 //!   in `log`, updated by both `install_snapshot` and `compact` — the
@@ -11,6 +12,23 @@
 //!   (`applied_seq`, recorded by `apply_committed` alone, for the same
 //!   reason) — plus `base_config`, the last cluster configuration to fall
 //!   out of `log` via `compact` or `install_snapshot` (see `config_at`).
+//!
+//! `latest_seq` is a derived index and holds nothing `latest` doesn't. It
+//! exists because of where the seq physically lives: it is the first field
+//! *inside* the `latest` row's value, and `latest` uses KV separation, so
+//! past fjall's separation threshold that value is in a blob file. Asking
+//! "what seq is this key at?" out of `latest` therefore means reading --
+//! and copying -- an entire value nobody asked for, which for a large one
+//! is megabytes of I/O to answer with eight bytes. The same number in a
+//! keyspace whose rows are eight bytes long answers it at a fixed cost.
+//! See `get_version`.
+//!
+//! The trade is real and worth stating: one extra row per live key (its
+//! key bytes plus eight) and one extra batch operation per applied
+//! mutation. `latest_seq` is written in the *same* batch as every `latest`
+//! row so the two cannot drift, and `open` rebuilds it outright whenever
+//! anything could have left them apart -- see
+//! `rebuild_latest_seq_if_needed`.
 //!
 //! Not every log entry is key/value data: `EntryPayload` also covers a
 //! leader's term-opening no-op and the cluster configuration. Those
@@ -105,17 +123,19 @@ mod snapshot;
 
 use codec::{
     be_bytes, decode_latest_value, decode_log_entry, encode_latest_value, encode_log_entry,
-    from_be_bytes,
+    from_be_bytes, seq_of_latest_value,
 };
 use meta::{
     META_APPLIED_SEQ, META_BASE_CONFIG, META_COMPACT_SEQ, META_CURRENT_TERM, META_FLOOR_SEQ,
-    META_FLOOR_TERM, META_VOTED_FOR, read_applied_seq, read_compact_watermark, read_floor,
+    META_FLOOR_TERM, META_LATEST_SEQ_BUILT, META_VOTED_FOR, latest_seq_built, read_applied_seq,
+    read_compact_watermark, read_floor,
 };
 
 pub use snapshot::SnapshotMeta;
 
 const CF_LOG: &str = "log";
 const CF_LATEST: &str = "latest";
+const CF_LATEST_SEQ: &str = "latest_seq";
 const CF_META: &str = "meta";
 
 /// Max pending writes buffered in a `WriteBatch` before it's flushed, used
@@ -270,6 +290,7 @@ pub struct RaftLog {
     db: Database,
     log: Keyspace,
     latest: Keyspace,
+    latest_seq: Keyspace,
     meta: Keyspace,
     next_seq: Mutex<u64>,
 }
@@ -293,22 +314,84 @@ impl RaftLog {
         // separation: values past the threshold live in blob files
         // instead of being rewritten by every compaction. `meta` holds
         // a handful of tiny values and has nothing to separate.
+        //
+        // `latest_seq` is emphatically *not* separated, and that is the
+        // entire point of it: a row there is eight bytes, and it must
+        // never be able to reach a blob file, or reading one would cost
+        // exactly what reading the `latest` row it indexes costs.
         let separated = || {
             KeyspaceCreateOptions::default()
                 .with_kv_separation(Some(KvSeparationOptions::default()))
         };
         let log = db.keyspace(CF_LOG, separated)?;
         let latest = db.keyspace(CF_LATEST, separated)?;
+        let latest_seq = db.keyspace(CF_LATEST_SEQ, KeyspaceCreateOptions::default)?;
         let meta = db.keyspace(CF_META, KeyspaceCreateOptions::default)?;
         let next_seq = Self::recover_next_seq(&log, &meta)?;
 
-        Ok(Self {
+        let this = Self {
             db,
             log,
             latest,
+            latest_seq,
             meta,
             next_seq: Mutex::new(next_seq),
-        })
+        };
+        this.rebuild_latest_seq_if_needed()?;
+        Ok(this)
+    }
+
+    /// Bring `latest_seq` into agreement with `latest`, if anything could
+    /// have left them apart: a store written before this index existed, or
+    /// a crash during `install_snapshot`, which wipes `latest` outside any
+    /// batch and so cannot wipe both atomically.
+    ///
+    /// The marker in `meta` is the whole protocol. It is cleared before
+    /// anything destructive and set again only in the commit that leaves
+    /// the two in step, so its absence means "these may disagree" and is
+    /// an instruction to rebuild. One mechanism covers both the migration
+    /// of a store that predates the index and a half-finished install,
+    /// which is why there is one repair path here rather than two.
+    ///
+    /// Clears first rather than merging, so it repairs drift in either
+    /// direction -- a stale row for a key `latest` no longer has is as
+    /// wrong as a missing one.
+    ///
+    /// This reads every `latest` row, blobs included, which is the
+    /// one-time price of the migration. It costs nothing on a fresh store
+    /// (`latest` is empty) and nothing on any later open (the marker is
+    /// set).
+    fn rebuild_latest_seq_if_needed(&self) -> Result<()> {
+        if latest_seq_built(&self.meta)? {
+            return Ok(());
+        }
+
+        // Only worth the journal write if there is something to undo.
+        // The overwhelmingly common case for an unset marker is a store
+        // that has never had an index at all -- a fresh one, or one
+        // opened for the first time after this keyspace existed -- where
+        // there is nothing to clear and a `clear` is pure startup cost
+        // on every node that boots.
+        if !self.latest_seq.is_empty()? {
+            self.latest_seq.clear()?;
+        }
+
+        let mut batch = self.db.batch();
+        let mut pending = 0usize;
+        for item in self.latest.iter() {
+            let (key, value) = item.into_inner()?;
+            batch.insert(
+                &self.latest_seq,
+                key,
+                be_bytes(seq_of_latest_value(&value)?),
+            );
+            pending += 1;
+            self.flush_if_full(&mut batch, &mut pending)?;
+        }
+
+        batch.insert(&self.meta, META_LATEST_SEQ_BUILT, be_bytes(1));
+        batch.commit()?;
+        Ok(())
     }
 
     /// `next_seq` must account for both the physical log tail and the
@@ -470,6 +553,27 @@ impl RaftLog {
         }
     }
 
+    /// The seq `key`'s current committed value was written at, without
+    /// the value. `None` on exactly the terms `get_latest` returns `None`:
+    /// never written, or deleted.
+    ///
+    /// This is what `latest_seq` exists for. `get_latest` on a large key
+    /// reads the value out of a blob file and copies it, in order to hand
+    /// back eight bytes of it; this is a point lookup on a keyspace whose
+    /// rows *are* those eight bytes, so it costs the same whether the
+    /// value is one byte or sixteen megabytes.
+    ///
+    /// Deliberately no fallback to `latest` when the index row is missing.
+    /// A fallback would paper over drift between the two rather than the
+    /// invariant being maintained, and would make the one bug this index
+    /// can have the one bug no test could see.
+    pub fn get_version(&self, key: &[u8]) -> Result<Option<u64>> {
+        match self.latest_seq.get(key)? {
+            Some(bytes) => Ok(Some(from_be_bytes(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Up to `limit` committed keys at or after `start`, in ascending
     /// order, skipping any key `skip` rejects.
     ///
@@ -481,7 +585,10 @@ impl RaftLog {
     ///
     /// Keys only. The values are the caller's business to fetch (or
     /// not), and a scan that carried them would make the size of a batch
-    /// a property of the data rather than of `limit`.
+    /// a property of the data rather than of `limit`. `Guard::key` is
+    /// what makes that true in fact and not just in intent:
+    /// `Guard::into_inner` resolves the value, which under KV separation
+    /// is a blob file read per key, to be dropped on the next line.
     ///
     /// `Keyspace::range` pins a snapshot nonce, so this walks one point
     /// in time even while `apply_committed` is writing -- the same
@@ -498,7 +605,7 @@ impl RaftLog {
             if keys.len() == limit {
                 break;
             }
-            let (key, _value) = item.into_inner()?;
+            let key = item.key()?;
             if !skip(&key) {
                 keys.push(key.to_vec());
             }
@@ -552,14 +659,27 @@ impl RaftLog {
             match entry.payload {
                 EntryPayload::Write(writes) => {
                     for m in writes {
+                        // Both keyspaces in one batch: that, and nothing
+                        // else, is what stops the index drifting from
+                        // what it indexes.
                         match m.value {
-                            Some(value) => batch.insert(
-                                &self.latest,
-                                &m.key,
-                                encode_latest_value(seq, &value)?,
-                            ),
-                            None => batch.remove(&self.latest, &m.key),
+                            Some(value) => {
+                                batch.insert(
+                                    &self.latest,
+                                    &m.key,
+                                    encode_latest_value(seq, &value)?,
+                                );
+                                batch.insert(&self.latest_seq, &m.key, be_bytes(seq));
+                            }
+                            None => {
+                                batch.remove(&self.latest, &m.key);
+                                batch.remove(&self.latest_seq, &m.key);
+                            }
                         }
+                        // Counted per mutation, not per batch operation.
+                        // `WRITE_CHUNK` is bounding the batch's memory,
+                        // and the index row adds eight bytes and a key to
+                        // something that already carries the whole value.
                         pending += 1;
                     }
                 }

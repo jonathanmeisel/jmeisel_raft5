@@ -182,6 +182,18 @@ async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
             let [key] = fixed_args(args, "read <key>")?;
             print_read(client.read(key.as_bytes()).await);
         }
+        "read_current" => {
+            let [key] = fixed_args(args, "read_current <key>")?;
+            print_read(client.read_linearizable(key.as_bytes()).await);
+        }
+        "version" => {
+            let [key] = fixed_args(args, "version <key>")?;
+            print_version(client.get_version(key.as_bytes()).await);
+        }
+        "version_current" => {
+            let [key] = fixed_args(args, "version_current <key>")?;
+            print_version(client.get_version_linearizable(key.as_bytes()).await);
+        }
         "keys" => {
             let start = match args {
                 [] => "",
@@ -311,6 +323,16 @@ fn print_read(result: Result<raft5_client::ReadResult, Error>) {
     }
 }
 
+/// Seq 0 is the "no current value" sentinel, so it is spelled out rather
+/// than printed as a number that looks like a real version.
+fn print_version(result: Result<u64, raft5_client::Error>) {
+    match result {
+        Ok(0) => println!("(no value)"),
+        Ok(seq) => println!("seq={seq}"),
+        Err(e) => println!("error: {e}"),
+    }
+}
+
 fn print_help() {
     println!(
         "{}",
@@ -320,6 +342,11 @@ fn print_help() {
             "read <key>                       read from whichever node is currently connected,",
             "                                  without confirming it still leads -- so it may",
             "                                  miss a write that just returned",
+            "read_current <key>               read from the leader, confirming it still leads",
+            "version <key>                    the seq a key was last written at, without its",
+            "                                  value -- same cost whatever the value weighs;",
+            "                                  stale like `read`",
+            "version_current <key>            the same, confirmed by the leader",
             "keys [start_key]                list every key from <start_key> on, stale like `read`",
             "add_server <client_addr>         add a server as a learner, by its client address",
             "remove_server <id>               remove a server",

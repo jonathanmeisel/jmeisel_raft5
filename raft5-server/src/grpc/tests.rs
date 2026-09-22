@@ -93,7 +93,7 @@ async fn read(svc: &KvService, key: &[u8]) -> ReadOk {
     let resp = svc
         .read(Request::new(ReadRequest {
             key: key.to_vec(),
-            transaction_id: None,
+            consistency: None,
         }))
         .await
         .unwrap()
@@ -245,7 +245,7 @@ async fn write_then_read_round_trips_through_kv_service() {
     let read_resp = svc
         .read(Request::new(ReadRequest {
             key: b"hello".to_vec(),
-            transaction_id: None,
+            consistency: None,
         }))
         .await
         .unwrap()
@@ -282,7 +282,7 @@ async fn read_of_never_written_key_returns_no_value() {
     let read_resp = svc
         .read(Request::new(ReadRequest {
             key: b"missing".to_vec(),
-            transaction_id: None,
+            consistency: None,
         }))
         .await
         .unwrap()
@@ -362,7 +362,7 @@ async fn a_stale_read_is_served_without_a_leader() {
     let resp = svc
         .read(Request::new(ReadRequest {
             key: b"k".to_vec(),
-            transaction_id: None,
+            consistency: None,
         }))
         .await
         .unwrap()
@@ -372,7 +372,7 @@ async fn a_stale_read_is_served_without_a_leader() {
     let strict = svc
         .read(Request::new(ReadRequest {
             key: b"k".to_vec(),
-            transaction_id: Some(vec![0u8; 16]),
+            consistency: Some(read_request::Consistency::TransactionId(vec![0u8; 16])),
         }))
         .await
         .unwrap()
@@ -804,7 +804,7 @@ async fn a_committed_transaction_makes_every_key_visible_at_one_seq() {
     let read_back = svc
         .read(Request::new(ReadRequest {
             key: b"a".to_vec(),
-            transaction_id: Some(txn.clone()),
+            consistency: Some(read_request::Consistency::TransactionId(txn.clone())),
         }))
         .await
         .unwrap()
@@ -1319,11 +1319,11 @@ async fn read_refuses_a_reserved_key_transactional_or_not() {
     append_directly(&svc, &key, b"hash").await;
 
     let txn = begin_txn(&svc, 5000).await;
-    for transaction_id in [None, Some(txn)] {
+    for consistency in [None, Some(read_request::Consistency::TransactionId(txn))] {
         let status = svc
             .read(Request::new(ReadRequest {
                 key: key.clone(),
-                transaction_id,
+                consistency,
             }))
             .await
             .expect_err("a reserved key should be refused");
@@ -1797,7 +1797,7 @@ async fn an_account_is_invisible_through_the_client_api() {
     let status = svc
         .read(Request::new(ReadRequest {
             key: crate::keyspace::user_key("alice"),
-            transaction_id: None,
+            consistency: None,
         }))
         .await
         .expect_err("an account record is not readable");
@@ -1881,6 +1881,257 @@ async fn an_administrator_may_still_change_cluster_membership() {
         !matches!(answered, config_change_response::Result::AuthError(_)),
         "an administrator should not be turned away, got {answered:?}"
     );
+
+    cleanup(&path);
+}
+
+// --- GetVersion -------------------------------------------------------
+
+/// The seq `GetVersion` reports for `key`, at whatever consistency.
+async fn version_at(
+    svc: &KvService,
+    key: &[u8],
+    consistency: Option<get_version_request::Consistency>,
+) -> get_version_response::Result {
+    svc.get_version(Request::new(GetVersionRequest {
+        key: key.to_vec(),
+        consistency,
+    }))
+    .await
+    .unwrap()
+    .into_inner()
+    .result
+    .expect("a get_version response always carries a result")
+}
+
+/// A stale `GetVersion`, which is always answerable.
+async fn version(svc: &KvService, key: &[u8]) -> u64 {
+    match version_at(svc, key, None).await {
+        get_version_response::Result::Ok(ok) => ok.seq,
+        other => panic!("expected a successful get_version, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn get_version_reports_the_seq_a_write_landed_at() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+
+    let seq = write(&svc, b"k", Some(b"v")).await;
+    assert_eq!(version(&svc, b"k").await, seq);
+    // And agrees with what `Read` says about the same key, which is the
+    // property that makes it a substitute for one.
+    assert_eq!(read(&svc, b"k").await.seq, seq);
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn get_version_is_zero_for_a_key_with_no_value() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+
+    // Never written.
+    assert_eq!(version(&svc, b"missing").await, 0);
+
+    // And deleted, which is the same answer -- `Read` does not
+    // distinguish the two either.
+    write(&svc, b"k", Some(b"v")).await;
+    write(&svc, b"k", None).await;
+    assert_eq!(version(&svc, b"k").await, 0);
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn get_version_refuses_a_reserved_key_transactional_or_not() {
+    // As `read` does, and for a sharper reason: a seq is small enough to
+    // feel harmless, but "this account changed at seq N" is still the
+    // reserved range answering questions about itself.
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+    let key = crate::keyspace::user_key("alice");
+    append_directly(&svc, &key, b"hash").await;
+
+    let txn = begin_txn(&svc, 5000).await;
+    for consistency in [
+        None,
+        Some(get_version_request::Consistency::TransactionId(txn)),
+        Some(get_version_request::Consistency::Linearizable(true)),
+    ] {
+        let status = svc
+            .get_version(Request::new(GetVersionRequest {
+                key: key.clone(),
+                consistency,
+            }))
+            .await
+            .expect_err("a reserved key should be refused");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn a_stale_get_version_is_served_without_a_leader() {
+    // The mirror of `a_stale_read_is_served_without_a_leader`: the
+    // default asks for no guarantee, so any node answers, while both
+    // guaranteed forms need a leader and this node is not one.
+    let (log, path) = open_temp();
+    let (svc, _role_rx) = kv_service(log, "bystander");
+
+    assert!(matches!(
+        version_at(&svc, b"k", None).await,
+        get_version_response::Result::Ok(_)
+    ));
+
+    for consistency in [
+        get_version_request::Consistency::TransactionId(vec![0u8; 16]),
+        get_version_request::Consistency::Linearizable(true),
+    ] {
+        match version_at(&svc, b"k", Some(consistency)).await {
+            get_version_response::Result::Error(e) => {
+                assert!(matches!(e.kind, Some(raft_error::Kind::NotLeader(_))));
+            }
+            other => panic!("expected NotLeader, got {other:?}"),
+        }
+    }
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn a_transactional_get_version_holds_the_key() {
+    // What proves the transactional path takes the lock rather than
+    // reading storage behind the lock table's back: another transaction
+    // must not be able to write the key afterwards.
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+    write(&svc, b"k", Some(b"v")).await;
+
+    let reader = begin_txn(&svc, 5000).await;
+    let seq = match version_at(
+        &svc,
+        b"k",
+        Some(get_version_request::Consistency::TransactionId(
+            reader.clone(),
+        )),
+    )
+    .await
+    {
+        get_version_response::Result::Ok(ok) => ok.seq,
+        other => panic!("expected a successful get_version, got {other:?}"),
+    };
+    assert_ne!(seq, 0);
+
+    let writer = begin_txn(&svc, 5000).await;
+    match buffer(&svc, &writer, b"k", Some(b"other")).await {
+        write_response::Result::Error(e) => {
+            assert!(matches!(e.kind, Some(raft_error::Kind::Aborted(_))));
+        }
+        other => panic!("expected a lock conflict, got {other:?}"),
+    }
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn a_transactional_get_version_reports_committed_state_over_its_own_write() {
+    // A transaction asking about a key it has itself buffered gets the
+    // *committed* seq: the buffered write has no sequence number until
+    // the commit assigns one. It must also not deadlock on its own write
+    // lock, which is why the read side skips a key it already holds.
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+    let committed = write(&svc, b"k", Some(b"v")).await;
+
+    let txn = begin_txn(&svc, 5000).await;
+    assert!(matches!(
+        buffer(&svc, &txn, b"k", Some(b"buffered")).await,
+        write_response::Result::Ok(true)
+    ));
+
+    match version_at(
+        &svc,
+        b"k",
+        Some(get_version_request::Consistency::TransactionId(txn)),
+    )
+    .await
+    {
+        get_version_response::Result::Ok(ok) => assert_eq!(ok.seq, committed),
+        other => panic!("expected a successful get_version, got {other:?}"),
+    }
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn a_linearizable_read_and_version_agree_with_the_stale_ones_on_a_leader() {
+    // On a settled single-node leader all three consistencies describe
+    // the same state, so this pins that the two new paths answer at all
+    // and answer the same thing -- their guarantee is about *when*, not
+    // about what.
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+    let seq = write(&svc, b"k", Some(b"v")).await;
+
+    match version_at(
+        &svc,
+        b"k",
+        Some(get_version_request::Consistency::Linearizable(true)),
+    )
+    .await
+    {
+        get_version_response::Result::Ok(ok) => assert_eq!(ok.seq, seq),
+        other => panic!("expected a successful get_version, got {other:?}"),
+    }
+
+    let resp = svc
+        .read(Request::new(ReadRequest {
+            key: b"k".to_vec(),
+            consistency: Some(read_request::Consistency::Linearizable(true)),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    match resp.result {
+        Some(read_response::Result::Ok(ok)) => {
+            assert_eq!(ok.seq, seq);
+            assert_eq!(ok.value.as_deref(), Some(b"v".as_slice()));
+        }
+        other => panic!("expected a successful read, got {other:?}"),
+    }
+
+    cleanup(&path);
+}
+
+/// `linearizable: false` is a present field saying no guarantee was
+/// asked for, not a malformed request -- it must behave exactly as an
+/// unset `consistency` does, including on a node that is not a leader.
+#[tokio::test]
+async fn linearizable_false_is_a_stale_read() {
+    let (log, path) = open_temp();
+    let (svc, _role_rx) = kv_service(log, "bystander");
+
+    assert!(matches!(
+        version_at(
+            &svc,
+            b"k",
+            Some(get_version_request::Consistency::Linearizable(false)),
+        )
+        .await,
+        get_version_response::Result::Ok(_)
+    ));
+
+    let resp = svc
+        .read(Request::new(ReadRequest {
+            key: b"k".to_vec(),
+            consistency: Some(read_request::Consistency::Linearizable(false)),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matches!(resp.result, Some(read_response::Result::Ok(_))));
 
     cleanup(&path);
 }

@@ -370,7 +370,7 @@ pub async fn read(client: &Arc<Client>, key: &[u8]) -> Option<Vec<u8>> {
     let resp = client
         .read(ReadRequest {
             key: key.to_vec(),
-            transaction_id: None,
+            consistency: None,
         })
         .await
         .expect("read RPC failed")
@@ -428,7 +428,7 @@ pub async fn assert_eventually_reads(client: &Arc<Client>, key: &[u8], value: &[
         let resp = client
             .read(ReadRequest {
                 key: key.to_vec(),
-                transaction_id: None,
+                consistency: None,
             })
             .await
             .expect("read RPC failed")

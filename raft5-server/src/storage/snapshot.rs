@@ -12,7 +12,7 @@ use std::io::{Read, Write};
 use super::codec::{be_bytes, decode_latest_value, encode_latest_value};
 use super::meta::{
     META_APPLIED_SEQ, META_BASE_CONFIG, META_COMPACT_SEQ, META_FLOOR_SEQ, META_FLOOR_TERM,
-    read_applied_seq,
+    META_LATEST_SEQ_BUILT, read_applied_seq,
 };
 use super::{RaftLog, Result, StorageError};
 
@@ -133,6 +133,14 @@ impl RaftLog {
     /// operation, and Raft's InstallSnapshot is naturally retryable — a
     /// follower that crashes mid-install simply reports needing a snapshot
     /// again).
+    ///
+    /// The same non-atomicity is why the `latest_seq` index is torn down
+    /// before the wipe rather than alongside it: `Keyspace::clear` is not
+    /// a batch operation, so the two clears cannot be one. Clearing the
+    /// index's marker first means a crash anywhere in here leaves it
+    /// down, and the next `open` rebuilds from whatever `latest` ended up
+    /// being. The index cannot survive an install it did not finish, and
+    /// does not try to.
     pub fn install_snapshot<R: Read>(&self, reader: &mut R) -> Result<SnapshotMeta> {
         let mut magic = [0u8; 8];
         reader.read_exact(&mut magic)?;
@@ -159,8 +167,16 @@ impl RaftLog {
         // install, same discipline as `append`.
         let mut guard = self.next_seq.lock().unwrap();
 
+        // Down before anything is destroyed, and back up only in the
+        // final commit below -- so every moment in which `latest` and
+        // `latest_seq` might disagree is a moment the marker says so.
+        let mut marker = self.db.batch();
+        marker.remove(&self.meta, META_LATEST_SEQ_BUILT);
+        marker.commit()?;
+
         self.log.clear()?;
         self.latest.clear()?;
+        self.latest_seq.clear()?;
 
         // Stream incoming records straight into chunked write batches
         // instead of buffering the whole snapshot in memory.
@@ -190,6 +206,10 @@ impl RaftLog {
                 &key,
                 encode_latest_value(last_included_seq, &value)?,
             );
+            // Every key in a snapshot is stamped with the boundary seq --
+            // the per-key history the index mirrors does not survive an
+            // install any more than the values' own seqs do.
+            batch.insert(&self.latest_seq, &key, be_bytes(last_included_seq));
             entry_count += 1;
             pending += 1;
             self.flush_if_full(&mut batch, &mut pending)?;
@@ -212,6 +232,9 @@ impl RaftLog {
         // node's own `export_snapshot` reads the same, commit-only
         // `latest`) -- so it's already "applied" through this point.
         batch.insert(&self.meta, META_APPLIED_SEQ, be_bytes(last_included_seq));
+        // Last, in the commit that makes the install whole: from here the
+        // index agrees with `latest` again.
+        batch.insert(&self.meta, META_LATEST_SEQ_BUILT, be_bytes(1));
         batch.commit()?;
 
         *guard = last_included_seq + 1;

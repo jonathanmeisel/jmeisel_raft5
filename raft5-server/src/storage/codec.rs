@@ -18,7 +18,10 @@
 //!   entry's payload. Its seq isn't in there because it is the row's key.
 //! - a `latest` row: a postcard-encoded `(seq, value)`. `latest` never
 //!   stores a delete marker (see the parent module's doc), so unlike a
-//!   `log` row there is no "kind" to discriminate on.
+//!   `log` row there is no "kind" to discriminate on. `seq` being the
+//!   *first* field is load-bearing twice over: it is what lets
+//!   `seq_of_latest_value` stop before the payload, and reordering the
+//!   two would change the on-disk format besides.
 //!
 //! Changing either of those types changes the on-disk format. In
 //! particular postcard writes an enum's discriminant by *position*, so
@@ -92,4 +95,28 @@ pub(super) fn encode_latest_value(seq: u64, value: &[u8]) -> Result<Vec<u8>> {
 pub(super) fn decode_latest_value(bytes: &[u8]) -> Result<(u64, Vec<u8>)> {
     let row: Latest = postcard::from_bytes(bytes)?;
     Ok((row.seq, row.value))
+}
+
+/// The leading `seq` of a `latest` row, with no field after it.
+///
+/// Postcard writes a struct as its fields in order and nothing else, so a
+/// type holding only the first of them decodes from the front of the same
+/// bytes. `take_from_bytes` stops once it has what it was asked for and
+/// hands back the rest unread, so the payload is never copied -- the
+/// difference between a rebuild that allocates a second copy of the whole
+/// store and one that doesn't.
+///
+/// This still has the *bytes* in hand, so it is only worth reaching for
+/// where they are already there (`rebuild_latest_seq_if_needed`). Nothing
+/// here can avoid the blob read that producing them costs; that is what
+/// `RaftLog::get_version` and the `latest_seq` keyspace are for.
+pub(super) fn seq_of_latest_value(bytes: &[u8]) -> Result<u64> {
+    let (row, _rest) = postcard::take_from_bytes::<LatestSeq>(bytes)?;
+    Ok(row.seq)
+}
+
+/// A `latest` row truncated to its first field. See `seq_of_latest_value`.
+#[derive(Deserialize)]
+struct LatestSeq {
+    seq: u64,
 }

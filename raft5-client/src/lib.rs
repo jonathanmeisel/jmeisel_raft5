@@ -40,12 +40,13 @@ use tonic::Status;
 use raft5_shared::raft5::client::{
     AddServerRequest, BootstrapRequest, CommitTransactionRequest, CommitTransactionResponse,
     ConfigChangeResponse, CreateTransactionRequest, CreateTransactionResponse, CreateUserRequest,
-    CreateUserResponse, DeleteUserRequest, DeleteUserResponse, LoginRequest, LoginResponse,
-    auth_error, create_user_response, delete_user_response, login_response,
-    DropTransactionRequest, GetKeysRequest, GetKeysResponse, RaftError as PbRaftError,
-    ReadRequest, ReadResponse, RemoveServerRequest, WriteRequest, WriteResponse,
-    commit_transaction_response, config_change_response, create_transaction_response,
-    get_keys_response, raft_error, read_response, transaction_aborted, write_response,
+    CreateUserResponse, DeleteUserRequest, DeleteUserResponse, DropTransactionRequest,
+    GetKeysRequest, GetKeysResponse, GetVersionRequest, GetVersionResponse, LoginRequest,
+    LoginResponse, RaftError as PbRaftError, ReadRequest, ReadResponse, RemoveServerRequest,
+    WriteRequest, WriteResponse, auth_error, commit_transaction_response, config_change_response,
+    create_transaction_response, create_user_response, delete_user_response, get_keys_response,
+    get_version_request, get_version_response, login_response, raft_error, read_request,
+    read_response, transaction_aborted, write_response,
 };
 
 use routing::{Kv, Router};
@@ -488,13 +489,61 @@ impl Client {
     /// and no read-quorum round -- at the price of possibly missing
     /// recent writes, including ones this client itself just made.
     ///
-    /// For a read that is guaranteed current, open a [`transaction`] and
-    /// read inside it: that is what takes the lock and proves the node
-    /// answering is still the leader.
+    /// For a read that is guaranteed current, use
+    /// [`read_linearizable`], or open a [`transaction`] and read inside
+    /// it if the key must also *stay* as it was read.
     ///
+    /// [`read_linearizable`]: Client::read_linearizable
     /// [`transaction`]: Client::transaction
     pub async fn read(&self, key: &[u8]) -> Result<ReadResult, Error> {
         self.read_inner(key, None).await
+    }
+
+    /// Reads `key` as of the moment the call is answered, reflecting
+    /// everything committed anywhere in the cluster. The node answering
+    /// proves it still leads and still holds a quorum of leases first,
+    /// which costs a round of lease checks that [`read`] does not.
+    ///
+    /// Nothing is locked, so the answer describes an instant that has
+    /// already passed: the key may change immediately after. That is the
+    /// difference from reading inside a [`transaction`], which holds the
+    /// key against conflicting writes until the transaction ends.
+    ///
+    /// [`read`]: Client::read
+    /// [`transaction`]: Client::transaction
+    pub async fn read_linearizable(&self, key: &[u8]) -> Result<ReadResult, Error> {
+        self.read_inner(key, Some(read_request::Consistency::Linearizable(true)))
+            .await
+    }
+
+    /// The sequence number `key`'s current value was written at, without
+    /// fetching the value -- 0 if it has no current value.
+    ///
+    /// Answered from an index of seqs alone, so it costs the same
+    /// whatever the value weighs. This is the call for "has this changed
+    /// since I last looked?"; [`read`] can answer that only by sending
+    /// the whole value back for you to discard.
+    ///
+    /// Stale on exactly the terms [`read`] is stale. See
+    /// [`get_version_linearizable`] and [`Transaction::get_version`].
+    ///
+    /// [`read`]: Client::read
+    /// [`get_version_linearizable`]: Client::get_version_linearizable
+    pub async fn get_version(&self, key: &[u8]) -> Result<u64, Error> {
+        self.get_version_inner(key, None).await
+    }
+
+    /// [`get_version`], as of the moment the call is answered, on the
+    /// same terms (and at the same cost) as [`read_linearizable`].
+    ///
+    /// [`get_version`]: Client::get_version
+    /// [`read_linearizable`]: Client::read_linearizable
+    pub async fn get_version_linearizable(&self, key: &[u8]) -> Result<u64, Error> {
+        self.get_version_inner(
+            key,
+            Some(get_version_request::Consistency::Linearizable(true)),
+        )
+        .await
     }
 
     /// Walks every key that currently has a value, in order, from
@@ -540,15 +589,31 @@ impl Client {
     async fn read_inner(
         &self,
         key: &[u8],
-        transaction_id: Option<Vec<u8>>,
+        consistency: Option<read_request::Consistency>,
     ) -> Result<ReadResult, Error> {
         let request = ReadRequest {
             key: key.to_vec(),
-            transaction_id,
+            consistency,
         };
         self.call(|mut kv: Kv| {
             let request = request.clone();
             async move { kv.read(request).await.map(read_reply) }
+        })
+        .await
+    }
+
+    async fn get_version_inner(
+        &self,
+        key: &[u8],
+        consistency: Option<get_version_request::Consistency>,
+    ) -> Result<u64, Error> {
+        let request = GetVersionRequest {
+            key: key.to_vec(),
+            consistency,
+        };
+        self.call(|mut kv: Kv| {
+            let request = request.clone();
+            async move { kv.get_version(request).await.map(get_version_reply) }
         })
         .await
     }
@@ -1029,6 +1094,14 @@ fn read_reply(resp: tonic::Response<ReadResponse>) -> Reply<ReadResult> {
     }
 }
 
+fn get_version_reply(resp: tonic::Response<GetVersionResponse>) -> Reply<u64> {
+    match resp.into_inner().result {
+        Some(get_version_response::Result::Ok(ok)) => Reply::Ok(ok.seq),
+        Some(get_version_response::Result::Error(e)) => Reply::from_error(e),
+        None => empty_response(),
+    }
+}
+
 fn create_transaction_reply(resp: tonic::Response<CreateTransactionResponse>) -> Reply<Vec<u8>> {
     match resp.into_inner().result {
         Some(create_transaction_response::Result::TransactionId(id)) => Reply::Ok(id),
@@ -1144,7 +1217,36 @@ impl Transaction {
     /// always describes *committed* state even then, since a buffered
     /// write has no sequence number yet.
     pub async fn read(&self, key: &[u8]) -> Result<ReadResult, Error> {
-        self.client.read_inner(key, Some(self.id.clone())).await
+        self.client
+            .read_inner(
+                key,
+                Some(read_request::Consistency::TransactionId(self.id.clone())),
+            )
+            .await
+    }
+
+    /// The sequence number `key`'s current value was written at, without
+    /// fetching the value -- 0 if it has no current value.
+    ///
+    /// Holds `key` against conflicting writes for the rest of the
+    /// transaction exactly as [`read`] does, so this is the cheap half of
+    /// a check-then-write: take the version, decide, write, commit, and
+    /// the commit fails if anyone else touched the key in between.
+    ///
+    /// The answer describes *committed* state even for a key this
+    /// transaction has itself buffered a write for -- a buffered write
+    /// has no sequence number until the commit assigns one.
+    ///
+    /// [`read`]: Transaction::read
+    pub async fn get_version(&self, key: &[u8]) -> Result<u64, Error> {
+        self.client
+            .get_version_inner(
+                key,
+                Some(get_version_request::Consistency::TransactionId(
+                    self.id.clone(),
+                )),
+            )
+            .await
     }
 
     /// Walks every key that currently has a value, in order, from

@@ -52,13 +52,13 @@ use crate::pb::raft5::client::{
     CommitTransactionResponse, ConfigChangeResponse, CreateTransactionRequest,
     CreateTransactionResponse, CreateUserRequest, CreateUserResponse, DeleteUserRequest,
     DeleteUserResponse, DropTransactionRequest, DropTransactionResponse, GetConfigRequest,
-    GetConfigResponse, GetKeysOk, GetKeysRequest, GetKeysResponse, LoginOk, LoginRequest,
-    LoginResponse,
-    NotLeader, RaftError as PbRaftError, ReadOk, ReadRequest, ReadResponse, RemoveServerRequest,
-    TransactionAborted, WriteRequest, WriteResponse, auth_error, commit_transaction_response,
-    config_change_response, create_transaction_response, create_user_response,
-    delete_user_response, drop_transaction_response, get_keys_response, login_response, raft_error,
-    read_response, transaction_aborted, write_response,
+    GetConfigResponse, GetKeysOk, GetKeysRequest, GetKeysResponse, GetVersionOk, GetVersionRequest,
+    GetVersionResponse, LoginOk, LoginRequest, LoginResponse, NotLeader, RaftError as PbRaftError,
+    ReadOk, ReadRequest, ReadResponse, RemoveServerRequest, TransactionAborted, WriteRequest,
+    WriteResponse, auth_error, commit_transaction_response, config_change_response,
+    create_transaction_response, create_user_response, delete_user_response,
+    drop_transaction_response, get_keys_response, get_version_request, get_version_response,
+    login_response, raft_error, read_request, read_response, transaction_aborted, write_response,
 };
 use crate::pb::raft5::cluster::{ClusterConfig, ClusterMember};
 use crate::pb::raft5::raft::raft_peer_server::RaftPeer;
@@ -76,6 +76,25 @@ use crate::storage::{RaftLog, StorageError};
 use crate::store::ChunkReader;
 use crate::store::Store;
 use crate::txn::{AbortReason, BufferedKeys, Locks, Refused, TxnId};
+
+/// What storage found, as a `ReadOk`.
+///
+/// A never-written key and a deleted key both read as "no value"
+/// (storage's `get_latest` already collapses the two -- see its doc); seq
+/// 0 is never assigned, since sequencing starts at 1, so it doubles as
+/// the "never written" sentinel here.
+fn read_ok(found: Option<(u64, Vec<u8>)>) -> ReadOk {
+    match found {
+        Some((seq, value)) => ReadOk {
+            seq,
+            value: Some(value),
+        },
+        None => ReadOk {
+            seq: 0,
+            value: None,
+        },
+    }
+}
 
 /// How many keys `GetKeys` returns when the caller doesn't say.
 const DEFAULT_MAX_KEYS: u32 = 10;
@@ -454,11 +473,7 @@ impl KvService {
     /// leader still catching up should not be holding keys nobody can
     /// write while it does it.
     async fn transactional_read(&self, id: TxnId, key: &[u8]) -> Result<ReadOk, TxnError> {
-        let leader = self.transaction_leader(id)?;
-        leader.await_caught_up().await?;
-        if !leader.has_read_quorum() {
-            return Err(RaftError::NotLeader { leader_hint: None }.into());
-        }
+        self.transaction_read_quorum(id).await?;
 
         let buffered = self.locks.read(id, key)?;
 
@@ -481,6 +496,51 @@ impl KvService {
             None => committed.map(|(_, value)| value),
         };
         Ok(ReadOk { seq, value })
+    }
+
+    /// What a transaction must establish before it may answer a read:
+    /// this node leads the transaction's own term, its `latest` is
+    /// complete, and it still holds a quorum of leases.
+    ///
+    /// `transaction_leader` and `await_caught_up` come *before* the
+    /// caller takes any lock: a leader still catching up should not be
+    /// holding keys nobody can write while it does it.
+    async fn transaction_read_quorum(&self, id: TxnId) -> Result<(), TxnError> {
+        let leader = self.transaction_leader(id)?;
+        leader.await_caught_up().await?;
+        if !leader.has_read_quorum() {
+            return Err(RaftError::NotLeader { leader_hint: None }.into());
+        }
+        Ok(())
+    }
+
+    /// A transactional `GetVersion`: take the shared lock, then answer
+    /// from the index.
+    ///
+    /// `read_many` of a single key rather than `read`, which is otherwise
+    /// the obvious call. Both take the lock and record the read; `read`
+    /// additionally clones whatever this transaction has buffered for the
+    /// key, which is megabytes to answer an eight-byte question -- and a
+    /// question about committed state at that, which the buffered value
+    /// could not answer even if it were free. `read_many` also skips a
+    /// key the transaction already holds a write lock on, which is what
+    /// makes asking about one's own buffered write work rather than
+    /// deadlock on the upgrade.
+    async fn transactional_version(&self, id: TxnId, key: &[u8]) -> Result<GetVersionOk, TxnError> {
+        self.transaction_read_quorum(id).await?;
+
+        let keys = [key.to_vec()];
+        self.locks.read_many(id, &keys)?;
+
+        let [key] = keys;
+        let seq = self
+            .store
+            .run(move |log| log.get_version(&key))
+            .await
+            .map_err(|e| TxnError::Raft(RaftError::Storage(e)))?;
+        Ok(GetVersionOk {
+            seq: seq.unwrap_or(0),
+        })
     }
 
     /// One pass of a key scan: up to `limit` keys at or after `start`,
@@ -675,25 +735,49 @@ impl KvService {
         }))
     }
 
-    /// A read that reflects everything committed anywhere in the
-    /// cluster, without taking a lock.
+    /// What a lock-free linearizable read must establish: this node
+    /// leads, its `latest` is complete, and it still holds a quorum of
+    /// leases.
     ///
-    /// The same proof `transactional_read` rests on -- this node leads,
-    /// its `latest` is complete, and it still holds a quorum of leases
-    /// -- minus the lock, since nothing here belongs to a transaction
-    /// that would have to go on holding the key afterwards.
-    async fn linearizable_get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>, RaftError> {
+    /// The same proof `transaction_read_quorum` rests on, minus the
+    /// transaction -- nothing here belongs to one that would have to go
+    /// on holding the key afterwards, so nothing is locked and nothing
+    /// is held after the answer is given.
+    async fn read_quorum(&self) -> Result<(), RaftError> {
         let leader = self.leader()?;
         leader.await_caught_up().await?;
         if !leader.has_read_quorum() {
             return Err(RaftError::NotLeader { leader_hint: None });
         }
-        Ok(self
-            .store
+        Ok(())
+    }
+
+    /// A read that reflects everything committed anywhere in the
+    /// cluster, without taking a lock.
+    async fn linearizable_read(&self, key: Vec<u8>) -> Result<Option<(u64, Vec<u8>)>, RaftError> {
+        self.read_quorum().await?;
+        self.store
             .run(move |log| log.get_latest(&key))
             .await
+            .map_err(RaftError::Storage)
+    }
+
+    /// `linearizable_read`, for a caller that wants the value and not the
+    /// seq it came at.
+    async fn linearizable_get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>, RaftError> {
+        Ok(self.linearizable_read(key).await?.map(|(_, value)| value))
+    }
+
+    /// The seq alone, linearizably -- `linearizable_read` without the
+    /// read of the value, which is the whole saving.
+    async fn linearizable_version(&self, key: Vec<u8>) -> Result<u64, RaftError> {
+        self.read_quorum().await?;
+        Ok(self
+            .store
+            .run(move |log| log.get_version(&key))
+            .await
             .map_err(RaftError::Storage)?
-            .map(|(_, value)| value))
+            .unwrap_or(0))
     }
 
     /// The account record for `username`, read currently.
@@ -1028,11 +1112,11 @@ impl Kv for KvService {
         // back is one to attack offline, at leisure.
         reject_reserved(&req.key)?;
 
-        // A transactional read is a different thing: it takes a lock, it
-        // can be answered from what the transaction itself has buffered,
-        // and it is linearizable -- only this transaction's own leader,
-        // still holding a read quorum, will serve one.
-        if let Some(id) = &req.transaction_id {
+        // A transactional read is a different thing again: it takes a
+        // lock, and it can be answered from what the transaction itself
+        // has buffered -- only this transaction's own leader, still
+        // holding a read quorum, will serve one.
+        if let Some(read_request::Consistency::TransactionId(id)) = &req.consistency {
             let id = txn_id(id)?;
             let result = self.transactional_read(id, &req.key).await;
             return Ok(Response::new(ReadResponse {
@@ -1043,34 +1127,80 @@ impl Kv for KvService {
             }));
         }
 
-        // Outside a transaction, a read asks for no guarantee at all: it
-        // is answered from local state by whoever received it, leader or
-        // not, with no read-quorum round and no wait to catch up. So it
-        // can be behind -- by a write still replicating on the leader,
-        // or by however far this node has fallen behind.
+        // Linearizable without a transaction: this node proves it still
+        // leads and still holds a read quorum, and then answers. No lock,
+        // so nothing is held once the answer is given -- the key is free
+        // to change the moment after.
+        if let Some(read_request::Consistency::Linearizable(true)) = req.consistency {
+            return Ok(Response::new(ReadResponse {
+                result: Some(match self.linearizable_read(req.key).await {
+                    Ok(found) => read_response::Result::Ok(read_ok(found)),
+                    Err(e) => read_response::Result::Error(client_err(e)?),
+                }),
+            }));
+        }
+
+        // Everything else: `consistency` unset, or `linearizable: false`,
+        // which says the caller asked for no guarantee rather than failed
+        // to ask. Answered from local state by whoever received it,
+        // leader or not, with no read-quorum round and no wait to catch
+        // up. So it can be behind -- by a write still replicating on the
+        // leader, or by however far this node has fallen behind.
         let found = self
             .store
             .run(move |log| log.get_latest(&req.key))
             .await
             .map_err(storage_err)?;
 
-        // A never-written key and a deleted key both read as "no value"
-        // (storage's `get_latest` already collapses the two -- see its
-        // doc); seq 0 is never assigned (sequencing starts at 1), so it
-        // doubles as the "never written" sentinel here.
-        let ok = match found {
-            Some((seq, value)) => ReadOk {
-                seq,
-                value: Some(value),
-            },
-            None => ReadOk {
-                seq: 0,
-                value: None,
-            },
-        };
-
         Ok(Response::new(ReadResponse {
-            result: Some(read_response::Result::Ok(ok)),
+            result: Some(read_response::Result::Ok(read_ok(found))),
+        }))
+    }
+
+    async fn get_version(
+        &self,
+        request: Request<GetVersionRequest>,
+    ) -> Result<Response<GetVersionResponse>, Status> {
+        let req = request.into_inner();
+        // Before the branch, as in `read`, and for the same reason. The
+        // seq of an account record is still a fact about the reserved
+        // range, and "this key changed at seq N" is enough to watch the
+        // administration of a cluster one has no business watching.
+        reject_reserved(&req.key)?;
+
+        if let Some(get_version_request::Consistency::TransactionId(id)) = &req.consistency {
+            let id = txn_id(id)?;
+            let result = self.transactional_version(id, &req.key).await;
+            return Ok(Response::new(GetVersionResponse {
+                result: Some(match result {
+                    Ok(ok) => get_version_response::Result::Ok(ok),
+                    Err(e) => get_version_response::Result::Error(txn_error(e)?),
+                }),
+            }));
+        }
+
+        if let Some(get_version_request::Consistency::Linearizable(true)) = req.consistency {
+            return Ok(Response::new(GetVersionResponse {
+                result: Some(match self.linearizable_version(req.key).await {
+                    Ok(seq) => get_version_response::Result::Ok(GetVersionOk { seq }),
+                    Err(e) => get_version_response::Result::Error(client_err(e)?),
+                }),
+            }));
+        }
+
+        // Stale, as `read` is stale, and cheap in the way this RPC exists
+        // to be: one point lookup on `latest_seq`, whatever the value
+        // behind it weighs.
+        let seq = self
+            .store
+            .run(move |log| log.get_version(&req.key))
+            .await
+            .map_err(storage_err)?;
+
+        Ok(Response::new(GetVersionResponse {
+            result: Some(get_version_response::Result::Ok(GetVersionOk {
+                seq: seq.unwrap_or(0),
+            })),
         }))
     }
 

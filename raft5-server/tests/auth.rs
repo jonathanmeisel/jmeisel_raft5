@@ -171,7 +171,7 @@ async fn every_other_rpc_is_refused_without_a_token() {
         .clone()
         .read(Request::new(ReadRequest {
             key: b"k".to_vec(),
-            transaction_id: None,
+            consistency: None,
         }))
         .await
         .expect_err("a read needs a token");
@@ -228,7 +228,7 @@ async fn a_token_signed_with_another_secret_is_refused() {
             &foreign,
             ReadRequest {
                 key: b"k".to_vec(),
-                transaction_id: None,
+                consistency: None,
             },
         ))
         .await
@@ -243,7 +243,7 @@ async fn a_malformed_authorization_header_is_refused() {
     for header in ["", "Bearer", "Basic abc123", "Bearer not.a.token"] {
         let mut request = Request::new(ReadRequest {
             key: b"k".to_vec(),
-            transaction_id: None,
+            consistency: None,
         });
         request
             .metadata_mut()
@@ -276,7 +276,7 @@ async fn a_node_without_a_secret_requires_and_ignores_tokens_alike() {
         .clone()
         .read(Request::new(ReadRequest {
             key: b"k".to_vec(),
-            transaction_id: None,
+            consistency: None,
         }))
         .await
         .expect("an open node serves a read with no token at all");
@@ -288,7 +288,7 @@ async fn a_node_without_a_secret_requires_and_ignores_tokens_alike() {
             "not.a.real.token",
             ReadRequest {
                 key: b"k".to_vec(),
-                transaction_id: None,
+                consistency: None,
             },
         ))
         .await

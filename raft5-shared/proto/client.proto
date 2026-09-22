@@ -17,11 +17,21 @@ service Kv {
   // the whole protocol rather than a special case of it.
   rpc Write(WriteRequest) returns (WriteResponse);
 
-  // Read the current value for a key. Inside a transaction
-  // (`transaction_id` set) the read is linearizable and takes a lock;
-  // outside one it is a possibly-stale local read, served by whichever
-  // node received it.
+  // Read the current value for a key, at whichever of the three
+  // consistencies `ReadRequest.consistency` asks for -- stale by
+  // default, linearizable on request, or as part of a transaction.
   rpc Read(ReadRequest) returns (ReadResponse);
+
+  // The sequence number the key's current value was written at, and
+  // nothing else. Takes the same `consistency` choice Read does, and
+  // means the same thing by it.
+  //
+  // Answered without ever reading the value, so what it costs does not
+  // depend on how large the value is. That is the entire point of it:
+  // Read can answer "has this changed since I last looked?" only by
+  // sending back the whole value for the caller to discard, which for a
+  // large one is megabytes over the wire to learn eight bytes.
+  rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
 
   // Walk the keys that currently have a value, in order, starting at
   // `start_key`. Consistency follows Read exactly: inside a transaction
@@ -178,19 +188,36 @@ message WriteResponse {
 }
 
 message ReadRequest {
-  reserved 2; // a `linearizable` flag; `transaction_id` now says it
+  reserved 2; // a bare `linearizable` bool, before `consistency` held it
   bytes key = 1;
-  // Read as part of this transaction: the key joins its read set and is
-  // held against conflicting writes until it finishes, and a key it has
-  // already buffered a write for reads back as that write. Such a read
-  // is linearizable, and only the transaction's own leader will serve
-  // it.
+
+  // What the caller wants guaranteed. Leaving the whole field unset is a
+  // possibly-stale read, answered from local state by whichever node
+  // received it, with no check that it still leads -- the cheapest thing
+  // this service does, and the default because most reads can take it.
   //
-  // Unset is a possibly-stale read, answered from local state by
-  // whichever node received it, with no check that it still leads. That
-  // is the whole difference: linearizability comes from being in a
-  // transaction, not from a flag.
-  optional bytes transaction_id = 3;
+  // Field 3 was `optional bytes transaction_id` before this oneof
+  // existed. A proto3 `optional` is already a synthetic oneof, so the
+  // encoding did not change and a transactional read written against
+  // either version is the same bytes on the wire.
+  oneof consistency {
+    // Read as part of this transaction: the key joins its read set and
+    // is held against conflicting writes until it finishes, and a key it
+    // has already buffered a write for reads back as that write. Only
+    // the transaction's own leader will serve one.
+    bytes transaction_id = 3;
+
+    // Linearizable, without a transaction and without a lock. The node
+    // answering proves it still leads and still holds a read quorum, so
+    // the answer reflects everything committed anywhere in the cluster
+    // as of the moment it was given -- but nothing is held afterwards,
+    // so it may be stale by the time the caller acts on it. A caller
+    // that needs the key to *stay* that way wants a transaction.
+    //
+    // `false` is explicitly the same as leaving `consistency` unset: a
+    // present field saying no guarantee was asked for.
+    bool linearizable = 4;
+  }
 }
 
 message ReadResponse {
@@ -203,6 +230,37 @@ message ReadResponse {
 message ReadOk {
   uint64 seq = 1;
   optional bytes value = 2; // unset = key doesn't currently exist
+}
+
+message GetVersionRequest {
+  bytes key = 1;
+  // Exactly as in ReadRequest, including what an unset field means. A
+  // key the transaction has already buffered a write for still answers
+  // with the *committed* seq: a buffered write has no sequence number
+  // until the commit assigns one, so there is no other honest answer.
+  oneof consistency {
+    bytes transaction_id = 2;
+    bool linearizable = 3;
+  }
+}
+
+message GetVersionResponse {
+  oneof result {
+    GetVersionOk ok = 1;
+    RaftError error = 2;
+  }
+}
+
+message GetVersionOk {
+  // The seq the key's current value was written at, or 0 if it has no
+  // current value -- never written, or deleted, which are the same thing
+  // here as they are to Read. Sequencing starts at 1, so 0 is free to
+  // mean that.
+  //
+  // Deliberately the only field. An `exists` bool would carry nothing
+  // `seq` does not already say, and a value size would have to be exact
+  // to be worth having.
+  uint64 seq = 1;
 }
 
 message GetKeysRequest {
