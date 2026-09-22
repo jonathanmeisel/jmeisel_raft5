@@ -353,6 +353,22 @@ fn random_jitter_millis(max: u64) -> u64 {
 /// noticeable pause rather than the rest of the term.
 const APPLY_RETRY_DELAY: Duration = Duration::from_millis(100);
 
+/// How often the version GC wakes when it has nothing left to do.
+///
+/// Short, because what it is reclaiming is every superseded version of
+/// every key that has been overwritten -- on a write-heavy workload the
+/// store grows until this runs. A pass that stops on its budget does not
+/// wait this out; it goes straight round again.
+const VERSION_GC_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How many version rows one GC pass visits before yielding.
+///
+/// Bounds how long the blocking-pool worker is held and how large the
+/// write batch can get, in the same spirit as `WRITE_CHUNK`. A pass
+/// always finishes the key it is in the middle of, so this is
+/// approximate.
+const VERSION_GC_BUDGET: usize = 50_000;
+
 /// How many consecutive failed election cycles it takes to reach this.
 const MAX_ELECTION_BACKOFF_MS: u64 = 30_000;
 
@@ -987,6 +1003,69 @@ enum Next {
 /// while that used to cost only a stale read, `applied_tx` is now what
 /// every write and every transaction commit is parked on. A commit that
 /// never hears back holds its locks for the rest of the term.
+/// Collect versions no read can select, on a timer.
+///
+/// A task of its own rather than another arm of
+/// `spawn_storage_maintenance_task`, for three reasons. That loop is
+/// edge-driven on the commit and compaction watermarks, so adding a tick
+/// to it would make an idle cluster run `apply_committed` and `compact`
+/// for no reason. Its failure policy -- retry the same seq, skip that
+/// cycle's compaction -- has nothing to do with GC, and neither should
+/// be able to delay the other. And GC has its own budget, its own cursor
+/// and its own log line, which are easier to read apart than together.
+///
+/// Runs on every node regardless of role, and needs no coordination with
+/// any other: it only removes rows no read could have selected, so two
+/// nodes may hold different amounts of uncollected garbage with nothing
+/// observable differing between them. See `storage::gc`.
+fn spawn_version_gc_task(cancel: &CancellationToken, store: Store) -> Task {
+    Task::spawn(cancel, move |cancel| async move {
+        loop {
+            let started = Instant::now();
+            let stats = match store.run(|log| log.gc_versions(VERSION_GC_BUDGET)).await {
+                Ok(stats) => stats,
+                Err(e) => {
+                    // Logged, never fatal, same policy as the
+                    // maintenance task: uncollected garbage costs space,
+                    // and nothing else depends on this having run.
+                    warn!("version gc failed, retrying on the next tick: {e}");
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => return,
+                        () = tokio::time::sleep(VERSION_GC_INTERVAL) => continue,
+                    }
+                }
+            };
+
+            if stats.rows_removed > 0 || !stats.done {
+                info!(
+                    rows_visited = stats.rows_visited,
+                    rows_removed = stats.rows_removed,
+                    done = stats.done,
+                    gc_ms = started.elapsed().as_millis(),
+                    "version gc pass"
+                );
+            }
+
+            // A pass that stopped on its budget has work waiting, so it
+            // goes straight round rather than sleeping on a store it
+            // has already been told is behind.
+            if !stats.done {
+                if cancel.is_cancelled() {
+                    return;
+                }
+                continue;
+            }
+
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => return,
+                () = tokio::time::sleep(VERSION_GC_INTERVAL) => {}
+            }
+        }
+    })
+}
+
 fn spawn_storage_maintenance_task(
     cancel: &CancellationToken,
     store: Store,
@@ -1065,6 +1144,7 @@ pub async fn run(mut common: Common) {
         common.compact_tx.subscribe(),
         Arc::clone(&common.applied_tx),
     );
+    let version_gc_task = spawn_version_gc_task(common.cancel_token(), common.store.clone());
     let mut role = Role::Follower;
     loop {
         let (next_role, next_common) = match role {
@@ -1082,6 +1162,7 @@ pub async fn run(mut common: Common) {
         common = next_common;
     }
     maintenance_task.stop().await;
+    version_gc_task.stop().await;
     // Both a courtesy to anyone still holding a `RoleHandle` and a
     // necessity: it is what breaks the `LeaderHandle` reference cycle
     // that would otherwise pin this node's `Arc<RaftLog>` (and its

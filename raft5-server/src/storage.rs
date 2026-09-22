@@ -1,67 +1,82 @@
 //! Raft log storage backed by `fjall`.
 //!
-//! Layout (four keyspaces):
-//! - `log`:    seq (u64 BE)                -> encoded (term, payload) entry
-//! - `latest`: key                          -> encoded (seq, value) *committed* current state
-//! - `latest_seq`: key                      -> the seq of that key's `latest` row (u64 BE)
+//! Layout (three keyspaces):
+//! - `log`:      seq (u64 BE)  -> encoded (term, payload) entry
+//! - `versions`: one row per *version* of a key -- see below
 //! - `meta`:   small set of fixed keys: the floor (`floor_seq`,
 //!   `floor_term`) — the seq/term of the highest entry no longer physically
 //!   in `log`, updated by both `install_snapshot` and `compact` — the
 //!   compaction watermark (`compact_last_seq`, recorded by `compact` alone,
-//!   for resuming an incremental compaction) — and the applied watermark
+//!   for resuming an incremental compaction) — the applied watermark
 //!   (`applied_seq`, recorded by `apply_committed` alone, for the same
-//!   reason) — plus `base_config`, the last cluster configuration to fall
+//!   reason) — the version-GC cursor (`gc_cursor`, see `gc_versions`) —
+//!   plus `base_config`, the last cluster configuration to fall
 //!   out of `log` via `compact` or `install_snapshot` (see `config_at`).
 //!
-//! `latest_seq` is a derived index and holds nothing `latest` doesn't. It
-//! exists because of where the seq physically lives: it is the first field
-//! *inside* the `latest` row's value, and `latest` uses KV separation, so
-//! past fjall's separation threshold that value is in a blob file. Asking
-//! "what seq is this key at?" out of `latest` therefore means reading --
-//! and copying -- an entire value nobody asked for, which for a large one
-//! is megabytes of I/O to answer with eight bytes. The same number in a
-//! keyspace whose rows are eight bytes long answers it at a fixed cost.
-//! See `get_version`.
+//! # Versions
 //!
-//! The trade is real and worth stating: one extra row per live key (its
-//! key bytes plus eight) and one extra batch operation per applied
-//! mutation. `latest_seq` is written in the *same* batch as every `latest`
-//! row so the two cannot drift, and `open` rebuilds it outright whenever
-//! anything could have left them apart -- see
-//! `rebuild_latest_seq_if_needed`.
+//! `versions` is multi-version: a write does not replace what a key held,
+//! it *adds* a row, and a delete adds a tombstone row rather than removing
+//! anything. A row key is
+//! `escape(user key) || 00 00 || !seq || kind` (`codec::row_key`), which
+//! sorts by user key and then newest-seq-first, so every version of one
+//! key is a contiguous run with the current value at its head.
+//!
+//! That is what makes a *checkpoint* -- a client-visible, named,
+//! point-in-time read view (`checkpoint.rs`) -- possible: reading "as of
+//! seq S" is one seek into a key's run, and costs the same whether the key
+//! has one version or a thousand. `get_latest` is literally
+//! `get_as_of(key, u64::MAX)`, so there is no separate current-value path
+//! to keep in step.
+//!
+//! Everything describing a row lives in its *key*, never its value, which
+//! is why `get_version`, `scan_latest` and `gc_versions` can work entirely
+//! from `Guard::key()` and never touch the blob files that this keyspace's
+//! key-value separation puts large values in.
+//!
+//! The cost is that an overwritten version stays until something collects
+//! it. `gc_versions` is that something, and it is not optional: without it
+//! this keyspace grows without bound on any workload that overwrites, whether
+//! or not a checkpoint is ever created.
 //!
 //! Not every log entry is key/value data: `EntryPayload` also covers a
 //! leader's term-opening no-op and the cluster configuration. Those
 //! occupy a seq and take part in log matching and commitment like
 //! anything else, but `apply_committed` skips them, so they never reach
-//! `latest`.
+//! `versions`.
 //!
 //! A `Write` payload carries *any number* of mutations, and they apply to
-//! `latest` together: one entry, one seq, one batch. That is what makes a
+//! `versions` together: one entry, one seq, one batch. That is what makes a
 //! multi-key transaction possible -- see `apply_committed`.
 //!
 //! `append` only ever writes to `log`; `apply_committed` is the *only*
-//! thing that ever writes to `latest`, and it's driven by Raft's own commit
+//! thing that ever writes to `versions`, and it's driven by Raft's own commit
 //! index (`raft::Common::commit_tx`), not by appends. This separation
 //! matters: an appended-but-uncommitted entry can still be rolled back
 //! (`truncate_from`) if a leader change happens before it commits, so
-//! serving it out of `latest` (e.g. for a client read) before that's
+//! serving it out of `versions` (e.g. for a client read) before that's
 //! settled would risk exposing a write that never durably happened.
 //! Sequence numbers are assigned under a mutex held for the full duration
 //! of an `append`/`truncate_from`/`install_snapshot` write, so a failed
 //! write never leaves a gap or is double-assigned.
 //!
-//! Because `latest` is only ever driven by confirmed, permanent history, a
-//! delete simply *removes* the key from `latest` (`apply_committed`) rather
-//! than leaving a tombstone there the way `log` does: there's no "deleted a
-//! while ago vs. never written" ambiguity left to preserve, since `latest`
-//! was never ahead of what's actually final in the first place.
-//! `export_snapshot` therefore never needs to skip anything -- every row in
-//! `latest` is already current state.
+//! A delete writes a *tombstone* row (`apply_committed`) rather than
+//! removing anything. At the head of a key's run a tombstone reads exactly
+//! as "never written" does -- `get_as_of` answers `None` for both, and no
+//! caller can tell them apart -- but further down the run it is the only
+//! thing that can say "this key did not exist as of S" to a checkpoint
+//! taken before the delete. `gc_versions` drops a head tombstone once
+//! nothing older survives, which is what makes a deleted key's rows
+//! actually disappear on a store with no checkpoints.
+//!
+//! `export_snapshot` therefore *does* have to carry tombstones: one that a
+//! checkpoint selects is state, not absence, and a recipient without it
+//! would answer that checkpoint's reads with a value the sender knows was
+//! deleted.
 //!
 //! Because `compact` physically removes `log` entries, it must never run
 //! ahead of `apply_committed` for the same range -- otherwise an entry
-//! could be deleted from `log` before ever reaching `latest`, losing that
+//! could be deleted from `log` before ever reaching `versions`, losing that
 //! key's data outright. `compact` enforces this itself (clamping its own
 //! `below_seq` to whatever `apply_committed` has reached), and
 //! `raft::spawn_storage_maintenance_task` additionally always calls
@@ -117,25 +132,28 @@ use std::sync::Mutex;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, KvSeparationOptions, OwnedWriteBatch};
 use serde::{Deserialize, Serialize};
 
+mod checkpoint;
 mod codec;
+mod gc;
 mod meta;
 mod snapshot;
 
 use codec::{
-    be_bytes, decode_latest_value, decode_log_entry, encode_latest_value, encode_log_entry,
-    from_be_bytes, seq_of_latest_value,
+    Kind, be_bytes, chain_end, chain_start, decode_log_entry, encode_log_entry, from_be_bytes,
+    row_key, row_seq, row_user_key, seek_as_of,
 };
 use meta::{
     META_APPLIED_SEQ, META_BASE_CONFIG, META_COMPACT_SEQ, META_CURRENT_TERM, META_FLOOR_SEQ,
-    META_FLOOR_TERM, META_LATEST_SEQ_BUILT, META_VOTED_FOR, latest_seq_built, read_applied_seq,
-    read_compact_watermark, read_floor,
+    META_FLOOR_TERM, META_GC_CURSOR, META_VOTED_FOR, read_applied_seq, read_compact_watermark,
+    read_floor,
 };
 
+pub use checkpoint::{Checkpoint, MAX_LIVE_CHECKPOINTS, checkpoint_key, encode_record};
+pub use gc::GcStats;
 pub use snapshot::SnapshotMeta;
 
 const CF_LOG: &str = "log";
-const CF_LATEST: &str = "latest";
-const CF_LATEST_SEQ: &str = "latest_seq";
+const CF_VERSIONS: &str = "versions";
 const CF_META: &str = "meta";
 
 /// Max pending writes buffered in a `WriteBatch` before it's flushed, used
@@ -187,6 +205,46 @@ impl std::error::Error for StorageError {}
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 
+/// `writes` reduced to at most one mutation per key, the last for each
+/// winning, in their original order.
+///
+/// **One entry may contribute at most one row per key**, and that is a
+/// requirement of the row encoding rather than a tidiness. Two mutations
+/// for one key used to collapse on their own, because both produced the
+/// same `latest` row key and the second overwrote the first. They no
+/// longer do: a value and a tombstone at one seq are two *different* row
+/// keys, and the tombstone sorts first (`Kind::Tombstone` is 0), so a
+/// delete-then-write within one entry would leave the write buried under
+/// its own delete and the key would read as absent.
+///
+/// `txn::Locks` already dedups by key, so a well-formed entry from this
+/// cluster never contains a duplicate; this is for a hand-built
+/// `append_writes` and for a replicated entry from a peer that did not.
+fn last_write_per_key(writes: Vec<Mutation>) -> Vec<Mutation> {
+    use std::collections::{HashMap, HashSet};
+
+    // The index of the last mutation for each key. Built from borrows,
+    // which is why it is scoped: `writes` is consumed below.
+    let keep: HashSet<usize> = {
+        let mut last: HashMap<&[u8], usize> = HashMap::with_capacity(writes.len());
+        for (i, m) in writes.iter().enumerate() {
+            last.insert(&m.key, i);
+        }
+        // No duplicates is the overwhelmingly common case, and it needs
+        // no filtering pass at all.
+        if last.len() == writes.len() {
+            return writes;
+        }
+        last.into_values().collect()
+    };
+
+    writes
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, m)| keep.contains(&i).then_some(m))
+        .collect()
+}
+
 /// One key's change within a `Write` entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mutation {
@@ -200,8 +258,8 @@ pub struct Mutation {
     // CPU-seconds here.
     #[serde(with = "serde_bytes")]
     pub key: Vec<u8>,
-    /// `None` is a delete: a tombstone in `log`, and an outright removal
-    /// from `latest` when it applies.
+    /// `None` is a delete: a tombstone in `log`, and a tombstone row in
+    /// `versions` when it applies.
     #[serde(with = "serde_bytes")]
     pub value: Option<Vec<u8>>,
 }
@@ -289,8 +347,7 @@ pub struct CappedEntries {
 pub struct RaftLog {
     db: Database,
     log: Keyspace,
-    latest: Keyspace,
-    latest_seq: Keyspace,
+    versions: Keyspace,
     meta: Keyspace,
     next_seq: Mutex<u64>,
 }
@@ -310,88 +367,31 @@ impl RaftLog {
         // is awaiting. Raising `MAX_ENTRY_BYTES` past this means sizing
         // these keyspaces deliberately.
         //
-        // `log` and `latest` hold the large values, so they use KV
+        // `log` and `versions` hold the large values, so they use KV
         // separation: values past the threshold live in blob files
         // instead of being rewritten by every compaction. `meta` holds
         // a handful of tiny values and has nothing to separate.
         //
-        // `latest_seq` is emphatically *not* separated, and that is the
-        // entire point of it: a row there is eight bytes, and it must
-        // never be able to reach a blob file, or reading one would cost
-        // exactly what reading the `latest` row it indexes costs.
+        // Separation is why a `versions` row key carries everything that
+        // describes the row: a row *key* is never in a blob file, so the
+        // paths that only need to know which key, which seq and whether
+        // it is a tombstone stay off the blobs entirely. See `codec`.
         let separated = || {
             KeyspaceCreateOptions::default()
                 .with_kv_separation(Some(KvSeparationOptions::default()))
         };
         let log = db.keyspace(CF_LOG, separated)?;
-        let latest = db.keyspace(CF_LATEST, separated)?;
-        let latest_seq = db.keyspace(CF_LATEST_SEQ, KeyspaceCreateOptions::default)?;
+        let versions = db.keyspace(CF_VERSIONS, separated)?;
         let meta = db.keyspace(CF_META, KeyspaceCreateOptions::default)?;
         let next_seq = Self::recover_next_seq(&log, &meta)?;
 
-        let this = Self {
+        Ok(Self {
             db,
             log,
-            latest,
-            latest_seq,
+            versions,
             meta,
             next_seq: Mutex::new(next_seq),
-        };
-        this.rebuild_latest_seq_if_needed()?;
-        Ok(this)
-    }
-
-    /// Bring `latest_seq` into agreement with `latest`, if anything could
-    /// have left them apart: a store written before this index existed, or
-    /// a crash during `install_snapshot`, which wipes `latest` outside any
-    /// batch and so cannot wipe both atomically.
-    ///
-    /// The marker in `meta` is the whole protocol. It is cleared before
-    /// anything destructive and set again only in the commit that leaves
-    /// the two in step, so its absence means "these may disagree" and is
-    /// an instruction to rebuild. One mechanism covers both the migration
-    /// of a store that predates the index and a half-finished install,
-    /// which is why there is one repair path here rather than two.
-    ///
-    /// Clears first rather than merging, so it repairs drift in either
-    /// direction -- a stale row for a key `latest` no longer has is as
-    /// wrong as a missing one.
-    ///
-    /// This reads every `latest` row, blobs included, which is the
-    /// one-time price of the migration. It costs nothing on a fresh store
-    /// (`latest` is empty) and nothing on any later open (the marker is
-    /// set).
-    fn rebuild_latest_seq_if_needed(&self) -> Result<()> {
-        if latest_seq_built(&self.meta)? {
-            return Ok(());
-        }
-
-        // Only worth the journal write if there is something to undo.
-        // The overwhelmingly common case for an unset marker is a store
-        // that has never had an index at all -- a fresh one, or one
-        // opened for the first time after this keyspace existed -- where
-        // there is nothing to clear and a `clear` is pure startup cost
-        // on every node that boots.
-        if !self.latest_seq.is_empty()? {
-            self.latest_seq.clear()?;
-        }
-
-        let mut batch = self.db.batch();
-        let mut pending = 0usize;
-        for item in self.latest.iter() {
-            let (key, value) = item.into_inner()?;
-            batch.insert(
-                &self.latest_seq,
-                key,
-                be_bytes(seq_of_latest_value(&value)?),
-            );
-            pending += 1;
-            self.flush_if_full(&mut batch, &mut pending)?;
-        }
-
-        batch.insert(&self.meta, META_LATEST_SEQ_BUILT, be_bytes(1));
-        batch.commit()?;
-        Ok(())
+        })
     }
 
     /// `next_seq` must account for both the physical log tail and the
@@ -540,48 +540,97 @@ impl RaftLog {
         Ok(())
     }
 
-    /// The current *committed* value for `key` and the seq it was written
-    /// at, if it currently has one. `None` if the key was never written,
-    /// or if its most recent committed write was a delete -- the two are
-    /// indistinguishable, and always have been, since `latest` never
-    /// stores a delete marker (see the module doc). Never reflects an
-    /// appended-but-not-yet-committed write; see `apply_committed`.
+    /// The row at the head of `key`'s run as of `as_of`: the newest
+    /// version with `seq <= as_of`, whatever kind it is. `None` when the
+    /// key had no version at all by then.
+    ///
+    /// One seek, whatever the run's length: `seek_as_of` lands past every
+    /// version newer than `as_of` (they sort before it, having a larger
+    /// seq and so a smaller complement), and `chain_end` stops the range
+    /// before the next key's rows.
+    ///
+    /// The value comes back only when `want_value` is set *and* the head
+    /// is a value row. `Guard::into_inner_if` decides from the row key
+    /// whether to resolve the value at all, and under key-value
+    /// separation declining is what keeps a large value's blob file
+    /// unread -- so `version_as_of` asks for no value and pays for none,
+    /// and nobody ever pays to read a tombstone's (empty) one.
+    fn head_as_of(
+        &self,
+        key: &[u8],
+        as_of: u64,
+        want_value: bool,
+    ) -> Result<Option<(u64, Kind, Option<fjall::UserValue>)>> {
+        let range = seek_as_of(key, as_of)..chain_end(key);
+        match self.versions.range(range).next() {
+            Some(guard) => {
+                let (row, value) = guard.into_inner_if(|row| {
+                    want_value && matches!(codec::row_kind(row), Ok(Kind::Value))
+                })?;
+                Ok(Some((row_seq(&row)?, codec::row_kind(&row)?, value)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// The committed value for `key` as of `as_of`, and the seq it was
+    /// written at. `None` if the key had never been written by then, or
+    /// if its newest write at or before `as_of` was a delete -- the two
+    /// are indistinguishable to a caller, as they always have been.
+    ///
+    /// Never reflects an appended-but-not-yet-committed write; see
+    /// `apply_committed`.
+    pub fn get_as_of(&self, key: &[u8], as_of: u64) -> Result<Option<(u64, Vec<u8>)>> {
+        match self.head_as_of(key, as_of, true)? {
+            Some((seq, Kind::Value, Some(value))) => Ok(Some((seq, value.to_vec()))),
+            // A value row whose value did not come back cannot happen:
+            // `head_as_of` was asked for one and the predicate admits
+            // exactly this case.
+            Some((_, Kind::Value, None)) => {
+                Err(StorageError::Corrupt("a value row resolved to no value"))
+            }
+            Some((_, Kind::Tombstone, _)) | None => Ok(None),
+        }
+    }
+
+    /// The current committed value for `key`, and the seq it was written
+    /// at.
+    ///
+    /// Literally `get_as_of` at the largest seq there can be: `!u64::MAX`
+    /// is zero, so the seek lands at the very head of the key's run,
+    /// which is the newest version. There is deliberately no separate
+    /// current-value path to keep in step with the historical one.
     pub fn get_latest(&self, key: &[u8]) -> Result<Option<(u64, Vec<u8>)>> {
-        match self.latest.get(key)? {
-            Some(bytes) => Ok(Some(decode_latest_value(&bytes)?)),
-            None => Ok(None),
+        self.get_as_of(key, u64::MAX)
+    }
+
+    /// The seq `key`'s value as of `as_of` was written at, without the
+    /// value. `None` on exactly the terms `get_as_of` returns `None`.
+    ///
+    /// Costs the same whether the value is one byte or sixteen megabytes:
+    /// the seq is part of the row *key*, and `Guard::key` resolves it
+    /// without touching the blob file the value may live in.
+    pub fn version_as_of(&self, key: &[u8], as_of: u64) -> Result<Option<u64>> {
+        match self.head_as_of(key, as_of, false)? {
+            Some((seq, Kind::Value, _)) => Ok(Some(seq)),
+            Some((_, Kind::Tombstone, _)) | None => Ok(None),
         }
     }
 
-    /// The seq `key`'s current committed value was written at, without
-    /// the value. `None` on exactly the terms `get_latest` returns `None`:
-    /// never written, or deleted.
-    ///
-    /// This is what `latest_seq` exists for. `get_latest` on a large key
-    /// reads the value out of a blob file and copies it, in order to hand
-    /// back eight bytes of it; this is a point lookup on a keyspace whose
-    /// rows *are* those eight bytes, so it costs the same whether the
-    /// value is one byte or sixteen megabytes.
-    ///
-    /// Deliberately no fallback to `latest` when the index row is missing.
-    /// A fallback would paper over drift between the two rather than the
-    /// invariant being maintained, and would make the one bug this index
-    /// can have the one bug no test could see.
+    /// The seq `key`'s current committed value was written at.
     pub fn get_version(&self, key: &[u8]) -> Result<Option<u64>> {
-        match self.latest_seq.get(key)? {
-            Some(bytes) => Ok(Some(from_be_bytes(&bytes)?)),
-            None => Ok(None),
-        }
+        self.version_as_of(key, u64::MAX)
     }
 
-    /// Up to `limit` committed keys at or after `start`, in ascending
-    /// order, skipping any key `skip` rejects.
+    /// Up to `limit` keys at or after `start` that had a value as of
+    /// `as_of`, in ascending order, skipping any key `skip` rejects.
     ///
     /// `skip` is how a transaction's buffered deletes are honoured
     /// without teaching storage what a transaction is: a key the caller
     /// has already deleted doesn't exist as far as it is concerned, and
     /// skipping it here rather than filtering afterwards is what keeps a
-    /// full batch full.
+    /// full batch full. A key whose head as of `as_of` is a tombstone is
+    /// hidden on the same terms and for the same reason.
     ///
     /// Keys only. The values are the caller's business to fetch (or
     /// not), and a scan that carried them would make the size of a batch
@@ -590,40 +639,76 @@ impl RaftLog {
     /// `Guard::into_inner` resolves the value, which under KV separation
     /// is a blob file read per key, to be dropped on the next line.
     ///
-    /// `Keyspace::range` pins a snapshot nonce, so this walks one point
-    /// in time even while `apply_committed` is writing -- the same
-    /// guarantee `export_snapshot` relies on, and the reason a scan
-    /// can't catch a multi-key entry half-applied.
+    /// **One iterator, not a seek per key.** `Keyspace::range` pins a
+    /// snapshot nonce, so this walks one point in time even while
+    /// `apply_committed` is writing -- the same guarantee
+    /// `export_snapshot` relies on, and the reason a scan can't catch a
+    /// multi-key entry half-applied. Re-seeking per key would take a
+    /// fresh nonce each time and quietly give that up. The cost is that
+    /// this steps over the versions a key has that are newer than
+    /// `as_of`, which is bounded by how promptly `gc_versions` runs.
+    pub fn scan_as_of(
+        &self,
+        start: &[u8],
+        as_of: u64,
+        limit: usize,
+        skip: impl Fn(&[u8]) -> bool,
+    ) -> Result<Vec<Vec<u8>>> {
+        let mut keys = Vec::new();
+        // The run this scan has already decided about. Rows of one key
+        // arrive together and newest first, so the first row at or below
+        // `as_of` settles the key and the rest of its run is stepped
+        // over -- compared as `row_chain`, which is a memcmp on bytes
+        // already in hand rather than an unescape per row.
+        let mut settled: Option<Vec<u8>> = None;
+
+        for item in self.versions.range(chain_start(start)..) {
+            if keys.len() == limit {
+                break;
+            }
+            let row = item.key()?;
+            let chain = codec::row_chain(&row)?;
+            if settled.as_deref() == Some(chain) {
+                continue;
+            }
+            if row_seq(&row)? > as_of {
+                // Newer than the caller asked for; the next row down
+                // this run may still qualify.
+                continue;
+            }
+            settled = Some(chain.to_vec());
+            if codec::row_kind(&row)? != Kind::Value {
+                continue;
+            }
+            let key = row_user_key(&row)?;
+            if !skip(&key) {
+                keys.push(key);
+            }
+        }
+        Ok(keys)
+    }
+
+    /// `scan_as_of` over current state.
     pub fn scan_latest(
         &self,
         start: &[u8],
         limit: usize,
         skip: impl Fn(&[u8]) -> bool,
     ) -> Result<Vec<Vec<u8>>> {
-        let mut keys = Vec::new();
-        for item in self.latest.range(start.to_vec()..) {
-            if keys.len() == limit {
-                break;
-            }
-            let key = item.key()?;
-            if !skip(&key) {
-                keys.push(key.to_vec());
-            }
-        }
-        Ok(keys)
+        self.scan_as_of(start, u64::MAX, limit, skip)
     }
 
-    /// Applies every committed log entry not yet reflected in `latest`, up
-    /// through and including `up_to_seq`, so `latest` always represents
-    /// state that's permanent -- never a write that could still be rolled
-    /// back by a leader change (`truncate_from`) before it commits. See
-    /// the module doc.
+    /// Applies every committed log entry not yet reflected in `versions`,
+    /// up through and including `up_to_seq`, so `versions` always
+    /// represents state that's permanent -- never a write that could still
+    /// be rolled back by a leader change (`truncate_from`) before it
+    /// commits. See the module doc.
     ///
-    /// Entries are applied in ascending seq order, so a later write to the
-    /// same key always wins; a delete removes the key from `latest`
-    /// entirely rather than leaving a tombstone, since a *committed*
-    /// delete is permanent -- there's nothing left for anything to ever
-    /// need to distinguish it from "never written".
+    /// Every mutation *adds* a row: a write adds a value row at this
+    /// entry's seq, a delete adds a tombstone at it. Nothing is ever
+    /// overwritten or removed here, which is what leaves earlier versions
+    /// readable by a checkpoint taken before them, and is why
+    /// `gc_versions` exists to collect the ones no checkpoint can reach.
     ///
     /// An entry's mutations all go into the same batch, and the batch is
     /// only ever flushed *between* entries, so a `Write` is applied whole
@@ -658,35 +743,30 @@ impl RaftLog {
             let entry = decode_log_entry(&v)?;
             match entry.payload {
                 EntryPayload::Write(writes) => {
-                    for m in writes {
-                        // Both keyspaces in one batch: that, and nothing
-                        // else, is what stops the index drifting from
-                        // what it indexes.
+                    for m in last_write_per_key(writes) {
                         match m.value {
                             Some(value) => {
                                 batch.insert(
-                                    &self.latest,
-                                    &m.key,
-                                    encode_latest_value(seq, &value)?,
+                                    &self.versions,
+                                    row_key(&m.key, seq, Kind::Value),
+                                    value,
                                 );
-                                batch.insert(&self.latest_seq, &m.key, be_bytes(seq));
                             }
                             None => {
-                                batch.remove(&self.latest, &m.key);
-                                batch.remove(&self.latest_seq, &m.key);
+                                batch.insert(
+                                    &self.versions,
+                                    row_key(&m.key, seq, Kind::Tombstone),
+                                    [],
+                                );
                             }
                         }
-                        // Counted per mutation, not per batch operation.
-                        // `WRITE_CHUNK` is bounding the batch's memory,
-                        // and the index row adds eight bytes and a key to
-                        // something that already carries the whole value.
                         pending += 1;
                     }
                 }
                 // Not state machine data -- these still consume a seq and
                 // move the applied watermark, they just have no effect
                 // here. A `Config` in particular is deliberately *not*
-                // mirrored into `latest`: it takes effect on append, so
+                // mirrored into `versions`: it takes effect on append, so
                 // `current_config` reads it straight out of `log`, where
                 // it is visible before it commits.
                 EntryPayload::NoOp | EntryPayload::Config(_) => continue,
@@ -700,6 +780,17 @@ impl RaftLog {
         batch.insert(&self.meta, META_APPLIED_SEQ, be_bytes(up_to_seq));
         batch.commit()?;
         Ok(())
+    }
+
+    /// Whether any version row exists for `key` at all, at any seq --
+    /// including a tombstone. For the GC's benefit and for tests; a
+    /// caller asking whether a key *has a value* wants `get_as_of`.
+    #[cfg(test)]
+    pub(crate) fn version_count(&self, key: &[u8]) -> Result<usize> {
+        Ok(self
+            .versions
+            .range(chain_start(key)..chain_end(key))
+            .count())
     }
 
     /// Entries with `start <= seq < end`, in ascending seq order. Any seq in

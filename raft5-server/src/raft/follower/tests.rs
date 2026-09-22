@@ -775,13 +775,12 @@ async fn install_snapshot_applies_state_and_advances_watermarks() {
         .unwrap();
 
     assert_eq!(resp.term, 5);
-    // `install_snapshot` repopulates `latest` at `last_included_seq`
-    // for every key, regardless of the seq each was originally
-    // written at in the source log.
-    assert_eq!(
-        log.get_latest(b"a").unwrap(),
-        Some((meta.last_included_seq, b"1".to_vec()))
-    );
+    // `install_snapshot` repopulates `versions` with each row at the
+    // seq it was originally written at -- "a" at 1 and "b" at 2 --
+    // rather than stamping them all at `last_included_seq`. Keeping the
+    // real seqs is what lets a checkpoint survive the transfer; see
+    // `storage::snapshot::install_snapshot`.
+    assert_eq!(log.get_latest(b"a").unwrap(), Some((1, b"1".to_vec())));
     assert_eq!(
         log.get_latest(b"b").unwrap(),
         Some((meta.last_included_seq, b"2".to_vec()))

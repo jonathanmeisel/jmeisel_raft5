@@ -1,27 +1,37 @@
 //! Exporting and installing the portable snapshot format.
 //!
+//! This is Raft's InstallSnapshot -- a full state transfer to a follower
+//! that has fallen behind the compaction floor. It is *not* the
+//! client-visible snapshot feature, which lives in `super::checkpoint`
+//! and is called a checkpoint everywhere below the RPC boundary.
+//!
 //! Deliberately engine-agnostic rather than an `fjall`-native checkpoint:
-//! a snapshot is a header followed by length-prefixed `(key, value)`
-//! records, so it can be chunked over the wire by Raft's InstallSnapshot
+//! a snapshot is a header followed by length-prefixed version records,
+//! so it can be chunked over the wire by Raft's InstallSnapshot
 //! and read back by a node that isn't byte-identical in its storage
 //! layout. Both directions stream -- neither buffers the whole snapshot
 //! in memory (see each function's doc for what that costs on install).
 
 use std::io::{Read, Write};
 
-use super::codec::{be_bytes, decode_latest_value, encode_latest_value};
+use super::codec::{Kind, be_bytes, row_key, row_kind, row_seq, row_user_key};
 use super::meta::{
     META_APPLIED_SEQ, META_BASE_CONFIG, META_COMPACT_SEQ, META_FLOOR_SEQ, META_FLOOR_TERM,
-    META_LATEST_SEQ_BUILT, read_applied_seq,
+    read_applied_seq,
 };
 use super::{RaftLog, Result, StorageError};
 
 pub(super) const SNAPSHOT_MAGIC: &[u8; 8] = b"RLOGSNAP";
 
-/// v2 added the trailing `[config_len][config_bytes]` header field. There's
-/// no v1 compatibility path -- nothing has shipped, and a snapshot without
-/// a configuration would leave its recipient unable to find its peers.
-pub(super) const SNAPSHOT_VERSION: u32 = 2;
+/// v3 carries a *version* per record -- `[key][seq][kind][value]` rather
+/// than v2's `[key][value]` -- because `versions` is multi-version and a
+/// recipient that got one flattened value per key would be unable to
+/// serve any checkpoint read, silently and with an empty result rather
+/// than an error. v2 added the trailing config header field.
+///
+/// No compatibility path with either: nothing has shipped, and a
+/// half-understood snapshot is worse than a refused one.
+pub(super) const SNAPSHOT_VERSION: u32 = 3;
 
 pub struct SnapshotMeta {
     pub last_included_seq: u64,
@@ -33,20 +43,34 @@ impl RaftLog {
     /// Stream the current (post-compaction) state to `writer` as a portable
     /// snapshot: a header (magic, version, last_included_seq,
     /// last_included_term, cluster configuration) followed by
-    /// length-prefixed (key, value) records, read until EOF. Intended for Raft's InstallSnapshot path —
-    /// engine-agnostic and chunkable, unlike an `fjall`-native checkpoint.
-    /// Every row in `latest` is current state -- there's no tombstone case
-    /// to skip (see the module doc). Already bounded to O(1) extra memory
-    /// beyond one record at a time: entries are written straight to
-    /// `writer` as they're read from `fjall`, never accumulated.
+    /// length-prefixed `[key][seq][kind][value]` records, read until EOF.
+    /// Intended for Raft's InstallSnapshot path — engine-agnostic and
+    /// chunkable, unlike an `fjall`-native checkpoint. Bounded to O(1)
+    /// extra memory beyond one record at a time: records are written
+    /// straight to `writer` as they're read from `fjall`, never
+    /// accumulated.
+    ///
+    /// **Every retained version travels, tombstones included.** A
+    /// tombstone is not absence here: it is the only thing that can tell
+    /// the recipient a key did not exist as of some checkpoint taken
+    /// before the delete, and dropping it would make that checkpoint
+    /// report a value the sender knows was deleted. Likewise the
+    /// checkpoint records themselves are ordinary rows under `\0snap/`,
+    /// so they travel with everything they pin and sender and recipient
+    /// agree by construction.
+    ///
+    /// This makes an export O(retained versions) rather than O(live
+    /// keys) -- equal in the steady state with no checkpoints and a
+    /// recent `gc_versions` pass, and bounded above by
+    /// `(live checkpoints + 1) x live keys` plus retained tombstones.
     ///
     /// `last_included_seq`/`last_included_term` describe `applied_seq`,
-    /// *not* the log's raw physical tail: `latest` (what's actually being
-    /// exported here) only ever reflects state through `applied_seq` --
-    /// there can be appended-but-uncommitted entries past that point that
-    /// aren't in `latest` at all yet, so claiming the tail as this
-    /// snapshot's boundary would describe state the export doesn't
-    /// actually contain.
+    /// *not* the log's raw physical tail: `versions` (what's actually
+    /// being exported here) only ever reflects state through
+    /// `applied_seq` -- there can be appended-but-uncommitted entries
+    /// past that point that aren't in `versions` at all yet, so claiming
+    /// the tail as this snapshot's boundary would describe state the
+    /// export doesn't actually contain.
     ///
     /// The header also carries the configuration in force as of
     /// `last_included_seq`. Installing a snapshot wipes `log`, taking the
@@ -71,12 +95,16 @@ impl RaftLog {
         // point in time even while `apply_committed` is writing: an
         // entry's mutations can't be caught half-applied here.
         let mut entry_count: u64 = 0;
-        for item in self.latest.iter() {
-            let (key, value_bytes) = item.into_inner()?;
-            let (_, value) = decode_latest_value(&value_bytes)?;
+        for item in self.versions.iter() {
+            let (row, value) = item.into_inner()?;
+            let key = row_user_key(&row)?;
+            let seq = row_seq(&row)?;
+            let kind = row_kind(&row)?;
 
             writer.write_all(&(key.len() as u32).to_be_bytes())?;
             writer.write_all(&key)?;
+            writer.write_all(&seq.to_be_bytes())?;
+            writer.write_all(&[kind as u8])?;
             writer.write_all(&(value.len() as u32).to_be_bytes())?;
             writer.write_all(&value)?;
             entry_count += 1;
@@ -115,14 +143,22 @@ impl RaftLog {
     }
 
     /// Install a snapshot produced by `export_snapshot`, replacing all
-    /// current log/latest state. This is a full wipe (not the etcd-style
+    /// current log/version state. This is a full wipe (not the etcd-style
     /// "retain the suffix if it doesn't conflict" optimization): every
-    /// existing `log` and `latest` row is dropped (each `clear()` is an
-    /// O(1) keyspace-level operation), then the incoming (key, value)
-    /// records repopulate `latest` at `last_included_seq`, and the snapshot
+    /// existing `log` and `versions` row is dropped (each `clear()` is an
+    /// O(1) keyspace-level operation), then the incoming records
+    /// repopulate `versions` **each at its own seq**, and the snapshot
     /// watermark in `meta` is set so `last_entry`/`term_at` keep working
     /// even though `log` now has nothing at or below that point.
     /// Subsequent `append` calls continue from `last_included_seq + 1`.
+    ///
+    /// Restoring each row at its own seq rather than stamping them all at
+    /// `last_included_seq` is what keeps checkpoints working across an
+    /// install. Stamping would not merely lose history: a checkpoint
+    /// record's seq *is* its row's seq (see `super::checkpoint`), so
+    /// re-stamping would leave every checkpoint claiming to read at a
+    /// point it was never taken at, and answering with the wrong data
+    /// rather than refusing.
     ///
     /// Bounded memory: the incoming record stream is processed and
     /// committed in chunks of `WRITE_CHUNK`, rather than buffering the whole
@@ -133,14 +169,6 @@ impl RaftLog {
     /// operation, and Raft's InstallSnapshot is naturally retryable — a
     /// follower that crashes mid-install simply reports needing a snapshot
     /// again).
-    ///
-    /// The same non-atomicity is why the `latest_seq` index is torn down
-    /// before the wipe rather than alongside it: `Keyspace::clear` is not
-    /// a batch operation, so the two clears cannot be one. Clearing the
-    /// index's marker first means a crash anywhere in here leaves it
-    /// down, and the next `open` rebuilds from whatever `latest` ended up
-    /// being. The index cannot survive an install it did not finish, and
-    /// does not try to.
     pub fn install_snapshot<R: Read>(&self, reader: &mut R) -> Result<SnapshotMeta> {
         let mut magic = [0u8; 8];
         reader.read_exact(&mut magic)?;
@@ -167,16 +195,13 @@ impl RaftLog {
         // install, same discipline as `append`.
         let mut guard = self.next_seq.lock().unwrap();
 
-        // Down before anything is destroyed, and back up only in the
-        // final commit below -- so every moment in which `latest` and
-        // `latest_seq` might disagree is a moment the marker says so.
-        let mut marker = self.db.batch();
-        marker.remove(&self.meta, META_LATEST_SEQ_BUILT);
-        marker.commit()?;
-
         self.log.clear()?;
-        self.latest.clear()?;
-        self.latest_seq.clear()?;
+        self.versions.clear()?;
+        // Whatever the old store's GC had reached describes a keyspace
+        // that no longer exists.
+        let mut cursor = self.db.batch();
+        cursor.remove(&self.meta, super::META_GC_CURSOR);
+        cursor.commit()?;
 
         // Stream incoming records straight into chunked write batches
         // instead of buffering the whole snapshot in memory.
@@ -195,21 +220,26 @@ impl RaftLog {
             let mut key = vec![0u8; key_len];
             reader.read_exact(&mut key)?;
 
+            let mut seq_buf = [0u8; 8];
+            reader.read_exact(&mut seq_buf)?;
+            let seq = u64::from_be_bytes(seq_buf);
+
+            let mut kind_buf = [0u8; 1];
+            reader.read_exact(&mut kind_buf)?;
+            let kind = match kind_buf[0] {
+                0 => Kind::Tombstone,
+                1 => Kind::Value,
+                _ => return Err(StorageError::Corrupt("unknown version row kind")),
+            };
+
             let mut vlen_buf = [0u8; 4];
             reader.read_exact(&mut vlen_buf)?;
             let value_len = u32::from_be_bytes(vlen_buf) as usize;
             let mut value = vec![0u8; value_len];
             reader.read_exact(&mut value)?;
 
-            batch.insert(
-                &self.latest,
-                &key,
-                encode_latest_value(last_included_seq, &value)?,
-            );
-            // Every key in a snapshot is stamped with the boundary seq --
-            // the per-key history the index mirrors does not survive an
-            // install any more than the values' own seqs do.
-            batch.insert(&self.latest_seq, &key, be_bytes(last_included_seq));
+            // At its own seq, not the boundary -- see the doc above.
+            batch.insert(&self.versions, row_key(&key, seq, kind), value);
             entry_count += 1;
             pending += 1;
             self.flush_if_full(&mut batch, &mut pending)?;
@@ -227,14 +257,11 @@ impl RaftLog {
         // `last_included_seq` — reset the watermark to match, whatever it
         // was before.
         batch.insert(&self.meta, META_COMPACT_SEQ, be_bytes(last_included_seq));
-        // `latest` was just fully repopulated from the snapshot, which by
+        // `versions` was just fully repopulated from the snapshot, which by
         // construction only ever represents committed state (the source
         // node's own `export_snapshot` reads the same, commit-only
-        // `latest`) -- so it's already "applied" through this point.
+        // `versions`) -- so it's already "applied" through this point.
         batch.insert(&self.meta, META_APPLIED_SEQ, be_bytes(last_included_seq));
-        // Last, in the commit that makes the install whole: from here the
-        // index agrees with `latest` again.
-        batch.insert(&self.meta, META_LATEST_SEQ_BUILT, be_bytes(1));
         batch.commit()?;
 
         *guard = last_included_seq + 1;

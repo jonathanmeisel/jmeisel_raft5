@@ -49,16 +49,19 @@ use crate::keyspace::is_reserved;
 use crate::pb::raft5::client::kv_server::Kv;
 use crate::pb::raft5::client::{
     AddServerRequest, AuthError as PbAuthError, BootstrapRequest, CommitTransactionRequest,
-    CommitTransactionResponse, ConfigChangeResponse, CreateTransactionRequest,
-    CreateTransactionResponse, CreateUserRequest, CreateUserResponse, DeleteUserRequest,
-    DeleteUserResponse, DropTransactionRequest, DropTransactionResponse, GetConfigRequest,
-    GetConfigResponse, GetKeysOk, GetKeysRequest, GetKeysResponse, GetVersionOk, GetVersionRequest,
-    GetVersionResponse, LoginOk, LoginRequest, LoginResponse, NotLeader, RaftError as PbRaftError,
-    ReadOk, ReadRequest, ReadResponse, RemoveServerRequest, TransactionAborted, WriteRequest,
-    WriteResponse, auth_error, commit_transaction_response, config_change_response,
+    CommitTransactionResponse, ConfigChangeResponse, CreateSnapshotRequest, CreateSnapshotResponse,
+    CreateTransactionRequest, CreateTransactionResponse, CreateUserRequest, CreateUserResponse,
+    DeleteUserRequest, DeleteUserResponse, DropTransactionRequest, DropTransactionResponse,
+    GetConfigRequest, GetConfigResponse, GetKeysOk, GetKeysRequest, GetKeysResponse, GetVersionOk,
+    GetVersionRequest, GetVersionResponse, ListSnapshotsRequest, ListSnapshotsResponse, LoginOk,
+    LoginRequest, LoginResponse, NotLeader, RaftError as PbRaftError, ReadOk, ReadRequest,
+    ReadResponse, RemoveServerRequest, RemoveSnapshotRequest, RemoveSnapshotResponse,
+    Snapshot as PbSnapshot, SnapshotList, TransactionAborted, WriteRequest, WriteResponse,
+    auth_error, commit_transaction_response, config_change_response, create_snapshot_response,
     create_transaction_response, create_user_response, delete_user_response,
-    drop_transaction_response, get_keys_response, get_version_request, get_version_response,
-    login_response, raft_error, read_request, read_response, transaction_aborted, write_response,
+    drop_transaction_response, get_keys_request, get_keys_response, get_version_request,
+    get_version_response, list_snapshots_response, login_response, raft_error, read_request,
+    read_response, remove_snapshot_response, transaction_aborted, write_response,
 };
 use crate::pb::raft5::cluster::{ClusterConfig, ClusterMember};
 use crate::pb::raft5::raft::raft_peer_server::RaftPeer;
@@ -71,7 +74,7 @@ use crate::raft::{
     self, AppendError, ClientHandle, ConfigChange, LeaderHandle, MAX_APPEND_ENTRIES_BYTES,
     RaftError, RaftPeerHandle, RoleHandle,
 };
-use crate::storage::Mutation;
+use crate::storage::{Checkpoint, MAX_LIVE_CHECKPOINTS, Mutation, checkpoint_key};
 use crate::storage::{RaftLog, StorageError};
 use crate::store::ChunkReader;
 use crate::store::Store;
@@ -303,6 +306,47 @@ fn reject_reserved(key: &[u8]) -> Result<(), Status> {
     if is_reserved(key) {
         return Err(Status::invalid_argument(
             "that key is reserved for the cluster's own use",
+        ));
+    }
+    Ok(())
+}
+
+/// A checkpoint as the wire carries it.
+fn pb_snapshot(cp: Checkpoint) -> PbSnapshot {
+    PbSnapshot {
+        snapshot_id: cp.id,
+        seq: cp.seq,
+        created_unix_ms: cp.created_unix_ms,
+    }
+}
+
+/// How long a snapshot id may be.
+const MAX_SNAPSHOT_ID_LEN: usize = 128;
+
+/// Checks that `id` is one `checkpoint_key` can safely build a key from.
+///
+/// The character set is the point, not the length, and the reasoning is
+/// `keyspace::validate_username`'s exactly: the id is appended to a
+/// fixed prefix with no separator or escaping, so any byte that could
+/// make two ids collide -- or let one climb back out of the prefix --
+/// has to be excluded here rather than handled there. The set is wider
+/// than a username's only by `:` and `+`, so that an RFC-3339 timestamp
+/// is a legal id, which is what the client defaults to.
+fn validate_snapshot_id(id: &[u8]) -> Result<(), Status> {
+    if id.is_empty() {
+        return Err(Status::invalid_argument("a snapshot id cannot be empty"));
+    }
+    if id.len() > MAX_SNAPSHOT_ID_LEN {
+        return Err(Status::invalid_argument(format!(
+            "a snapshot id may be at most {MAX_SNAPSHOT_ID_LEN} bytes"
+        )));
+    }
+    if !id
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':' | b'+'))
+    {
+        return Err(Status::invalid_argument(
+            "a snapshot id may contain only letters, digits, '.', '_', '-', ':' and '+'",
         ));
     }
     Ok(())
@@ -552,6 +596,7 @@ impl KvService {
     async fn scan(
         &self,
         start: Vec<u8>,
+        as_of: u64,
         limit: usize,
         buffered: &BufferedKeys,
     ) -> Result<(Vec<Vec<u8>>, bool), StorageError> {
@@ -579,7 +624,7 @@ impl KvService {
                     // the caller no batch length. Both callers -- the
                     // transactional scan and the plain one -- come
                     // through here, so this is the whole of `GetKeys`.
-                    log.scan_latest(&start, want, |key| {
+                    log.scan_as_of(&start, as_of, want, |key| {
                         deleted.contains(key) || is_reserved(key)
                     })
                 })
@@ -640,13 +685,13 @@ impl KvService {
         let buffered = self.locks.buffered_from(id, &start)?;
 
         let (candidates, _) = self
-            .scan(start.clone(), limit, &buffered)
+            .scan(start.clone(), u64::MAX, limit, &buffered)
             .await
             .map_err(|e| TxnError::Raft(RaftError::Storage(e)))?;
         self.locks.read_many(id, &candidates)?;
 
         let (keys, has_more) = self
-            .scan(start, limit, &buffered)
+            .scan(start, u64::MAX, limit, &buffered)
             .await
             .map_err(|e| TxnError::Raft(RaftError::Storage(e)))?;
 
@@ -778,6 +823,127 @@ impl KvService {
             .await
             .map_err(RaftError::Storage)?
             .unwrap_or(0))
+    }
+
+    /// Resolve a snapshot id to the seq it reads at.
+    ///
+    /// A local read, deliberately: the record's existence on this node
+    /// is itself the proof that this node has applied everything the
+    /// snapshot could need (see `storage::checkpoint`), so there is
+    /// nothing a leader could add.
+    async fn checkpoint_seq(&self, id: &[u8]) -> Result<u64, Status> {
+        if id.is_empty() {
+            return Err(Status::invalid_argument(
+                "a snapshot id cannot be empty; leave `consistency` unset for a current read",
+            ));
+        }
+        let owned = id.to_vec();
+        let found = self
+            .store
+            .run(move |log| log.checkpoint_seq(&owned))
+            .await
+            .map_err(storage_err)?;
+        found.ok_or_else(|| {
+            Status::not_found(
+                "no such snapshot; it may have been removed, or not reached this node yet",
+            )
+        })
+    }
+
+    /// Create a checkpoint: write its record, once, and report the seq
+    /// that write landed at -- which *is* the snapshot's seq.
+    ///
+    /// The `put_user` shape verbatim, and for the same reason: the
+    /// read-and-then-write has to be one transaction or two callers
+    /// could both find the id absent and both create it, and the second
+    /// record would silently move the snapshot forward in time.
+    async fn create_checkpoint_inner(
+        &self,
+        extensions: &tonic::Extensions,
+        req: CreateSnapshotRequest,
+    ) -> Result<Checkpoint, AuthFailure> {
+        self.require_admin(extensions).await?;
+        validate_snapshot_id(&req.snapshot_id)?;
+
+        let live = self
+            .store
+            .run(|log| log.checkpoint_count())
+            .await
+            .map_err(|e| TxnError::Raft(RaftError::Storage(e)))?;
+        if live >= MAX_LIVE_CHECKPOINTS {
+            return Err(Status::resource_exhausted(format!(
+                "this cluster already holds {MAX_LIVE_CHECKPOINTS} snapshots; \
+                 remove one before creating another"
+            ))
+            .into());
+        }
+
+        let key = checkpoint_key(&req.snapshot_id);
+        let leader = self.leader()?;
+        leader.await_caught_up().await?;
+        let id = self
+            .locks
+            .create(leader.term(), ADMIN_TXN_TTL, crate::txn::fresh_id())?;
+        let result = self
+            .write_checkpoint(id, &key, Some(req.created_unix_ms))
+            .await;
+        self.locks.discard(id);
+
+        let seq = result?;
+        Ok(Checkpoint {
+            id: req.snapshot_id,
+            seq,
+            created_unix_ms: req.created_unix_ms,
+        })
+    }
+
+    async fn remove_checkpoint_inner(
+        &self,
+        extensions: &tonic::Extensions,
+        req: RemoveSnapshotRequest,
+    ) -> Result<u64, AuthFailure> {
+        self.require_admin(extensions).await?;
+        validate_snapshot_id(&req.snapshot_id)?;
+
+        let key = checkpoint_key(&req.snapshot_id);
+        let leader = self.leader()?;
+        leader.await_caught_up().await?;
+        let id = self
+            .locks
+            .create(leader.term(), ADMIN_TXN_TTL, crate::txn::fresh_id())?;
+        let result = self.write_checkpoint(id, &key, None).await;
+        self.locks.discard(id);
+        result
+    }
+
+    /// `write_user` for checkpoints: `Some(created)` creates, `None`
+    /// removes, and either is refused if the record is not in the state
+    /// that implies.
+    async fn write_checkpoint(
+        &self,
+        id: TxnId,
+        key: &[u8],
+        created_unix_ms: Option<u64>,
+    ) -> Result<u64, AuthFailure> {
+        let existing = self.transactional_read(id, key).await?.value;
+        match (&created_unix_ms, &existing) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    Status::already_exists("a snapshot with that id already exists").into(),
+                );
+            }
+            (None, None) => {
+                return Err(Status::not_found("there is no snapshot with that id").into());
+            }
+            _ => {}
+        }
+
+        let value = created_unix_ms
+            .map(crate::storage::encode_record)
+            .transpose()
+            .map_err(|e| TxnError::Raft(RaftError::Storage(e)))?;
+        self.locks.buffer_write(id, key, value)?;
+        Ok(self.commit(id).await?)
     }
 
     /// The account record for `username`, read currently.
@@ -1140,6 +1306,22 @@ impl Kv for KvService {
             }));
         }
 
+        // A snapshot read. Stale by construction -- it describes a
+        // moment that has already passed -- so any node serves it, with
+        // no leader check and no quorum round.
+        if let Some(read_request::Consistency::SnapshotId(id)) = &req.consistency {
+            let as_of = self.checkpoint_seq(id).await?;
+            let key = req.key;
+            let found = self
+                .store
+                .run(move |log| log.get_as_of(&key, as_of))
+                .await
+                .map_err(storage_err)?;
+            return Ok(Response::new(ReadResponse {
+                result: Some(read_response::Result::Ok(read_ok(found))),
+            }));
+        }
+
         // Everything else: `consistency` unset, or `linearizable: false`,
         // which says the caller asked for no guarantee rather than failed
         // to ask. Answered from local state by whoever received it,
@@ -1188,9 +1370,24 @@ impl Kv for KvService {
             }));
         }
 
+        if let Some(get_version_request::Consistency::SnapshotId(id)) = &req.consistency {
+            let as_of = self.checkpoint_seq(id).await?;
+            let key = req.key;
+            let seq = self
+                .store
+                .run(move |log| log.version_as_of(&key, as_of))
+                .await
+                .map_err(storage_err)?;
+            return Ok(Response::new(GetVersionResponse {
+                result: Some(get_version_response::Result::Ok(GetVersionOk {
+                    seq: seq.unwrap_or(0),
+                })),
+            }));
+        }
+
         // Stale, as `read` is stale, and cheap in the way this RPC exists
-        // to be: one point lookup on `latest_seq`, whatever the value
-        // behind it weighs.
+        // to be: the seq is part of the row key, so the value behind it
+        // is never read whatever it weighs.
         let seq = self
             .store
             .run(move |log| log.get_version(&req.key))
@@ -1229,7 +1426,7 @@ impl Kv for KvService {
             n => n,
         } as usize;
 
-        if let Some(id) = &req.transaction_id {
+        if let Some(get_keys_request::Consistency::TransactionId(id)) = &req.consistency {
             let id = txn_id(id)?;
             let result = self.transactional_scan(id, req.start_key, limit).await;
             return Ok(Response::new(GetKeysResponse {
@@ -1243,12 +1440,20 @@ impl Kv for KvService {
             }));
         }
 
+        // A snapshot walk: the keys that had a value as of that seq,
+        // including ones deleted since and excluding ones created
+        // since. Stale by construction, so any node serves it.
+        let as_of = match &req.consistency {
+            Some(get_keys_request::Consistency::SnapshotId(id)) => self.checkpoint_seq(id).await?,
+            _ => u64::MAX,
+        };
+
         // Outside a transaction, the same terms as `read`: local state,
         // no locks, whoever received it. There is nothing to merge --
         // no transaction means no buffered writes -- and no second pass,
         // since there are no locks for one to be taken under.
         let (keys, has_more) = self
-            .scan(req.start_key, limit, &BufferedKeys::new())
+            .scan(req.start_key, as_of, limit, &BufferedKeys::new())
             .await
             .map_err(storage_err)?;
 
@@ -1473,6 +1678,64 @@ impl Kv for KvService {
                     AuthReply::Auth(e) => login_response::Result::AuthError(e),
                 },
             }),
+        }))
+    }
+
+    async fn create_snapshot(
+        &self,
+        request: Request<CreateSnapshotRequest>,
+    ) -> Result<Response<CreateSnapshotResponse>, Status> {
+        // `into_parts` rather than `into_inner`: who the caller is lives
+        // in the extensions, put there by the auth layer.
+        let (_, extensions, req) = request.into_parts();
+        let result = self.create_checkpoint_inner(&extensions, req).await;
+        Ok(Response::new(CreateSnapshotResponse {
+            result: Some(match result {
+                Ok(cp) => create_snapshot_response::Result::Ok(pb_snapshot(cp)),
+                Err(e) => match auth_failure(e)? {
+                    AuthReply::Raft(e) => create_snapshot_response::Result::Error(e),
+                    AuthReply::Auth(e) => create_snapshot_response::Result::AuthError(e),
+                },
+            }),
+        }))
+    }
+
+    async fn remove_snapshot(
+        &self,
+        request: Request<RemoveSnapshotRequest>,
+    ) -> Result<Response<RemoveSnapshotResponse>, Status> {
+        let (_, extensions, req) = request.into_parts();
+        let result = self.remove_checkpoint_inner(&extensions, req).await;
+        Ok(Response::new(RemoveSnapshotResponse {
+            result: Some(match result {
+                Ok(seq) => remove_snapshot_response::Result::Seq(seq),
+                Err(e) => match auth_failure(e)? {
+                    AuthReply::Raft(e) => remove_snapshot_response::Result::Error(e),
+                    AuthReply::Auth(e) => remove_snapshot_response::Result::AuthError(e),
+                },
+            }),
+        }))
+    }
+
+    async fn list_snapshots(
+        &self,
+        _request: Request<ListSnapshotsRequest>,
+    ) -> Result<Response<ListSnapshotsResponse>, Status> {
+        // A local read, answerable by any node and stale on the same
+        // terms as any read outside a transaction: a snapshot created
+        // moments ago may not have reached this one yet. Not
+        // admin-gated -- knowing which snapshots exist is what a client
+        // needs in order to read at one, and the ids are its own.
+        let listed = self
+            .store
+            .run(|log| log.list_checkpoints())
+            .await
+            .map_err(storage_err)?;
+
+        Ok(Response::new(ListSnapshotsResponse {
+            result: Some(list_snapshots_response::Result::Ok(SnapshotList {
+                snapshots: listed.into_iter().map(pb_snapshot).collect(),
+            })),
         }))
     }
 

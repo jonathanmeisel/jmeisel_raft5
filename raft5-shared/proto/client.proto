@@ -34,10 +34,29 @@ service Kv {
   rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
 
   // Walk the keys that currently have a value, in order, starting at
-  // `start_key`. Consistency follows Read exactly: inside a transaction
-  // every key handed back is read-locked, outside one it is a
-  // possibly-stale local read.
+  // `start_key`. Consistency follows Read: inside a transaction every
+  // key handed back is read-locked, at a snapshot it is the key set as
+  // of that snapshot, and otherwise it is a possibly-stale local read.
   rpc GetKeys(GetKeysRequest) returns (GetKeysResponse);
+
+  // Pin the current sequence number under `snapshot_id`, so that Read,
+  // GetKeys and GetVersion can later be pointed at it and see the store
+  // exactly as it was at this moment -- however much it changes
+  // afterwards.
+  //
+  // Administrators only. A snapshot is a storage commitment, not a
+  // read: until it is removed, every key overwritten or deleted after
+  // it keeps the version this snapshot can still see.
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
+
+  // Release a snapshot. The versions it was holding become collectable,
+  // and reads at it start failing. Administrators only.
+  rpc RemoveSnapshot(RemoveSnapshotRequest) returns (RemoveSnapshotResponse);
+
+  // Every snapshot that currently exists. The only way to discover
+  // ids: snapshot records live in the reserved range, which GetKeys
+  // hides. Possibly stale, like any read outside a transaction.
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
 
   // Cluster membership changes, one server at a time (single-server
   // change, not joint consensus -- simpler to reason about; joint
@@ -217,6 +236,19 @@ message ReadRequest {
     // `false` is explicitly the same as leaving `consistency` unset: a
     // present field saying no guarantee was asked for.
     bool linearizable = 4;
+
+    // Read as of the snapshot with this id: the value the key held at
+    // the sequence number that snapshot was created at, whatever has
+    // happened to it since -- including being deleted.
+    //
+    // Stale in the same sense an unset `consistency` is, and for a
+    // stronger reason: it deliberately describes a moment that has
+    // already passed, so any node can serve it without proving it
+    // leads. An id no node knows is refused rather than answered as
+    // empty; on a node that has not yet applied the CreateSnapshot
+    // entry that is a transient condition reported like a permanent
+    // one, the same staleness a read of a just-written key has.
+    bytes snapshot_id = 5;
   }
 }
 
@@ -241,6 +273,7 @@ message GetVersionRequest {
   oneof consistency {
     bytes transaction_id = 2;
     bool linearizable = 3;
+    bytes snapshot_id = 4;
   }
 }
 
@@ -274,25 +307,89 @@ message GetKeysRequest {
   // over-long transaction lifetime is: a caller told "yes" would
   // otherwise page as though it had a batch size it did not get.
   uint32 max_keys = 2;
-  // Walk as part of this transaction: every key returned joins its read
-  // set, exactly as Read does, and keys it has buffered writes for are
-  // reflected -- a buffered write makes a key appear, a buffered delete
-  // makes it disappear.
-  //
-  // Note what this does and does not promise. Every key handed back is
-  // locked, so none of them can change while the transaction lives. The
-  // *range* is not locked: these are per-key locks, not predicate
-  // locks, so a key that did not exist when the walk passed its
-  // position can still be created by someone else. A transaction that
-  // must not miss such a key cannot get that guarantee from here.
-  //
-  // Unset is a possibly-stale read, on the same terms as Read.
-  optional bytes transaction_id = 3;
+  // What the caller wants guaranteed, as in ReadRequest. Unset is a
+  // possibly-stale read on the same terms.
+  oneof consistency {
+    // Walk as part of this transaction: every key returned joins its
+    // read set, exactly as Read does, and keys it has buffered writes
+    // for are reflected -- a buffered write makes a key appear, a
+    // buffered delete makes it disappear.
+    //
+    // Note what this does and does not promise. Every key handed back
+    // is locked, so none of them can change while the transaction
+    // lives. The *range* is not locked: these are per-key locks, not
+    // predicate locks, so a key that did not exist when the walk passed
+    // its position can still be created by someone else. A transaction
+    // that must not miss such a key cannot get that guarantee from
+    // here.
+    bytes transaction_id = 3;
+
+    // Walk the keys that had a value as of this snapshot -- including
+    // ones deleted since, and excluding ones created since.
+    bytes snapshot_id = 4;
+  }
 }
 
 message GetKeysResponse {
   oneof result {
     GetKeysOk ok = 1;
+    RaftError error = 2;
+  }
+}
+
+message Snapshot {
+  bytes snapshot_id = 1;
+  // The sequence number this snapshot reads at.
+  //
+  // Not stored in the record: it is the seq the record's own write
+  // landed at. That is why a snapshot is created once and never
+  // updated -- a second write would move it forward in time.
+  uint64 seq = 2;
+  // When the client that created it said it was doing so. For humans
+  // reading a listing; nothing depends on it, and nothing should -- it
+  // is one client's clock, recorded verbatim.
+  uint64 created_unix_ms = 3;
+}
+
+message CreateSnapshotRequest {
+  // Chosen by the caller, and unique: creating one that already exists
+  // is refused rather than moving the existing one. Same character set
+  // as a username, and for the same reason -- it is appended to a fixed
+  // key prefix with no separator.
+  bytes snapshot_id = 1;
+  uint64 created_unix_ms = 2;
+}
+
+message CreateSnapshotResponse {
+  oneof result {
+    Snapshot ok = 1;
+    RaftError error = 2;
+    AuthError auth_error = 3;
+  }
+}
+
+message RemoveSnapshotRequest {
+  bytes snapshot_id = 1;
+}
+
+message RemoveSnapshotResponse {
+  oneof result {
+    // The seq the removal landed at.
+    uint64 seq = 1;
+    RaftError error = 2;
+    AuthError auth_error = 3;
+  }
+}
+
+message ListSnapshotsRequest {}
+
+message SnapshotList {
+  repeated Snapshot snapshots = 1;
+}
+
+message ListSnapshotsResponse {
+  oneof result {
+    SnapshotList ok = 1;
     RaftError error = 2;
   }
 }

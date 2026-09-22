@@ -1166,3 +1166,212 @@ async fn a_transactional_get_version_reports_committed_state() {
     assert!(landed > committed);
     assert_eq!(fresh_version(&client, b"k").await, landed);
 }
+
+// --- snapshots --------------------------------------------------------
+
+#[tokio::test]
+async fn a_snapshot_holds_the_store_as_it_was_taken() {
+    let n1 = TestNode::start("n1");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "n1").await;
+
+    client.write(b"kept", Some(b"v1")).await.unwrap();
+    client.write(b"doomed", Some(b"here")).await.unwrap();
+    let snap = client.create_snapshot(Some(b"s1")).await.unwrap();
+
+    // Churn the store thoroughly after the snapshot.
+    for i in 0..5 {
+        client
+            .write(b"kept", Some(format!("v{i}").as_bytes()))
+            .await
+            .unwrap();
+    }
+    client.write(b"doomed", None).await.unwrap();
+    client.write(b"fresh", Some(b"new")).await.unwrap();
+
+    // The snapshot is unmoved by any of it.
+    assert_eq!(
+        client
+            .read_at(b"s1", b"kept")
+            .await
+            .unwrap()
+            .value
+            .as_deref(),
+        Some(&b"v1"[..])
+    );
+    assert_eq!(
+        client
+            .read_at(b"s1", b"doomed")
+            .await
+            .unwrap()
+            .value
+            .as_deref(),
+        Some(&b"here"[..]),
+        "a key deleted after the snapshot is still visible through it"
+    );
+    assert_eq!(client.read_at(b"s1", b"fresh").await.unwrap().value, None);
+
+    // The key set as of the snapshot, too.
+    let keys = client.key_iterator_at(b"s1", b"").collect().await.unwrap();
+    assert_eq!(keys, vec![b"doomed".to_vec(), b"kept".to_vec()]);
+
+    // And it is listed, at the seq it was taken at.
+    let listed = client.list_snapshots().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, b"s1".to_vec());
+    assert_eq!(listed[0].seq, snap.seq);
+
+    // Once released, reads at it fail rather than silently drifting.
+    client.remove_snapshot(b"s1").await.unwrap();
+    assert!(client.read_at(b"s1", b"kept").await.is_err());
+    assert!(client.list_snapshots().await.unwrap().is_empty());
+}
+
+/// A snapshot is replicated state, so every node serves it -- and serves
+/// the same answer. This is what would break if the registry lived
+/// anywhere but the replicated keyspace.
+#[tokio::test]
+async fn every_node_serves_the_same_snapshot_read() {
+    let n1 = TestNode::start("n1");
+    let n2 = TestNode::start("n2");
+    let n3 = TestNode::start("n3");
+
+    let admin = Client::new([n1.url()]).unwrap();
+    bootstrap(&admin, "n1").await;
+    admin.add_server(&n2.url()).await.unwrap();
+    admin.add_server(&n3.url()).await.unwrap();
+
+    admin.write(b"k", Some(b"at-snapshot")).await.unwrap();
+    let snap = admin.create_snapshot(Some(b"s1")).await.unwrap();
+    admin.write(b"k", Some(b"after")).await.unwrap();
+
+    // Each client is seeded with exactly one node, so each read is
+    // answered by a different one -- and a snapshot read takes no
+    // leader, so whichever node it lands on must answer it.
+    for node in [&n1, &n2, &n3] {
+        let client = Client::new([node.url()]).unwrap();
+        // The snapshot has to have reached this node first; it arrives
+        // as an ordinary replicated write, so this is the same wait any
+        // read-after-write needs.
+        let mut seen = None;
+        let deadline = Instant::now() + BOOTSTRAP_TIMEOUT;
+        while Instant::now() < deadline {
+            if let Ok(r) = client.read_at(b"s1", b"k").await {
+                seen = Some(r);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let read = seen.expect("the snapshot should have replicated");
+        assert_eq!(
+            read.value.as_deref(),
+            Some(&b"at-snapshot"[..]),
+            "node {} disagreed about the snapshot",
+            node.id
+        );
+        assert_eq!(client.list_snapshots().await.unwrap()[0].seq, snap.seq);
+    }
+}
+
+/// Two snapshots at different points, each holding its own view, and
+/// neither disturbed by the other being released.
+#[tokio::test]
+async fn snapshots_at_different_points_hold_different_views() {
+    let n1 = TestNode::start("n1");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "n1").await;
+
+    client.write(b"k", Some(b"one")).await.unwrap();
+    client.create_snapshot(Some(b"first")).await.unwrap();
+    client.write(b"k", Some(b"two")).await.unwrap();
+    client.create_snapshot(Some(b"second")).await.unwrap();
+    client.write(b"k", Some(b"three")).await.unwrap();
+
+    let at = |id: &'static [u8]| {
+        let client = client.clone();
+        async move {
+            client
+                .read_at(id, b"k")
+                .await
+                .unwrap()
+                .value
+                .map(|v| String::from_utf8(v).unwrap())
+        }
+    };
+    assert_eq!(at(b"first").await.as_deref(), Some("one"));
+    assert_eq!(at(b"second").await.as_deref(), Some("two"));
+    assert_eq!(
+        fresh(&client, b"k").await.value.as_deref(),
+        Some(&b"three"[..])
+    );
+
+    // Releasing one leaves the other exactly where it was.
+    client.remove_snapshot(b"first").await.unwrap();
+    assert_eq!(at(b"second").await.as_deref(), Some("two"));
+}
+
+/// The id defaults to the client's own clock, and two in the same
+/// millisecond disambiguate rather than colliding.
+#[tokio::test]
+async fn a_snapshot_id_defaults_to_a_timestamp() {
+    let n1 = TestNode::start("n1");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "n1").await;
+    client.write(b"k", Some(b"v")).await.unwrap();
+
+    let a = client.create_snapshot(None).await.unwrap();
+    let b = client.create_snapshot(None).await.unwrap();
+    assert_ne!(a.id, b.id, "two defaulted ids collided");
+
+    // Both are usable.
+    for snap in [&a, &b] {
+        assert_eq!(
+            client
+                .read_at(&snap.id, b"k")
+                .await
+                .unwrap()
+                .value
+                .as_deref(),
+            Some(&b"v"[..])
+        );
+    }
+}
+
+/// A snapshot walk pages like any other, across a batch boundary, with
+/// keys deleted after the snapshot still in the walk.
+#[tokio::test]
+async fn a_snapshot_walk_pages_across_batches() {
+    let n1 = TestNode::start("n1");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "n1").await;
+
+    for i in 0..25 {
+        client
+            .write(format!("k{i:02}").as_bytes(), Some(b"v"))
+            .await
+            .unwrap();
+    }
+    client.create_snapshot(Some(b"s1")).await.unwrap();
+    // Delete every third key *after* the snapshot; the walk should
+    // still see all 25.
+    for i in (0..25).step_by(3) {
+        client
+            .write(format!("k{i:02}").as_bytes(), None)
+            .await
+            .unwrap();
+    }
+
+    let keys = client
+        .key_iterator_at(b"s1", b"")
+        .batch_size(4)
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(keys.len(), 25, "the snapshot walk lost keys across batches");
+    let expected: Vec<Vec<u8>> = (0..25).map(|i| format!("k{i:02}").into_bytes()).collect();
+    assert_eq!(keys, expected);
+
+    // While the current walk sees only what survives.
+    let now = client.key_iterator(b"").collect().await.unwrap();
+    assert_eq!(now.len(), 25 - 9);
+}

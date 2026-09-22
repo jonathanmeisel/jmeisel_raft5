@@ -39,14 +39,17 @@ use tonic::Status;
 
 use raft5_shared::raft5::client::{
     AddServerRequest, BootstrapRequest, CommitTransactionRequest, CommitTransactionResponse,
-    ConfigChangeResponse, CreateTransactionRequest, CreateTransactionResponse, CreateUserRequest,
-    CreateUserResponse, DeleteUserRequest, DeleteUserResponse, DropTransactionRequest,
-    GetKeysRequest, GetKeysResponse, GetVersionRequest, GetVersionResponse, LoginRequest,
-    LoginResponse, RaftError as PbRaftError, ReadRequest, ReadResponse, RemoveServerRequest,
-    WriteRequest, WriteResponse, auth_error, commit_transaction_response, config_change_response,
-    create_transaction_response, create_user_response, delete_user_response, get_keys_response,
-    get_version_request, get_version_response, login_response, raft_error, read_request,
-    read_response, transaction_aborted, write_response,
+    ConfigChangeResponse, CreateSnapshotRequest, CreateSnapshotResponse, CreateTransactionRequest,
+    CreateTransactionResponse, CreateUserRequest, CreateUserResponse, DeleteUserRequest,
+    DeleteUserResponse, DropTransactionRequest, GetKeysRequest, GetKeysResponse, GetVersionRequest,
+    GetVersionResponse, ListSnapshotsRequest, ListSnapshotsResponse, LoginRequest, LoginResponse,
+    RaftError as PbRaftError, ReadRequest, ReadResponse, RemoveServerRequest,
+    RemoveSnapshotRequest, RemoveSnapshotResponse, WriteRequest, WriteResponse, auth_error,
+    commit_transaction_response, config_change_response, create_snapshot_response,
+    create_transaction_response, create_user_response, delete_user_response, get_keys_request,
+    get_keys_response, get_version_request, get_version_response, list_snapshots_response,
+    login_response, raft_error, read_request, read_response, remove_snapshot_response,
+    transaction_aborted, write_response,
 };
 
 use routing::{Kv, Router};
@@ -293,6 +296,20 @@ impl std::error::Error for Error {}
 pub struct ReadResult {
     pub seq: u64,
     pub value: Option<Vec<u8>>,
+}
+
+/// A point-in-time view of the store, pinned until it is removed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotInfo {
+    pub id: Vec<u8>,
+    /// The sequence number this snapshot reads at. Every write with a
+    /// seq at or below this one is visible through it; nothing above it
+    /// is, however long the snapshot lives.
+    pub seq: u64,
+    /// What the creating client's clock said at the time. Informational
+    /// only -- it is one machine's wall clock, recorded verbatim, and
+    /// nothing in the cluster depends on it.
+    pub created_unix_ms: u64,
 }
 
 /// How one attempt came back, with the transport and protocol-level
@@ -546,6 +563,141 @@ impl Client {
         .await
     }
 
+    /// Reads `key` as it was when snapshot `snapshot_id` was created --
+    /// whatever has happened to it since, including being deleted.
+    ///
+    /// Stale in the same sense [`read`] is, and deliberately so: it
+    /// describes a moment that has already passed, so any node can
+    /// serve it without proving it still leads. What it *does*
+    /// guarantee is stability: the same call against the same snapshot
+    /// gives the same answer for as long as that snapshot exists.
+    ///
+    /// [`read`]: Client::read
+    pub async fn read_at(&self, snapshot_id: &[u8], key: &[u8]) -> Result<ReadResult, Error> {
+        self.read_inner(
+            key,
+            Some(read_request::Consistency::SnapshotId(snapshot_id.to_vec())),
+        )
+        .await
+    }
+
+    /// [`get_version`] as of a snapshot. See [`read_at`].
+    ///
+    /// [`get_version`]: Client::get_version
+    /// [`read_at`]: Client::read_at
+    pub async fn get_version_at(&self, snapshot_id: &[u8], key: &[u8]) -> Result<u64, Error> {
+        self.get_version_inner(
+            key,
+            Some(get_version_request::Consistency::SnapshotId(
+                snapshot_id.to_vec(),
+            )),
+        )
+        .await
+    }
+
+    /// Walks the keys that had a value when `snapshot_id` was created --
+    /// including ones deleted since, and excluding ones created since.
+    pub fn key_iterator_at(&self, snapshot_id: &[u8], start_key: &[u8]) -> KeyIterator {
+        KeyIterator::new(
+            self.clone(),
+            Some(get_keys_request::Consistency::SnapshotId(
+                snapshot_id.to_vec(),
+            )),
+            start_key,
+        )
+    }
+
+    /// Pins the current sequence number as a snapshot, so that
+    /// [`read_at`] and friends can later see the store exactly as it is
+    /// now.
+    ///
+    /// `id` must be unique; creating one that already exists is refused
+    /// rather than moving the existing snapshot forward. Passing `None`
+    /// uses this machine's clock, formatted as a timestamp -- which is
+    /// where a clock belongs, since the cluster has no wall clock of its
+    /// own and a leader-assigned one would be a replicated
+    /// non-determinism. A collision at the same millisecond comes back
+    /// as an ordinary already-exists, which [`create_snapshot`] retries
+    /// past with a suffix.
+    ///
+    /// Administrators only: until it is removed, a snapshot holds every
+    /// version of every key that has changed since it was taken.
+    ///
+    /// [`read_at`]: Client::read_at
+    /// [`create_snapshot`]: Client::create_snapshot
+    pub async fn create_snapshot(&self, id: Option<&[u8]>) -> Result<SnapshotInfo, Error> {
+        let now = unix_millis();
+        match id {
+            Some(id) => self.create_snapshot_once(id, now).await,
+            None => {
+                let base = timestamp_id(now);
+                match self.create_snapshot_once(base.as_bytes(), now).await {
+                    // Two snapshots defaulted in the same millisecond.
+                    // Disambiguating here rather than making the caller
+                    // do it: they asked for "a snapshot of now", and
+                    // which suffix it gets is not their problem.
+                    Err(Error::Rejected(_)) => {
+                        let mut last = Err(Error::Rejected("snapshot id taken".into()));
+                        for n in 1..16u32 {
+                            let id = format!("{base}-{n}");
+                            last = self.create_snapshot_once(id.as_bytes(), now).await;
+                            if !matches!(last, Err(Error::Rejected(_))) {
+                                break;
+                            }
+                        }
+                        last
+                    }
+                    other => other,
+                }
+            }
+        }
+    }
+
+    async fn create_snapshot_once(
+        &self,
+        id: &[u8],
+        created_unix_ms: u64,
+    ) -> Result<SnapshotInfo, Error> {
+        let request = CreateSnapshotRequest {
+            snapshot_id: id.to_vec(),
+            created_unix_ms,
+        };
+        self.call(|mut kv: Kv| {
+            let request = request.clone();
+            async move { kv.create_snapshot(request).await.map(create_snapshot_reply) }
+        })
+        .await
+    }
+
+    /// Releases a snapshot. The versions it was holding become
+    /// collectable, and reads at it start failing. Administrators only.
+    pub async fn remove_snapshot(&self, id: &[u8]) -> Result<u64, Error> {
+        let request = RemoveSnapshotRequest {
+            snapshot_id: id.to_vec(),
+        };
+        self.call(|mut kv: Kv| {
+            let request = request.clone();
+            async move { kv.remove_snapshot(request).await.map(remove_snapshot_reply) }
+        })
+        .await
+    }
+
+    /// Every snapshot that currently exists.
+    ///
+    /// The only way to discover ids: snapshot records live in the
+    /// reserved range, which [`key_iterator`] hides. Possibly stale, on
+    /// the same terms as any read outside a transaction.
+    ///
+    /// [`key_iterator`]: Client::key_iterator
+    pub async fn list_snapshots(&self) -> Result<Vec<SnapshotInfo>, Error> {
+        self.call(|mut kv: Kv| async move {
+            kv.list_snapshots(ListSnapshotsRequest {})
+                .await
+                .map(list_snapshots_reply)
+        })
+        .await
+    }
+
     /// Walks every key that currently has a value, in order, from
     /// `start_key` on. Pass an empty slice to start at the beginning.
     ///
@@ -572,12 +724,12 @@ impl Client {
         &self,
         start_key: Vec<u8>,
         max_keys: u32,
-        transaction_id: Option<Vec<u8>>,
+        consistency: Option<get_keys_request::Consistency>,
     ) -> Result<(Vec<Vec<u8>>, bool), Error> {
         let request = GetKeysRequest {
             start_key,
             max_keys,
-            transaction_id,
+            consistency,
         };
         self.call(|mut kv: Kv| {
             let request = request.clone();
@@ -1094,6 +1246,59 @@ fn read_reply(resp: tonic::Response<ReadResponse>) -> Reply<ReadResult> {
     }
 }
 
+fn snapshot_info(s: raft5_shared::raft5::client::Snapshot) -> SnapshotInfo {
+    SnapshotInfo {
+        id: s.snapshot_id,
+        seq: s.seq,
+        created_unix_ms: s.created_unix_ms,
+    }
+}
+
+fn create_snapshot_reply(resp: tonic::Response<CreateSnapshotResponse>) -> Reply<SnapshotInfo> {
+    match resp.into_inner().result {
+        Some(create_snapshot_response::Result::Ok(s)) => Reply::Ok(snapshot_info(s)),
+        Some(create_snapshot_response::Result::Error(e)) => Reply::from_error(e),
+        Some(create_snapshot_response::Result::AuthError(e)) => denied(e),
+        None => empty_response(),
+    }
+}
+
+fn remove_snapshot_reply(resp: tonic::Response<RemoveSnapshotResponse>) -> Reply<u64> {
+    match resp.into_inner().result {
+        Some(remove_snapshot_response::Result::Seq(seq)) => Reply::Ok(seq),
+        Some(remove_snapshot_response::Result::Error(e)) => Reply::from_error(e),
+        Some(remove_snapshot_response::Result::AuthError(e)) => denied(e),
+        None => empty_response(),
+    }
+}
+
+fn list_snapshots_reply(resp: tonic::Response<ListSnapshotsResponse>) -> Reply<Vec<SnapshotInfo>> {
+    match resp.into_inner().result {
+        Some(list_snapshots_response::Result::Ok(list)) => {
+            Reply::Ok(list.snapshots.into_iter().map(snapshot_info).collect())
+        }
+        Some(list_snapshots_response::Result::Error(e)) => Reply::from_error(e),
+        None => empty_response(),
+    }
+}
+
+/// Milliseconds since the Unix epoch, by this machine's clock.
+///
+/// The cluster has no wall clock, so a timestamp only ever means "what
+/// the client that asked believed the time to be".
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// A default snapshot id: the timestamp, in a form the server's id
+/// character set accepts and that sorts chronologically.
+fn timestamp_id(unix_ms: u64) -> String {
+    format!("t{unix_ms}")
+}
+
 fn get_version_reply(resp: tonic::Response<GetVersionResponse>) -> Reply<u64> {
     match resp.into_inner().result {
         Some(get_version_response::Result::Ok(ok)) => Reply::Ok(ok.seq),
@@ -1265,7 +1470,13 @@ impl Transaction {
     ///
     /// [`read`]: Transaction::read
     pub fn key_iterator(&self, start_key: &[u8]) -> KeyIterator {
-        KeyIterator::new(self.client.clone(), Some(self.id.clone()), start_key)
+        KeyIterator::new(
+            self.client.clone(),
+            Some(get_keys_request::Consistency::TransactionId(
+                self.id.clone(),
+            )),
+            start_key,
+        )
     }
 
     /// Buffers a write to `key` (or a delete, if `value` is `None`) and
@@ -1384,7 +1595,11 @@ impl Drop for Transaction {
 /// [`batch_size`]: KeyIterator::batch_size
 pub struct KeyIterator {
     client: Client,
-    transaction_id: Option<Vec<u8>>,
+    /// What the walk asks for: a transaction, a snapshot, or nothing at
+    /// all. Fixed when the iterator is made, so every batch is asked
+    /// for on the same terms -- a walk that changed consistency
+    /// half-way would not describe any one state of the store.
+    consistency: Option<get_keys_request::Consistency>,
     /// Where the next batch starts, inclusive. `None` once the cluster
     /// has said there is nothing after what we have.
     next_start: Option<Vec<u8>>,
@@ -1395,10 +1610,14 @@ pub struct KeyIterator {
 }
 
 impl KeyIterator {
-    fn new(client: Client, transaction_id: Option<Vec<u8>>, start_key: &[u8]) -> Self {
+    fn new(
+        client: Client,
+        consistency: Option<get_keys_request::Consistency>,
+        start_key: &[u8],
+    ) -> Self {
         Self {
             client,
-            transaction_id,
+            consistency,
             next_start: Some(start_key.to_vec()),
             batch_size: DEFAULT_KEY_BATCH,
             buffer: Vec::new(),
@@ -1432,7 +1651,7 @@ impl KeyIterator {
 
             let (mut keys, has_more) = self
                 .client
-                .get_keys_batch(start, self.batch_size, self.transaction_id.clone())
+                .get_keys_batch(start, self.batch_size, self.consistency.clone())
                 .await?;
 
             // The next batch starts just past the last key of this one.

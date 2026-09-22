@@ -845,7 +845,7 @@ async fn get_keys(
         .get_keys(Request::new(GetKeysRequest {
             start_key: start.to_vec(),
             max_keys,
-            transaction_id: txn.map(<[u8]>::to_vec),
+            consistency: txn.map(|t| get_keys_request::Consistency::TransactionId(t.to_vec())),
         }))
         .await
         .unwrap()
@@ -951,7 +951,7 @@ async fn a_scan_of_absurdly_many_keys_is_refused_rather_than_shortened() {
         .get_keys(Request::new(GetKeysRequest {
             start_key: Vec::new(),
             max_keys: MAX_KEYS_PER_SCAN + 1,
-            transaction_id: None,
+            consistency: None,
         }))
         .await
         .expect_err("an over-large batch should be refused");
@@ -1072,7 +1072,7 @@ async fn a_scan_outside_a_transaction_is_served_without_a_leader() {
         .get_keys(Request::new(GetKeysRequest {
             start_key: Vec::new(),
             max_keys: 10,
-            transaction_id: Some(vec![0u8; 16]),
+            consistency: Some(get_keys_request::Consistency::TransactionId(vec![0u8; 16])),
         }))
         .await
         .unwrap()
@@ -1342,7 +1342,7 @@ async fn get_keys_refuses_a_reserved_start_key() {
         .get_keys(Request::new(GetKeysRequest {
             start_key: vec![crate::keyspace::RESERVED],
             max_keys: 10,
-            transaction_id: None,
+            consistency: None,
         }))
         .await
         .expect_err("a reserved start key should be refused");
@@ -2132,6 +2132,388 @@ async fn linearizable_false_is_a_stale_read() {
         .unwrap()
         .into_inner();
     assert!(matches!(resp.result, Some(read_response::Result::Ok(_))));
+
+    cleanup(&path);
+}
+
+// --- snapshots --------------------------------------------------------
+
+/// Create a snapshot on a node that keeps no accounts, so `require_admin`
+/// is satisfied by there being nobody to be an administrator.
+async fn make_snapshot(svc: &KvService, id: &[u8]) -> PbSnapshot {
+    let result = svc
+        .create_snapshot(Request::new(CreateSnapshotRequest {
+            snapshot_id: id.to_vec(),
+            created_unix_ms: 1234,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .result
+        .expect("a create_snapshot response always carries a result");
+    match result {
+        create_snapshot_response::Result::Ok(s) => s,
+        other => panic!("expected a snapshot, got {other:?}"),
+    }
+}
+
+async fn read_at(svc: &KvService, id: &[u8], key: &[u8]) -> Result<ReadOk, Status> {
+    let resp = svc
+        .read(Request::new(ReadRequest {
+            key: key.to_vec(),
+            consistency: Some(read_request::Consistency::SnapshotId(id.to_vec())),
+        }))
+        .await?
+        .into_inner();
+    match resp.result {
+        Some(read_response::Result::Ok(ok)) => Ok(ok),
+        other => panic!("expected a successful read, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_snapshot_reads_the_store_as_it_was_when_it_was_taken() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+
+    let before = write(&svc, b"k", Some(b"before")).await;
+    write(&svc, b"doomed", Some(b"here")).await;
+    let snap = make_snapshot(&svc, b"s1").await;
+
+    // Everything after the snapshot is invisible through it.
+    write(&svc, b"k", Some(b"after")).await;
+    write(&svc, b"doomed", None).await;
+    write(&svc, b"fresh", Some(b"new")).await;
+
+    let at = read_at(&svc, b"s1", b"k").await.unwrap();
+    assert_eq!(at.value.as_deref(), Some(b"before".as_slice()));
+    assert_eq!(at.seq, before);
+    assert_eq!(
+        read_at(&svc, b"s1", b"doomed")
+            .await
+            .unwrap()
+            .value
+            .as_deref(),
+        Some(b"here".as_slice()),
+        "a key deleted after the snapshot is still visible through it"
+    );
+    assert_eq!(
+        read_at(&svc, b"s1", b"fresh").await.unwrap().value,
+        None,
+        "a key created after the snapshot is not"
+    );
+
+    // Current reads are unaffected.
+    assert_eq!(
+        read(&svc, b"k").await.value.as_deref(),
+        Some(b"after".as_slice())
+    );
+
+    assert!(snap.seq > before);
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn a_snapshot_walk_sees_the_key_set_as_of_the_snapshot() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+
+    write(&svc, b"a", Some(b"1")).await;
+    write(&svc, b"b", Some(b"2")).await;
+    make_snapshot(&svc, b"s1").await;
+    write(&svc, b"b", None).await;
+    write(&svc, b"c", Some(b"3")).await;
+
+    let (keys, _) = get_keys_at(&svc, b"s1", b"", 10).await;
+    assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
+
+    let (now, _) = get_keys(&svc, b"", 10, None).await;
+    assert_eq!(now, vec![b"a".to_vec(), b"c".to_vec()]);
+
+    cleanup(&path);
+}
+
+async fn get_keys_at(
+    svc: &KvService,
+    id: &[u8],
+    start: &[u8],
+    max_keys: u32,
+) -> (Vec<Vec<u8>>, bool) {
+    let result = svc
+        .get_keys(Request::new(GetKeysRequest {
+            start_key: start.to_vec(),
+            max_keys,
+            consistency: Some(get_keys_request::Consistency::SnapshotId(id.to_vec())),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .result;
+    match result {
+        Some(get_keys_response::Result::Ok(ok)) => (ok.keys, ok.has_more),
+        other => panic!("expected a successful scan, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn get_version_at_a_snapshot_reports_the_seq_it_was_written_at() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+
+    let first = write(&svc, b"k", Some(b"1")).await;
+    make_snapshot(&svc, b"s1").await;
+    let second = write(&svc, b"k", Some(b"2")).await;
+
+    let at = snapshot_version(&svc, b"s1", b"k").await;
+    assert_eq!(at, first);
+    assert_eq!(version(&svc, b"k").await, second);
+
+    cleanup(&path);
+}
+
+async fn snapshot_version(svc: &KvService, id: &[u8], key: &[u8]) -> u64 {
+    match snapshot_version_result(svc, id, key).await.unwrap() {
+        get_version_response::Result::Ok(ok) => ok.seq,
+        other => panic!("expected a successful get_version, got {other:?}"),
+    }
+}
+
+async fn snapshot_version_result(
+    svc: &KvService,
+    id: &[u8],
+    key: &[u8],
+) -> Result<get_version_response::Result, Status> {
+    Ok(svc
+        .get_version(Request::new(GetVersionRequest {
+            key: key.to_vec(),
+            consistency: Some(get_version_request::Consistency::SnapshotId(id.to_vec())),
+        }))
+        .await?
+        .into_inner()
+        .result
+        .expect("a get_version response always carries a result"))
+}
+
+#[tokio::test]
+async fn an_unknown_snapshot_is_refused_rather_than_answered_as_empty() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+    write(&svc, b"k", Some(b"v")).await;
+
+    // Answering an unknown id as "no value" would be indistinguishable
+    // from a snapshot taken before the key existed, which is exactly the
+    // confusion an explicit refusal avoids.
+    let status = read_at(&svc, b"nope", b"k").await.expect_err("unknown id");
+    assert_eq!(status.code(), tonic::Code::NotFound);
+    let status = snapshot_version_result(&svc, b"nope", b"k")
+        .await
+        .expect_err("unknown id");
+    assert_eq!(status.code(), tonic::Code::NotFound);
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn a_removed_snapshot_stops_being_readable() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+    write(&svc, b"k", Some(b"v")).await;
+    make_snapshot(&svc, b"s1").await;
+    assert!(read_at(&svc, b"s1", b"k").await.is_ok());
+
+    let result = svc
+        .remove_snapshot(Request::new(RemoveSnapshotRequest {
+            snapshot_id: b"s1".to_vec(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .result
+        .expect("a remove_snapshot response always carries a result");
+    assert!(matches!(result, remove_snapshot_response::Result::Seq(_)));
+
+    let status = read_at(&svc, b"s1", b"k").await.expect_err("removed");
+    assert_eq!(status.code(), tonic::Code::NotFound);
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn creating_a_snapshot_twice_is_refused_rather_than_moving_it() {
+    // The invariant the whole feature rests on: a snapshot's seq is the
+    // seq of its own record, so a second write would silently move it
+    // forward in time.
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+    let first = make_snapshot(&svc, b"s1").await;
+    write(&svc, b"k", Some(b"later")).await;
+
+    let result = svc
+        .create_snapshot(Request::new(CreateSnapshotRequest {
+            snapshot_id: b"s1".to_vec(),
+            created_unix_ms: 9999,
+        }))
+        .await
+        .expect_err("a duplicate id should be refused");
+    assert_eq!(result.code(), tonic::Code::AlreadyExists);
+
+    // And it still reads where it originally did.
+    let listed = list_snapshots(&svc).await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].seq, first.seq);
+
+    cleanup(&path);
+}
+
+async fn list_snapshots(svc: &KvService) -> Vec<PbSnapshot> {
+    let result = svc
+        .list_snapshots(Request::new(ListSnapshotsRequest {}))
+        .await
+        .unwrap()
+        .into_inner()
+        .result
+        .expect("a list_snapshots response always carries a result");
+    match result {
+        list_snapshots_response::Result::Ok(list) => list.snapshots,
+        other => panic!("expected a listing, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_malformed_snapshot_id_is_refused() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+
+    for id in [
+        b"".as_slice(),
+        b"has/slash".as_slice(),
+        b"has space".as_slice(),
+    ] {
+        let status = svc
+            .create_snapshot(Request::new(CreateSnapshotRequest {
+                snapshot_id: id.to_vec(),
+                created_unix_ms: 0,
+            }))
+            .await
+            .expect_err("a malformed id should be refused");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "id {id:?}");
+    }
+
+    // An RFC-3339-ish timestamp, which is what the client defaults to,
+    // must be legal.
+    make_snapshot(&svc, b"2026-09-22T14:03:11.482Z").await;
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn snapshot_records_are_invisible_to_a_key_walk() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+    write(&svc, b"visible", Some(b"v")).await;
+    make_snapshot(&svc, b"s1").await;
+
+    let (keys, _) = get_keys(&svc, b"", 10, None).await;
+    assert_eq!(keys, vec![b"visible".to_vec()]);
+
+    // And the record's key is unaddressable directly.
+    let status = svc
+        .read(Request::new(ReadRequest {
+            key: b"\0snap/s1".to_vec(),
+            consistency: None,
+        }))
+        .await
+        .expect_err("the reserved range should be refused");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn the_number_of_live_snapshots_is_capped() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+
+    for i in 0..crate::storage::MAX_LIVE_CHECKPOINTS {
+        make_snapshot(&svc, format!("s{i}").as_bytes()).await;
+    }
+    let status = svc
+        .create_snapshot(Request::new(CreateSnapshotRequest {
+            snapshot_id: b"one-too-many".to_vec(),
+            created_unix_ms: 0,
+        }))
+        .await
+        .expect_err("the cap should be enforced");
+    assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+
+    cleanup(&path);
+}
+
+/// Managing snapshots is administration, not reading: a snapshot pins
+/// storage cluster-wide until someone releases it.
+#[tokio::test]
+async fn an_ordinary_account_may_not_manage_snapshots() {
+    let (log, path) = open_temp();
+    let svc = authenticated_service(log, "kv-test").await;
+    created_seq(create_user(&svc, "root", "alice", "correct horse", false).await);
+
+    let refused = svc
+        .create_snapshot(as_user(
+            "alice",
+            CreateSnapshotRequest {
+                snapshot_id: b"s1".to_vec(),
+                created_unix_ms: 0,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .result;
+    match refused {
+        Some(create_snapshot_response::Result::AuthError(e)) => {
+            assert_eq!(auth_kind(&e), auth_error::Kind::NotAdmin);
+        }
+        other => panic!("expected NOT_ADMIN, got {other:?}"),
+    }
+
+    // An admin may, and then an ordinary account may not release it.
+    let made = svc
+        .create_snapshot(as_user(
+            "root",
+            CreateSnapshotRequest {
+                snapshot_id: b"s1".to_vec(),
+                created_unix_ms: 0,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .result;
+    assert!(matches!(
+        made,
+        Some(create_snapshot_response::Result::Ok(_))
+    ));
+
+    let refused = svc
+        .remove_snapshot(as_user(
+            "alice",
+            RemoveSnapshotRequest {
+                snapshot_id: b"s1".to_vec(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .result;
+    match refused {
+        Some(remove_snapshot_response::Result::AuthError(e)) => {
+            assert_eq!(auth_kind(&e), auth_error::Kind::NotAdmin);
+        }
+        other => panic!("expected NOT_ADMIN, got {other:?}"),
+    }
+
+    // But reading at it needs no privilege at all: it is a read.
+    assert!(read_at(&svc, b"s1", b"anything").await.is_ok());
 
     cleanup(&path);
 }

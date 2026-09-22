@@ -194,6 +194,67 @@ async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
             let [key] = fixed_args(args, "version_current <key>")?;
             print_version(client.get_version_linearizable(key.as_bytes()).await);
         }
+        "snapshot" => {
+            // An id is optional: with none, the client stamps its own
+            // clock, which is where a clock belongs.
+            let id = match args {
+                [] => None,
+                [id] => Some(id.as_bytes()),
+                _ => return Err("usage: snapshot [id]".to_string()),
+            };
+            match client.create_snapshot(id).await {
+                Ok(s) => println!(
+                    "created {} at seq={}",
+                    String::from_utf8_lossy(&s.id),
+                    s.seq
+                ),
+                Err(e) => println!("error: {e}"),
+            }
+        }
+        "snapshots" => match client.list_snapshots().await {
+            Ok(list) if list.is_empty() => println!("(no snapshots)"),
+            Ok(list) => {
+                for s in list {
+                    println!("{} seq={}", String::from_utf8_lossy(&s.id), s.seq);
+                }
+            }
+            Err(e) => println!("error: {e}"),
+        },
+        "drop_snapshot" => {
+            let [id] = fixed_args(args, "drop_snapshot <id>")?;
+            match client.remove_snapshot(id.as_bytes()).await {
+                Ok(seq) => println!("ok, seq={seq}"),
+                Err(e) => println!("error: {e}"),
+            }
+        }
+        "read_at" => {
+            let [id, key] = fixed_args(args, "read_at <snapshot> <key>")?;
+            print_read(client.read_at(id.as_bytes(), key.as_bytes()).await);
+        }
+        "version_at" => {
+            let [id, key] = fixed_args(args, "version_at <snapshot> <key>")?;
+            print_version(client.get_version_at(id.as_bytes(), key.as_bytes()).await);
+        }
+        "keys_at" => {
+            let (id, start) = match args {
+                [id] => (id.as_str(), ""),
+                [id, start] => (id.as_str(), start.as_str()),
+                _ => return Err("usage: keys_at <snapshot> [start_key]".to_string()),
+            };
+            match client
+                .key_iterator_at(id.as_bytes(), start.as_bytes())
+                .collect()
+                .await
+            {
+                Ok(keys) if keys.is_empty() => println!("(no keys)"),
+                Ok(keys) => {
+                    for key in keys {
+                        println!("{}", String::from_utf8_lossy(&key));
+                    }
+                }
+                Err(e) => println!("error: {e}"),
+            }
+        }
         "keys" => {
             let start = match args {
                 [] => "",
@@ -348,6 +409,13 @@ fn print_help() {
             "                                  stale like `read`",
             "version_current <key>            the same, confirmed by the leader",
             "keys [start_key]                list every key from <start_key> on, stale like `read`",
+            "snapshot [id]                    pin the current sequence as a snapshot; the id",
+            "                                  defaults to this machine's clock. admins only",
+            "snapshots                        list every snapshot that exists",
+            "drop_snapshot <id>               release a snapshot. admins only",
+            "read_at <snapshot> <key>         read a key as it was when the snapshot was taken",
+            "version_at <snapshot> <key>      the seq a key was at when the snapshot was taken",
+            "keys_at <snapshot> [start_key]   list the keys that existed at the snapshot",
             "add_server <client_addr>         add a server as a learner, by its client address",
             "remove_server <id>               remove a server",
             "bootstrap <id>                   form a single-node cluster around <id>",
