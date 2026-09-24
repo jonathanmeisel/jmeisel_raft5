@@ -44,24 +44,28 @@ use tonic::transport::Endpoint;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::Instrument;
 
-use crate::auth::{AuthConfig, AuthContext, UserRecord};
+use crate::auth::{AuthConfig, AuthContext, InviteRecord, InviteSecret, UserRecord};
 use crate::keyspace::is_reserved;
 use crate::pb::raft5::client::kv_server::Kv;
 use crate::pb::raft5::client::{
     AddServerRequest, AuthError as PbAuthError, BootstrapRequest, CommitTransactionRequest,
     CommitTransactionResponse, ConfigChangeResponse, CreateSnapshotRequest, CreateSnapshotResponse,
-    CreateTransactionRequest, CreateTransactionResponse, CreateUserRequest, CreateUserResponse,
-    DeleteUserRequest, DeleteUserResponse, DropTransactionRequest, DropTransactionResponse,
-    GetConfigRequest, GetConfigResponse, GetKeysOk, GetKeysRequest, GetKeysResponse, GetVersionOk,
-    GetVersionRequest, GetVersionResponse, ListSnapshotsRequest, ListSnapshotsResponse, LoginOk,
-    LoginRequest, LoginResponse, NotLeader, RaftError as PbRaftError, ReadOk, ReadRequest,
-    ReadResponse, RemoveServerRequest, RemoveSnapshotRequest, RemoveSnapshotResponse,
-    Snapshot as PbSnapshot, SnapshotList, TransactionAborted, WriteRequest, WriteResponse,
-    auth_error, commit_transaction_response, config_change_response, create_snapshot_response,
-    create_transaction_response, create_user_response, delete_user_response,
-    drop_transaction_response, get_keys_request, get_keys_response, get_version_request,
-    get_version_response, list_snapshots_response, login_response, raft_error, read_request,
-    read_response, remove_snapshot_response, transaction_aborted, write_response,
+    CreateInviteOk, CreateInviteRequest, CreateInviteResponse, CreateTransactionRequest,
+    CreateTransactionResponse, CreateUserRequest, CreateUserResponse, DeleteUserRequest,
+    DeleteUserResponse, DropTransactionRequest, DropTransactionResponse, GetConfigRequest,
+    GetConfigResponse, GetKeysOk, GetKeysRequest, GetKeysResponse, GetVersionOk, GetVersionRequest,
+    GetVersionResponse, Invite as PbInvite, InviteList, ListInvitesRequest, ListInvitesResponse,
+    ListSnapshotsRequest, ListSnapshotsResponse, LoginOk, LoginRequest, LoginResponse, NotLeader,
+    RaftError as PbRaftError, ReadOk, ReadRequest, ReadResponse, RedeemInviteOk,
+    RedeemInviteRequest, RedeemInviteResponse, RemoveServerRequest, RemoveSnapshotRequest,
+    RemoveSnapshotResponse, RevokeInviteRequest, RevokeInviteResponse, Snapshot as PbSnapshot,
+    SnapshotList, TransactionAborted, WriteRequest, WriteResponse, auth_error,
+    commit_transaction_response, config_change_response, create_invite_response,
+    create_snapshot_response, create_transaction_response, create_user_response,
+    delete_user_response, drop_transaction_response, get_keys_request, get_keys_response,
+    get_version_request, get_version_response, list_invites_response, list_snapshots_response,
+    login_response, raft_error, read_request, read_response, redeem_invite_response,
+    remove_snapshot_response, revoke_invite_response, transaction_aborted, write_response,
 };
 use crate::pb::raft5::cluster::{ClusterConfig, ClusterMember};
 use crate::pb::raft5::raft::raft_peer_server::RaftPeer;
@@ -119,6 +123,33 @@ const MAX_KEYS_PER_SCAN: u32 = 1024;
 /// this only bounds how long a wedged admin call leaves an account
 /// unwritable.
 const ADMIN_TXN_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The lifetime an invitation gets when its issuer does not name one.
+///
+/// A day: long enough to survive being sent to someone in another
+/// timezone and read the next morning, short enough that an invite
+/// forgotten in an inbox is not still spendable a month later.
+const DEFAULT_INVITE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// The longest lifetime this cluster will grant one.
+///
+/// An invitation is a credential that creates a credential, and the only
+/// thing bounding how long a leaked one stays dangerous is this. A week
+/// covers "I am on holiday until Monday"; anything past that is an
+/// account, not an invitation, and should be created as one.
+const MAX_INVITE_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// How many invitations may be outstanding at once.
+///
+/// Unlike `MAX_LIVE_CHECKPOINTS` this does not protect the store from
+/// anything -- an invite record is a hundred bytes, and an administrator
+/// who wanted to fill the disk has `CreateUser` for that. What it bounds
+/// is the *listing*: `ListInvites` reads every outstanding record in one
+/// unpaged call, and this is the number that keeps that call small
+/// enough to be answered that way. Lapsed invitations are swept by the
+/// next `CreateInvite` rather than counted against it, so a cluster that
+/// issues a steady trickle never meets this at all.
+const MAX_LIVE_INVITES: usize = 64;
 
 /// How long `Bootstrap` will wait for this node to start leading before
 /// giving up on writing the administrator it was started with.
@@ -259,6 +290,14 @@ impl AuthFailure {
             "the username or password was wrong",
         )
     }
+
+    /// An invitation that cannot be spent. `why` is for a human to read
+    /// -- an invite holder is someone an administrator deliberately gave
+    /// a secret to, so telling them "that lapsed on Tuesday" rather than
+    /// a flat no costs nothing and saves a support conversation.
+    fn bad_invite(why: &'static str) -> Self {
+        Self::refused(auth_error::Kind::BadInvite, why)
+    }
 }
 
 /// Which of the two error shapes a response should carry.
@@ -309,6 +348,71 @@ fn reject_reserved(key: &[u8]) -> Result<(), Status> {
         ));
     }
     Ok(())
+}
+
+/// An invitation as the wire carries it: everything but the secret,
+/// which no longer exists anywhere by the time anyone can ask for this.
+fn pb_invite(invite_id: String, record: InviteRecord) -> PbInvite {
+    PbInvite {
+        invite_id,
+        issued_by: record.issued_by,
+        is_admin: record.is_admin,
+        username: record.username,
+        expires_unix_ms: record.expires_unix_ms,
+    }
+}
+
+/// How long an invitation asked for with `ttl_ms` should last.
+///
+/// Over the limit is refused rather than quietly shortened, exactly as
+/// an over-long transaction lifetime is and for the same reason: an
+/// issuer told "yes" would hand out an invitation believing it good for
+/// a month and hear about it when the recipient could not use it.
+fn invite_ttl(ttl_ms: u64) -> Result<std::time::Duration, Status> {
+    if ttl_ms == 0 {
+        return Ok(DEFAULT_INVITE_TTL);
+    }
+    let ttl = std::time::Duration::from_millis(ttl_ms);
+    if ttl > MAX_INVITE_TTL {
+        return Err(Status::invalid_argument(format!(
+            "an invitation may last at most {} hours",
+            MAX_INVITE_TTL.as_secs() / 3600
+        )));
+    }
+    Ok(ttl)
+}
+
+/// Whether `record` may be spent, right now, on `username`.
+///
+/// Both halves answer `BAD_INVITE` rather than saying anything more
+/// structured: from the holder's side an invitation that has lapsed and
+/// one that was meant for someone else call for the same thing, which is
+/// to go back to whoever issued it.
+fn check_invite(record: &InviteRecord, username: &str) -> Result<(), AuthFailure> {
+    if record.has_expired(crate::auth::now_unix_ms()) {
+        return Err(AuthFailure::bad_invite(
+            "that invitation has lapsed; ask whoever issued it for another",
+        ));
+    }
+    match record.username.as_deref() {
+        Some(pinned) if pinned != username => Err(AuthFailure::bad_invite(
+            "that invitation was issued for a different username",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Who a request is from, for the records that want to say so.
+///
+/// Only sound after `require_admin` has run on a node that keeps
+/// accounts: it is that call which establishes there is an identity here
+/// at all. The error is the same one it would have raised, so a caller
+/// that forgets the ordering fails closed.
+fn caller(extensions: &tonic::Extensions) -> Result<String, AuthFailure> {
+    extensions
+        .get::<AuthContext>()
+        .map(|context| context.username.clone())
+        .ok_or_else(|| Status::unauthenticated("this request carried no verified identity").into())
 }
 
 /// A checkpoint as the wire carries it.
@@ -879,17 +983,12 @@ impl KvService {
         }
 
         let key = checkpoint_key(&req.snapshot_id);
-        let leader = self.leader()?;
-        leader.await_caught_up().await?;
-        let id = self
-            .locks
-            .create(leader.term(), ADMIN_TXN_TTL, crate::txn::fresh_id())?;
-        let result = self
-            .write_checkpoint(id, &key, Some(req.created_unix_ms))
-            .await;
-        self.locks.discard(id);
-
-        let seq = result?;
+        let seq = self
+            .admin_txn(async |id| {
+                self.write_checkpoint(id, &key, Some(req.created_unix_ms))
+                    .await
+            })
+            .await?;
         Ok(Checkpoint {
             id: req.snapshot_id,
             seq,
@@ -906,14 +1005,8 @@ impl KvService {
         validate_snapshot_id(&req.snapshot_id)?;
 
         let key = checkpoint_key(&req.snapshot_id);
-        let leader = self.leader()?;
-        leader.await_caught_up().await?;
-        let id = self
-            .locks
-            .create(leader.term(), ADMIN_TXN_TTL, crate::txn::fresh_id())?;
-        let result = self.write_checkpoint(id, &key, None).await;
-        self.locks.discard(id);
-        result
+        self.admin_txn(async |id| self.write_checkpoint(id, &key, None).await)
+            .await
     }
 
     /// `write_user` for checkpoints: `Some(created)` creates, `None`
@@ -957,20 +1050,37 @@ impl KvService {
         }
     }
 
-    /// Writes an account record, or removes it when `record` is `None`.
+    /// Writes an account record, or removes it when `record` is `None`,
+    /// in a transaction of its own -- see [`admin_txn`] for why that is
+    /// what this takes rather than an append.
     ///
-    /// A read-modify-write -- whether the account already exists decides
-    /// whether the call is allowed at all -- so the check and the write
-    /// have to be atomic against another admin doing the same thing at
-    /// the same moment. That is why this drives an ordinary transaction
-    /// instead of appending directly, and in turn why reserved keys are
-    /// refused at the RPC boundary rather than in `Locks`: the lock
-    /// table cannot tell this write from a client's, and must not.
+    /// [`admin_txn`]: KvService::admin_txn
+    async fn put_user(
+        &self,
+        username: &str,
+        record: Option<UserRecord>,
+    ) -> Result<u64, AuthFailure> {
+        let key = crate::keyspace::user_key(username);
+        self.admin_txn(async |id| self.write_user(id, &key, record).await)
+            .await
+    }
+
+    /// Runs `f` inside a transaction of the server's own, on the leader,
+    /// and releases what it held however it ends.
+    ///
+    /// Every administrative write is a read-modify-write -- whether the
+    /// record already exists is what decides if the call is allowed at
+    /// all -- so the check and the write have to be atomic against
+    /// another administrator doing the same thing at the same moment.
+    /// That is why these drive an ordinary transaction instead of
+    /// appending directly, and in turn why reserved keys are refused at
+    /// the RPC boundary rather than in `Locks`: the lock table cannot
+    /// tell this write from a client's, and must not.
     ///
     /// Nothing a client does can contend for these keys, since `write`
-    /// refuses them, so the only competition here is another admin call.
-    /// Two racing creations of one name resolve the way any two
-    /// transactions do, and the loser is told its transaction aborted.
+    /// refuses them, so the only competition is another administrative
+    /// call. Two racing ones resolve the way any two transactions do,
+    /// and the loser is told its transaction aborted.
     ///
     /// Clients and the server do share one thing, though: the open
     /// transaction table. Enough concurrent client transactions to fill
@@ -979,23 +1089,21 @@ impl KvService {
     /// headroom, because an administrator retrying is a far smaller
     /// problem than a second allocation rule to keep consistent with the
     /// first.
-    async fn put_user(
+    ///
+    /// The discard is explicit rather than a `Drop` guard: discarding a
+    /// transaction that already committed is a no-op, and the commit
+    /// path itself hands its locks to the task doing the append, so
+    /// there is nothing here that releasing early could cut short.
+    async fn admin_txn<T>(
         &self,
-        username: &str,
-        record: Option<UserRecord>,
-    ) -> Result<u64, AuthFailure> {
-        let key = crate::keyspace::user_key(username);
+        f: impl AsyncFnOnce(TxnId) -> Result<T, AuthFailure>,
+    ) -> Result<T, AuthFailure> {
         let leader = self.leader()?;
         leader.await_caught_up().await?;
         let id = self
             .locks
             .create(leader.term(), ADMIN_TXN_TTL, crate::txn::fresh_id())?;
-
-        // Explicit rather than a `Drop` guard: discarding a transaction
-        // that already committed is a no-op, and the commit path itself
-        // hands its locks to the task doing the append, so there is
-        // nothing here that releasing early could cut short.
-        let result = self.write_user(id, &key, record).await;
+        let result = f(id).await;
         self.locks.discard(id);
         result
     }
@@ -1221,6 +1329,268 @@ impl KvService {
         crate::keyspace::validate_username(&req.username)?;
         self.require_admin(extensions).await?;
         self.put_user(&req.username, None).await
+    }
+
+    /// Every outstanding invitation, split into the ones that can still
+    /// be spent and the ids of the ones that cannot.
+    ///
+    /// A local read, not a linearizable one. Both callers can take that:
+    /// `ListInvites` is a listing, stale on the same terms as any read
+    /// outside a transaction, and `CreateInvite` uses it only to count
+    /// and to sweep -- an invitation this node has not heard of yet is
+    /// one more that goes uncounted and unswept, which costs a slot and
+    /// a sweep, not correctness. Nothing here decides whether an invite
+    /// may be *spent*; that happens under a lock in `redeem_invite`.
+    async fn read_invites(&self) -> Result<(Vec<(String, InviteRecord)>, Vec<String>), AuthFailure> {
+        let rows = self
+            .store
+            .run(|log| log.list_records_under(crate::keyspace::INVITE_PREFIX))
+            .await
+            .map_err(|e| AuthFailure::from(RaftError::Storage(e)))?;
+
+        // One `now` for the whole partition, so a listing cannot report
+        // two invitations expiring in the same millisecond differently.
+        let now = crate::auth::now_unix_ms();
+        let mut live = Vec::new();
+        let mut lapsed = Vec::new();
+        for (id, value) in rows {
+            let id = String::from_utf8(id)
+                .map_err(|_| Status::internal("a stored invitation's id is not text"))?;
+            let record = InviteRecord::from_bytes(&value)?;
+            if record.has_expired(now) {
+                lapsed.push(id);
+            } else {
+                live.push((id, record));
+            }
+        }
+        Ok((live, lapsed))
+    }
+
+    /// Mints an invitation and writes the cluster's half of it.
+    ///
+    /// The secret exists in this process, in the response, and nowhere
+    /// else: what goes into the log is its SHA-256, which is also the
+    /// key the record is written under. So this is the only moment the
+    /// token is knowable, and an issuer who loses it has to revoke and
+    /// mint again -- there is nothing to look it up from.
+    async fn create_invite_inner(
+        &self,
+        extensions: &tonic::Extensions,
+        req: CreateInviteRequest,
+    ) -> Result<CreateInviteOk, AuthFailure> {
+        if self.auth.is_none() {
+            return Err(AuthFailure::disabled());
+        }
+        self.require_admin(extensions).await?;
+        let issued_by = caller(extensions)?;
+
+        // A name that could never be stored cannot be pinned to, and
+        // refusing it here means the pin is checked once, now, rather
+        // than by the recipient discovering their invitation is
+        // unusable.
+        if let Some(username) = req.username.as_deref() {
+            crate::keyspace::validate_username(username)?;
+        }
+        let ttl = invite_ttl(req.ttl_ms)?;
+
+        let (live, lapsed) = self.read_invites().await?;
+        if live.len() >= MAX_LIVE_INVITES {
+            return Err(Status::resource_exhausted(format!(
+                "this cluster already holds {MAX_LIVE_INVITES} outstanding invitations; \
+                 withdraw one before issuing another"
+            ))
+            .into());
+        }
+
+        let secret = InviteSecret::mint()?;
+        let record = InviteRecord::new(
+            issued_by,
+            req.is_admin,
+            req.username,
+            crate::auth::now_unix_ms().saturating_add(ttl.as_millis() as u64),
+        );
+        let key = crate::keyspace::invite_key(&secret.id);
+        let value = record.to_bytes()?;
+
+        let seq = self
+            .admin_txn(async |id| {
+                // Two distinct 32-byte secrets hashing alike is not a
+                // thing that happens, so this is not a race being
+                // guarded against -- it is the invariant that a record
+                // is written once, stated where it could be violated.
+                if self.transactional_read(id, &key).await?.value.is_some() {
+                    return Err(Status::internal(
+                        "the invitation drawn already exists; try again",
+                    )
+                    .into());
+                }
+                // Lapsed invitations are swept here rather than by
+                // anything of their own. There is no timer in this
+                // cluster to hang an expiry on and no state machine hook
+                // to run one from, so the work is folded into the call
+                // that has a reason to care how many there are -- which
+                // keeps the reserved range from accumulating records
+                // that can never be spent again.
+                for id_of_lapsed in &lapsed {
+                    self.locks.buffer_write(
+                        id,
+                        &crate::keyspace::invite_key(id_of_lapsed),
+                        None,
+                    )?;
+                }
+                self.locks.buffer_write(id, &key, Some(value))?;
+                Ok(self.commit(id).await?)
+            })
+            .await?;
+
+        Ok(CreateInviteOk {
+            token: secret.token,
+            invite: Some(pb_invite(secret.id, record)),
+            seq,
+        })
+    }
+
+    /// Spends an invitation on a new account.
+    ///
+    /// Answered for anyone: this is the one write on the service that
+    /// runs without a token (see `auth::EXEMPT`), because its callers
+    /// are by definition people who have no account yet. The invitation
+    /// stands in for the token, and everything below turns on it.
+    ///
+    /// The checking happens twice on purpose, and the two are not the
+    /// same check.
+    ///
+    /// The first is a plain read, before any work: an anonymous caller
+    /// can ask this node to do whatever it does before it decides, so
+    /// what it does before it decides had better be cheap. Hashing a
+    /// password with Argon2 costs 19 MiB and several milliseconds --
+    /// worth paying for a real redemption, and not worth paying for a
+    /// stranger sending in garbage.
+    ///
+    /// The second is inside the transaction, under a lock, and is the
+    /// one that counts. Between the two the invitation could have been
+    /// revoked, spent by someone else, or lapsed; the account name could
+    /// have been taken. That is why the record is read again rather than
+    /// carried over, and why `is_admin` is taken from the *locked* read
+    /// -- the rights the account gets must come from the invitation as
+    /// it stood when it was spent, not as it stood when it was glanced
+    /// at.
+    ///
+    /// The account and the invitation's removal are buffered into one
+    /// transaction, so they land at one sequence number or not at all.
+    /// That is the whole of "single use": two callers racing with the
+    /// same token contend for the same key, and one of them loses.
+    async fn redeem_invite_inner(&self, req: RedeemInviteRequest) -> Result<u64, AuthFailure> {
+        if self.auth.is_none() {
+            return Err(AuthFailure::disabled());
+        }
+        // Bounded before it is hashed. Everything else about the token
+        // is answered by whether its hash names a record, which is the
+        // point of keying records by that hash -- but the hashing itself
+        // is work, and an anonymous caller does not get to choose how
+        // much of it to ask for.
+        if req.token.is_empty() || req.token.len() > crate::auth::MAX_INVITE_TOKEN_LEN {
+            return Err(AuthFailure::bad_invite(
+                "that is not an invitation this cluster issued",
+            ));
+        }
+        crate::keyspace::validate_username(&req.username)?;
+
+        let invite_key = crate::keyspace::invite_key(&crate::auth::invite_id(&req.token));
+        let user_key = crate::keyspace::user_key(&req.username);
+
+        let Some(bytes) = self.linearizable_get(invite_key.clone()).await? else {
+            return Err(AuthFailure::bad_invite(
+                "this cluster is not holding that invitation; it may already have been \
+                 used, or withdrawn",
+            ));
+        };
+        check_invite(&InviteRecord::from_bytes(&bytes)?, &req.username)?;
+
+        // Outside the transaction: Argon2 is deliberately slow, and
+        // holding a lock on the account name for the length of it would
+        // make every redemption wait on every other one.
+        let password_hash = crate::auth::hash_password(req.password).await?;
+
+        self.admin_txn(async |id| {
+            let Some(bytes) = self.transactional_read(id, &invite_key).await?.value else {
+                return Err(AuthFailure::bad_invite(
+                    "this cluster is not holding that invitation; it may already have been \
+                     used, or withdrawn",
+                ));
+            };
+            let record = InviteRecord::from_bytes(&bytes)?;
+            check_invite(&record, &req.username)?;
+
+            if self.transactional_read(id, &user_key).await?.value.is_some() {
+                // Deliberately not spent. The holder chose a name
+                // somebody already has, which is a thing they can fix by
+                // choosing another -- and burning their invitation for
+                // it would leave them unable to.
+                return Err(AuthFailure::refused(
+                    auth_error::Kind::AlreadyExists,
+                    "that account already exists; the invitation has not been spent, so \
+                     another name can be tried with it",
+                ));
+            }
+
+            let user = UserRecord::new(req.username.clone(), password_hash, record.is_admin);
+            self.locks
+                .buffer_write(id, &user_key, Some(user.to_bytes()?))?;
+            self.locks.buffer_write(id, &invite_key, None)?;
+            Ok(self.commit(id).await?)
+        })
+        .await
+    }
+
+    async fn list_invites_inner(
+        &self,
+        extensions: &tonic::Extensions,
+    ) -> Result<Vec<PbInvite>, AuthFailure> {
+        if self.auth.is_none() {
+            return Err(AuthFailure::disabled());
+        }
+        self.require_admin(extensions).await?;
+
+        // Lapsed ones are left out rather than listed as expired. They
+        // cannot be spent and the next `CreateInvite` will sweep them,
+        // so reporting them would be reporting the cluster's own
+        // housekeeping as something to act on.
+        let (live, _) = self.read_invites().await?;
+        Ok(live
+            .into_iter()
+            .map(|(id, record)| pb_invite(id, record))
+            .collect())
+    }
+
+    async fn revoke_invite_inner(
+        &self,
+        extensions: &tonic::Extensions,
+        req: RevokeInviteRequest,
+    ) -> Result<u64, AuthFailure> {
+        if self.auth.is_none() {
+            return Err(AuthFailure::disabled());
+        }
+        self.require_admin(extensions).await?;
+        crate::keyspace::validate_invite_id(&req.invite_id)?;
+
+        let key = crate::keyspace::invite_key(&req.invite_id);
+        self.admin_txn(async |id| {
+            // An id that is not here is `not_found` rather than a quiet
+            // success. Withdrawing an invitation is something an
+            // administrator does because they believe a live one is out
+            // there, and "already gone" is the answer they most need to
+            // hear -- it means someone spent it first.
+            if self.transactional_read(id, &key).await?.value.is_none() {
+                return Err(Status::not_found(
+                    "there is no such invitation; it may have been redeemed already",
+                )
+                .into());
+            }
+            self.locks.buffer_write(id, &key, None)?;
+            Ok(self.commit(id).await?)
+        })
+        .await
     }
 
     async fn get_config_internal(&self) -> Result<Vec<ClusterMember>, StorageError> {
@@ -1770,6 +2140,77 @@ impl Kv for KvService {
                 Err(e) => match auth_failure(e)? {
                     AuthReply::Raft(e) => delete_user_response::Result::Error(e),
                     AuthReply::Auth(e) => delete_user_response::Result::AuthError(e),
+                },
+            }),
+        }))
+    }
+
+    async fn create_invite(
+        &self,
+        request: Request<CreateInviteRequest>,
+    ) -> Result<Response<CreateInviteResponse>, Status> {
+        let (_, extensions, req) = request.into_parts();
+        let result = self.create_invite_inner(&extensions, req).await;
+        Ok(Response::new(CreateInviteResponse {
+            result: Some(match result {
+                Ok(ok) => create_invite_response::Result::Ok(ok),
+                Err(e) => match auth_failure(e)? {
+                    AuthReply::Raft(e) => create_invite_response::Result::Error(e),
+                    AuthReply::Auth(e) => create_invite_response::Result::AuthError(e),
+                },
+            }),
+        }))
+    }
+
+    async fn redeem_invite(
+        &self,
+        request: Request<RedeemInviteRequest>,
+    ) -> Result<Response<RedeemInviteResponse>, Status> {
+        // `into_inner`, not `into_parts`: there is no verified identity
+        // to look at here and there is not meant to be. Whatever the
+        // caller may do comes from the invitation they present, which is
+        // in the message.
+        let result = self.redeem_invite_inner(request.into_inner()).await;
+        Ok(Response::new(RedeemInviteResponse {
+            result: Some(match result {
+                Ok(seq) => redeem_invite_response::Result::Ok(RedeemInviteOk { seq }),
+                Err(e) => match auth_failure(e)? {
+                    AuthReply::Raft(e) => redeem_invite_response::Result::Error(e),
+                    AuthReply::Auth(e) => redeem_invite_response::Result::AuthError(e),
+                },
+            }),
+        }))
+    }
+
+    async fn list_invites(
+        &self,
+        request: Request<ListInvitesRequest>,
+    ) -> Result<Response<ListInvitesResponse>, Status> {
+        let (_, extensions, _) = request.into_parts();
+        let result = self.list_invites_inner(&extensions).await;
+        Ok(Response::new(ListInvitesResponse {
+            result: Some(match result {
+                Ok(invites) => list_invites_response::Result::Ok(InviteList { invites }),
+                Err(e) => match auth_failure(e)? {
+                    AuthReply::Raft(e) => list_invites_response::Result::Error(e),
+                    AuthReply::Auth(e) => list_invites_response::Result::AuthError(e),
+                },
+            }),
+        }))
+    }
+
+    async fn revoke_invite(
+        &self,
+        request: Request<RevokeInviteRequest>,
+    ) -> Result<Response<RevokeInviteResponse>, Status> {
+        let (_, extensions, req) = request.into_parts();
+        let result = self.revoke_invite_inner(&extensions, req).await;
+        Ok(Response::new(RevokeInviteResponse {
+            result: Some(match result {
+                Ok(seq) => revoke_invite_response::Result::Seq(seq),
+                Err(e) => match auth_failure(e)? {
+                    AuthReply::Raft(e) => revoke_invite_response::Result::Error(e),
+                    AuthReply::Auth(e) => revoke_invite_response::Result::AuthError(e),
                 },
             }),
         }))

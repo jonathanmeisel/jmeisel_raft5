@@ -29,17 +29,39 @@
 //! token still passes verification, for non-admin requests, until it
 //! expires. Bounding that is what the token lifetime is for.
 //!
+//! # Invitations
+//!
+//! An account can also come into being without an administrator ever
+//! choosing its password. [`InviteSecret::mint`] produces 32 bytes from
+//! the OS, handed to the issuing administrator once; what is stored is
+//! the SHA-256 of them, under a key derived from that same hash. So the
+//! record is looked up *by* the thing being checked, and there is no
+//! comparison to get wrong and no secret in the log to leak.
+//!
+//! Argon2 is deliberately not used here, and the difference is worth
+//! being explicit about. Argon2's cost exists to make guessing a
+//! human-chosen password infeasible; a 256-bit secret from `getrandom`
+//! is already past guessing, so the only thing a slow hash would buy is
+//! a slow unauthenticated RPC -- see `grpc::KvService::redeem_invite`,
+//! which is open to anyone holding a token and therefore to anyone at
+//! all.
+//!
 //! # Not yet TLS
 //!
-//! `Login` takes a plaintext password over the wire. Until the client
-//! API is behind TLS, anyone who can see the traffic can see passwords
-//! and can replay tokens.
+//! `Login` takes a plaintext password over the wire, and `RedeemInvite`
+//! takes both a password and an invitation. Until the client API is
+//! behind TLS, anyone who can see the traffic can see passwords, can
+//! replay tokens, and can spend an invitation before its recipient
+//! does.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
+use sha2::{Digest, Sha256};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 use tonic::Status;
@@ -118,6 +140,139 @@ impl UserRecord {
         }
         Ok(record)
     }
+}
+
+/// One outstanding invitation, as stored.
+///
+/// The secret itself is absent by construction: this record is found by
+/// hashing the secret, so holding the record tells you what the invite
+/// is *for* without telling you how to spend it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteRecord {
+    /// First, for the reason [`UserRecord::version`] is first.
+    pub version: u8,
+    /// The administrator who issued it. Kept so that a listing can say
+    /// where an invitation came from -- with accounts creating accounts,
+    /// "who let this person in" is otherwise unanswerable.
+    pub issued_by: String,
+    /// What the account made from this will be. Fixed at issue time by
+    /// an administrator; the redeemer never gets a say.
+    pub is_admin: bool,
+    /// The one username this invite may create, if it was pinned to one.
+    pub username: Option<String>,
+    /// When it stops being redeemable, by the clock of the leader that
+    /// wrote it.
+    pub expires_unix_ms: u64,
+}
+
+impl InviteRecord {
+    pub fn new(
+        issued_by: String,
+        is_admin: bool,
+        username: Option<String>,
+        expires_unix_ms: u64,
+    ) -> Self {
+        Self {
+            version: RECORD_VERSION,
+            issued_by,
+            is_admin,
+            username,
+            expires_unix_ms,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Status> {
+        postcard::to_allocvec(self)
+            .map_err(|e| Status::internal(format!("could not encode an invitation: {e}")))
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Status> {
+        let record: Self = postcard::from_bytes(bytes)
+            .map_err(|_| Status::internal("a stored invitation could not be decoded"))?;
+        if record.version != RECORD_VERSION {
+            return Err(Status::internal(format!(
+                "a stored invitation is version {}, and this node understands {RECORD_VERSION}",
+                record.version
+            )));
+        }
+        Ok(record)
+    }
+
+    /// Whether this invitation has lapsed, as of `now_unix_ms`.
+    pub fn has_expired(&self, now_unix_ms: u64) -> bool {
+        now_unix_ms >= self.expires_unix_ms
+    }
+}
+
+/// How many bytes of entropy an invitation is worth.
+///
+/// 32, so that guessing one is not a thing anyone attempts and the
+/// cluster does not have to make guessing expensive to be safe from it.
+const INVITE_SECRET_BYTES: usize = 32;
+
+/// The longest token this node will even hash.
+///
+/// `RedeemInvite` answers callers with no account, so the work it does
+/// before deciding anything is work an anonymous caller can ask for. A
+/// token longer than one this cluster mints is refused on sight rather
+/// than hashed.
+pub const MAX_INVITE_TOKEN_LEN: usize = 128;
+
+/// A freshly minted invitation: the secret to hand over, and the id the
+/// cluster will know it by.
+pub struct InviteSecret {
+    /// Given out exactly once, by the response to `CreateInvite`.
+    pub token: String,
+    /// `invite_id(&token)`, carried alongside so the caller does not
+    /// recompute what minting already knows.
+    pub id: String,
+}
+
+impl InviteSecret {
+    /// A new invitation, from the operating system's randomness.
+    ///
+    /// Not `txn::fresh_id`, which is a `RandomState` hash and is fine
+    /// for naming a transaction and useless for anything an attacker
+    /// would like to predict. This is a credential, so it comes from
+    /// `getrandom` and nothing else.
+    pub fn mint() -> Result<Self, Status> {
+        let mut bytes = [0u8; INVITE_SECRET_BYTES];
+        getrandom::fill(&mut bytes)
+            .map_err(|e| Status::internal(format!("could not draw a secret: {e}")))?;
+        let token = BASE64.encode(bytes);
+        let id = invite_id(&token);
+        Ok(Self { token, id })
+    }
+}
+
+/// The id the cluster knows `token` by: its SHA-256, in URL-safe base64.
+///
+/// This is the whole of the lookup and the whole of the check. Because
+/// the record's key *is* this hash, a presented token either names a
+/// record or it does not; there is no stored secret to compare against,
+/// so there is no comparison whose timing could leak one.
+///
+/// Hashes the token's characters rather than the bytes they decode to,
+/// so a token that is not base64 at all is simply a token that names no
+/// record -- there is no parse here to fail, and no malformed-input path
+/// distinguishable from a wrong-secret one.
+pub fn invite_id(token: &str) -> String {
+    BASE64.encode(Sha256::digest(token.as_bytes()))
+}
+
+/// Wall-clock milliseconds since the epoch.
+///
+/// An invitation's lifetime is the leader's to measure: the issuer's
+/// clock and the recipient's are both outside this cluster, and a
+/// credential's expiry cannot be left to either. Before the epoch is
+/// treated as the epoch -- a node whose clock says 1969 has a problem
+/// this function cannot fix, and saturating keeps it from being an
+/// invitation that never lapses.
+pub fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// The administrator a node was started with, for the one window where
@@ -203,7 +358,20 @@ impl AuthConfig {
 /// is how a client finds the leader, which it has to do before it has
 /// anywhere to send a login; it discloses the cluster's membership
 /// addresses, which is what a client was configured with to begin with.
-const EXEMPT: [&str; 2] = ["/raft5.client.Kv/Login", "/raft5.client.Kv/GetConfig"];
+///
+/// `RedeemInvite` is the third and the only one that writes. It is
+/// exempt because the caller is by definition someone with no account --
+/// that is what they are here to fix -- and requiring a token to get a
+/// token is the same circle `Login` is exempt to break. What stands in
+/// place of a token is the invitation: 32 bytes an administrator drew
+/// and handed over, which the handler checks before it does anything
+/// else. An invite that is unknown, spent, revoked or lapsed buys
+/// exactly what no token at all buys.
+const EXEMPT: [&str; 3] = [
+    "/raft5.client.Kv/Login",
+    "/raft5.client.Kv/GetConfig",
+    "/raft5.client.Kv/RedeemInvite",
+];
 
 /// Turns away any request to the client API that does not carry a token
 /// this cluster signed.

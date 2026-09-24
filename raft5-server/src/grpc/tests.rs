@@ -2,10 +2,12 @@ use std::sync::Arc;
 
 use super::*;
 use crate::pb::raft5::client::{
-    CommitTransactionRequest, CreateTransactionRequest, DropTransactionRequest, GetKeysRequest,
-    auth_error, commit_transaction_response, config_change_response, create_transaction_response,
-    create_user_response, delete_user_response, get_keys_response, login_response, raft_error,
-    read_response, transaction_aborted, write_response,
+    CommitTransactionRequest, CreateInviteRequest, CreateTransactionRequest, DropTransactionRequest,
+    GetKeysRequest, ListInvitesRequest, RedeemInviteRequest, RevokeInviteRequest, auth_error,
+    commit_transaction_response, config_change_response, create_invite_response,
+    create_transaction_response, create_user_response, delete_user_response, get_keys_response,
+    list_invites_response, login_response, raft_error, read_response, redeem_invite_response,
+    revoke_invite_response, transaction_aborted, write_response,
 };
 use crate::auth::{AuthConfig, AuthContext, InitialAdmin};
 use crate::raft::{self, RoleHandle};
@@ -2514,6 +2516,406 @@ async fn an_ordinary_account_may_not_manage_snapshots() {
 
     // But reading at it needs no privilege at all: it is a read.
     assert!(read_at(&svc, b"s1", b"anything").await.is_ok());
+
+    cleanup(&path);
+}
+
+// --- Invitations ---------------------------------------------------------
+//
+// The workflow these cover has two halves that never meet: an
+// administrator who decides an account may exist, and a person who
+// decides what it is called and what its password is. The tests below
+// are mostly about the seam between them -- what the invitation carries
+// across it, and what it must not.
+
+/// Mints an invitation and hands back `(token, invite_id)`.
+async fn create_invite(
+    svc: &KvService,
+    caller: &str,
+    is_admin: bool,
+    username: Option<&str>,
+    ttl_ms: u64,
+) -> create_invite_response::Result {
+    svc.create_invite(as_user(
+        caller,
+        CreateInviteRequest {
+            is_admin,
+            ttl_ms,
+            username: username.map(str::to_string),
+        },
+    ))
+    .await
+    .unwrap()
+    .into_inner()
+    .result
+    .expect("create_invite always answers")
+}
+
+/// The ordinary case: an invitation for anyone, with the default
+/// lifetime, made by `root`.
+async fn invite(svc: &KvService) -> (String, String) {
+    minted(create_invite(svc, "root", false, None, 0).await)
+}
+
+fn minted(result: create_invite_response::Result) -> (String, String) {
+    match result {
+        create_invite_response::Result::Ok(ok) => {
+            let invite = ok.invite.expect("a minted invitation carries its record");
+            assert!(ok.seq > 0, "the invitation should have been written");
+            (ok.token, invite.invite_id)
+        }
+        other => panic!("expected an invitation, got {other:?}"),
+    }
+}
+
+fn invite_refusal(result: create_invite_response::Result) -> auth_error::Kind {
+    match result {
+        create_invite_response::Result::AuthError(e) => auth_kind(&e),
+        other => panic!("expected the invitation to be refused, got {other:?}"),
+    }
+}
+
+/// `RedeemInvite` carries no identity by design, so this is the one
+/// account call built with a plain `Request`.
+async fn redeem(
+    svc: &KvService,
+    token: &str,
+    username: &str,
+    password: &str,
+) -> redeem_invite_response::Result {
+    svc.redeem_invite(Request::new(RedeemInviteRequest {
+        token: token.to_string(),
+        username: username.to_string(),
+        password: password.to_string(),
+    }))
+    .await
+    .unwrap()
+    .into_inner()
+    .result
+    .expect("redeem_invite always answers")
+}
+
+fn redeemed_seq(result: redeem_invite_response::Result) -> u64 {
+    match result {
+        redeem_invite_response::Result::Ok(ok) => ok.seq,
+        other => panic!("expected the account to be created, got {other:?}"),
+    }
+}
+
+fn redeem_refusal(result: redeem_invite_response::Result) -> auth_error::Kind {
+    match result {
+        redeem_invite_response::Result::AuthError(e) => auth_kind(&e),
+        other => panic!("expected the redemption to be refused, got {other:?}"),
+    }
+}
+
+async fn list_invites(svc: &KvService, caller: &str) -> Vec<crate::pb::raft5::client::Invite> {
+    let result = svc
+        .list_invites(as_user(caller, ListInvitesRequest {}))
+        .await
+        .unwrap()
+        .into_inner()
+        .result
+        .expect("list_invites always answers");
+    match result {
+        list_invites_response::Result::Ok(list) => list.invites,
+        other => panic!("expected a listing, got {other:?}"),
+    }
+}
+
+async fn revoke(svc: &KvService, caller: &str, invite_id: &str) -> revoke_invite_response::Result {
+    svc.revoke_invite(as_user(
+        caller,
+        RevokeInviteRequest {
+            invite_id: invite_id.to_string(),
+        },
+    ))
+    .await
+    .unwrap()
+    .into_inner()
+    .result
+    .expect("revoke_invite always answers")
+}
+
+/// The whole point of the feature, end to end: an administrator issues a
+/// secret, hands it over, and someone else turns it into an account
+/// whose password the administrator never knew.
+#[tokio::test]
+async fn an_invitation_becomes_an_account_its_issuer_cannot_log_in_as() {
+    let (log, path) = open_temp();
+    let svc = authenticated_service(log, "kv-test").await;
+
+    let (token, _) = invite(&svc).await;
+    assert!(redeemed_seq(redeem(&svc, &token, "alice", "correct horse").await) > 0);
+
+    assert!(!login_token(login(&svc, "alice", "correct horse").await).is_empty());
+    // `root` chose nothing about this account but that it could exist.
+    assert_eq!(
+        login_refusal(login(&svc, "alice", "hunter42").await),
+        auth_error::Kind::BadCredentials
+    );
+
+    cleanup(&path);
+}
+
+/// An invitation is spent in the same transaction that writes the
+/// account, which is the whole of "single use".
+#[tokio::test]
+async fn an_invitation_can_only_be_redeemed_once() {
+    let (log, path) = open_temp();
+    let svc = authenticated_service(log, "kv-test").await;
+
+    let (token, _) = invite(&svc).await;
+    redeemed_seq(redeem(&svc, &token, "alice", "one").await);
+
+    assert_eq!(
+        redeem_refusal(redeem(&svc, &token, "bob", "two").await),
+        auth_error::Kind::BadInvite
+    );
+    assert_eq!(
+        login_refusal(login(&svc, "bob", "two").await),
+        auth_error::Kind::BadCredentials,
+        "the second redemption must not have created anything"
+    );
+
+    cleanup(&path);
+}
+
+/// The rights of the new account come from the invitation, which the
+/// redeemer cannot influence -- an invite whose holder could ask for
+/// `is_admin` would be a way to promote oneself by accepting one.
+#[tokio::test]
+async fn the_invitation_decides_whether_the_new_account_is_an_administrator() {
+    let (log, path) = open_temp();
+    let svc = authenticated_service(log, "kv-test").await;
+
+    let (ordinary, _) = minted(create_invite(&svc, "root", false, None, 0).await);
+    let (privileged, _) = minted(create_invite(&svc, "root", true, None, 0).await);
+    redeemed_seq(redeem(&svc, &ordinary, "alice", "one").await);
+    redeemed_seq(redeem(&svc, &privileged, "bob", "two").await);
+
+    // `create_user` is the admin-only call, so who can run it is the
+    // question these two accounts answer differently.
+    assert_eq!(
+        create_refusal(create_user(&svc, "alice", "carol", "three", false).await),
+        auth_error::Kind::NotAdmin
+    );
+    assert!(created_seq(create_user(&svc, "bob", "carol", "three", false).await) > 0);
+
+    cleanup(&path);
+}
+
+/// Issuing one is an administrator's call. It grants an account, and
+/// possibly an administrator's account, so it is exactly as privileged
+/// as `CreateUser`.
+#[tokio::test]
+async fn only_an_administrator_may_issue_or_list_or_revoke_an_invitation() {
+    let (log, path) = open_temp();
+    let svc = authenticated_service(log, "kv-test").await;
+    created_seq(create_user(&svc, "root", "alice", "correct horse", false).await);
+
+    let (_, invite_id) = invite(&svc).await;
+
+    assert_eq!(
+        invite_refusal(create_invite(&svc, "alice", true, None, 0).await),
+        auth_error::Kind::NotAdmin
+    );
+    match svc
+        .list_invites(as_user("alice", ListInvitesRequest {}))
+        .await
+        .unwrap()
+        .into_inner()
+        .result
+    {
+        Some(list_invites_response::Result::AuthError(e)) => {
+            assert_eq!(auth_kind(&e), auth_error::Kind::NotAdmin);
+        }
+        other => panic!("expected NOT_ADMIN, got {other:?}"),
+    }
+    match revoke(&svc, "alice", &invite_id).await {
+        revoke_invite_response::Result::AuthError(e) => {
+            assert_eq!(auth_kind(&e), auth_error::Kind::NotAdmin);
+        }
+        other => panic!("expected NOT_ADMIN, got {other:?}"),
+    }
+
+    cleanup(&path);
+}
+
+/// The remedy for an invitation sent to the wrong address: the secret
+/// cannot be recalled, only made worthless.
+#[tokio::test]
+async fn a_revoked_invitation_cannot_be_redeemed() {
+    let (log, path) = open_temp();
+    let svc = authenticated_service(log, "kv-test").await;
+
+    let (token, invite_id) = invite(&svc).await;
+    match revoke(&svc, "root", &invite_id).await {
+        revoke_invite_response::Result::Seq(seq) => assert!(seq > 0),
+        other => panic!("expected the invitation to be withdrawn, got {other:?}"),
+    }
+
+    assert_eq!(
+        redeem_refusal(redeem(&svc, &token, "alice", "one").await),
+        auth_error::Kind::BadInvite
+    );
+
+    cleanup(&path);
+}
+
+/// An invitation outlives neither its ttl nor the leader's clock.
+#[tokio::test]
+async fn a_lapsed_invitation_cannot_be_redeemed() {
+    let (log, path) = open_temp();
+    let svc = authenticated_service(log, "kv-test").await;
+
+    let (token, _) = minted(create_invite(&svc, "root", false, None, 1).await);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    assert_eq!(
+        redeem_refusal(redeem(&svc, &token, "alice", "one").await),
+        auth_error::Kind::BadInvite
+    );
+    // And the next issue sweeps it, so lapsed records do not pile up in
+    // the reserved range with nothing to remove them.
+    invite(&svc).await;
+    assert_eq!(
+        list_invites(&svc, "root").await.len(),
+        1,
+        "the lapsed invitation should have been swept by the new one"
+    );
+
+    cleanup(&path);
+}
+
+/// A pinned invitation is still a secret; the pin is what stops a
+/// misdelivered one from quietly becoming an account under a name
+/// nobody expected.
+#[tokio::test]
+async fn an_invitation_pinned_to_a_username_refuses_any_other() {
+    let (log, path) = open_temp();
+    let svc = authenticated_service(log, "kv-test").await;
+
+    let (token, _) = minted(create_invite(&svc, "root", false, Some("alice"), 0).await);
+
+    assert_eq!(
+        redeem_refusal(redeem(&svc, &token, "mallory", "one").await),
+        auth_error::Kind::BadInvite
+    );
+    assert!(redeemed_seq(redeem(&svc, &token, "alice", "one").await) > 0);
+
+    cleanup(&path);
+}
+
+/// Choosing a name somebody already has is a thing the holder can fix by
+/// choosing another -- so it must not cost them the invitation.
+#[tokio::test]
+async fn a_name_that_is_taken_refuses_the_redemption_without_spending_it() {
+    let (log, path) = open_temp();
+    let svc = authenticated_service(log, "kv-test").await;
+
+    let (token, _) = invite(&svc).await;
+    assert_eq!(
+        redeem_refusal(redeem(&svc, &token, "root", "one").await),
+        auth_error::Kind::AlreadyExists
+    );
+    assert!(
+        redeemed_seq(redeem(&svc, &token, "alice", "one").await) > 0,
+        "the invitation should have survived the name clash"
+    );
+    assert!(!login_token(login(&svc, "root", "hunter42").await).is_empty(),
+        "the existing account must not have been overwritten");
+
+    cleanup(&path);
+}
+
+/// What a listing says, and what it deliberately does not: the token is
+/// gone, and a redeemed invitation is not an outstanding one.
+#[tokio::test]
+async fn the_listing_shows_outstanding_invitations_and_never_their_secrets() {
+    let (log, path) = open_temp();
+    let svc = authenticated_service(log, "kv-test").await;
+
+    let (token, invite_id) = minted(create_invite(&svc, "root", true, Some("alice"), 0).await);
+
+    let listed = list_invites(&svc, "root").await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].invite_id, invite_id);
+    assert_eq!(listed[0].issued_by, "root");
+    assert!(listed[0].is_admin);
+    assert_eq!(listed[0].username.as_deref(), Some("alice"));
+    assert!(listed[0].expires_unix_ms > 0);
+    // The id is a hash of the token, not the token: naming an invitation
+    // is not the same as being able to spend one.
+    assert_ne!(listed[0].invite_id, token);
+
+    redeemed_seq(redeem(&svc, &token, "alice", "one").await);
+    assert!(
+        list_invites(&svc, "root").await.is_empty(),
+        "a redeemed invitation is no longer outstanding"
+    );
+
+    cleanup(&path);
+}
+
+/// Nothing about a token that is not one this cluster issued
+/// distinguishes it from one that was: both name no record.
+#[tokio::test]
+async fn a_token_this_cluster_never_issued_is_refused() {
+    let (log, path) = open_temp();
+    let svc = authenticated_service(log, "kv-test").await;
+
+    for token in ["", "not-a-token", &"x".repeat(4096)] {
+        assert_eq!(
+            redeem_refusal(redeem(&svc, token, "alice", "one").await),
+            auth_error::Kind::BadInvite,
+            "{token:?} should not be redeemable"
+        );
+    }
+
+    cleanup(&path);
+}
+
+/// The lifetime is the cluster's policy. One past what it grants is
+/// refused rather than quietly shortened, so an issuer never hands out
+/// an invitation believing it good for longer than it is.
+#[tokio::test]
+async fn an_invitation_may_not_outlast_what_the_cluster_grants() {
+    let (log, path) = open_temp();
+    let svc = authenticated_service(log, "kv-test").await;
+
+    let status = svc
+        .create_invite(as_user(
+            "root",
+            CreateInviteRequest {
+                is_admin: false,
+                ttl_ms: MAX_INVITE_TTL.as_millis() as u64 + 1,
+                username: None,
+            },
+        ))
+        .await
+        .expect_err("an over-long lifetime is refused outright");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    cleanup(&path);
+}
+
+/// With no secret there are no accounts to invite anyone into, so these
+/// say so rather than half-working -- the same answer `Login` and
+/// `CreateUser` give.
+#[tokio::test]
+async fn the_invitation_rpcs_report_themselves_disabled_without_a_secret() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+
+    assert_eq!(
+        invite_refusal(create_invite(&svc, "root", false, None, 0).await),
+        auth_error::Kind::AuthDisabled
+    );
+    assert_eq!(
+        redeem_refusal(redeem(&svc, "whatever", "alice", "one").await),
+        auth_error::Kind::AuthDisabled
+    );
 
     cleanup(&path);
 }

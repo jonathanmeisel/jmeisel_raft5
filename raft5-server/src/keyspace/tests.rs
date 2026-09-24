@@ -85,3 +85,62 @@ fn a_username_cannot_contain_anything_that_would_let_it_escape_its_prefix() {
         assert!(!valid(username), "{username:?} should be refused");
     }
 }
+
+#[test]
+fn an_invite_key_is_reserved() {
+    assert!(is_reserved(&invite_key(&"a".repeat(INVITE_ID_LEN))));
+}
+
+/// The same property `user_key` needs, for the same reason: the id is
+/// appended to a fixed prefix with nothing after it, so the character
+/// set has to be what stops a key climbing back out.
+#[test]
+fn every_valid_invite_id_produces_a_reserved_key() {
+    for id in [
+        "a".repeat(INVITE_ID_LEN),
+        "-".repeat(INVITE_ID_LEN),
+        "_".repeat(INVITE_ID_LEN),
+        // The shape a real one has: `invite_id` is base64 of a SHA-256.
+        crate::auth::invite_id("some token"),
+    ] {
+        assert!(
+            validate_invite_id(&id).is_ok(),
+            "{id:?} should be a valid invite id"
+        );
+        assert!(is_reserved(&invite_key(&id)));
+    }
+}
+
+/// An id is never a name anybody picked -- every one this cluster issues
+/// is the base64 of a hash -- so anything that is not exactly that shape
+/// is refused rather than accommodated.
+#[test]
+fn an_invite_id_that_is_not_a_hash_is_refused() {
+    for id in [
+        "",
+        "short",
+        &"a".repeat(INVITE_ID_LEN - 1),
+        &"a".repeat(INVITE_ID_LEN + 1),
+        // Right length, wrong alphabet: base64 padding, the separator
+        // the prefix is built from, and a NUL that would put the id back
+        // at the top of the reserved range.
+        &format!("{}=", "a".repeat(INVITE_ID_LEN - 1)),
+        &format!("{}/", "a".repeat(INVITE_ID_LEN - 1)),
+        &format!("{}\0", "a".repeat(INVITE_ID_LEN - 1)),
+    ] {
+        assert!(
+            validate_invite_id(id).is_err(),
+            "{id:?} should be refused as an invite id"
+        );
+    }
+}
+
+/// Accounts and invitations share the `\0auth/` prefix, so this is worth
+/// stating: no username can produce the key of an invitation, or the
+/// other way round.
+#[test]
+fn a_user_key_and_an_invite_key_can_never_meet() {
+    let id = crate::auth::invite_id("some token");
+    assert_ne!(user_key(&id), invite_key(&id));
+    assert!(!user_key(&id).starts_with(INVITE_PREFIX));
+}

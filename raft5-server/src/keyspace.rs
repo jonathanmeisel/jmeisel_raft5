@@ -34,6 +34,14 @@ pub const RESERVED: u8 = 0;
 /// looking at both halves of the same invariant.
 const USER_PREFIX: &[u8] = b"\0auth/user/";
 
+/// Where outstanding invitations live, under the same reservation and
+/// for the same reasons -- and with one of its own. An invite record is
+/// a credential's hash and the rights that credential buys; a client who
+/// could read one would learn which accounts are about to exist and
+/// which of them will be administrators, and one who could write one
+/// would mint themselves an invitation.
+pub const INVITE_PREFIX: &[u8] = b"\0auth/invite/";
+
 /// Whether `key` belongs to the cluster rather than to a client.
 ///
 /// The empty key is *not* reserved -- it has no first byte to be
@@ -55,6 +63,44 @@ pub fn user_key(username: &str) -> Vec<u8> {
     key.extend_from_slice(USER_PREFIX);
     key.extend_from_slice(username.as_bytes());
     key
+}
+
+/// Where the invitation with this id is stored.
+///
+/// Sound for an id [`validate_invite_id`] has accepted, on exactly the
+/// terms [`user_key`] is sound for a validated username.
+pub fn invite_key(invite_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(INVITE_PREFIX.len() + invite_id.len());
+    key.extend_from_slice(INVITE_PREFIX);
+    key.extend_from_slice(invite_id.as_bytes());
+    key
+}
+
+/// How long an invite id is: a SHA-256 in URL-safe base64 without
+/// padding, which is always 43 characters.
+const INVITE_ID_LEN: usize = 43;
+
+/// Checks that `invite_id` is one [`invite_key`] can safely build a key
+/// from.
+///
+/// Unlike a username, this is not a name anybody chose -- every id this
+/// cluster ever issues is the base64 of a hash, so the check is for
+/// exactly that shape rather than for a permissive set of characters
+/// someone might reasonably want. An id that is not one the cluster
+/// could have minted is refused before it reaches the store, which keeps
+/// the append in `invite_key` as safe as the one in `user_key`.
+pub fn validate_invite_id(invite_id: &str) -> Result<(), Status> {
+    if invite_id.len() != INVITE_ID_LEN
+        || !invite_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        return Err(Status::invalid_argument(
+            "that is not an invite id; an id is 43 characters of URL-safe base64, \
+             as CreateInvite and ListInvites give them",
+        ));
+    }
+    Ok(())
 }
 
 /// How long a username may be. Bounded so that a username cannot be

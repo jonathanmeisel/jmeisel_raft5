@@ -9,7 +9,7 @@ use std::io::{self, IsTerminal, Write};
 
 use clap::Parser;
 
-use raft5_client::{Client, Error};
+use raft5_client::{Client, Error, Invite};
 
 /// Opens an interactive session against a raft5 cluster.
 #[derive(Parser)]
@@ -332,10 +332,143 @@ async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
             let [username] = fixed_args(args, "delete_user <username>")?;
             print_seq(client.delete_user(username).await);
         }
+        "invite" => {
+            let options = invite_options(args)?;
+            match client
+                .create_invite(options.is_admin, options.ttl, options.username.as_deref())
+                .await
+            {
+                Ok(new) => print_new_invite(&new),
+                Err(e) => println!("error: {e}"),
+            }
+        }
+        "redeem" => {
+            // The token is a positional argument and the password is
+            // not, which looks inconsistent and is not. A password is
+            // reusable and its owner's forever; an invitation is
+            // single-use and stops being a secret the moment it is
+            // spent, which is the same moment this command spends it.
+            let (token, username) = match args {
+                [token] => (token.clone(), read_line("username: ")?),
+                [token, username] => (token.clone(), username.clone()),
+                _ => return Err("usage: redeem <token> [username]".to_string()),
+            };
+            let password = prompt_password(&username)?;
+            match client.redeem_invite(&token, &username, &password).await {
+                Ok(seq) => println!("ok, seq={seq} -- now `login {username}`"),
+                Err(e) => println!("error: {e}"),
+            }
+        }
+        "invites" => match client.list_invites().await {
+            Ok(invites) if invites.is_empty() => println!("(no outstanding invitations)"),
+            Ok(invites) => {
+                let now = unix_millis();
+                for invite in &invites {
+                    println!("{}", describe_invite(invite, now));
+                }
+            }
+            Err(e) => println!("error: {e}"),
+        },
+        "revoke_invite" => {
+            let [invite_id] = fixed_args(args, "revoke_invite <invite_id>")?;
+            print_seq(client.revoke_invite(invite_id).await);
+        }
         other => println!("unknown command {other:?}; type `help` for a list"),
     }
 
     Ok(true)
+}
+
+/// What `invite` was asked for.
+struct InviteOptions {
+    is_admin: bool,
+    username: Option<String>,
+    /// `Duration::ZERO` asks the cluster for its own default rather than
+    /// guessing at one here -- how long an invitation may last is the
+    /// cluster's policy, and this shell should not have a second opinion
+    /// about it.
+    ttl: std::time::Duration,
+}
+
+/// `invite`'s flags, which are enough of them to want parsing rather
+/// than matching on shapes the way the fixed-arity commands do.
+fn invite_options(args: &[String]) -> Result<InviteOptions, String> {
+    const USAGE: &str = "usage: invite [--admin] [--user <name>] [--hours <n>]";
+    let mut options = InviteOptions {
+        is_admin: false,
+        username: None,
+        ttl: std::time::Duration::ZERO,
+    };
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--admin" => options.is_admin = true,
+            "--user" => {
+                options.username = Some(rest.next().ok_or_else(|| USAGE.to_string())?.clone());
+            }
+            "--hours" => {
+                let hours: u64 = rest
+                    .next()
+                    .ok_or_else(|| USAGE.to_string())?
+                    .parse()
+                    .map_err(|_| "--hours takes a whole number of hours".to_string())?;
+                options.ttl = std::time::Duration::from_secs(hours * 60 * 60);
+            }
+            _ => return Err(USAGE.to_string()),
+        }
+    }
+    Ok(options)
+}
+
+/// Prints a freshly minted invitation, token first.
+///
+/// The warning is not decoration. This is the only time the cluster will
+/// ever produce the token -- it keeps a hash -- so an issuer who scrolls
+/// past it has to revoke the invitation and mint another.
+fn print_new_invite(new: &raft5_client::NewInvite) {
+    println!("token: {}", new.token);
+    println!("  ^ copy this now; the cluster keeps only a hash and cannot show it again");
+    println!("{}", describe_invite(&new.invite, unix_millis()));
+}
+
+fn describe_invite(invite: &Invite, now_unix_ms: u64) -> String {
+    let who = match &invite.username {
+        Some(username) => format!("for {username}"),
+        None => "for anyone holding it".to_string(),
+    };
+    let rights = if invite.is_admin { "admin" } else { "ordinary" };
+    // The id leads the line: it is what `revoke_invite` takes, and the
+    // thing most likely to be copied out of a listing.
+    format!(
+        "{}  {who}, {rights}, from {}, {}",
+        invite.id,
+        invite.issued_by,
+        remaining(invite.expires_unix_ms, now_unix_ms)
+    )
+}
+
+/// How much longer an invitation has, by this machine's clock.
+///
+/// Relative rather than absolute because the cluster's clock is the one
+/// that decides and this one is only approximating it -- "in about 3h"
+/// is honest about that in a way a printed timestamp would not be.
+fn remaining(expires_unix_ms: u64, now_unix_ms: u64) -> String {
+    let left_ms = expires_unix_ms.saturating_sub(now_unix_ms);
+    if left_ms == 0 {
+        return "lapsed".to_string();
+    }
+    let minutes = left_ms / 60_000;
+    match (minutes / 60, minutes % 60) {
+        (0, m) => format!("expires in {m}m"),
+        (h, m) => format!("expires in {h}h{m:02}m"),
+    }
+}
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Reads one line from stdin, for the arguments a command would rather
@@ -425,6 +558,13 @@ fn print_help() {
             "whoami                           show who this session is logged in as",
             "create_user <name> [--admin]     create an account; administrators only",
             "delete_user <name>               remove an account; administrators only",
+            "invite [--admin] [--user <name>] mint a single-use invitation for someone else to",
+            "       [--hours <n>]              make their own account with. administrators only;",
+            "                                  the token it prints is shown once and never again",
+            "redeem <token> [username]        spend an invitation on a new account. needs no",
+            "                                  login -- it is what you run before you have one",
+            "invites                          list the invitations still outstanding; admins only",
+            "revoke_invite <id>               withdraw one, by the id `invites` shows",
             "help                             show this message",
             "quit                             end the session",
         ]

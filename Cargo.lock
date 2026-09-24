@@ -1567,11 +1567,13 @@ name = "raft5-server"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "base64",
  "bytes",
  "clap",
  "fjall",
  "futures-core",
  "futures-util",
+ "getrandom 0.4.3",
  "http",
  "jsonwebtoken",
  "postcard",
@@ -1579,6 +1581,7 @@ dependencies = [
  "raft5-shared",
  "serde",
  "serde_bytes",
+ "sha2",
  "tokio",
  "tokio-stream",
  "tokio-util",

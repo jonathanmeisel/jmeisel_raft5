@@ -136,6 +136,7 @@ mod checkpoint;
 mod codec;
 mod gc;
 mod meta;
+mod reserved;
 mod snapshot;
 
 use codec::{

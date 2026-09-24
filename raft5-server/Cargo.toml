@@ -31,6 +31,13 @@ serde_bytes = "0.11.19"
 jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust_crypto"] }
 argon2 = "0.6.0"
 http = "1.5.0"
+# Invite tokens: 32 bytes from the OS (`getrandom`), stored as their
+# SHA-256 (`sha2`) so the log never holds the secret, and spelled in
+# URL-safe base64 (`base64`) so a whole token survives being pasted into
+# a chat window or a shell.
+getrandom = "0.4.3"
+sha2 = "0.10.9"
+base64 = "0.22.1"
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }

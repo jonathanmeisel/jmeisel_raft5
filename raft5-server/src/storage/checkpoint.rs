@@ -44,8 +44,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::codec::{Kind, chain_start, row_kind, row_seq, row_user_key};
-use super::{RaftLog, Result, StorageError};
+use super::{RaftLog, Result};
 
 /// First bytes of every checkpoint record's key.
 ///
@@ -119,7 +118,7 @@ impl RaftLog {
     /// which would then have to know what a checkpoint is.
     pub fn live_checkpoint_seqs(&self) -> Result<Vec<u64>> {
         let mut seqs = Vec::new();
-        self.for_each_live_checkpoint(|_, seq, _| {
+        self.for_each_live_record(PREFIX, |_, seq, _| {
             seqs.push(seq);
             Ok(())
         })?;
@@ -133,7 +132,7 @@ impl RaftLog {
     /// which is what `ListSnapshots` needs and the GC does not.
     pub fn list_checkpoints(&self) -> Result<Vec<Checkpoint>> {
         let mut out = Vec::new();
-        self.for_each_live_checkpoint(|id, seq, row| {
+        self.for_each_live_record(PREFIX, |id, seq, row| {
             let created_unix_ms = match self.versions.get(row)? {
                 Some(bytes) => {
                     let record: CheckpointRecord = postcard::from_bytes(&bytes)?;
@@ -158,48 +157,10 @@ impl RaftLog {
     /// How many checkpoints are live. For the cap.
     pub fn checkpoint_count(&self) -> Result<usize> {
         let mut n = 0;
-        self.for_each_live_checkpoint(|_, _, _| {
+        self.for_each_live_record(PREFIX, |_, _, _| {
             n += 1;
             Ok(())
         })?;
         Ok(n)
-    }
-
-    /// Walk the head row of every checkpoint record that currently
-    /// exists, in key order, skipping ones whose head is a tombstone --
-    /// those are removed checkpoints whose rows the GC has not collected
-    /// yet.
-    ///
-    /// One iterator over the prefix rather than a seek per record, for
-    /// the reason `scan_as_of` gives: a single pinned nonce, so the walk
-    /// sees one point in time.
-    fn for_each_live_checkpoint(
-        &self,
-        mut f: impl FnMut(Vec<u8>, u64, &[u8]) -> Result<()>,
-    ) -> Result<()> {
-        let mut settled: Option<Vec<u8>> = None;
-        for item in self.versions.range(chain_start(PREFIX)..) {
-            let row = item.key()?;
-            let key = row_user_key(&row)?;
-            if !key.starts_with(PREFIX) {
-                break;
-            }
-            let chain = super::codec::row_chain(&row)?;
-            if settled.as_deref() == Some(chain) {
-                continue;
-            }
-            settled = Some(chain.to_vec());
-            if row_kind(&row)? != Kind::Value {
-                continue;
-            }
-            let id = key
-                .get(PREFIX.len()..)
-                .ok_or(StorageError::Corrupt(
-                    "checkpoint key is shorter than its prefix",
-                ))?
-                .to_vec();
-            f(id, row_seq(&row)?, &row)?;
-        }
-        Ok(())
     }
 }

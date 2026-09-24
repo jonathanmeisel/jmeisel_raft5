@@ -135,6 +135,55 @@ service Kv {
   // that token expired.
   rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
   rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse);
+
+  // Invitations: accounts created by the person who will own them,
+  // rather than by an administrator on their behalf.
+  //
+  // CreateUser asks an administrator to choose someone else's password,
+  // which means knowing it, typing it, and sending it to them over
+  // whatever channel is to hand. The invitation flow replaces that with
+  // a single-use secret: the administrator decides *that* an account may
+  // exist and what rights it gets, the recipient decides the username
+  // and the password, and no password is ever known to two people.
+  //
+  // What an invite is: 32 random bytes, handed out once by CreateInvite
+  // and never recoverable afterwards -- the cluster keeps only a SHA-256
+  // of them, so a leaked log, snapshot or database directory yields no
+  // usable invite. Redeeming one consumes it in the same transaction
+  // that writes the account, so a token works exactly once however many
+  // callers race to use it.
+
+  // Mint an invitation. Administrators only.
+  //
+  // The rights the resulting account will have are fixed here, by the
+  // administrator, and are not the recipient's to choose -- an invite
+  // whose holder could ask for `is_admin` would be a way to promote
+  // oneself by accepting an invitation.
+  rpc CreateInvite(CreateInviteRequest) returns (CreateInviteResponse);
+
+  // Spend an invitation on a new account.
+  //
+  // The one RPC besides Login and GetConfig that is answered without a
+  // token, and it has to be: the caller is someone who has no account
+  // yet, which is the entire point of them holding an invite. The token
+  // is the credential, and is the only thing standing between this call
+  // and an open cluster.
+  //
+  // Answered only by the leader. `password` is plaintext on the wire,
+  // exactly as Login's is, with the same caveat until this API is behind
+  // TLS.
+  rpc RedeemInvite(RedeemInviteRequest) returns (RedeemInviteResponse);
+
+  // The invitations that are outstanding, with who issued each one and
+  // when it lapses -- never the secret, which no longer exists anywhere
+  // once CreateInvite has answered. Administrators only: an invite names
+  // the person who issued it and may name its intended recipient.
+  rpc ListInvites(ListInvitesRequest) returns (ListInvitesResponse);
+
+  // Withdraw an invitation that has not been redeemed. Administrators
+  // only. This is the remedy for one sent to the wrong address: there is
+  // no way to un-send the secret, only to make it worthless.
+  rpc RevokeInvite(RevokeInviteRequest) returns (RevokeInviteResponse);
 }
 
 // Carried in every response so a client can find the real leader without a
@@ -527,6 +576,13 @@ message AuthError {
     // This node was started without a signing secret, so it has no
     // accounts to consult and nothing to sign a token with.
     AUTH_DISABLED = 5;
+    // The invitation offered is not one that can be spent: unknown,
+    // already redeemed, revoked, lapsed, or issued for a username other
+    // than the one being asked for. Which of those is deliberately not
+    // said in the `kind` -- `detail` says more, for a human, but a
+    // client has one thing to do about any of them, which is to ask the
+    // person who issued it for another.
+    BAD_INVITE = 6;
   }
   Kind kind = 1;
   string detail = 2;
@@ -575,6 +631,118 @@ message DeleteUserRequest {
 
 message DeleteUserResponse {
   oneof result {
+    uint64 seq = 1;
+    RaftError error = 2;
+    AuthError auth_error = 3;
+  }
+}
+
+message CreateInviteRequest {
+  // Whether the account this invite creates may itself manage accounts.
+  // The issuer's choice, never the recipient's.
+  bool is_admin = 1;
+  // How long the invite may be spent for, from the moment the leader
+  // writes it. 0 means the server's default (24 hours). Longer than the
+  // server is willing to grant is refused rather than quietly shortened,
+  // for the reason CreateTransactionRequest.ttl_ms gives.
+  uint64 ttl_ms = 2;
+  // If set, the one username this invite may create. An invite meant for
+  // a particular person, rather than for whoever ends up holding it --
+  // it does not make the invite less of a secret, it just stops a
+  // misdelivered one from becoming an account under an unexpected name.
+  optional string username = 3;
+}
+
+// An invitation as everyone but its recipient sees it: everything about
+// it except the secret.
+message Invite {
+  // The SHA-256 of the token, in URL-safe base64. Derived rather than
+  // stored alongside the secret, so this is a name that can be written
+  // down, listed and revoked by without being worth anything to whoever
+  // reads it -- naming an invite does not help you spend it.
+  string invite_id = 1;
+  // The administrator who issued it.
+  string issued_by = 2;
+  bool is_admin = 3;
+  // The username it is pinned to, if it was pinned to one.
+  optional string username = 4;
+  // When it stops being redeemable, by the leader's clock -- the only
+  // clock involved, since neither the issuer's nor the recipient's can
+  // be trusted to bound a credential.
+  uint64 expires_unix_ms = 5;
+}
+
+message CreateInviteOk {
+  // The secret, and the only time it is ever transmitted. The cluster
+  // keeps its hash, so an issuer who loses this has no way to recover it
+  // and has to revoke the invite and mint another.
+  string token = 1;
+  Invite invite = 2;
+  // The sequence number the invite record was written at.
+  uint64 seq = 3;
+}
+
+message CreateInviteResponse {
+  oneof result {
+    CreateInviteOk ok = 1;
+    RaftError error = 2;
+    AuthError auth_error = 3;
+  }
+}
+
+message RedeemInviteRequest {
+  // The secret, exactly as CreateInvite gave it out.
+  string token = 1;
+  // The account to create. Free for the recipient to choose, unless the
+  // invite pinned one, and subject to the same character set every other
+  // username is.
+  string username = 2;
+  string password = 3;
+}
+
+message RedeemInviteOk {
+  // The sequence number the account record was written at. The invite's
+  // removal landed at the same one: they are the same transaction, which
+  // is what makes an invite single-use.
+  uint64 seq = 1;
+}
+
+message RedeemInviteResponse {
+  oneof result {
+    RedeemInviteOk ok = 1;
+    RaftError error = 2;
+    // ALREADY_EXISTS here means the username is taken, and the invite
+    // has *not* been spent -- the caller is free to try another name
+    // with the same token.
+    AuthError auth_error = 3;
+  }
+}
+
+message ListInvitesRequest {}
+
+message InviteList {
+  // In id order, which is hash order, which is no order at all --
+  // there is nothing meaningful to sort invites by that is not already
+  // in each one.
+  repeated Invite invites = 1;
+}
+
+message ListInvitesResponse {
+  oneof result {
+    InviteList ok = 1;
+    RaftError error = 2;
+    AuthError auth_error = 3;
+  }
+}
+
+message RevokeInviteRequest {
+  // As `Invite.invite_id` gives it, not the token itself.
+  string invite_id = 1;
+}
+
+message RevokeInviteResponse {
+  oneof result {
+    // The seq the removal landed at.
     uint64 seq = 1;
     RaftError error = 2;
     AuthError auth_error = 3;

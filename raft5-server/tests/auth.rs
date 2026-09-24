@@ -15,8 +15,9 @@ use tonic::Request;
 
 use raft5_server::auth::{AuthConfig, InitialAdmin};
 use raft5_server::pb::raft5::client::{
-    BootstrapRequest, CreateTransactionRequest, CreateUserRequest, GetConfigRequest, LoginRequest,
-    ReadRequest, create_user_response, login_response,
+    BootstrapRequest, CreateInviteRequest, CreateTransactionRequest, CreateUserRequest,
+    GetConfigRequest, ListInvitesRequest, LoginRequest, ReadRequest, RedeemInviteRequest,
+    create_invite_response, create_user_response, login_response, redeem_invite_response,
 };
 
 use common::TestNode;
@@ -293,4 +294,154 @@ async fn a_node_without_a_secret_requires_and_ignores_tokens_alike() {
         ))
         .await
         .expect("and is not troubled by a token it never asked for");
+}
+
+/// The third exemption, and the only one that writes.
+///
+/// `RedeemInvite` is answered without a bearer token because its callers
+/// are people who have no account yet. What it is not is unprotected:
+/// the layer lets the request through, and the handler then refuses
+/// everything that does not carry an invitation this cluster issued.
+/// This test is about that distinction -- the request is *answered*, on
+/// its merits, rather than turned away for want of a token.
+#[tokio::test]
+async fn an_invitation_creates_an_account_with_no_token_anywhere() {
+    let node = TestNode::with_auth("auth6", auth_config(Some(("root", "hunter42"))).await).await;
+    let client = node.client();
+
+    let token = log_in(&node, "root", "hunter42").await;
+    client
+        .as_ref()
+        .clone()
+        .bootstrap(with_token(
+            &token,
+            BootstrapRequest {
+                server_id: node.id.clone(),
+            },
+        ))
+        .await
+        .expect("the startup administrator may bootstrap");
+    let token = log_in(&node, "root", "hunter42").await;
+
+    // Issuing one needs the administrator's token, like any other
+    // account management.
+    let status = client
+        .as_ref()
+        .clone()
+        .create_invite(Request::new(CreateInviteRequest::default()))
+        .await
+        .expect_err("issuing an invitation needs a token");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+    let status = client
+        .as_ref()
+        .clone()
+        .list_invites(Request::new(ListInvitesRequest {}))
+        .await
+        .expect_err("listing invitations needs a token");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+    let issued = client
+        .as_ref()
+        .clone()
+        .create_invite(with_token(
+            &token,
+            CreateInviteRequest {
+                is_admin: false,
+                ttl_ms: 0,
+                username: None,
+            },
+        ))
+        .await
+        .expect("an administrator may issue an invitation")
+        .into_inner()
+        .result
+        .expect("create_invite always answers");
+    let invite_token = match issued {
+        create_invite_response::Result::Ok(ok) => ok.token,
+        other => panic!("expected an invitation, got {other:?}"),
+    };
+
+    // No `with_token` anywhere here: this is someone who has nothing but
+    // the secret they were handed.
+    let redeemed = client
+        .as_ref()
+        .clone()
+        .redeem_invite(Request::new(RedeemInviteRequest {
+            token: invite_token,
+            username: "alice".to_string(),
+            password: "correct horse".to_string(),
+        }))
+        .await
+        .expect("redeeming an invitation never needs a token")
+        .into_inner()
+        .result
+        .expect("redeem_invite always answers");
+    assert!(
+        matches!(redeemed, redeem_invite_response::Result::Ok(ref ok) if ok.seq > 0),
+        "expected the account to be created, got {redeemed:?}"
+    );
+
+    // And the account it made is an ordinary one, which can now get a
+    // token the ordinary way.
+    assert!(!log_in(&node, "alice", "correct horse").await.is_empty());
+}
+
+/// The exemption is for the RPC, not for whoever calls it. A redemption
+/// with no usable invitation is answered and refused -- which is the
+/// whole of what keeps an open write on this service from being an open
+/// cluster.
+#[tokio::test]
+async fn a_redemption_without_a_real_invitation_creates_nothing() {
+    let node = TestNode::with_auth("auth7", auth_config(Some(("root", "hunter42"))).await).await;
+    let client = node.client();
+
+    let token = log_in(&node, "root", "hunter42").await;
+    client
+        .as_ref()
+        .clone()
+        .bootstrap(with_token(
+            &token,
+            BootstrapRequest {
+                server_id: node.id.clone(),
+            },
+        ))
+        .await
+        .expect("the startup administrator may bootstrap");
+
+    let refused = client
+        .as_ref()
+        .clone()
+        .redeem_invite(Request::new(RedeemInviteRequest {
+            token: "a token nobody issued".to_string(),
+            username: "mallory".to_string(),
+            password: "letmein".to_string(),
+        }))
+        .await
+        .expect("the request is answered, not turned away")
+        .into_inner()
+        .result
+        .expect("redeem_invite always answers");
+    assert!(
+        matches!(refused, redeem_invite_response::Result::AuthError(_)),
+        "expected a refusal, got {refused:?}"
+    );
+
+    assert!(
+        matches!(
+            node.client()
+                .as_ref()
+                .clone()
+                .login(Request::new(LoginRequest {
+                    username: "mallory".to_string(),
+                    password: "letmein".to_string(),
+                }))
+                .await
+                .expect("Login needs no token")
+                .into_inner()
+                .result,
+            Some(login_response::Result::AuthError(_))
+        ),
+        "no account should have been created"
+    );
 }

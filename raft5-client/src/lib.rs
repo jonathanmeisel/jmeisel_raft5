@@ -40,16 +40,20 @@ use tonic::Status;
 use raft5_shared::raft5::client::{
     AddServerRequest, BootstrapRequest, CommitTransactionRequest, CommitTransactionResponse,
     ConfigChangeResponse, CreateSnapshotRequest, CreateSnapshotResponse, CreateTransactionRequest,
-    CreateTransactionResponse, CreateUserRequest, CreateUserResponse, DeleteUserRequest,
+    CreateInviteRequest, CreateInviteResponse, CreateTransactionResponse, CreateUserRequest,
+    CreateUserResponse, DeleteUserRequest,
     DeleteUserResponse, DropTransactionRequest, GetKeysRequest, GetKeysResponse, GetVersionRequest,
-    GetVersionResponse, ListSnapshotsRequest, ListSnapshotsResponse, LoginRequest, LoginResponse,
+    GetVersionResponse, ListInvitesRequest, ListInvitesResponse, ListSnapshotsRequest,
+    ListSnapshotsResponse, LoginRequest, LoginResponse, RedeemInviteRequest, RedeemInviteResponse,
+    RevokeInviteRequest, RevokeInviteResponse,
     RaftError as PbRaftError, ReadRequest, ReadResponse, RemoveServerRequest,
     RemoveSnapshotRequest, RemoveSnapshotResponse, WriteRequest, WriteResponse, auth_error,
     commit_transaction_response, config_change_response, create_snapshot_response,
-    create_transaction_response, create_user_response, delete_user_response, get_keys_request,
-    get_keys_response, get_version_request, get_version_response, list_snapshots_response,
-    login_response, raft_error, read_request, read_response, remove_snapshot_response,
-    transaction_aborted, write_response,
+    create_invite_response, create_transaction_response, create_user_response,
+    delete_user_response, get_keys_request, get_keys_response, get_version_request,
+    get_version_response, list_invites_response, list_snapshots_response, login_response,
+    raft_error, read_request, read_response, redeem_invite_response, remove_snapshot_response,
+    revoke_invite_response, transaction_aborted, write_response,
 };
 
 use routing::{Kv, Router};
@@ -171,6 +175,11 @@ pub enum Denial {
     /// The cluster was started without a signing secret, so it keeps no
     /// accounts and issues no tokens.
     AuthDisabled,
+    /// The invitation offered cannot be spent: unknown, already
+    /// redeemed, withdrawn, lapsed, or issued for a different username.
+    /// Which of those is not distinguished -- there is one thing to do
+    /// about any of them, which is to ask for another.
+    BadInvite,
     /// A reason this version of the client does not know about.
     Unknown,
 }
@@ -183,6 +192,7 @@ impl std::fmt::Display for Denial {
             Self::NoSuchUser => "there is no such account",
             Self::NotAdmin => "that account is not an administrator",
             Self::AuthDisabled => "this cluster keeps no accounts",
+            Self::BadInvite => "that invitation cannot be used",
             Self::Unknown => "the cluster refused",
         };
         f.write_str(text)
@@ -197,6 +207,7 @@ impl From<auth_error::Kind> for Denial {
             auth_error::Kind::NoSuchUser => Self::NoSuchUser,
             auth_error::Kind::NotAdmin => Self::NotAdmin,
             auth_error::Kind::AuthDisabled => Self::AuthDisabled,
+            auth_error::Kind::BadInvite => Self::BadInvite,
             auth_error::Kind::Unspecified => Self::Unknown,
         }
     }
@@ -310,6 +321,45 @@ pub struct SnapshotInfo {
     /// only -- it is one machine's wall clock, recorded verbatim, and
     /// nothing in the cluster depends on it.
     pub created_unix_ms: u64,
+}
+
+/// One outstanding invitation, as an administrator sees it.
+///
+/// Everything about an invitation except the secret, which exists only
+/// in the reply to the [`create_invite`] that minted it.
+///
+/// [`create_invite`]: Client::create_invite
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Invite {
+    /// What to name this invitation in a [`revoke_invite`] -- the hash
+    /// of the token rather than the token, so it can be written down and
+    /// passed around without being worth anything.
+    ///
+    /// [`revoke_invite`]: Client::revoke_invite
+    pub id: String,
+    /// The administrator who issued it.
+    pub issued_by: String,
+    /// Whether the account it creates will be an administrator. Settled
+    /// when the invitation was issued; the recipient has no say.
+    pub is_admin: bool,
+    /// The one username it may create, if it was issued for a particular
+    /// person.
+    pub username: Option<String>,
+    /// When it stops being redeemable, by the cluster's clock.
+    pub expires_unix_ms: u64,
+}
+
+/// A newly minted invitation: the secret to pass on, and the public
+/// record of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewInvite {
+    /// **The only time this is ever available.** The cluster keeps a
+    /// hash of it and cannot produce it again; an issuer who loses it
+    /// has to withdraw the invitation and mint another.
+    pub token: String,
+    pub invite: Invite,
+    /// The sequence number the invitation was written at.
+    pub seq: u64,
 }
 
 /// How one attempt came back, with the transport and protocol-level
@@ -969,6 +1019,109 @@ impl Client {
         .await
     }
 
+    /// Mints an invitation, so that someone without an account can
+    /// create one for themselves. Administrators only.
+    ///
+    /// The returned [`NewInvite::token`] is the thing to pass on, and
+    /// this is the only moment it exists: the cluster stores a hash of
+    /// it and cannot produce it again.
+    ///
+    /// `is_admin` fixes what the resulting account will be -- an
+    /// administrator's decision, made here, not the recipient's.
+    /// `username`, if given, pins the invitation to that one name, so a
+    /// misdelivered invitation cannot become an account under an
+    /// unexpected one. `ttl` is refused outright if it is longer than
+    /// the cluster is willing to grant, rather than quietly shortened;
+    /// `Duration::ZERO` asks for the cluster's default.
+    pub async fn create_invite(
+        &self,
+        is_admin: bool,
+        ttl: Duration,
+        username: Option<&str>,
+    ) -> Result<NewInvite, Error> {
+        let request = CreateInviteRequest {
+            is_admin,
+            ttl_ms: ttl.as_millis() as u64,
+            username: username.map(str::to_string),
+        };
+        self.call(|mut kv: Kv| {
+            let request = request.clone();
+            async move { kv.create_invite(request).await.map(create_invite_reply) }
+        })
+        .await
+    }
+
+    /// Spends an invitation on a new account, choosing its password.
+    ///
+    /// The one call on this client that needs no login -- a caller
+    /// holding an invitation is by definition someone with no account
+    /// yet. It does not log the client in either: the account exists
+    /// afterwards, and [`login`](Client::login) is what gets a token for
+    /// it.
+    ///
+    /// The invitation is spent in the same transaction that writes the
+    /// account, so it works exactly once. Two failures leave it
+    /// unspent and are worth telling apart:
+    /// [`Denial::AlreadyExists`] means the username is taken and
+    /// another can be tried with the same token, while
+    /// [`Denial::BadInvite`] means the token itself is no good and a new
+    /// one has to come from whoever issued it.
+    pub async fn redeem_invite(
+        &self,
+        token: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<u64, Error> {
+        let request = RedeemInviteRequest {
+            token: token.to_string(),
+            username: username.to_string(),
+            password: password.to_string(),
+        };
+        // `call_inner(.., false)`: there are no credentials to fall back
+        // on here and nothing to fall back to. A client redeeming an
+        // invitation has no account to log in to -- that is what it is
+        // in the middle of creating.
+        self.call_inner(
+            |mut kv: Kv| {
+                let request = request.clone();
+                async move { kv.redeem_invite(request).await.map(redeem_invite_reply) }
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Every invitation that is still outstanding. Administrators only.
+    ///
+    /// Never the secrets -- those are gone. Lapsed invitations are not
+    /// listed: they cannot be spent, and the cluster sweeps them itself.
+    pub async fn list_invites(&self) -> Result<Vec<Invite>, Error> {
+        self.call(|mut kv: Kv| async move {
+            kv.list_invites(ListInvitesRequest {})
+                .await
+                .map(list_invites_reply)
+        })
+        .await
+    }
+
+    /// Withdraws an outstanding invitation, by its
+    /// [`id`](Invite::id). Administrators only.
+    ///
+    /// The remedy for one sent to the wrong person: the secret cannot be
+    /// recalled, only made worthless. An invitation that has already
+    /// been redeemed is [`Error::Rejected`] -- which is the answer worth
+    /// having, since it means someone got there first.
+    pub async fn revoke_invite(&self, invite_id: &str) -> Result<u64, Error> {
+        let request = RevokeInviteRequest {
+            invite_id: invite_id.to_string(),
+        };
+        self.call(|mut kv: Kv| {
+            let request = request.clone();
+            async move { kv.revoke_invite(request).await.map(revoke_invite_reply) }
+        })
+        .await
+    }
+
     /// Gets a token and starts using it, without touching whatever
     /// credentials are stored.
     ///
@@ -1320,6 +1473,66 @@ fn login_reply(resp: tonic::Response<LoginResponse>) -> Reply<String> {
         Some(login_response::Result::Ok(ok)) => Reply::Ok(ok.token),
         Some(login_response::Result::Error(e)) => Reply::from_error(e),
         Some(login_response::Result::AuthError(e)) => denied(e),
+        None => empty_response(),
+    }
+}
+
+/// An `Invite` off the wire.
+fn invite_from_wire(invite: raft5_shared::raft5::client::Invite) -> Invite {
+    Invite {
+        id: invite.invite_id,
+        issued_by: invite.issued_by,
+        is_admin: invite.is_admin,
+        username: invite.username,
+        expires_unix_ms: invite.expires_unix_ms,
+    }
+}
+
+fn create_invite_reply(resp: tonic::Response<CreateInviteResponse>) -> Reply<NewInvite> {
+    match resp.into_inner().result {
+        // A reply with the token but no record is treated like any other
+        // half-filled one. It is not papered over with a default,
+        // because an invitation shown with no expiry would read as one
+        // that never lapses.
+        Some(create_invite_response::Result::Ok(ok)) => match ok.invite.map(invite_from_wire) {
+            Some(invite) => Reply::Ok(NewInvite {
+                token: ok.token,
+                invite,
+                seq: ok.seq,
+            }),
+            None => empty_response(),
+        },
+        Some(create_invite_response::Result::Error(e)) => Reply::from_error(e),
+        Some(create_invite_response::Result::AuthError(e)) => denied(e),
+        None => empty_response(),
+    }
+}
+
+fn redeem_invite_reply(resp: tonic::Response<RedeemInviteResponse>) -> Reply<u64> {
+    match resp.into_inner().result {
+        Some(redeem_invite_response::Result::Ok(ok)) => Reply::Ok(ok.seq),
+        Some(redeem_invite_response::Result::Error(e)) => Reply::from_error(e),
+        Some(redeem_invite_response::Result::AuthError(e)) => denied(e),
+        None => empty_response(),
+    }
+}
+
+fn list_invites_reply(resp: tonic::Response<ListInvitesResponse>) -> Reply<Vec<Invite>> {
+    match resp.into_inner().result {
+        Some(list_invites_response::Result::Ok(list)) => {
+            Reply::Ok(list.invites.into_iter().map(invite_from_wire).collect())
+        }
+        Some(list_invites_response::Result::Error(e)) => Reply::from_error(e),
+        Some(list_invites_response::Result::AuthError(e)) => denied(e),
+        None => empty_response(),
+    }
+}
+
+fn revoke_invite_reply(resp: tonic::Response<RevokeInviteResponse>) -> Reply<u64> {
+    match resp.into_inner().result {
+        Some(revoke_invite_response::Result::Seq(seq)) => Reply::Ok(seq),
+        Some(revoke_invite_response::Result::Error(e)) => Reply::from_error(e),
+        Some(revoke_invite_response::Result::AuthError(e)) => denied(e),
         None => empty_response(),
     }
 }
