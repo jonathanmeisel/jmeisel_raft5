@@ -2,6 +2,10 @@ use super::checkpoint::{checkpoint_key, encode_record};
 use super::snapshot::SNAPSHOT_MAGIC;
 use super::*;
 
+/// A budget no test here can reach, for the tests that are about
+/// something other than the budget.
+const NO_BUDGET: usize = usize::MAX;
+
 fn open_temp() -> (RaftLog, std::path::PathBuf) {
     let mut path = std::env::temp_dir();
     path.push(format!("raftlog_test_{}", std::process::id()));
@@ -1178,9 +1182,9 @@ fn a_boundary_sees_what_existed_at_it_and_nothing_since() {
     );
 
     // And the same through a scan.
-    let keys = log.scan_as_of(b"", boundary, 10, |_| false).unwrap();
+    let (keys, _) = log.scan_as_of(b"", boundary, 10, NO_BUDGET, |_| false).unwrap();
     assert_eq!(keys, vec![b"deleted-later".to_vec()]);
-    let keys = log.scan_latest(b"", 10, |_| false).unwrap();
+    let (keys, _) = log.scan_latest(b"", 10, NO_BUDGET, |_| false).unwrap();
     assert_eq!(keys, vec![b"made-later".to_vec()]);
 
     cleanup(&path);
@@ -1210,14 +1214,15 @@ fn a_scan_dedups_versions_and_hides_tombstones_without_shortening_a_batch() {
 
     // 15 keys survive; a batch of 10 is full, not shortened by the
     // tombstones or the superseded versions it stepped over.
-    let batch = log.scan_latest(b"", 10, |_| false).unwrap();
+    let (batch, resume) = log.scan_latest(b"", 10, NO_BUDGET, |_| false).unwrap();
     assert_eq!(batch.len(), 10);
+    assert_eq!(resume, None, "a full batch did not run out of budget");
     assert_eq!(batch[0], b"k01".to_vec(), "k00 was deleted");
     let mut deduped = batch.clone();
     deduped.dedup();
     assert_eq!(deduped, batch, "a key came back more than once");
 
-    let all = log.scan_latest(b"", 100, |_| false).unwrap();
+    let (all, _) = log.scan_latest(b"", 100, NO_BUDGET, |_| false).unwrap();
     assert_eq!(all.len(), 15);
 
     cleanup(&path);
@@ -1626,10 +1631,76 @@ fn checkpoint_records_sit_in_the_reserved_range() {
     log.apply_committed(k.max(cp)).unwrap();
 
     assert!(crate::keyspace::is_reserved(&checkpoint_key(b"c")));
-    let keys = log
-        .scan_latest(b"", 10, crate::keyspace::is_reserved)
+    let (keys, _) = log
+        .scan_latest(b"", 10, NO_BUDGET, crate::keyspace::is_reserved)
         .unwrap();
     assert_eq!(keys, vec![b"visible".to_vec()]);
+
+    cleanup(&path);
+}
+
+/// The bound a filtered scan needs: `skip` rejecting nearly everything
+/// must not turn one call into a walk of the whole keyspace.
+///
+/// The batch comes back short -- empty, here -- with a cursor, which is
+/// the case the old "append a zero byte to the last key" rule had no
+/// answer for.
+#[test]
+fn a_scan_that_skips_everything_stops_at_its_budget_and_says_where() {
+    let (log, path) = open_temp();
+
+    let writes: Vec<_> = (0..50)
+        .map(|i| Mutation::new(format!("k{i:02}"), Some("v")))
+        .collect();
+    let seq = log.append_writes(1, writes).unwrap();
+    log.apply_committed(seq).unwrap();
+
+    // Nothing is acceptable, so the batch can never fill; the budget is
+    // the only thing that ends the walk.
+    let (keys, resume) = log.scan_latest(b"", 10, 20, |_| true).unwrap();
+    assert!(keys.is_empty());
+    assert_eq!(resume, Some(b"k20".to_vec()), "should resume where it stopped");
+
+    // Resuming there sees the rest, and the walk as a whole misses
+    // nothing: the cursor is a key the first pass did not decide about.
+    let (keys, resume) = log
+        .scan_latest(&resume.unwrap(), 10, 20, |key| key != b"k25")
+        .unwrap();
+    assert_eq!(keys, vec![b"k25".to_vec()]);
+    assert_eq!(resume, Some(b"k40".to_vec()));
+
+    // A budget the scan never reaches leaves no cursor behind.
+    let (keys, resume) = log.scan_latest(b"", 10, NO_BUDGET, |_| false).unwrap();
+    assert_eq!(keys.len(), 10);
+    assert_eq!(resume, None);
+
+    cleanup(&path);
+}
+
+/// Skipped keys count against the budget but not against `limit` -- the
+/// two bounds are about different things, and conflating them is what
+/// would make a batch silently short for a reason the caller cannot see.
+#[test]
+fn the_budget_counts_keys_examined_and_the_limit_counts_keys_kept() {
+    let (log, path) = open_temp();
+
+    let writes: Vec<_> = (0..30)
+        .map(|i| Mutation::new(format!("k{i:02}"), Some("v")))
+        .collect();
+    let seq = log.append_writes(1, writes).unwrap();
+    log.apply_committed(seq).unwrap();
+
+    // Every third key is acceptable. A budget of 30 examines them all,
+    // so the batch fills normally and the budget never bites.
+    let (keys, resume) = log
+        .scan_latest(b"", 5, 30, |key| {
+            let n: usize = std::str::from_utf8(&key[1..]).unwrap().parse().unwrap();
+            !n.is_multiple_of(3)
+        })
+        .unwrap();
+    assert_eq!(keys.len(), 5, "skipped keys must not shorten the batch");
+    assert_eq!(keys[4], b"k12".to_vec());
+    assert_eq!(resume, None);
 
     cleanup(&path);
 }

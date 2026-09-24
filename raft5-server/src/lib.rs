@@ -19,6 +19,7 @@ pub mod auth;
 pub mod grpc;
 pub mod keyspace;
 pub mod pb;
+pub mod perms;
 pub mod raft;
 pub mod storage;
 pub mod store;

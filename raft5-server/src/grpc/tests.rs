@@ -2,8 +2,13 @@ use std::sync::Arc;
 
 use super::*;
 use crate::pb::raft5::client::{
-    CommitTransactionRequest, CreateInviteRequest, CreateTransactionRequest, DropTransactionRequest,
-    GetKeysRequest, ListInvitesRequest, RedeemInviteRequest, RevokeInviteRequest, auth_error,
+    AclEntry as PbAclEntry, CommitTransactionRequest, CreateGroupRequest, CreateInviteRequest,
+    CreateTransactionRequest, DeleteAclRequest, DropTransactionRequest, GetAclRequest,
+    GetGroupRequest, GetKeysRequest, ListAclsRequest, ListGroupsRequest, ListInvitesRequest,
+    Principal as PbPrincipal, RedeemInviteRequest, RevokeInviteRequest, Right as PbRight,
+    SetAclRequest, UpdateGroupRequest, create_group_response, delete_acl_response,
+    get_acl_response, get_group_response, list_acls_response, list_groups_response, principal,
+    set_acl_response, update_group_response, auth_error,
     commit_transaction_response, config_change_response, create_invite_response,
     create_transaction_response, create_user_response, delete_user_response, get_keys_response,
     list_invites_response, login_response, raft_error, read_response, redeem_invite_response,
@@ -2915,6 +2920,1081 @@ async fn the_invitation_rpcs_report_themselves_disabled_without_a_secret() {
     assert_eq!(
         redeem_refusal(redeem(&svc, "whatever", "alice", "one").await),
         auth_error::Kind::AuthDisabled
+    );
+
+    cleanup(&path);
+}
+
+// ---------------------------------------------------------------------
+// Permissions: groups and prefix ACLs.
+//
+// The handler-level half. These hand the service a verified identity
+// directly, as the rest of this file does; `tests/auth.rs` covers the
+// same ground through the real tower layer and real tokens.
+// ---------------------------------------------------------------------
+
+fn pb_user(name: &str) -> PbPrincipal {
+    PbPrincipal {
+        kind: Some(principal::Kind::User(name.to_string())),
+    }
+}
+
+fn pb_group(name: &str) -> PbPrincipal {
+    PbPrincipal {
+        kind: Some(principal::Kind::Group(name.to_string())),
+    }
+}
+
+fn grant(principal: PbPrincipal, right: PbRight) -> PbAclEntry {
+    PbAclEntry {
+        principal: Some(principal),
+        right: right as i32,
+    }
+}
+
+async fn set_acl(
+    svc: &KvService,
+    caller: &str,
+    prefix: &[u8],
+    entries: Vec<PbAclEntry>,
+) -> set_acl_response::Result {
+    svc.set_acl(as_user(
+        caller,
+        SetAclRequest {
+            prefix: prefix.to_vec(),
+            entries,
+        },
+    ))
+    .await
+    .unwrap()
+    .into_inner()
+    .result
+    .expect("set_acl always answers")
+}
+
+/// `set_acl`, for the calls a test expects to work.
+async fn must_set_acl(svc: &KvService, caller: &str, prefix: &[u8], entries: Vec<PbAclEntry>) -> u64 {
+    match set_acl(svc, caller, prefix, entries).await {
+        set_acl_response::Result::Seq(seq) => seq,
+        other => panic!("expected the ACL to be written, got {other:?}"),
+    }
+}
+
+async fn delete_acl(svc: &KvService, caller: &str, prefix: &[u8]) -> delete_acl_response::Result {
+    svc.delete_acl(as_user(
+        caller,
+        DeleteAclRequest {
+            prefix: prefix.to_vec(),
+        },
+    ))
+    .await
+    .unwrap()
+    .into_inner()
+    .result
+    .expect("delete_acl always answers")
+}
+
+async fn create_group(
+    svc: &KvService,
+    caller: &str,
+    name: &str,
+    members: Vec<PbPrincipal>,
+) -> create_group_response::Result {
+    svc.create_group(as_user(
+        caller,
+        CreateGroupRequest {
+            name: name.to_string(),
+            members,
+            admins: Vec::new(),
+        },
+    ))
+    .await
+    .unwrap()
+    .into_inner()
+    .result
+    .expect("create_group always answers")
+}
+
+async fn must_create_group(svc: &KvService, caller: &str, name: &str, members: Vec<PbPrincipal>) {
+    match create_group(svc, caller, name, members).await {
+        create_group_response::Result::Seq(_) => {}
+        other => panic!("expected the group to be created, got {other:?}"),
+    }
+}
+
+/// `UpdateGroup` with only the two fields most tests need.
+async fn update_group(
+    svc: &KvService,
+    caller: &str,
+    name: &str,
+    add_members: Vec<PbPrincipal>,
+    remove_members: Vec<PbPrincipal>,
+) -> update_group_response::Result {
+    svc.update_group(as_user(
+        caller,
+        UpdateGroupRequest {
+            name: name.to_string(),
+            add_members,
+            remove_members,
+            add_admins: Vec::new(),
+            remove_admins: Vec::new(),
+        },
+    ))
+    .await
+    .unwrap()
+    .into_inner()
+    .result
+    .expect("update_group always answers")
+}
+
+/// `UpdateGroup` without unwrapping the transport error.
+///
+/// A request that is malformed rather than merely refused -- one that
+/// would put a group inside itself, or leave it with no administrator --
+/// comes back as an `InvalidArgument` status, not in band. That is the
+/// same channel `reject_reserved` uses and the same one the client
+/// treats as permanent, so it is worth a helper that can see it.
+async fn try_update_group(
+    svc: &KvService,
+    caller: &str,
+    req: UpdateGroupRequest,
+) -> Result<update_group_response::Result, Status> {
+    Ok(svc
+        .update_group(as_user(caller, req))
+        .await?
+        .into_inner()
+        .result
+        .expect("update_group always answers"))
+}
+
+fn members_only(name: &str, add: Vec<PbPrincipal>, remove: Vec<PbPrincipal>) -> UpdateGroupRequest {
+    UpdateGroupRequest {
+        name: name.to_string(),
+        add_members: add,
+        remove_members: remove,
+        add_admins: Vec::new(),
+        remove_admins: Vec::new(),
+    }
+}
+
+async fn read_as(svc: &KvService, caller: &str, key: &[u8]) -> read_response::Result {
+    svc.read(as_user(
+        caller,
+        ReadRequest {
+            key: key.to_vec(),
+            consistency: None,
+        },
+    ))
+    .await
+    .unwrap()
+    .into_inner()
+    .result
+    .expect("a read always answers")
+}
+
+/// A whole single-key write as `caller`. The transaction is opened and
+/// disposed of here, so a refusal leaves nothing behind.
+async fn write_as(
+    svc: &KvService,
+    caller: &str,
+    key: &[u8],
+    value: Option<&[u8]>,
+) -> write_response::Result {
+    let txn = begin_txn(svc, 5000).await;
+    let result = svc
+        .write(as_user(
+            caller,
+            WriteRequest {
+                transaction_id: txn.clone(),
+                key: key.to_vec(),
+                value: value.map(<[u8]>::to_vec),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .result
+        .expect("a write always answers");
+
+    match &result {
+        write_response::Result::Ok(true) => {
+            commit(svc, txn).await;
+        }
+        _ => {
+            svc.drop_transaction(Request::new(DropTransactionRequest {
+                transaction_id: txn,
+            }))
+            .await
+            .unwrap();
+        }
+    }
+    result
+}
+
+async fn get_keys_as(
+    svc: &KvService,
+    caller: &str,
+    start: &[u8],
+    max_keys: u32,
+) -> crate::pb::raft5::client::GetKeysOk {
+    let result = svc
+        .get_keys(as_user(
+            caller,
+            GetKeysRequest {
+                start_key: start.to_vec(),
+                max_keys,
+                consistency: None,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .result;
+    match result {
+        Some(get_keys_response::Result::Ok(ok)) => ok,
+        other => panic!("expected a successful scan, got {other:?}"),
+    }
+}
+
+fn read_refusal(result: read_response::Result) -> auth_error::Kind {
+    match result {
+        read_response::Result::AuthError(e) => auth_kind(&e),
+        other => panic!("expected the read to be refused, got {other:?}"),
+    }
+}
+
+fn write_refusal(result: write_response::Result) -> auth_error::Kind {
+    match result {
+        write_response::Result::AuthError(e) => auth_kind(&e),
+        other => panic!("expected the write to be refused, got {other:?}"),
+    }
+}
+
+fn acl_refusal(result: set_acl_response::Result) -> auth_error::Kind {
+    match result {
+        set_acl_response::Result::AuthError(e) => auth_kind(&e),
+        other => panic!("expected the ACL not to be written, got {other:?}"),
+    }
+}
+
+fn group_refusal(result: create_group_response::Result) -> auth_error::Kind {
+    match result {
+        create_group_response::Result::AuthError(e) => auth_kind(&e),
+        other => panic!("expected the group not to be created, got {other:?}"),
+    }
+}
+
+fn ok_read(result: read_response::Result) -> ReadOk {
+    match result {
+        read_response::Result::Ok(ok) => ok,
+        other => panic!("expected a successful read, got {other:?}"),
+    }
+}
+
+/// A node with accounts, `root` as its administrator, and an ordinary
+/// account `alice` -- the shape nearly every test below wants.
+async fn service_with_alice(log: Arc<RaftLog>, node_id: &str) -> KvService {
+    let svc = authenticated_service(log, node_id).await;
+    created_seq(create_user(&svc, "root", "alice", "hunter42", false).await);
+    svc
+}
+
+// -- the default -------------------------------------------------------
+
+/// The property every existing cluster depends on across this upgrade:
+/// with no ACLs written, nothing is refused and nothing changes.
+#[tokio::test]
+async fn without_any_acl_every_account_reaches_every_key() {
+    let (log, path) = open_temp();
+    let svc = service_with_alice(log, "kv-test").await;
+
+    assert!(matches!(
+        write_as(&svc, "alice", b"app/config", Some(b"v")).await,
+        write_response::Result::Ok(true)
+    ));
+    assert_eq!(
+        ok_read(read_as(&svc, "alice", b"app/config").await).value,
+        Some(b"v".to_vec())
+    );
+    assert_eq!(
+        as_strings(&get_keys_as(&svc, "alice", b"", 10).await.keys),
+        vec!["app/config"]
+    );
+
+    cleanup(&path);
+}
+
+/// A cluster with no secret keeps no accounts, so there is nobody for an
+/// ACL to be about. Decided in one place, as `require_admin` decides it.
+#[tokio::test]
+async fn a_node_without_a_secret_enforces_no_acls_and_has_none_to_manage() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+
+    assert_eq!(
+        acl_refusal(set_acl(&svc, "root", b"app/", vec![grant(pb_user("root"), PbRight::Write)]).await),
+        auth_error::Kind::AuthDisabled
+    );
+    assert_eq!(
+        group_refusal(create_group(&svc, "root", "ops", vec![]).await),
+        auth_error::Kind::AuthDisabled
+    );
+    // And the data path is untouched -- no identity is even looked for.
+    assert!(write(&svc, b"app/config", Some(b"v")).await > 0);
+
+    cleanup(&path);
+}
+
+// -- enforcement on the data path --------------------------------------
+
+/// An ACL on `app/` naming only `root` shuts `alice` out of that subtree
+/// and leaves the rest of the store exactly as open as it was.
+#[tokio::test]
+async fn an_acl_denies_the_subtree_it_governs_and_nothing_else() {
+    let (log, path) = open_temp();
+    let svc = service_with_alice(log, "kv-test").await;
+
+    write(&svc, b"app/config", Some(b"v")).await;
+    write(&svc, b"other/config", Some(b"v")).await;
+    must_set_acl(&svc, "root", b"app/", vec![grant(pb_user("root"), PbRight::Write)]).await;
+
+    assert_eq!(
+        read_refusal(read_as(&svc, "alice", b"app/config").await),
+        auth_error::Kind::NotPermitted
+    );
+    assert_eq!(
+        write_refusal(write_as(&svc, "alice", b"app/config", Some(b"x")).await),
+        auth_error::Kind::NotPermitted
+    );
+    // A delete is a write of no value, so the same check covers it.
+    assert_eq!(
+        write_refusal(write_as(&svc, "alice", b"app/config", None).await),
+        auth_error::Kind::NotPermitted
+    );
+    // The seq of a key is a fact about a key she may not read.
+    let refused = svc
+        .get_version(as_user(
+            "alice",
+            GetVersionRequest {
+                key: b"app/config".to_vec(),
+                consistency: None,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .result;
+    assert!(matches!(
+        refused,
+        Some(get_version_response::Result::AuthError(_))
+    ));
+    // An administrator gets an answer for the same key.
+    assert!(matches!(
+        svc.get_version(as_user(
+            "root",
+            GetVersionRequest {
+                key: b"app/config".to_vec(),
+                consistency: None,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .result,
+        Some(get_version_response::Result::Ok(_))
+    ));
+
+    // Nothing governs `other/`, so it stays open.
+    assert_eq!(
+        ok_read(read_as(&svc, "alice", b"other/config").await).value,
+        Some(b"v".to_vec())
+    );
+    assert!(matches!(
+        write_as(&svc, "alice", b"other/config", Some(b"x")).await,
+        write_response::Result::Ok(true)
+    ));
+
+    cleanup(&path);
+}
+
+/// An administrator is never shut out by an ACL -- they could rewrite
+/// it anyway, and locking one out would only mean locking out the
+/// cluster.
+#[tokio::test]
+async fn an_administrator_is_never_denied_by_an_acl() {
+    let (log, path) = open_temp();
+    let svc = service_with_alice(log, "kv-test").await;
+
+    write(&svc, b"app/config", Some(b"v")).await;
+    // An ACL that names `alice` and not `root` at all.
+    must_set_acl(&svc, "root", b"app/", vec![grant(pb_user("alice"), PbRight::Read)]).await;
+
+    assert_eq!(
+        ok_read(read_as(&svc, "root", b"app/config").await).value,
+        Some(b"v".to_vec())
+    );
+    assert!(matches!(
+        write_as(&svc, "root", b"app/config", Some(b"x")).await,
+        write_response::Result::Ok(true)
+    ));
+    // And `alice`'s own grant is read, not write.
+    assert!(matches!(
+        read_as(&svc, "alice", b"app/config").await,
+        read_response::Result::Ok(_)
+    ));
+    assert_eq!(
+        write_refusal(write_as(&svc, "alice", b"app/config", Some(b"y")).await),
+        auth_error::Kind::NotPermitted
+    );
+
+    cleanup(&path);
+}
+
+/// The longest ACL that *exists* decides, not the longest that grants.
+/// `alice` holds write on `app/` and is still shut out of `app/secret/`.
+#[tokio::test]
+async fn the_longest_prefix_with_an_acl_decides() {
+    let (log, path) = open_temp();
+    let svc = service_with_alice(log, "kv-test").await;
+
+    write(&svc, b"app/config", Some(b"v")).await;
+    write(&svc, b"app/secret/k", Some(b"v")).await;
+    must_set_acl(&svc, "root", b"app/", vec![grant(pb_user("alice"), PbRight::Write)]).await;
+    must_set_acl(
+        &svc,
+        "root",
+        b"app/secret/",
+        vec![grant(pb_user("root"), PbRight::Write)],
+    )
+    .await;
+
+    assert!(matches!(
+        read_as(&svc, "alice", b"app/config").await,
+        read_response::Result::Ok(_)
+    ));
+    assert_eq!(
+        read_refusal(read_as(&svc, "alice", b"app/secret/k").await),
+        auth_error::Kind::NotPermitted
+    );
+
+    cleanup(&path);
+}
+
+/// An ACL on the empty prefix governs every key there is, which is how a
+/// cluster takes the closed posture.
+#[tokio::test]
+async fn an_acl_on_the_empty_prefix_closes_the_whole_store() {
+    let (log, path) = open_temp();
+    let svc = service_with_alice(log, "kv-test").await;
+
+    write(&svc, b"anything", Some(b"v")).await;
+    must_set_acl(&svc, "root", b"", vec![grant(pb_user("root"), PbRight::Write)]).await;
+
+    assert_eq!(
+        read_refusal(read_as(&svc, "alice", b"anything").await),
+        auth_error::Kind::NotPermitted
+    );
+    assert_eq!(
+        read_refusal(read_as(&svc, "alice", b"").await),
+        auth_error::Kind::NotPermitted
+    );
+
+    cleanup(&path);
+}
+
+// -- groups ------------------------------------------------------------
+
+/// Membership grants what the group holds, nesting and all -- and taking
+/// the member out takes the access away on the very next request, which
+/// is the test that the epoch key really does invalidate the cache.
+#[tokio::test]
+async fn group_membership_grants_access_and_removing_it_revokes_at_once() {
+    let (log, path) = open_temp();
+    let svc = service_with_alice(log, "kv-test").await;
+
+    write(&svc, b"app/config", Some(b"v")).await;
+    must_create_group(&svc, "root", "interns", vec![pb_user("alice")]).await;
+    must_create_group(&svc, "root", "staff", vec![pb_group("interns")]).await;
+    // The ACL names only the outermost group.
+    must_set_acl(&svc, "root", b"app/", vec![grant(pb_group("staff"), PbRight::Read)]).await;
+
+    assert!(
+        matches!(read_as(&svc, "alice", b"app/config").await, read_response::Result::Ok(_)),
+        "membership through a nested group should grant what the outer group holds"
+    );
+
+    // Out of the inner group, and so out of the outer one.
+    assert!(matches!(
+        update_group(&svc, "root", "interns", vec![], vec![pb_user("alice")]).await,
+        update_group_response::Result::Seq(_)
+    ));
+    assert_eq!(
+        read_refusal(read_as(&svc, "alice", b"app/config").await),
+        auth_error::Kind::NotPermitted,
+        "the next request after the change must already see it"
+    );
+
+    cleanup(&path);
+}
+
+/// Creating a group is not an administrator's privilege -- it grants
+/// its creator nothing they did not already have -- but administering
+/// one is its own administrators' business.
+#[tokio::test]
+async fn anyone_may_create_a_group_and_only_its_admins_may_change_it() {
+    let (log, path) = open_temp();
+    let svc = service_with_alice(log, "kv-test").await;
+    created_seq(create_user(&svc, "root", "bob", "hunter42", false).await);
+
+    must_create_group(&svc, "alice", "oncall", vec![]).await;
+
+    // The creator administers it, whatever the request said.
+    let group = match svc
+        .get_group(as_user(
+            "bob",
+            GetGroupRequest {
+                name: "oncall".to_string(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .result
+    {
+        Some(get_group_response::Result::Ok(group)) => group,
+        other => panic!("expected the group, got {other:?}"),
+    };
+    assert_eq!(group.admins, vec![pb_user("alice")]);
+    assert_eq!(group.created_by, "alice");
+
+    // Someone else's group is not bob's to change.
+    let refused = update_group(&svc, "bob", "oncall", vec![pb_user("bob")], vec![]).await;
+    assert!(
+        matches!(&refused, update_group_response::Result::AuthError(e) if auth_kind(e) == auth_error::Kind::NotPermitted),
+        "got {refused:?}"
+    );
+    assert!(matches!(
+        update_group(&svc, "alice", "oncall", vec![pb_user("bob")], vec![]).await,
+        update_group_response::Result::Seq(_)
+    ));
+    // A cluster administrator may always.
+    assert!(matches!(
+        update_group(&svc, "root", "oncall", vec![], vec![pb_user("bob")]).await,
+        update_group_response::Result::Seq(_)
+    ));
+
+    cleanup(&path);
+}
+
+/// A cycle would make "who is in this group" a question with no answer,
+/// so the edge that would close one is refused where it is added.
+#[tokio::test]
+async fn a_group_cannot_be_put_inside_itself() {
+    let (log, path) = open_temp();
+    let svc = service_with_alice(log, "kv-test").await;
+
+    must_create_group(&svc, "root", "a", vec![]).await;
+    must_create_group(&svc, "root", "b", vec![pb_group("a")]).await;
+
+    // `b` is already inside `a`'s would-be ancestry: a contains nothing,
+    // b contains a. Putting b into a closes the loop.
+    assert!(
+        try_update_group(&svc, "root", members_only("a", vec![pb_group("b")], vec![]))
+            .await
+            .is_err(),
+        "a cycle should be refused"
+    );
+    // Directly, too.
+    assert!(
+        try_update_group(&svc, "root", members_only("a", vec![pb_group("a")], vec![]))
+            .await
+            .is_err()
+    );
+    // And at creation, against a group that already names the new one --
+    // naming a group that does not exist is allowed, so this is a cycle
+    // the new group walks into rather than one it could see coming.
+    must_create_group(&svc, "root", "c", vec![pb_group("later")]).await;
+    assert!(
+        svc.create_group(as_user(
+            "root",
+            CreateGroupRequest {
+                name: "later".to_string(),
+                members: vec![pb_group("c")],
+                admins: Vec::new(),
+            },
+        ))
+        .await
+        .is_err()
+    );
+    // The edge that does not close a loop is fine.
+    assert!(matches!(
+        update_group(&svc, "root", "b", vec![pb_user("alice")], vec![]).await,
+        update_group_response::Result::Seq(_)
+    ));
+
+    cleanup(&path);
+}
+
+/// A group with no administrators could never be changed again except by
+/// a cluster administrator, so the call that would empty the list is
+/// refused rather than leaving someone to discover it later.
+#[tokio::test]
+async fn a_group_must_keep_at_least_one_administrator() {
+    let (log, path) = open_temp();
+    let svc = service_with_alice(log, "kv-test").await;
+
+    must_create_group(&svc, "alice", "oncall", vec![]).await;
+    assert!(
+        try_update_group(
+            &svc,
+            "alice",
+            UpdateGroupRequest {
+                name: "oncall".to_string(),
+                add_members: vec![],
+                remove_members: vec![],
+                add_admins: vec![],
+                remove_admins: vec![pb_user("alice")],
+            },
+        )
+        .await
+        .is_err(),
+        "emptying the administrator list should be refused"
+    );
+
+    // Handing it over is fine, because additions happen first.
+    assert!(matches!(
+        try_update_group(
+            &svc,
+            "alice",
+            UpdateGroupRequest {
+                name: "oncall".to_string(),
+                add_members: vec![],
+                remove_members: vec![],
+                add_admins: vec![pb_user("root")],
+                remove_admins: vec![pb_user("alice")],
+            },
+        )
+        .await
+        .unwrap(),
+        update_group_response::Result::Seq(_)
+    ));
+    // And having handed it over, she is no longer the one who may.
+    let refused = update_group(&svc, "alice", "oncall", vec![pb_user("alice")], vec![]).await;
+    assert!(
+        matches!(&refused, update_group_response::Result::AuthError(e) if auth_kind(e) == auth_error::Kind::NotPermitted),
+        "got {refused:?}"
+    );
+
+    cleanup(&path);
+}
+
+/// A group that does not exist is `NO_SUCH_GROUP`, not `NO_SUCH_USER`:
+/// the two namespaces are separate, and a caller told the wrong one
+/// would go looking in the wrong place.
+#[tokio::test]
+async fn a_missing_group_is_reported_as_a_missing_group() {
+    let (log, path) = open_temp();
+    let svc = service_with_alice(log, "kv-test").await;
+
+    let result = svc
+        .get_group(as_user(
+            "alice",
+            GetGroupRequest {
+                name: "nope".to_string(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .result;
+    assert!(
+        matches!(&result, Some(get_group_response::Result::AuthError(e)) if auth_kind(e) == auth_error::Kind::NoSuchGroup),
+        "got {result:?}"
+    );
+
+    cleanup(&path);
+}
+
+// -- authority over the ACLs themselves --------------------------------
+
+/// `write` on a prefix carries authority over that prefix's ACL and over
+/// every longer prefix's -- and stops exactly there.
+#[tokio::test]
+async fn write_on_a_prefix_carries_authority_over_its_acls() {
+    let (log, path) = open_temp();
+    let svc = service_with_alice(log, "kv-test").await;
+
+    must_set_acl(&svc, "root", b"app/", vec![grant(pb_user("alice"), PbRight::Write)]).await;
+
+    // Longer: hers.
+    must_set_acl(
+        &svc,
+        "alice",
+        b"app/sub/",
+        vec![grant(pb_user("alice"), PbRight::Write)],
+    )
+    .await;
+    // The prefix itself: also hers, since her own ACL grants her write.
+    must_set_acl(
+        &svc,
+        "alice",
+        b"app/",
+        vec![
+            grant(pb_user("alice"), PbRight::Write),
+            grant(pb_user("root"), PbRight::Write),
+        ],
+    )
+    .await;
+    // A sibling nothing governs: not hers, and not because she lacks a
+    // grant -- because nobody's grant reaches there.
+    assert_eq!(
+        acl_refusal(set_acl(&svc, "alice", b"app2/", vec![grant(pb_user("alice"), PbRight::Write)]).await),
+        auth_error::Kind::NotPermitted
+    );
+
+    cleanup(&path);
+}
+
+/// `read` is not authority. Being able to see a subtree is not being
+/// able to decide who else may.
+#[tokio::test]
+async fn read_on_a_prefix_is_not_authority_over_its_acls() {
+    let (log, path) = open_temp();
+    let svc = service_with_alice(log, "kv-test").await;
+
+    must_set_acl(&svc, "root", b"app/", vec![grant(pb_user("alice"), PbRight::Read)]).await;
+    assert_eq!(
+        acl_refusal(set_acl(&svc, "alice", b"app/x", vec![grant(pb_user("alice"), PbRight::Write)]).await),
+        auth_error::Kind::NotPermitted
+    );
+
+    cleanup(&path);
+}
+
+/// The hole this closes: a key nothing governs is open to everyone, and
+/// without this rule any account could write an ACL on the empty prefix
+/// and lock the cluster out of its own keyspace.
+#[tokio::test]
+async fn the_default_is_not_authority_to_write_an_acl() {
+    let (log, path) = open_temp();
+    let svc = service_with_alice(log, "kv-test").await;
+
+    // Nothing governs anything yet, and `alice` can write every key --
+    // and still may not be the one to decide who else can.
+    assert!(matches!(
+        write_as(&svc, "alice", b"app/config", Some(b"v")).await,
+        write_response::Result::Ok(true)
+    ));
+    assert_eq!(
+        acl_refusal(set_acl(&svc, "alice", b"", vec![grant(pb_user("alice"), PbRight::Write)]).await),
+        auth_error::Kind::NotPermitted
+    );
+    assert_eq!(
+        acl_refusal(set_acl(&svc, "alice", b"app/", vec![grant(pb_user("alice"), PbRight::Write)]).await),
+        auth_error::Kind::NotPermitted
+    );
+    // An administrator may, which is how the first ACL ever gets written.
+    must_set_acl(&svc, "root", b"app/", vec![grant(pb_user("alice"), PbRight::Write)]).await;
+
+    cleanup(&path);
+}
+
+/// The same rule from the other side: removing an ACL that nothing
+/// shorter would replace opens the subtree to everyone, so it is an
+/// administrator's act -- even for the account that holds write there.
+#[tokio::test]
+async fn removing_the_last_acl_over_a_prefix_is_an_administrators_act() {
+    let (log, path) = open_temp();
+    let svc = service_with_alice(log, "kv-test").await;
+
+    must_set_acl(&svc, "root", b"app/", vec![grant(pb_user("alice"), PbRight::Write)]).await;
+    must_set_acl(
+        &svc,
+        "root",
+        b"app/sub/",
+        vec![grant(pb_user("alice"), PbRight::Write)],
+    )
+    .await;
+
+    // `app/sub/` falls back to `app/`, which still protects it: hers.
+    assert!(matches!(
+        delete_acl(&svc, "alice", b"app/sub/").await,
+        delete_acl_response::Result::Seq(_)
+    ));
+    // `app/` falls back to nothing at all: not hers.
+    let refused = delete_acl(&svc, "alice", b"app/").await;
+    assert!(
+        matches!(&refused, delete_acl_response::Result::AuthError(e) if auth_kind(e) == auth_error::Kind::NotPermitted),
+        "got {refused:?}"
+    );
+    assert!(matches!(
+        delete_acl(&svc, "root", b"app/").await,
+        delete_acl_response::Result::Seq(_)
+    ));
+    // And with it gone, the subtree is open again.
+    assert!(matches!(
+        read_as(&svc, "alice", b"app/config").await,
+        read_response::Result::Ok(_)
+    ));
+
+    cleanup(&path);
+}
+
+/// A prefix with no ACL of its own is `NO_SUCH_ACL`, which is not the
+/// same as "nothing governs the keys under it".
+#[tokio::test]
+async fn removing_an_acl_that_is_not_there_says_so() {
+    let (log, path) = open_temp();
+    let svc = service_with_alice(log, "kv-test").await;
+
+    must_set_acl(&svc, "root", b"app/", vec![grant(pb_user("root"), PbRight::Write)]).await;
+    let result = delete_acl(&svc, "root", b"app/sub/").await;
+    assert!(
+        matches!(&result, delete_acl_response::Result::AuthError(e) if auth_kind(e) == auth_error::Kind::NoSuchAcl),
+        "got {result:?}"
+    );
+
+    cleanup(&path);
+}
+
+// -- scans --------------------------------------------------------------
+
+/// Keys the caller may not read are left out of a walk rather than
+/// refusing it -- and, because they are skipped inside the scan rather
+/// than filtered after, they cost no batch length.
+#[tokio::test]
+async fn a_scan_omits_what_the_caller_may_not_read_without_shortening_the_batch() {
+    let (log, path) = open_temp();
+    let svc = service_with_alice(log, "kv-test").await;
+
+    for i in 0..10 {
+        write(&svc, format!("hidden/{i:02}").as_bytes(), Some(b"v")).await;
+        write(&svc, format!("open/{i:02}").as_bytes(), Some(b"v")).await;
+    }
+    must_set_acl(
+        &svc,
+        "root",
+        b"hidden/",
+        vec![grant(pb_user("root"), PbRight::Write)],
+    )
+    .await;
+
+    // `hidden/` sorts before `open/`, so a naive filter-after-the-fact
+    // would hand back an empty first batch.
+    let batch = get_keys_as(&svc, "alice", b"", 5).await;
+    assert_eq!(
+        as_strings(&batch.keys),
+        vec!["open/00", "open/01", "open/02", "open/03", "open/04"]
+    );
+    assert!(batch.has_more);
+
+    // An administrator sees everything, which is also the check that the
+    // filter is about the caller and not about the keys.
+    let batch = get_keys_as(&svc, "root", b"", 5).await;
+    assert_eq!(
+        as_strings(&batch.keys),
+        vec!["hidden/00", "hidden/01", "hidden/02", "hidden/03", "hidden/04"]
+    );
+
+    cleanup(&path);
+}
+
+/// A walk of a store the caller can see almost none of stops at its
+/// budget and says where to resume, rather than becoming an O(keyspace)
+/// call. The cursor is the whole point: the batch can come back empty.
+#[tokio::test]
+async fn a_filtered_walk_pages_with_the_cursor_the_server_sends() {
+    let (log, path) = open_temp();
+    let svc = service_with_alice(log, "kv-test").await;
+
+    for i in 0..20 {
+        write(&svc, format!("hidden/{i:02}").as_bytes(), Some(b"v")).await;
+    }
+    write(&svc, b"zzz-visible", Some(b"v")).await;
+    must_set_acl(
+        &svc,
+        "root",
+        b"hidden/",
+        vec![grant(pb_user("root"), PbRight::Write)],
+    )
+    .await;
+
+    // Walk it the way a client does, following the cursor. Without one,
+    // a batch that came back empty would end the walk and `zzz-visible`
+    // would never be reached.
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    let mut start = Vec::new();
+    loop {
+        let batch = get_keys_as(&svc, "alice", &start, 5).await;
+        seen.extend(batch.keys.iter().cloned());
+        if !batch.has_more {
+            break;
+        }
+        start = if batch.next_start_key.is_empty() {
+            let mut next = batch.keys.last().expect("a full batch has a last key").clone();
+            next.push(0);
+            next
+        } else {
+            batch.next_start_key
+        };
+    }
+    assert_eq!(as_strings(&seen), vec!["zzz-visible"]);
+
+    cleanup(&path);
+}
+
+// -- reading the ACLs ---------------------------------------------------
+
+/// The question someone holding a refusal actually has: which ACL
+/// decided, and what does it give me?
+#[tokio::test]
+async fn get_acl_says_which_prefix_governs_and_what_it_grants() {
+    let (log, path) = open_temp();
+    let svc = service_with_alice(log, "kv-test").await;
+
+    must_create_group(&svc, "root", "ops", vec![pb_user("alice")]).await;
+    must_set_acl(
+        &svc,
+        "root",
+        b"app/",
+        vec![grant(pb_group("ops"), PbRight::Read)],
+    )
+    .await;
+
+    let ok = match svc
+        .get_acl(as_user(
+            "alice",
+            GetAclRequest {
+                key: b"app/config".to_vec(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .result
+    {
+        Some(get_acl_response::Result::Ok(ok)) => ok,
+        other => panic!("expected an answer, got {other:?}"),
+    };
+    let acl = ok.acl.expect("an ACL governs that key");
+    assert_eq!(acl.prefix, b"app/".to_vec());
+    // Granted through the group, which is what `effective` saves a
+    // client from working out for itself.
+    assert_eq!(ok.effective, Some(PbRight::Read as i32));
+
+    // A key nothing governs: no ACL, and no grant to report.
+    let ok = match svc
+        .get_acl(as_user(
+            "alice",
+            GetAclRequest {
+                key: b"other".to_vec(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .result
+    {
+        Some(get_acl_response::Result::Ok(ok)) => ok,
+        other => panic!("expected an answer, got {other:?}"),
+    };
+    assert_eq!(ok.acl, None);
+    assert_eq!(ok.effective, None);
+
+    cleanup(&path);
+}
+
+/// ACLs and groups are readable by anyone with an account: they say who
+/// may reach which keys, which is not a secret from the people they are
+/// about, and a caller who could not read them could not tell a refusal
+/// from a bug.
+#[tokio::test]
+async fn any_account_may_read_the_acls_and_the_groups() {
+    let (log, path) = open_temp();
+    let svc = service_with_alice(log, "kv-test").await;
+
+    must_create_group(&svc, "root", "ops", vec![]).await;
+    must_set_acl(&svc, "root", b"b/", vec![grant(pb_user("root"), PbRight::Write)]).await;
+    must_set_acl(&svc, "root", b"a/", vec![grant(pb_user("root"), PbRight::Write)]).await;
+
+    let acls = match svc
+        .list_acls(as_user("alice", ListAclsRequest {}))
+        .await
+        .unwrap()
+        .into_inner()
+        .result
+    {
+        Some(list_acls_response::Result::Ok(list)) => list.acls,
+        other => panic!("expected a listing, got {other:?}"),
+    };
+    // Shortest prefix first, which is the order they take effect in.
+    assert_eq!(
+        acls.iter().map(|a| a.prefix.clone()).collect::<Vec<_>>(),
+        vec![b"a/".to_vec(), b"b/".to_vec()]
+    );
+
+    let groups = match svc
+        .list_groups(as_user("alice", ListGroupsRequest {}))
+        .await
+        .unwrap()
+        .into_inner()
+        .result
+    {
+        Some(list_groups_response::Result::Ok(list)) => list.groups,
+        other => panic!("expected a listing, got {other:?}"),
+    };
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].name, "ops");
+
+    cleanup(&path);
+}
+
+// -- the reserved range -------------------------------------------------
+
+/// Groups and ACLs live in the reserved range, so no client can reach
+/// them through the data path -- the check `reject_reserved` has always
+/// made, now covering three more prefixes.
+#[tokio::test]
+async fn the_permission_records_are_not_reachable_as_keys() {
+    let (log, path) = open_temp();
+    let svc = service_with_alice(log, "kv-test").await;
+
+    must_create_group(&svc, "root", "ops", vec![]).await;
+    must_set_acl(&svc, "root", b"app/", vec![grant(pb_user("root"), PbRight::Write)]).await;
+
+    for key in [
+        crate::keyspace::group_key("ops"),
+        crate::keyspace::acl_key(b"app/"),
+        crate::keyspace::EPOCH_KEY.to_vec(),
+    ] {
+        assert!(
+            svc.read(as_user("root", ReadRequest { key: key.clone(), consistency: None }))
+                .await
+                .is_err(),
+            "reading {key:?} should be refused outright"
+        );
+        let txn = begin_txn(&svc, 5000).await;
+        assert!(
+            svc.write(as_user(
+                "root",
+                WriteRequest {
+                    transaction_id: txn,
+                    key: key.clone(),
+                    value: Some(b"x".to_vec()),
+                },
+            ))
+            .await
+            .is_err(),
+            "writing {key:?} should be refused outright"
+        );
+    }
+    // Nor do they appear in a walk.
+    assert!(
+        get_keys_as(&svc, "root", b"", 100)
+            .await
+            .keys
+            .is_empty(),
+        "the reserved range must not show up in a scan"
     );
 
     cleanup(&path);

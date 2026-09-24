@@ -15,9 +15,12 @@ use tonic::Request;
 
 use raft5_server::auth::{AuthConfig, InitialAdmin};
 use raft5_server::pb::raft5::client::{
-    BootstrapRequest, CreateInviteRequest, CreateTransactionRequest, CreateUserRequest,
-    GetConfigRequest, ListInvitesRequest, LoginRequest, ReadRequest, RedeemInviteRequest,
-    create_invite_response, create_user_response, login_response, redeem_invite_response,
+    AclEntry, AddServerRequest, BootstrapRequest, CommitTransactionRequest, CreateGroupRequest,
+    CreateInviteRequest, config_change_response,
+    CreateTransactionRequest, CreateUserRequest, GetConfigRequest, ListAclsRequest,
+    ListInvitesRequest, LoginRequest, Principal, ReadRequest, RedeemInviteRequest, Right,
+    SetAclRequest, WriteRequest, auth_error, create_invite_response, create_user_response,
+    login_response, principal, read_response, redeem_invite_response, set_acl_response,
 };
 
 use common::TestNode;
@@ -204,6 +207,40 @@ async fn every_other_rpc_is_refused_without_a_token() {
         }))
         .await
         .expect_err("creating an account needs a token");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+    // The permission RPCs are on the list by construction -- `EXEMPT`
+    // is an allowlist and nothing was added to it -- but a new RPC that
+    // forgot to be is exactly what this test exists to catch.
+    let status = client
+        .as_ref()
+        .clone()
+        .create_group(Request::new(CreateGroupRequest {
+            name: "mallorys".to_string(),
+            members: vec![],
+            admins: vec![],
+        }))
+        .await
+        .expect_err("creating a group needs a token");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+    let status = client
+        .as_ref()
+        .clone()
+        .set_acl(Request::new(SetAclRequest {
+            prefix: vec![],
+            entries: vec![],
+        }))
+        .await
+        .expect_err("writing an ACL needs a token");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+    let status = client
+        .as_ref()
+        .clone()
+        .list_acls(Request::new(ListAclsRequest {}))
+        .await
+        .expect_err("reading the ACLs needs a token");
     assert_eq!(status.code(), tonic::Code::Unauthenticated);
 }
 
@@ -444,4 +481,311 @@ async fn a_redemption_without_a_real_invitation_creates_nothing() {
         ),
         "no account should have been created"
     );
+}
+
+fn user(name: &str) -> Principal {
+    Principal {
+        kind: Some(principal::Kind::User(name.to_string())),
+    }
+}
+
+/// A whole single-key write as whoever holds `token`.
+async fn write_with(
+    node: &TestNode,
+    token: &str,
+    key: &[u8],
+    value: &[u8],
+) -> Result<(), tonic::Status> {
+    let mut client = node.client().as_ref().clone();
+    let txn = match client
+        .create_transaction(with_token(token, CreateTransactionRequest { ttl_ms: 5000 }))
+        .await?
+        .into_inner()
+        .result
+    {
+        Some(raft5_server::pb::raft5::client::create_transaction_response::Result::TransactionId(
+            id,
+        )) => id,
+        other => panic!("expected a transaction, got {other:?}"),
+    };
+
+    let result = client
+        .write(with_token(
+            token,
+            WriteRequest {
+                transaction_id: txn.clone(),
+                key: key.to_vec(),
+                value: Some(value.to_vec()),
+            },
+        ))
+        .await?
+        .into_inner()
+        .result
+        .expect("a write always answers");
+
+    match result {
+        raft5_server::pb::raft5::client::write_response::Result::Ok(true) => {
+            client
+                .commit_transaction(with_token(token, CommitTransactionRequest {
+                    transaction_id: txn,
+                }))
+                .await?;
+            Ok(())
+        }
+        raft5_server::pb::raft5::client::write_response::Result::AuthError(e) => Err(
+            tonic::Status::permission_denied(format!("refused: {}", e.detail)),
+        ),
+        other => panic!("unexpected write result {other:?}"),
+    }
+}
+
+/// Permissions end to end: two real accounts, two real tokens, and an
+/// ACL that has to be enforced against whoever the layer says is calling
+/// rather than against an identity a test put there.
+///
+/// The refusal arriving *in band* is half the point. A token that is
+/// missing or forged is an `UNAUTHENTICATED` status raised before any
+/// handler runs; an ACL saying no is an answer, and a client that
+/// retried it would spend its whole deadline arriving back here.
+#[tokio::test]
+async fn an_acl_is_enforced_against_the_identity_the_token_carries() {
+    let node = TestNode::with_auth("auth9", auth_config(Some(("root", "hunter42"))).await).await;
+    let mut client = node.client().as_ref().clone();
+
+    // The startup administrator breaks the circle, exactly as in
+    // `an_authenticated_cluster_can_be_bootstrapped_and_then_used`.
+    let startup = log_in(&node, "root", "hunter42").await;
+    client
+        .bootstrap(with_token(&startup, BootstrapRequest {
+            server_id: node.id.clone(),
+        }))
+        .await
+        .expect("the startup administrator may bootstrap");
+    let root = log_in(&node, "root", "hunter42").await;
+
+    // An ordinary account, and a token for it.
+    let created = client
+        .create_user(with_token(&root, CreateUserRequest {
+            username: "alice".to_string(),
+            password: "correct horse".to_string(),
+            is_admin: false,
+        }))
+        .await
+        .expect("creating an account should be answered")
+        .into_inner()
+        .result
+        .expect("create_user always answers");
+    assert!(matches!(created, create_user_response::Result::Seq(_)));
+    let alice = log_in(&node, "alice", "correct horse").await;
+
+    // Before any ACL: alice reaches everything, as she always could.
+    write_with(&node, &alice, b"app/config", b"v")
+        .await
+        .expect("with no ACL, every account reaches every key");
+
+    let set = client
+        .set_acl(with_token(&root, SetAclRequest {
+            prefix: b"app/".to_vec(),
+            entries: vec![AclEntry {
+                principal: Some(user("root")),
+                right: Right::Write as i32,
+            }],
+        }))
+        .await
+        .expect("setting an ACL should be answered")
+        .into_inner()
+        .result
+        .expect("set_acl always answers");
+    assert!(matches!(set, set_acl_response::Result::Seq(_)), "got {set:?}");
+
+    // Now the same call is refused, and refused in band.
+    let refused = client
+        .read(with_token(&alice, ReadRequest {
+            key: b"app/config".to_vec(),
+            consistency: None,
+        }))
+        .await
+        .expect("an ACL refusal is an answer, not a transport failure")
+        .into_inner()
+        .result
+        .expect("a read always answers");
+    match refused {
+        read_response::Result::AuthError(e) => assert_eq!(
+            auth_error::Kind::try_from(e.kind).expect("a kind this build knows"),
+            auth_error::Kind::NotPermitted
+        ),
+        other => panic!("expected the read to be refused, got {other:?}"),
+    }
+    assert!(write_with(&node, &alice, b"app/config", b"x").await.is_err());
+
+    // And root, whose token names an administrator, still gets through.
+    let allowed = client
+        .read(with_token(&root, ReadRequest {
+            key: b"app/config".to_vec(),
+            consistency: None,
+        }))
+        .await
+        .expect("root should be answered")
+        .into_inner()
+        .result
+        .expect("a read always answers");
+    assert!(matches!(allowed, read_response::Result::Ok(_)), "got {allowed:?}");
+
+    // A key the ACL does not govern is untouched for either of them.
+    write_with(&node, &alice, b"other/config", b"v")
+        .await
+        .expect("nothing governs `other/`");
+}
+
+/// A follower enforces the ACLs, which is what proves the permission
+/// snapshot is fed by locally applied state rather than by a read of
+/// the leader.
+///
+/// This is the case the obvious implementation gets wrong. The account
+/// check beside it, `require_admin`, reads the store *linearizably*: it
+/// needs a leader and a read quorum, and it can have both because it
+/// guards a handful of rare RPCs that all run on the leader anyway. A
+/// stale read does not run on the leader, so a permission check built
+/// the same way would not merely be slow here -- there would be nothing
+/// for it to ask.
+///
+/// So the check reads what this node has applied, which is the same
+/// state the read it is authorizing is answered from. The cost is the
+/// honest one: a change reaches a follower when replication does, which
+/// is why this polls rather than asserting straight away.
+#[tokio::test]
+async fn a_follower_enforces_an_acl_written_on_the_leader() {
+    let leader = TestNode::with_auth("auth10", auth_config(Some(("root", "hunter42"))).await).await;
+    // The same secret, so a token minted by one is good at the other --
+    // which is the whole of what makes them one cluster to a client.
+    let follower = TestNode::with_auth("auth11", auth_config(None).await).await;
+
+    let startup = log_in(&leader, "root", "hunter42").await;
+    let mut lead = leader.client().as_ref().clone();
+    lead.bootstrap(with_token(&startup, BootstrapRequest {
+        server_id: leader.id.clone(),
+    }))
+    .await
+    .expect("the startup administrator may bootstrap");
+
+    let root = log_in(&leader, "root", "hunter42").await;
+    retry("adding the follower", || {
+        let mut lead = lead.clone();
+        let root = root.clone();
+        let address = format!("http://{}", follower.client_addr);
+        async move {
+            matches!(
+                lead.add_server(with_token(&root, AddServerRequest {
+                    client_address: address,
+                }))
+                .await
+                .map(|r| r.into_inner().result),
+                Ok(Some(config_change_response::Result::Ok(true)))
+            )
+        }
+    })
+    .await;
+
+    lead.create_user(with_token(&root, CreateUserRequest {
+        username: "alice".to_string(),
+        password: "correct horse".to_string(),
+        is_admin: false,
+    }))
+    .await
+    .expect("an administrator may create accounts");
+    let alice = log_in(&leader, "alice", "correct horse").await;
+
+    write_with(&leader, &root, b"app/config", b"v")
+        .await
+        .expect("nothing governs this key yet");
+
+    // Until replication catches up the follower knows nothing about
+    // either. Waiting for the *value* is what makes the next assertion
+    // meaningful: it says the follower could have answered, and then
+    // stopped.
+    let mut follow = follower.client().as_ref().clone();
+    retry("the write reaching the follower", || {
+        let mut follow = follow.clone();
+        let alice = alice.clone();
+        async move {
+            matches!(
+                follow
+                    .read(with_token(&alice, ReadRequest {
+                        key: b"app/config".to_vec(),
+                        consistency: None,
+                    }))
+                    .await
+                    .map(|r| r.into_inner().result),
+                Ok(Some(read_response::Result::Ok(_)))
+            )
+        }
+    })
+    .await;
+
+    lead.set_acl(with_token(&root, SetAclRequest {
+        prefix: b"app/".to_vec(),
+        entries: vec![AclEntry {
+            principal: Some(user("root")),
+            right: Right::Write as i32,
+        }],
+    }))
+    .await
+    .expect("setting an ACL should be answered")
+    .into_inner();
+
+    // And now the follower -- which is not the leader, holds no quorum,
+    // and answers this read entirely from its own state -- refuses it.
+    retry("the ACL reaching the follower", || {
+        let mut follow = follow.clone();
+        let alice = alice.clone();
+        async move {
+            matches!(
+                follow
+                    .read(with_token(&alice, ReadRequest {
+                        key: b"app/config".to_vec(),
+                        consistency: None,
+                    }))
+                    .await
+                    .map(|r| r.into_inner().result),
+                Ok(Some(read_response::Result::AuthError(_)))
+            )
+        }
+    })
+    .await;
+
+    // The administrator's bypass is resolved from the follower's own
+    // account records, so it works there too.
+    let answered = follow
+        .read(with_token(&root, ReadRequest {
+            key: b"app/config".to_vec(),
+            consistency: None,
+        }))
+        .await
+        .expect("root should be answered")
+        .into_inner()
+        .result;
+    assert!(
+        matches!(answered, Some(read_response::Result::Ok(_))),
+        "got {answered:?}"
+    );
+}
+
+/// Polls `check` until it holds, or fails the test after ten seconds.
+///
+/// Replication and apply are both asynchronous, so everything a
+/// follower is asked about here is "eventually" rather than "now".
+/// Sleeping a fixed amount instead would be either flaky or slow.
+async fn retry<F, Fut>(what: &str, mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if check().await {
+            return;
+        }
+        assert!(std::time::Instant::now() < until, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }

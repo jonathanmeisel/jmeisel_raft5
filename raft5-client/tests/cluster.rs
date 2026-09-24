@@ -1375,3 +1375,330 @@ async fn a_snapshot_walk_pages_across_batches() {
     let now = client.key_iterator(b"").collect().await.unwrap();
     assert_eq!(now.len(), 25 - 9);
 }
+
+// --- permissions ------------------------------------------------------
+
+/// The client's side of an ACL: written by one account, enforced against
+/// another, and reported by `get_acl` in the terms the refusal used.
+#[tokio::test]
+async fn an_acl_written_by_an_admin_is_enforced_against_another_account() {
+    use raft5_client::{Denial, Principal, Right};
+
+    let n1 = TestNode::start_with_auth("perm-c1", auth_config(Some(("root", "hunter42"))).await);
+    let admin = Client::new([n1.url()]).unwrap();
+    admin.login("root", "hunter42").await.unwrap();
+    bootstrap(&admin, "perm-c1").await;
+    admin.write(b"app/config", Some(b"v")).await.unwrap();
+    admin.write(b"other/config", Some(b"v")).await.unwrap();
+    admin
+        .create_user("alice", "correct horse", false)
+        .await
+        .unwrap();
+
+    let alice = Client::new([n1.url()]).unwrap();
+    alice.login("alice", "correct horse").await.unwrap();
+    // Before the ACL, alice reaches everything -- which is the state
+    // every cluster upgrades into.
+    assert_eq!(
+        alice.read(b"app/config").await.unwrap().value,
+        Some(b"v".to_vec())
+    );
+
+    admin
+        .set_acl(b"app/", &[(Principal::user("root"), Right::Write)])
+        .await
+        .unwrap();
+
+    let error = alice
+        .read(b"app/config")
+        .await
+        .expect_err("the ACL does not name alice");
+    assert!(
+        matches!(
+            error,
+            Error::Denied {
+                reason: Denial::NotPermitted,
+                ..
+            }
+        ),
+        "expected NotPermitted, got {error:?}"
+    );
+    let error = alice
+        .write(b"app/config", Some(b"x"))
+        .await
+        .expect_err("nor for writing");
+    assert!(matches!(error, Error::Denied { reason: Denial::NotPermitted, .. }));
+
+    // A key the ACL does not govern is untouched.
+    assert_eq!(
+        alice.read(b"other/config").await.unwrap().value,
+        Some(b"v".to_vec())
+    );
+
+    // And she can find out why, which is what makes a refusal
+    // actionable rather than a mystery.
+    let governing = alice.get_acl(b"app/config").await.unwrap();
+    let acl = governing.acl.expect("something governs that key");
+    assert_eq!(acl.prefix, b"app/".to_vec());
+    assert_eq!(acl.entries, vec![(Principal::user("root"), Right::Write)]);
+    assert_eq!(governing.effective, None, "the ACL grants alice nothing");
+
+    assert_eq!(alice.get_acl(b"other/config").await.unwrap().acl, None);
+}
+
+/// A group is a name for a set of accounts, and granting one is what
+/// makes that name worth having. Nesting included: the ACL names only
+/// the outer group.
+#[tokio::test]
+async fn a_nested_group_carries_a_grant_to_its_members() {
+    use raft5_client::{Denial, Principal, Right};
+
+    let n1 = TestNode::start_with_auth("perm-c2", auth_config(Some(("root", "hunter42"))).await);
+    let admin = Client::new([n1.url()]).unwrap();
+    admin.login("root", "hunter42").await.unwrap();
+    bootstrap(&admin, "perm-c2").await;
+    admin.write(b"app/config", Some(b"v")).await.unwrap();
+    for name in ["alice", "bob"] {
+        admin.create_user(name, "correct horse", false).await.unwrap();
+    }
+
+    admin
+        .create_group("interns", &[Principal::user("alice")], &[])
+        .await
+        .unwrap();
+    admin
+        .create_group("staff", &[Principal::group("interns")], &[])
+        .await
+        .unwrap();
+    admin
+        .set_acl(
+            b"app/",
+            &[
+                (Principal::user("root"), Right::Write),
+                (Principal::group("staff"), Right::Read),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let alice = Client::new([n1.url()]).unwrap();
+    alice.login("alice", "correct horse").await.unwrap();
+    let bob = Client::new([n1.url()]).unwrap();
+    bob.login("bob", "correct horse").await.unwrap();
+
+    assert_eq!(
+        alice.read(b"app/config").await.unwrap().value,
+        Some(b"v".to_vec()),
+        "membership of a nested group should carry the outer group's grant"
+    );
+    assert_eq!(
+        alice.get_acl(b"app/config").await.unwrap().effective,
+        Some(Right::Read)
+    );
+    // Read, not write.
+    assert!(matches!(
+        alice.write(b"app/config", Some(b"x")).await,
+        Err(Error::Denied { reason: Denial::NotPermitted, .. })
+    ));
+    // Bob is in nothing.
+    assert!(matches!(
+        bob.read(b"app/config").await,
+        Err(Error::Denied { reason: Denial::NotPermitted, .. })
+    ));
+
+    // Taking alice out of the inner group takes her out of the outer
+    // one, and the very next call sees it.
+    admin
+        .update_group("interns", &[], &[Principal::user("alice")], &[], &[])
+        .await
+        .unwrap();
+    assert!(matches!(
+        alice.read(b"app/config").await,
+        Err(Error::Denied { reason: Denial::NotPermitted, .. })
+    ));
+
+    // The listings are readable by anyone with an account: a caller who
+    // could not read them could not tell a refusal from a bug.
+    let groups = bob.list_groups().await.unwrap();
+    assert_eq!(
+        groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
+        vec!["interns", "staff"]
+    );
+    assert_eq!(bob.list_acls().await.unwrap().len(), 1);
+}
+
+/// The paging case the server-side cursor exists for: a walk over a
+/// store the caller can see almost none of.
+///
+/// The iterator has to keep going through batches that come back empty,
+/// which is the thing it could not do before -- an empty batch used to
+/// mean the end of the keyspace, and here it means "still looking".
+#[tokio::test]
+async fn a_key_walk_pages_past_everything_the_caller_may_not_see() {
+    use raft5_client::{Principal, Right};
+
+    let n1 = TestNode::start_with_auth("perm-c3", auth_config(Some(("root", "hunter42"))).await);
+    let admin = Client::new([n1.url()]).unwrap();
+    admin.login("root", "hunter42").await.unwrap();
+    bootstrap(&admin, "perm-c3").await;
+
+    for i in 0..40 {
+        admin
+            .write(format!("hidden/{i:02}").as_bytes(), Some(b"v"))
+            .await
+            .unwrap();
+    }
+    // Sorts after every hidden key, so reaching it means the walk got
+    // all the way through them.
+    admin.write(b"zzz", Some(b"v")).await.unwrap();
+    admin
+        .create_user("alice", "correct horse", false)
+        .await
+        .unwrap();
+    admin
+        .set_acl(b"hidden/", &[(Principal::user("root"), Right::Write)])
+        .await
+        .unwrap();
+
+    let alice = Client::new([n1.url()]).unwrap();
+    alice.login("alice", "correct horse").await.unwrap();
+
+    let keys = alice.key_iterator(b"").batch_size(5).collect().await.unwrap();
+    assert_eq!(keys, vec![b"zzz".to_vec()]);
+
+    // The administrator's walk is unaffected.
+    let keys = admin.key_iterator(b"").batch_size(5).collect().await.unwrap();
+    assert_eq!(keys.len(), 41);
+}
+
+/// An account may create a group -- it grants them nothing they did not
+/// already have -- but writing an ACL where none yet decides is an
+/// administrator's act. Without that rule any account could write an ACL
+/// on the empty prefix and lock the cluster out of its own keyspace.
+#[tokio::test]
+async fn an_ordinary_account_may_make_a_group_but_not_claim_an_unowned_prefix() {
+    use raft5_client::{Denial, Principal, Right};
+
+    let n1 = TestNode::start_with_auth("perm-c4", auth_config(Some(("root", "hunter42"))).await);
+    let admin = Client::new([n1.url()]).unwrap();
+    admin.login("root", "hunter42").await.unwrap();
+    bootstrap(&admin, "perm-c4").await;
+    admin
+        .create_user("alice", "correct horse", false)
+        .await
+        .unwrap();
+
+    let alice = Client::new([n1.url()]).unwrap();
+    alice.login("alice", "correct horse").await.unwrap();
+
+    alice.create_group("oncall", &[], &[]).await.unwrap();
+    let group = alice.get_group("oncall").await.unwrap();
+    assert_eq!(group.created_by, "alice");
+    assert_eq!(group.admins, vec![Principal::user("alice")]);
+
+    // Nothing governs the empty prefix, so it is not hers to claim.
+    let error = alice
+        .set_acl(b"", &[(Principal::user("alice"), Right::Write)])
+        .await
+        .expect_err("the default confers no authority over the ACLs");
+    assert!(
+        matches!(error, Error::Denied { reason: Denial::NotPermitted, .. }),
+        "got {error:?}"
+    );
+
+    // Once an administrator grants her group write on a prefix, that
+    // prefix and everything under it are the group's to govern.
+    admin
+        .set_acl(b"app/", &[(Principal::group("oncall"), Right::Write)])
+        .await
+        .unwrap();
+
+    // Administering a group is not being in one. Alice created
+    // `oncall` and decides who is in it, and until she puts herself in
+    // it the grant to the group does not reach her -- otherwise every
+    // group's administrator would silently hold everything that group
+    // was ever granted.
+    assert!(matches!(
+        alice.set_acl(b"app/sub/", &[(Principal::user("alice"), Right::Read)]).await,
+        Err(Error::Denied { reason: Denial::NotPermitted, .. })
+    ));
+    alice
+        .update_group("oncall", &[Principal::user("alice")], &[], &[], &[])
+        .await
+        .unwrap();
+    alice
+        .set_acl(b"app/sub/", &[(Principal::user("alice"), Right::Read)])
+        .await
+        .unwrap();
+    // But not a sibling nothing reaches.
+    assert!(matches!(
+        alice.set_acl(b"app2/", &[(Principal::user("alice"), Right::Write)]).await,
+        Err(Error::Denied { reason: Denial::NotPermitted, .. })
+    ));
+
+    // A group that does not exist is reported as such.
+    assert!(matches!(
+        alice.get_group("nope").await,
+        Err(Error::Denied { reason: Denial::NoSuchGroup, .. })
+    ));
+}
+
+/// Permission changes contend for one key -- the epoch, which every one
+/// of them writes -- so two at once resolve the way any two conflicting
+/// transactions do, and the loser is told to retry rather than quietly
+/// deciding from a view that has already moved.
+///
+/// This is the cost of pinning those decisions, and it is worth knowing
+/// exactly what a caller sees: both of these must end up applied, one of
+/// them possibly after a retry.
+#[tokio::test]
+async fn two_permission_changes_at_once_both_land_one_may_retry() {
+    use raft5_client::{Principal, Right};
+
+    let n1 = TestNode::start_with_auth("perm-c5", auth_config(Some(("root", "hunter42"))).await);
+    let admin = Client::new([n1.url()]).unwrap();
+    admin.login("root", "hunter42").await.unwrap();
+    bootstrap(&admin, "perm-c5").await;
+
+    let a = admin.clone();
+    let b = admin.clone();
+    let one = tokio::spawn(async move {
+        let grant = [(Principal::user("root"), Right::Write)];
+        retry_on_abort(|| a.set_acl(b"one/", &grant)).await
+    });
+    let two = tokio::spawn(async move {
+        let grant = [(Principal::user("root"), Right::Write)];
+        retry_on_abort(|| b.set_acl(b"two/", &grant)).await
+    });
+    one.await.unwrap();
+    two.await.unwrap();
+
+    let acls = admin.list_acls().await.unwrap();
+    assert_eq!(
+        acls.iter().map(|a| a.prefix.clone()).collect::<Vec<_>>(),
+        vec![b"one/".to_vec(), b"two/".to_vec()],
+        "both changes should have landed"
+    );
+}
+
+/// Replays a call that lost a lock race. An aborted transaction wrote
+/// nothing, so replaying it is always safe -- the client does not do it
+/// automatically because in general the retry is the whole transaction,
+/// reads and all, and only the caller knows what those were.
+async fn retry_on_abort<F, Fut>(mut call: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<u64, Error>>,
+{
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        match call().await {
+            Ok(_) => return,
+            Err(e @ Error::Aborted { .. }) | Err(e @ Error::Unavailable(_)) => {
+                assert!(Instant::now() < until, "never succeeded: {e}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => panic!("unexpected failure: {e}"),
+        }
+    }
+}

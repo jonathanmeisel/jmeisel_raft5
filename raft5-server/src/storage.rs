@@ -345,6 +345,11 @@ pub struct CappedEntries {
 }
 
 /// Append-only, gap-free, per-key-compactable log on top of `fjall`.
+/// What a scan hands back: the keys it kept, and where to start again
+/// if it stopped before it could fill the batch. See
+/// [`RaftLog::scan_as_of`].
+pub type ScanPage = (Vec<Vec<u8>>, Option<Vec<u8>>);
+
 pub struct RaftLog {
     db: Database,
     log: Keyspace,
@@ -624,7 +629,25 @@ impl RaftLog {
     }
 
     /// Up to `limit` keys at or after `start` that had a value as of
-    /// `as_of`, in ascending order, skipping any key `skip` rejects.
+    /// `as_of`, in ascending order, skipping any key `skip` rejects --
+    /// and, alongside them, where to start again if this stopped early.
+    ///
+    /// `budget` bounds how many keys it will decide about, kept or
+    /// skipped, before giving up on filling the batch. Without one, a
+    /// `skip` that rejects most of what it sees makes a single call walk
+    /// the entire keyspace: the two callers that can do that are a
+    /// transaction with a great many buffered deletes, and -- since keys
+    /// a caller may not read are hidden this way too -- anyone whose
+    /// access is a narrow slice of a large store. The second returned
+    /// value is `Some(key)` exactly when the budget ran out, and is a
+    /// key this scan has *not* decided about, so a caller that starts
+    /// its next batch there misses nothing in between.
+    ///
+    /// Note that it is a bound on work, not on results: a batch cut
+    /// short this way can be shorter than `limit`, or empty, with plenty
+    /// of keys left after it. That is why the cursor is returned rather
+    /// than left to the caller to derive from the last key it got --
+    /// there may not be one.
     ///
     /// `skip` is how a transaction's buffered deletes are honoured
     /// without teaching storage what a transaction is: a key the caller
@@ -653,8 +676,9 @@ impl RaftLog {
         start: &[u8],
         as_of: u64,
         limit: usize,
+        budget: usize,
         skip: impl Fn(&[u8]) -> bool,
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<ScanPage> {
         let mut keys = Vec::new();
         // The run this scan has already decided about. Rows of one key
         // arrive together and newest first, so the first row at or below
@@ -662,6 +686,9 @@ impl RaftLog {
         // over -- compared as `row_chain`, which is a memcmp on bytes
         // already in hand rather than an unescape per row.
         let mut settled: Option<Vec<u8>> = None;
+        // How many keys this scan has decided about, skipped or kept.
+        let mut examined = 0usize;
+        let mut resume = None;
 
         for item in self.versions.range(chain_start(start)..) {
             if keys.len() == limit {
@@ -677,7 +704,19 @@ impl RaftLog {
                 // this run may still qualify.
                 continue;
             }
+            if examined == budget {
+                // Out of budget with the batch unfilled, which means
+                // `skip` rejected most of what this walked. Stop and say
+                // where to start again -- at this key, which has not
+                // been decided about, so nothing between the two batches
+                // is missed. The unescape is paid here and nowhere else,
+                // which is why the budget is checked before the key is
+                // settled rather than after.
+                resume = Some(row_user_key(&row)?);
+                break;
+            }
             settled = Some(chain.to_vec());
+            examined += 1;
             if codec::row_kind(&row)? != Kind::Value {
                 continue;
             }
@@ -686,7 +725,7 @@ impl RaftLog {
                 keys.push(key);
             }
         }
-        Ok(keys)
+        Ok((keys, resume))
     }
 
     /// `scan_as_of` over current state.
@@ -694,9 +733,10 @@ impl RaftLog {
         &self,
         start: &[u8],
         limit: usize,
+        budget: usize,
         skip: impl Fn(&[u8]) -> bool,
-    ) -> Result<Vec<Vec<u8>>> {
-        self.scan_as_of(start, u64::MAX, limit, skip)
+    ) -> Result<ScanPage> {
+        self.scan_as_of(start, u64::MAX, limit, budget, skip)
     }
 
     /// Applies every committed log entry not yet reflected in `versions`,

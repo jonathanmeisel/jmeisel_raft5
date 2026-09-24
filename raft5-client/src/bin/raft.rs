@@ -9,7 +9,7 @@ use std::io::{self, IsTerminal, Write};
 
 use clap::Parser;
 
-use raft5_client::{Client, Error, Invite};
+use raft5_client::{Client, Error, Invite, Principal, Right};
 
 /// Opens an interactive session against a raft5 cluster.
 #[derive(Parser)]
@@ -373,6 +373,115 @@ async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
             let [invite_id] = fixed_args(args, "revoke_invite <invite_id>")?;
             print_seq(client.revoke_invite(invite_id).await);
         }
+        "groups" => match client.list_groups().await {
+            Ok(groups) if groups.is_empty() => println!("(no groups)"),
+            Ok(groups) => {
+                for group in &groups {
+                    println!("{}", describe_group(group));
+                }
+            }
+            Err(e) => println!("error: {e}"),
+        },
+        "group" => {
+            let [name] = fixed_args(args, "group <name>")?;
+            match client.get_group(name).await {
+                Ok(group) => println!("{}", describe_group(&group)),
+                Err(e) => println!("error: {e}"),
+            }
+        }
+        "group_create" => {
+            let [name] = fixed_args(args, "group_create <name>")?;
+            print_seq(client.create_group(name, &[], &[]).await);
+        }
+        "group_delete" => {
+            let [name] = fixed_args(args, "group_delete <name>")?;
+            print_seq(client.delete_group(name).await);
+        }
+        "group_add" | "group_remove" => {
+            let usage = format!("{cmd} <group> <principal> [principal ...]");
+            let Some((name, rest)) = args.split_first() else {
+                return Err(format!("usage: {usage}"));
+            };
+            if rest.is_empty() {
+                return Err(format!("usage: {usage}"));
+            }
+            // `--admin` says these principals are being added to (or
+            // taken from) the group's administrators rather than its
+            // members. The two lists are separate everywhere else, and
+            // collapsing them here would be the one place they were not.
+            let (as_admin, names) = match rest.split_first() {
+                Some((flag, names)) if flag == "--admin" && !names.is_empty() => (true, names),
+                _ => (false, rest),
+            };
+            let principals = names
+                .iter()
+                .map(|name| parse_principal(name))
+                .collect::<Result<Vec<_>, _>>()?;
+            let none: &[Principal] = &[];
+            let result = if cmd == "group_add" {
+                if as_admin {
+                    client.update_group(name, none, none, &principals, none).await
+                } else {
+                    client.update_group(name, &principals, none, none, none).await
+                }
+            } else if as_admin {
+                client.update_group(name, none, none, none, &principals).await
+            } else {
+                client.update_group(name, none, &principals, none, none).await
+            };
+            print_seq(result);
+        }
+        "acls" => match client.list_acls().await {
+            Ok(acls) if acls.is_empty() => println!("(no ACLs -- every key is open)"),
+            Ok(acls) => {
+                for acl in &acls {
+                    println!("{}", describe_acl(acl));
+                }
+            }
+            Err(e) => println!("error: {e}"),
+        },
+        "acl" => {
+            let [key] = fixed_args(args, "acl <key>")?;
+            match client.get_acl(key.as_bytes()).await {
+                Ok(raft5_client::AclFor { acl: None, .. }) => {
+                    println!("(no ACL governs that key -- it is open to every account)");
+                }
+                Ok(raft5_client::AclFor {
+                    acl: Some(acl),
+                    effective,
+                }) => {
+                    println!("{}", describe_acl(&acl));
+                    match effective {
+                        Some(right) => println!("  you: {right}"),
+                        None => println!("  you: (nothing)"),
+                    }
+                }
+                Err(e) => println!("error: {e}"),
+            }
+        }
+        "acl_set" => {
+            // The prefix is first and may be empty, which is the one
+            // that governs every key -- so it is a positional argument
+            // that can legitimately be "".
+            let Some((prefix, grants)) = args.split_first() else {
+                return Err("usage: acl_set <prefix> <principal>=<right> ...".to_string());
+            };
+            if grants.is_empty() {
+                return Err(
+                    "usage: acl_set <prefix> <principal>=<right> ... (use acl_delete to remove one)"
+                        .to_string(),
+                );
+            }
+            let entries = grants
+                .iter()
+                .map(|grant| parse_grant(grant))
+                .collect::<Result<Vec<_>, _>>()?;
+            print_seq(client.set_acl(prefix.as_bytes(), &entries).await);
+        }
+        "acl_delete" => {
+            let [prefix] = fixed_args(args, "acl_delete <prefix>")?;
+            print_seq(client.delete_acl(prefix.as_bytes()).await);
+        }
         other => println!("unknown command {other:?}; type `help` for a list"),
     }
 
@@ -471,6 +580,74 @@ fn unix_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// A principal as this shell spells one: `user:alice` or `group:ops`.
+///
+/// The kind is never inferred from the name. Users and groups are
+/// separate namespaces, so `ops` alone is genuinely ambiguous, and
+/// guessing would make the one command where it mattered -- granting
+/// something to the wrong `ops` -- the one that failed silently.
+fn parse_principal(text: &str) -> Result<Principal, String> {
+    match text.split_once(':') {
+        Some(("user", name)) if !name.is_empty() => Ok(Principal::user(name)),
+        Some(("group", name)) if !name.is_empty() => Ok(Principal::group(name)),
+        _ => Err(format!(
+            "{text:?} is not a principal; write user:<name> or group:<name>"
+        )),
+    }
+}
+
+/// One ACL grant, as `acl_set` takes them: `user:alice=write`.
+fn parse_grant(text: &str) -> Result<(Principal, Right), String> {
+    let Some((who, right)) = text.rsplit_once('=') else {
+        return Err(format!(
+            "{text:?} is not a grant; write <principal>=read or <principal>=write"
+        ));
+    };
+    let right = match right {
+        "read" => Right::Read,
+        "write" => Right::Write,
+        other => return Err(format!("{other:?} is not a right; write `read` or `write`")),
+    };
+    Ok((parse_principal(who)?, right))
+}
+
+fn join_principals(principals: &[Principal]) -> String {
+    if principals.is_empty() {
+        return "(none)".to_string();
+    }
+    principals
+        .iter()
+        .map(Principal::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn describe_group(group: &raft5_client::Group) -> String {
+    format!(
+        "{}  admins: {}  members: {}  (created by {}, seq={})",
+        group.name,
+        join_principals(&group.admins),
+        join_principals(&group.members),
+        group.created_by,
+        group.seq,
+    )
+}
+
+fn describe_acl(acl: &raft5_client::Acl) -> String {
+    let prefix = if acl.prefix.is_empty() {
+        "(every key)".to_string()
+    } else {
+        format!("{:?}", String::from_utf8_lossy(&acl.prefix))
+    };
+    let grants = acl
+        .entries
+        .iter()
+        .map(|(principal, right)| format!("{principal}={right}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{prefix}  {grants}  (seq={})", acl.seq)
+}
+
 /// Reads one line from stdin, for the arguments a command would rather
 /// ask for than have typed where they can be seen.
 fn read_line(prompt: &str) -> Result<String, String> {
@@ -565,6 +742,23 @@ fn print_help() {
             "                                  login -- it is what you run before you have one",
             "invites                          list the invitations still outstanding; admins only",
             "revoke_invite <id>               withdraw one, by the id `invites` shows",
+            "groups                           list every group",
+            "group <name>                     show one group's members and administrators",
+            "group_create <name>              create a group; you become its administrator",
+            "group_delete <name>              delete one; its administrators, or a cluster admin",
+            "group_add <group> [--admin]      add principals to a group's members, or with",
+            "          <principal> ...         --admin to its administrators. a principal is",
+            "                                  written user:<name> or group:<name>",
+            "group_remove <group> [--admin]   the same, taking them out again",
+            "             <principal> ...",
+            "acls                             list every ACL, least specific prefix first",
+            "acl <key>                        which ACL governs a key, and what it grants you",
+            "acl_set <prefix>                 replace the ACL on a key prefix. a grant is",
+            "        <principal>=<right> ...   written user:alice=write or group:ops=read; an",
+            "                                  empty prefix governs every key. needs write on",
+            "                                  that prefix, or -- where no ACL governs it yet",
+            "                                  -- an administrator",
+            "acl_delete <prefix>              remove one, so a shorter prefix governs instead",
             "help                             show this message",
             "quit                             end the session",
         ]

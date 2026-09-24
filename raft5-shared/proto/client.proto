@@ -184,6 +184,98 @@ service Kv {
   // only. This is the remedy for one sent to the wrong address: there is
   // no way to un-send the secret, only to make it worthless.
   rpc RevokeInvite(RevokeInviteRequest) returns (RevokeInviteResponse);
+
+  // Permissions: groups, and access control lists on key prefixes.
+  //
+  // Also opt-in, and in a stronger sense than authentication is. A key
+  // no ACL governs is open to every authenticated caller, exactly as
+  // every key was before any of this existed, so a cluster that writes
+  // no ACL behaves as it always did. ACLs restrict; they do not enable.
+  //
+  // A key is governed by the ACL on the longest key prefix that has one
+  // -- the longest that *exists*, not the longest that happens to
+  // mention the caller. An ACL on `app/` naming only alice denies bob
+  // `app/config` outright rather than falling back to whatever a shorter
+  // prefix said, which is what makes an ACL a statement about a subtree
+  // and makes revoking access to one possible at all.
+  //
+  // `write` subsumes `read`, and adds creating and deleting keys, and
+  // authority over the ACL of that prefix and of every longer one.
+  //
+  // Administrators are outside all of it: `is_admin` is write everywhere
+  // and cannot be revoked by an ACL, since an administrator could
+  // rewrite that ACL anyway and locking one out would only mean locking
+  // out the cluster.
+
+  // Create a group. Any authenticated caller may, up to a per-creator
+  // quota; the creator becomes its sole administrator.
+  //
+  // Unlike accounts, this is deliberately not an administrator's
+  // privilege. A group is a name for a set of people, useful only when
+  // an ACL names it, and an ACL is written by someone who already holds
+  // write on the prefix -- so creating one grants its creator nothing
+  // they did not already have.
+  rpc CreateGroup(CreateGroupRequest) returns (CreateGroupResponse);
+
+  // Delete a group. Its administrators, or a cluster administrator.
+  //
+  // ACLs that named it are left alone: a grant to a group that no longer
+  // exists matches nobody, which is how a dangling reference should
+  // fail. Rewriting every ACL that mentioned it would be a far larger
+  // operation with the same result.
+  rpc DeleteGroup(DeleteGroupRequest) returns (DeleteGroupResponse);
+
+  // Add and remove members and administrators, in one transaction.
+  // The group's administrators, or a cluster administrator.
+  //
+  // One RPC rather than four, because the interesting changes are not
+  // single edits: handing a group over is adding the new administrator
+  // and removing the old one, and that must not be able to land halfway.
+  // Removals are applied after additions, so a call that does both to
+  // the same principal removes it.
+  //
+  // A group must always have at least one administrator, and cannot be
+  // made to contain itself -- a cycle would make "who is in this group"
+  // a question with no answer.
+  rpc UpdateGroup(UpdateGroupRequest) returns (UpdateGroupResponse);
+
+  // What a group contains and who administers it. Any authenticated
+  // caller: a group is a name for a set of people, and one that could
+  // not be looked up could not be reasoned about by anyone deciding
+  // whether to grant it anything.
+  rpc GetGroup(GetGroupRequest) returns (GetGroupResponse);
+  rpc ListGroups(ListGroupsRequest) returns (ListGroupsResponse);
+
+  // Write the ACL governing a key prefix, replacing whatever it held.
+  //
+  // Requires `write` on that prefix -- which, by the longest-prefix
+  // rule, is exactly "write on this prefix or on a shorter one that
+  // governs it". A cluster administrator may always.
+  //
+  // What it does *not* accept is the default. A key nothing governs is
+  // open to everyone, and that is permission to use the key, not
+  // authority over who else may: without this, any account could write
+  // an ACL on the empty prefix and lock out the cluster. So creating an
+  // ACL where no ACL currently decides is an administrator's act.
+  rpc SetAcl(SetAclRequest) returns (SetAclResponse);
+
+  // Remove the ACL on a key prefix, so the next shorter one that has one
+  // governs instead. Same authority as writing it -- with the same
+  // exception, from the other side: a removal that would leave the
+  // prefix governed by nothing, and so open to everyone, is an
+  // administrator's act.
+  rpc DeleteAcl(DeleteAclRequest) returns (DeleteAclResponse);
+
+  // Read the ACLs. Any authenticated caller: these say who may reach
+  // which keys, which is not a secret from the people they are about,
+  // and a caller who could not read them could not tell a refusal from
+  // a bug.
+  //
+  // GetAcl answers about one key or prefix, including which prefix
+  // turned out to govern it, because that is the question someone
+  // holding a refusal actually has.
+  rpc GetAcl(GetAclRequest) returns (GetAclResponse);
+  rpc ListAcls(ListAclsRequest) returns (ListAclsResponse);
 }
 
 // Carried in every response so a client can find the real leader without a
@@ -252,6 +344,12 @@ message WriteResponse {
     // key in the transaction at once.
     bool ok = 1;
     RaftError error = 2;
+    // An ACL governs this key and does not grant the caller `write`.
+    // Raised here, where the key is buffered, rather than at commit:
+    // the caller finds out about the key it named, at the moment it
+    // named it, instead of losing a whole transaction's work later to
+    // an error that cannot say which key caused it.
+    AuthError auth_error = 3;
   }
 }
 
@@ -305,6 +403,10 @@ message ReadResponse {
   oneof result {
     ReadOk ok = 1;
     RaftError error = 2;
+    // An ACL governs this key and does not grant the caller `read`.
+    // Refused rather than answered as absent, for the reason a reserved
+    // key is: "there is nothing here" is itself something to learn.
+    AuthError auth_error = 3;
   }
 }
 
@@ -330,6 +432,9 @@ message GetVersionResponse {
   oneof result {
     GetVersionOk ok = 1;
     RaftError error = 2;
+    // As ReadResponse's, and for the same reason: "this key changed at
+    // seq N" is a fact about a key the caller may not read.
+    AuthError auth_error = 3;
   }
 }
 
@@ -383,6 +488,13 @@ message GetKeysResponse {
   oneof result {
     GetKeysOk ok = 1;
     RaftError error = 2;
+    // No auth_error, deliberately, though every key this returns is
+    // permission-checked. Keys the caller may not read are omitted from
+    // the walk rather than refusing it: a scan asks about a range, not
+    // about a key, and "some of what is in here is not for you" would
+    // say more than handing back what is. It is also the only answer
+    // that composes -- a caller whose access is one subtree of a large
+    // store can still walk the store.
   }
 }
 
@@ -453,6 +565,22 @@ message GetKeysOk {
   // buffered deletes can make wrong -- they can shorten a batch that
   // was not the last one.
   bool has_more = 2;
+  // Where the next batch starts, set whenever `has_more` is. A caller
+  // that has this should use it and not compute its own cursor.
+  //
+  // Appending a zero byte to the last key returned is the right next
+  // start only when the scan stopped because the batch filled. It can
+  // now also stop because it examined as many keys as the server will
+  // look at in one call -- which is what keeps a walk bounded when
+  // most of what it passes is filtered out, by an ACL or by a
+  // transaction's buffered deletes. A batch that ends that way can be
+  // short, or empty, while there is plenty left; there is no last key
+  // to derive a cursor from, so the server sends the one it stopped at.
+  //
+  // An older server sends nothing here and can only stop the first way,
+  // so a client that prefers this and falls back to the zero-byte rule
+  // is correct against both.
+  bytes next_start_key = 3;
 }
 
 message AddServerRequest {
@@ -583,6 +711,18 @@ message AuthError {
     // client has one thing to do about any of them, which is to ask the
     // person who issued it for another.
     BAD_INVITE = 6;
+    // An ACL governs this key, or this prefix, and does not grant the
+    // caller what the call needed. Deliberately not saying which ACL or
+    // what it does grant: GetAcl answers that, for a caller who may ask.
+    NOT_PERMITTED = 7;
+    // There is no such group. Separate from NO_SUCH_USER because the
+    // two namespaces are separate -- a caller told "no such user" about
+    // a group name would go looking for an account.
+    NO_SUCH_GROUP = 8;
+    // There is no ACL on that exact prefix. Only DeleteAcl raises it,
+    // and it means the prefix itself has none -- a longer or shorter one
+    // may well, which is why this is not "there is no ACL here".
+    NO_SUCH_ACL = 9;
   }
   Kind kind = 1;
   string detail = 2;
@@ -744,6 +884,221 @@ message RevokeInviteResponse {
   oneof result {
     // The seq the removal landed at.
     uint64 seq = 1;
+    RaftError error = 2;
+    AuthError auth_error = 3;
+  }
+}
+
+// Something a group or an ACL can name.
+//
+// A oneof rather than a name plus a kind enum, so that "a principal with
+// no kind set" is not a thing a request can contain. Users and groups
+// are separate namespaces: `user:ops` and `group:ops` are two different
+// principals, and nothing resolves one to the other.
+message Principal {
+  oneof kind {
+    string user = 1;
+    string group = 2;
+  }
+}
+
+// What a principal may do with the keys an ACL governs.
+//
+// No UNSPECIFIED member, deliberately: proto3 would make it the default,
+// and a grant whose right was left unset would then be the one with the
+// lowest number rather than an error. Requests are refused unless they
+// name one of these explicitly.
+enum Right {
+  RIGHT_UNSPECIFIED = 0;
+  // Read the keys under this prefix, and nothing else.
+  RIGHT_READ = 1;
+  // Read, write, create and delete them -- and set the ACL of this
+  // prefix and of any longer one.
+  RIGHT_WRITE = 2;
+}
+
+message AclEntry {
+  Principal principal = 1;
+  Right right = 2;
+}
+
+// One access control list: the key prefix it governs and what it grants.
+message Acl {
+  // The prefix, exactly as it was set. The empty prefix governs every
+  // key there is.
+  bytes prefix = 1;
+  repeated AclEntry entries = 2;
+  // The seq the record was written at.
+  uint64 seq = 3;
+}
+
+message CreateGroupRequest {
+  // Same character set as a username, and for the same reason -- it is
+  // appended to a fixed key prefix with no separator. A separate
+  // namespace from usernames, though: a group may share a name with an
+  // account without being it.
+  string name = 1;
+  // Optional initial contents, applied in the same transaction that
+  // creates the group. The creator is always an administrator of it,
+  // whatever these say, so that a group can never be created already
+  // unadministrable.
+  repeated Principal members = 2;
+  repeated Principal admins = 3;
+}
+
+message CreateGroupResponse {
+  oneof result {
+    uint64 seq = 1;
+    RaftError error = 2;
+    AuthError auth_error = 3;
+  }
+}
+
+message DeleteGroupRequest {
+  string name = 1;
+}
+
+message DeleteGroupResponse {
+  oneof result {
+    uint64 seq = 1;
+    RaftError error = 2;
+    AuthError auth_error = 3;
+  }
+}
+
+message UpdateGroupRequest {
+  string name = 1;
+  // Additions first, then removals, so that a principal named in both
+  // ends up removed. That order is the one that makes "replace these
+  // members with those" a single call that cannot be read two ways.
+  repeated Principal add_members = 2;
+  repeated Principal remove_members = 3;
+  repeated Principal add_admins = 4;
+  repeated Principal remove_admins = 5;
+}
+
+message UpdateGroupResponse {
+  oneof result {
+    uint64 seq = 1;
+    RaftError error = 2;
+    AuthError auth_error = 3;
+  }
+}
+
+message Group {
+  string name = 1;
+  // The account that created it. Recorded so a listing can say where a
+  // group came from; nothing but the per-creator quota depends on it,
+  // and an administrator of the group need not be this account.
+  string created_by = 2;
+  // Who may change the group. Separate from its members, and not
+  // implicitly part of them: administering a group is deciding who is
+  // in it, and being in it is holding whatever it has been granted.
+  // An administrator who wants the group's access adds themselves to
+  // it, which they may, and which then shows up here.
+  repeated Principal admins = 3;
+  repeated Principal members = 4;
+  // The seq the record was last written at.
+  uint64 seq = 5;
+}
+
+message GetGroupRequest {
+  string name = 1;
+}
+
+message GetGroupResponse {
+  oneof result {
+    Group ok = 1;
+    RaftError error = 2;
+    AuthError auth_error = 3;
+  }
+}
+
+message ListGroupsRequest {}
+
+message GroupList {
+  // In name order, with members and admins as stored -- not expanded.
+  // A nested group appears as itself, because the nesting is the thing
+  // somebody reading a listing needs to see.
+  repeated Group groups = 1;
+}
+
+message ListGroupsResponse {
+  oneof result {
+    GroupList ok = 1;
+    RaftError error = 2;
+    AuthError auth_error = 3;
+  }
+}
+
+message SetAclRequest {
+  // The key prefix to govern. Empty is legal and governs everything.
+  bytes prefix = 1;
+  // Replaces whatever the prefix held, rather than merging into it: a
+  // caller that read an ACL, decided what it should say, and sends that
+  // is writing what it meant, which a merge could not express -- there
+  // would be no way to take an entry away.
+  //
+  // A principal may appear at most once.
+  repeated AclEntry entries = 2;
+}
+
+message SetAclResponse {
+  oneof result {
+    uint64 seq = 1;
+    RaftError error = 2;
+    AuthError auth_error = 3;
+  }
+}
+
+message DeleteAclRequest {
+  bytes prefix = 1;
+}
+
+message DeleteAclResponse {
+  oneof result {
+    uint64 seq = 1;
+    RaftError error = 2;
+    AuthError auth_error = 3;
+  }
+}
+
+message GetAclRequest {
+  // A key, or a prefix -- the same thing as far as this is concerned.
+  // The answer is about whichever ACL governs it.
+  bytes key = 1;
+}
+
+message GetAclOk {
+  // The ACL that governs `key`, absent if none does -- which means the
+  // key is open to every authenticated caller.
+  optional Acl acl = 1;
+  // What that ACL grants the caller asking, absent when nothing governs
+  // the key. Answered here so that "may I write this?" is one round
+  // trip rather than a client reimplementing group expansion.
+  optional Right effective = 2;
+}
+
+message GetAclResponse {
+  oneof result {
+    GetAclOk ok = 1;
+    RaftError error = 2;
+    AuthError auth_error = 3;
+  }
+}
+
+message ListAclsRequest {}
+
+message AclList {
+  // In prefix order, shortest first where one is a prefix of another --
+  // which is the order they take effect in, read from least to most
+  // specific.
+  repeated Acl acls = 1;
+}
+
+message ListAclsResponse {
+  oneof result {
+    AclList ok = 1;
     RaftError error = 2;
     AuthError auth_error = 3;
   }

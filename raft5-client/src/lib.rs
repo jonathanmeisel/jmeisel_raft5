@@ -55,6 +55,16 @@ use raft5_shared::raft5::client::{
     raft_error, read_request, read_response, redeem_invite_response, remove_snapshot_response,
     revoke_invite_response, transaction_aborted, write_response,
 };
+use raft5_shared::raft5::client::{
+    Acl as PbAcl, AclEntry as PbAclEntry, CreateGroupRequest, CreateGroupResponse,
+    DeleteAclRequest, DeleteAclResponse, DeleteGroupRequest, DeleteGroupResponse, GetAclRequest,
+    GetAclResponse, GetGroupRequest, GetGroupResponse, Group as PbGroup, ListAclsRequest,
+    ListAclsResponse, ListGroupsRequest, ListGroupsResponse, Principal as PbPrincipal,
+    Right as PbRight, SetAclRequest, SetAclResponse, UpdateGroupRequest, UpdateGroupResponse,
+    create_group_response, delete_acl_response, delete_group_response, get_acl_response,
+    get_group_response, list_acls_response, list_groups_response, principal, set_acl_response,
+    update_group_response,
+};
 
 use routing::{Kv, Router};
 
@@ -159,6 +169,181 @@ pub enum Error {
     },
 }
 
+/// One batch of a key walk, as the cluster answered it.
+///
+/// Internal: [`KeyIterator`] is the public way to walk keys, and the
+/// only reason this is a type of its own is that `has_more` and
+/// `next_start_key` are two different facts -- a batch can be short, or
+/// empty, and still have keys after it.
+struct KeyBatch {
+    keys: Vec<Vec<u8>>,
+    has_more: bool,
+    /// Where the server says the next batch starts. Absent from an
+    /// older server, and from a batch that is the last one.
+    next_start_key: Option<Vec<u8>>,
+}
+
+/// Someone an ACL or a group can name.
+///
+/// Users and groups are separate namespaces: `Principal::user("ops")`
+/// and `Principal::group("ops")` are two different principals, and
+/// nothing resolves one to the other.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Principal {
+    User(String),
+    Group(String),
+}
+
+impl Principal {
+    pub fn user(name: impl Into<String>) -> Self {
+        Self::User(name.into())
+    }
+
+    pub fn group(name: impl Into<String>) -> Self {
+        Self::Group(name.into())
+    }
+
+    fn to_pb(&self) -> PbPrincipal {
+        PbPrincipal {
+            kind: Some(match self {
+                Self::User(name) => principal::Kind::User(name.clone()),
+                Self::Group(name) => principal::Kind::Group(name.clone()),
+            }),
+        }
+    }
+
+    /// A principal off the wire. A kind this client does not know about
+    /// is left out of the list it was in rather than failing the call:
+    /// an ACL from a newer cluster is still worth most of what it says.
+    fn from_pb(pb: &PbPrincipal) -> Option<Self> {
+        match &pb.kind {
+            Some(principal::Kind::User(name)) => Some(Self::User(name.clone())),
+            Some(principal::Kind::Group(name)) => Some(Self::Group(name.clone())),
+            None => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Principal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::User(name) => write!(f, "user:{name}"),
+            Self::Group(name) => write!(f, "group:{name}"),
+        }
+    }
+}
+
+/// What an ACL grants. `Write` includes everything `Read` does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Right {
+    Read,
+    Write,
+}
+
+impl Right {
+    fn to_pb(self) -> i32 {
+        match self {
+            Self::Read => PbRight::Read as i32,
+            Self::Write => PbRight::Write as i32,
+        }
+    }
+
+    fn from_pb(right: i32) -> Option<Self> {
+        match PbRight::try_from(right) {
+            Ok(PbRight::Read) => Some(Self::Read),
+            Ok(PbRight::Write) => Some(Self::Write),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Right {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        })
+    }
+}
+
+/// One access control list: the key prefix it governs and what it grants.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Acl {
+    /// The prefix. Empty governs every key there is.
+    pub prefix: Vec<u8>,
+    pub entries: Vec<(Principal, Right)>,
+    /// The seq the record was last written at.
+    pub seq: u64,
+}
+
+impl Acl {
+    fn from_pb(pb: PbAcl) -> Self {
+        Self {
+            prefix: pb.prefix,
+            entries: pb
+                .entries
+                .iter()
+                .filter_map(|entry| {
+                    let principal = Principal::from_pb(entry.principal.as_ref()?)?;
+                    Some((principal, Right::from_pb(entry.right)?))
+                })
+                .collect(),
+            seq: pb.seq,
+        }
+    }
+}
+
+/// What governs one key, and what it grants the account that asked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AclFor {
+    /// The ACL that governs the key, or `None` when nothing does --
+    /// which means the key is open to every authenticated account.
+    pub acl: Option<Acl>,
+    /// What that ACL grants this account, or `None` when it grants it
+    /// nothing, and when nothing governs the key.
+    ///
+    /// Note that an administrator sees what the ACL says about them,
+    /// not their bypass: the question is about the ACL.
+    pub effective: Option<Right>,
+}
+
+/// One group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Group {
+    pub name: String,
+    /// The account that created it, which need not still administer it.
+    pub created_by: String,
+    /// Who may change it.
+    pub admins: Vec<Principal>,
+    /// Who is in it. A group here is a nested group: everything in it
+    /// is in this one too, transitively.
+    pub members: Vec<Principal>,
+    /// The seq the record was last written at.
+    pub seq: u64,
+}
+
+impl Group {
+    fn from_pb(pb: PbGroup) -> Self {
+        Self {
+            name: pb.name,
+            created_by: pb.created_by,
+            admins: pb.admins.iter().filter_map(Principal::from_pb).collect(),
+            members: pb.members.iter().filter_map(Principal::from_pb).collect(),
+            seq: pb.seq,
+        }
+    }
+}
+
+fn entries_to_pb(entries: &[(Principal, Right)]) -> Vec<PbAclEntry> {
+    entries
+        .iter()
+        .map(|(principal, right)| PbAclEntry {
+            principal: Some(principal.to_pb()),
+            right: right.to_pb(),
+        })
+        .collect()
+}
+
 /// Why the cluster refused an account request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Denial {
@@ -180,6 +365,15 @@ pub enum Denial {
     /// Which of those is not distinguished -- there is one thing to do
     /// about any of them, which is to ask for another.
     BadInvite,
+    /// An ACL governs the key or prefix asked about, and does not grant
+    /// this account what the call needed. `Client::get_acl` says which
+    /// ACL decided and what it grants.
+    NotPermitted,
+    /// There is no group by that name.
+    NoSuchGroup,
+    /// There is no ACL on that exact prefix. A longer or a shorter one
+    /// may still govern the keys under it.
+    NoSuchAcl,
     /// A reason this version of the client does not know about.
     Unknown,
 }
@@ -193,6 +387,9 @@ impl std::fmt::Display for Denial {
             Self::NotAdmin => "that account is not an administrator",
             Self::AuthDisabled => "this cluster keeps no accounts",
             Self::BadInvite => "that invitation cannot be used",
+            Self::NotPermitted => "an ACL does not grant this account that",
+            Self::NoSuchGroup => "there is no such group",
+            Self::NoSuchAcl => "there is no ACL on that prefix",
             Self::Unknown => "the cluster refused",
         };
         f.write_str(text)
@@ -208,6 +405,9 @@ impl From<auth_error::Kind> for Denial {
             auth_error::Kind::NotAdmin => Self::NotAdmin,
             auth_error::Kind::AuthDisabled => Self::AuthDisabled,
             auth_error::Kind::BadInvite => Self::BadInvite,
+            auth_error::Kind::NotPermitted => Self::NotPermitted,
+            auth_error::Kind::NoSuchGroup => Self::NoSuchGroup,
+            auth_error::Kind::NoSuchAcl => Self::NoSuchAcl,
             auth_error::Kind::Unspecified => Self::Unknown,
         }
     }
@@ -775,7 +975,7 @@ impl Client {
         start_key: Vec<u8>,
         max_keys: u32,
         consistency: Option<get_keys_request::Consistency>,
-    ) -> Result<(Vec<Vec<u8>>, bool), Error> {
+    ) -> Result<KeyBatch, Error> {
         let request = GetKeysRequest {
             start_key,
             max_keys,
@@ -1122,6 +1322,178 @@ impl Client {
         .await
     }
 
+    // -- groups and ACLs ----------------------------------------------
+    //
+    // Every call here that *changes* something contends for one key --
+    // the permission epoch, which all of them write -- so two at once
+    // resolve the way any two conflicting transactions do and one may
+    // come back [`Error::Aborted`]. That is deliberate: it is what lets
+    // the cluster decide each of these against a view that cannot move
+    // underneath it, so that (say) a write grant being revoked cannot be
+    // spent in its last moment on an ACL granting it back. Replaying an
+    // aborted one is always safe, since it wrote nothing.
+    //
+    // Reading them contends for nothing.
+
+    /// Creates a group. Any authenticated account may, up to a
+    /// per-account quota; this client's account becomes its sole
+    /// administrator whether or not `admins` says so.
+    ///
+    /// A group is a name for a set of principals and is worth something
+    /// only when an ACL names it, so creating one grants its creator
+    /// nothing they did not already have.
+    pub async fn create_group(
+        &self,
+        name: &str,
+        members: &[Principal],
+        admins: &[Principal],
+    ) -> Result<u64, Error> {
+        let request = CreateGroupRequest {
+            name: name.to_string(),
+            members: members.iter().map(Principal::to_pb).collect(),
+            admins: admins.iter().map(Principal::to_pb).collect(),
+        };
+        self.call(|mut kv: Kv| {
+            let request = request.clone();
+            async move { kv.create_group(request).await.map(create_group_reply) }
+        })
+        .await
+    }
+
+    /// Deletes a group. Its administrators, or a cluster administrator.
+    ///
+    /// ACLs that named it are left alone: a grant to a group that no
+    /// longer exists matches nobody.
+    pub async fn delete_group(&self, name: &str) -> Result<u64, Error> {
+        let request = DeleteGroupRequest {
+            name: name.to_string(),
+        };
+        self.call(|mut kv: Kv| {
+            let request = request.clone();
+            async move { kv.delete_group(request).await.map(delete_group_reply) }
+        })
+        .await
+    }
+
+    /// Adds and removes members and administrators, in one transaction.
+    /// The group's administrators, or a cluster administrator.
+    ///
+    /// Additions are applied before removals, so a principal in both
+    /// lists ends up removed -- which is what makes "these exactly" a
+    /// single call that cannot land halfway.
+    pub async fn update_group(
+        &self,
+        name: &str,
+        add_members: &[Principal],
+        remove_members: &[Principal],
+        add_admins: &[Principal],
+        remove_admins: &[Principal],
+    ) -> Result<u64, Error> {
+        let request = UpdateGroupRequest {
+            name: name.to_string(),
+            add_members: add_members.iter().map(Principal::to_pb).collect(),
+            remove_members: remove_members.iter().map(Principal::to_pb).collect(),
+            add_admins: add_admins.iter().map(Principal::to_pb).collect(),
+            remove_admins: remove_admins.iter().map(Principal::to_pb).collect(),
+        };
+        self.call(|mut kv: Kv| {
+            let request = request.clone();
+            async move { kv.update_group(request).await.map(update_group_reply) }
+        })
+        .await
+    }
+
+    /// One group, as stored -- members and admins are not expanded, so a
+    /// nested group appears as itself.
+    pub async fn get_group(&self, name: &str) -> Result<Group, Error> {
+        let request = GetGroupRequest {
+            name: name.to_string(),
+        };
+        self.call(|mut kv: Kv| {
+            let request = request.clone();
+            async move { kv.get_group(request).await.map(get_group_reply) }
+        })
+        .await
+    }
+
+    /// Every group, in name order.
+    pub async fn list_groups(&self) -> Result<Vec<Group>, Error> {
+        self.call(|mut kv: Kv| async move {
+            kv.list_groups(ListGroupsRequest {})
+                .await
+                .map(list_groups_reply)
+        })
+        .await
+    }
+
+    /// Writes the ACL governing a key prefix, replacing whatever it
+    /// held. An empty prefix governs every key there is.
+    ///
+    /// Requires `write` on that prefix -- which, by the longest-prefix
+    /// rule, means write on it or on a shorter prefix that governs it.
+    /// A cluster administrator may always.
+    ///
+    /// What it will not accept is the *default*: creating an ACL where
+    /// no ACL currently decides is an administrator's act, because a key
+    /// nothing governs is open to everyone and that is permission to use
+    /// the key rather than authority over who else may.
+    pub async fn set_acl(
+        &self,
+        prefix: &[u8],
+        entries: &[(Principal, Right)],
+    ) -> Result<u64, Error> {
+        let request = SetAclRequest {
+            prefix: prefix.to_vec(),
+            entries: entries_to_pb(entries),
+        };
+        self.call(|mut kv: Kv| {
+            let request = request.clone();
+            async move { kv.set_acl(request).await.map(set_acl_reply) }
+        })
+        .await
+    }
+
+    /// Removes the ACL on a key prefix, so the next shorter one that has
+    /// one governs instead.
+    ///
+    /// Same authority as writing it, with the same exception from the
+    /// other side: a removal that would leave the prefix governed by
+    /// nothing, and so open to everyone, is an administrator's act.
+    pub async fn delete_acl(&self, prefix: &[u8]) -> Result<u64, Error> {
+        let request = DeleteAclRequest {
+            prefix: prefix.to_vec(),
+        };
+        self.call(|mut kv: Kv| {
+            let request = request.clone();
+            async move { kv.delete_acl(request).await.map(delete_acl_reply) }
+        })
+        .await
+    }
+
+    /// Which ACL governs `key`, and what it grants this client's
+    /// account.
+    ///
+    /// The question someone holding a [`Denial::NotPermitted`] actually
+    /// has, answered in one round trip rather than by reimplementing
+    /// group expansion against [`list_acls`](Client::list_acls).
+    pub async fn get_acl(&self, key: &[u8]) -> Result<AclFor, Error> {
+        let request = GetAclRequest { key: key.to_vec() };
+        self.call(|mut kv: Kv| {
+            let request = request.clone();
+            async move { kv.get_acl(request).await.map(get_acl_reply) }
+        })
+        .await
+    }
+
+    /// Every ACL, shortest prefix first -- which is the order they take
+    /// effect in, least specific to most.
+    pub async fn list_acls(&self) -> Result<Vec<Acl>, Error> {
+        self.call(|mut kv: Kv| async move {
+            kv.list_acls(ListAclsRequest {}).await.map(list_acls_reply)
+        })
+        .await
+    }
+
     /// Gets a token and starts using it, without touching whatever
     /// credentials are stored.
     ///
@@ -1376,13 +1748,18 @@ fn write_reply(resp: tonic::Response<WriteResponse>) -> Reply<()> {
     match resp.into_inner().result {
         Some(write_response::Result::Ok(_)) => Reply::Ok(()),
         Some(write_response::Result::Error(e)) => Reply::from_error(e),
+        Some(write_response::Result::AuthError(e)) => denied(e),
         None => empty_response(),
     }
 }
 
-fn get_keys_reply(resp: tonic::Response<GetKeysResponse>) -> Reply<(Vec<Vec<u8>>, bool)> {
+fn get_keys_reply(resp: tonic::Response<GetKeysResponse>) -> Reply<KeyBatch> {
     match resp.into_inner().result {
-        Some(get_keys_response::Result::Ok(ok)) => Reply::Ok((ok.keys, ok.has_more)),
+        Some(get_keys_response::Result::Ok(ok)) => Reply::Ok(KeyBatch {
+            keys: ok.keys,
+            has_more: ok.has_more,
+            next_start_key: (!ok.next_start_key.is_empty()).then_some(ok.next_start_key),
+        }),
         Some(get_keys_response::Result::Error(e)) => Reply::from_error(e),
         None => empty_response(),
     }
@@ -1395,6 +1772,7 @@ fn read_reply(resp: tonic::Response<ReadResponse>) -> Reply<ReadResult> {
             value: ok.value,
         }),
         Some(read_response::Result::Error(e)) => Reply::from_error(e),
+        Some(read_response::Result::AuthError(e)) => denied(e),
         None => empty_response(),
     }
 }
@@ -1456,6 +1834,7 @@ fn get_version_reply(resp: tonic::Response<GetVersionResponse>) -> Reply<u64> {
     match resp.into_inner().result {
         Some(get_version_response::Result::Ok(ok)) => Reply::Ok(ok.seq),
         Some(get_version_response::Result::Error(e)) => Reply::from_error(e),
+        Some(get_version_response::Result::AuthError(e)) => denied(e),
         None => empty_response(),
     }
 }
@@ -1465,6 +1844,94 @@ fn create_transaction_reply(resp: tonic::Response<CreateTransactionResponse>) ->
         Some(create_transaction_response::Result::TransactionId(id)) => Reply::Ok(id),
         Some(create_transaction_response::Result::Error(e)) => Reply::from_error(e),
         None => Reply::Unavailable("the node answered without a result".to_string()),
+    }
+}
+
+fn create_group_reply(resp: tonic::Response<CreateGroupResponse>) -> Reply<u64> {
+    match resp.into_inner().result {
+        Some(create_group_response::Result::Seq(seq)) => Reply::Ok(seq),
+        Some(create_group_response::Result::Error(e)) => Reply::from_error(e),
+        Some(create_group_response::Result::AuthError(e)) => denied(e),
+        None => empty_response(),
+    }
+}
+
+fn delete_group_reply(resp: tonic::Response<DeleteGroupResponse>) -> Reply<u64> {
+    match resp.into_inner().result {
+        Some(delete_group_response::Result::Seq(seq)) => Reply::Ok(seq),
+        Some(delete_group_response::Result::Error(e)) => Reply::from_error(e),
+        Some(delete_group_response::Result::AuthError(e)) => denied(e),
+        None => empty_response(),
+    }
+}
+
+fn update_group_reply(resp: tonic::Response<UpdateGroupResponse>) -> Reply<u64> {
+    match resp.into_inner().result {
+        Some(update_group_response::Result::Seq(seq)) => Reply::Ok(seq),
+        Some(update_group_response::Result::Error(e)) => Reply::from_error(e),
+        Some(update_group_response::Result::AuthError(e)) => denied(e),
+        None => empty_response(),
+    }
+}
+
+fn get_group_reply(resp: tonic::Response<GetGroupResponse>) -> Reply<Group> {
+    match resp.into_inner().result {
+        Some(get_group_response::Result::Ok(group)) => Reply::Ok(Group::from_pb(group)),
+        Some(get_group_response::Result::Error(e)) => Reply::from_error(e),
+        Some(get_group_response::Result::AuthError(e)) => denied(e),
+        None => empty_response(),
+    }
+}
+
+fn list_groups_reply(resp: tonic::Response<ListGroupsResponse>) -> Reply<Vec<Group>> {
+    match resp.into_inner().result {
+        Some(list_groups_response::Result::Ok(list)) => {
+            Reply::Ok(list.groups.into_iter().map(Group::from_pb).collect())
+        }
+        Some(list_groups_response::Result::Error(e)) => Reply::from_error(e),
+        Some(list_groups_response::Result::AuthError(e)) => denied(e),
+        None => empty_response(),
+    }
+}
+
+fn set_acl_reply(resp: tonic::Response<SetAclResponse>) -> Reply<u64> {
+    match resp.into_inner().result {
+        Some(set_acl_response::Result::Seq(seq)) => Reply::Ok(seq),
+        Some(set_acl_response::Result::Error(e)) => Reply::from_error(e),
+        Some(set_acl_response::Result::AuthError(e)) => denied(e),
+        None => empty_response(),
+    }
+}
+
+fn delete_acl_reply(resp: tonic::Response<DeleteAclResponse>) -> Reply<u64> {
+    match resp.into_inner().result {
+        Some(delete_acl_response::Result::Seq(seq)) => Reply::Ok(seq),
+        Some(delete_acl_response::Result::Error(e)) => Reply::from_error(e),
+        Some(delete_acl_response::Result::AuthError(e)) => denied(e),
+        None => empty_response(),
+    }
+}
+
+fn get_acl_reply(resp: tonic::Response<GetAclResponse>) -> Reply<AclFor> {
+    match resp.into_inner().result {
+        Some(get_acl_response::Result::Ok(ok)) => Reply::Ok(AclFor {
+            acl: ok.acl.map(Acl::from_pb),
+            effective: ok.effective.and_then(Right::from_pb),
+        }),
+        Some(get_acl_response::Result::Error(e)) => Reply::from_error(e),
+        Some(get_acl_response::Result::AuthError(e)) => denied(e),
+        None => empty_response(),
+    }
+}
+
+fn list_acls_reply(resp: tonic::Response<ListAclsResponse>) -> Reply<Vec<Acl>> {
+    match resp.into_inner().result {
+        Some(list_acls_response::Result::Ok(list)) => {
+            Reply::Ok(list.acls.into_iter().map(Acl::from_pb).collect())
+        }
+        Some(list_acls_response::Result::Error(e)) => Reply::from_error(e),
+        Some(list_acls_response::Result::AuthError(e)) => denied(e),
+        None => empty_response(),
     }
 }
 
@@ -1862,25 +2329,42 @@ impl KeyIterator {
                 return Ok(None);
             };
 
-            let (mut keys, has_more) = self
+            let batch = self
                 .client
                 .get_keys_batch(start, self.batch_size, self.consistency.clone())
                 .await?;
+            let mut keys = batch.keys;
 
-            // The next batch starts just past the last key of this one.
-            // A single zero byte appended is the smallest key that can
-            // sort after it, so nothing between the two can be skipped
-            // -- there is nothing between them.
-            if has_more && let Some(last) = keys.last() {
-                let mut next = last.clone();
-                next.push(0);
-                self.next_start = Some(next);
-            }
+            // Where to go next. The server's own cursor when it sent
+            // one, because only it knows why the batch ended: a walk
+            // can stop having examined far more keys than it kept --
+            // hidden by an ACL, or deleted by the transaction -- and
+            // then there is no last key to derive a cursor from.
+            //
+            // Otherwise the last key of this batch with a single zero
+            // byte appended, which is the smallest key that can sort
+            // after it, so nothing between the two can be skipped --
+            // there is nothing between them. That is also what an older
+            // server, which sends no cursor, needs.
+            self.next_start = match batch.next_start_key {
+                Some(next) => Some(next),
+                None if batch.has_more => keys.last().map(|last| {
+                    let mut next = last.clone();
+                    next.push(0);
+                    next
+                }),
+                None => None,
+            };
 
-            // An empty batch with `has_more` set can't happen, but if it
-            // did, `next_start` would be unchanged and this would spin.
-            // The loop only goes round again on a non-empty batch.
+            // An empty batch used not to be able to carry `has_more`.
+            // It can now -- a walk that examined its whole budget
+            // without finding a key this caller may see is exactly
+            // that -- so the loop goes round on the cursor rather than
+            // stopping, and stops only when there is no cursor left.
             if keys.is_empty() {
+                if self.next_start.is_some() {
+                    continue;
+                }
                 return Ok(None);
             }
             keys.reverse();

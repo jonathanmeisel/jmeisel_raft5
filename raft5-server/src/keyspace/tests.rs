@@ -144,3 +144,124 @@ fn a_user_key_and_an_invite_key_can_never_meet() {
     assert_ne!(user_key(&id), invite_key(&id));
     assert!(!user_key(&id).starts_with(INVITE_PREFIX));
 }
+
+/// The generalisation of the test above, now that there are five things
+/// in the reserved range rather than two.
+///
+/// Every record range must be disjoint from every other, *and* from the
+/// one key that stands alone. A prefix that were a prefix of another
+/// would be worse than a collision: a listing over the shorter one would
+/// hand back the longer one's records as if they were its own.
+#[test]
+fn no_two_reserved_prefixes_can_ever_meet() {
+    let ranges = [
+        ("user", USER_PREFIX),
+        ("invite", INVITE_PREFIX),
+        ("group", GROUP_PREFIX),
+        ("acl", ACL_PREFIX),
+        // Not a range: the whole key, treated as one so that the
+        // "nothing under another" check covers it too.
+        ("epoch", EPOCH_KEY),
+    ];
+    for (i, (one, a)) in ranges.iter().enumerate() {
+        assert!(is_reserved(a), "{one} prefix should be reserved");
+        for (other, b) in &ranges[i + 1..] {
+            assert!(
+                !a.starts_with(b) && !b.starts_with(a),
+                "the {one} and {other} ranges overlap"
+            );
+        }
+    }
+}
+
+/// A name and a group name are the same shape, so the interesting thing
+/// is that they land in different places -- and that neither can reach
+/// the epoch key, which has no separator to hide behind.
+#[test]
+fn a_group_key_is_reserved_and_meets_nothing_else() {
+    for name in ["a", "oncall", "A.B_c-9", &"g".repeat(MAX_USERNAME_LEN)] {
+        assert!(validate_group_name(name).is_ok(), "{name:?} should be valid");
+        let key = group_key(name);
+        assert!(is_reserved(&key));
+        assert_ne!(key, user_key(name));
+        assert_eq!(key, [GROUP_PREFIX, name.as_bytes()].concat());
+        assert_ne!(key, EPOCH_KEY.to_vec());
+    }
+}
+
+#[test]
+fn distinct_group_names_produce_distinct_keys() {
+    let names = ["a", "ab", "b", "oncall", "on.call", "on_call", "on-call"];
+    for (i, one) in names.iter().enumerate() {
+        for other in &names[i + 1..] {
+            assert_ne!(group_key(one), group_key(other), "{one:?} and {other:?}");
+        }
+    }
+}
+
+#[test]
+fn a_group_name_is_held_to_the_same_rule_as_a_username() {
+    for name in ["", "on/call", "on\0call", "../etc", "on call", "ali\u{00e9}"] {
+        assert!(validate_group_name(name).is_err(), "{name:?}");
+        assert!(validate_username(name).is_err(), "{name:?}");
+    }
+    assert!(validate_group_name(&"g".repeat(MAX_USERNAME_LEN)).is_ok());
+    assert!(validate_group_name(&"g".repeat(MAX_USERNAME_LEN + 1)).is_err());
+}
+
+/// The property that makes `acl_key` safe for bytes no character set
+/// restricts: *any* prefix, including the ones that would walk straight
+/// out of an unencoded append, lands inside the ACL range and comes back
+/// out unchanged.
+#[test]
+fn any_key_prefix_at_all_round_trips_through_an_acl_key() {
+    let prefixes: [&[u8]; 9] = [
+        b"",
+        b"a",
+        b"app/",
+        b"\0",
+        b"\0auth/user/root",
+        b"/",
+        b"../etc",
+        &[0xff, 0x00, 0xff],
+        &[0u8; MAX_ACL_PREFIX_LEN],
+    ];
+    for prefix in prefixes {
+        assert!(validate_acl_prefix(prefix).is_ok(), "{prefix:?}");
+        let key = acl_key(prefix);
+        assert!(is_reserved(&key), "{prefix:?} should produce a reserved key");
+        assert!(key.starts_with(ACL_PREFIX), "{prefix:?} escaped its range");
+        assert_eq!(
+            acl_prefix_from_key_suffix(&key[ACL_PREFIX.len()..]).as_deref(),
+            Some(prefix),
+            "{prefix:?} did not round trip"
+        );
+    }
+}
+
+/// Injectivity, stated over the pairs most likely to break an encoding:
+/// one prefix of another, and the empty one against everything.
+#[test]
+fn distinct_key_prefixes_produce_distinct_acl_keys() {
+    let prefixes: [&[u8]; 6] = [b"", b"a", b"ab", b"b", b"app/", b"app/sub/"];
+    for (i, one) in prefixes.iter().enumerate() {
+        for other in &prefixes[i + 1..] {
+            assert_ne!(acl_key(one), acl_key(other), "{one:?} and {other:?}");
+        }
+    }
+}
+
+#[test]
+fn an_over_long_acl_prefix_is_refused() {
+    assert!(validate_acl_prefix(&[0u8; MAX_ACL_PREFIX_LEN]).is_ok());
+    assert!(validate_acl_prefix(&[0u8; MAX_ACL_PREFIX_LEN + 1]).is_err());
+}
+
+/// A suffix this module could not have written is a corrupt record, not
+/// a request to refuse -- so it reports rather than panics.
+#[test]
+fn a_suffix_that_is_not_hex_decodes_to_nothing() {
+    for suffix in [b"abc".as_slice(), b"zz", b"0g", b"AB"] {
+        assert_eq!(acl_prefix_from_key_suffix(suffix), None, "{suffix:?}");
+    }
+}

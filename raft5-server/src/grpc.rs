@@ -49,8 +49,8 @@ use crate::keyspace::is_reserved;
 use crate::pb::raft5::client::kv_server::Kv;
 use crate::pb::raft5::client::{
     AddServerRequest, AuthError as PbAuthError, BootstrapRequest, CommitTransactionRequest,
-    CommitTransactionResponse, ConfigChangeResponse, CreateSnapshotRequest, CreateSnapshotResponse,
-    CreateInviteOk, CreateInviteRequest, CreateInviteResponse, CreateTransactionRequest,
+    CommitTransactionResponse, ConfigChangeResponse, CreateInviteOk, CreateInviteRequest,
+    CreateInviteResponse, CreateSnapshotRequest, CreateSnapshotResponse, CreateTransactionRequest,
     CreateTransactionResponse, CreateUserRequest, CreateUserResponse, DeleteUserRequest,
     DeleteUserResponse, DropTransactionRequest, DropTransactionResponse, GetConfigRequest,
     GetConfigResponse, GetKeysOk, GetKeysRequest, GetKeysResponse, GetVersionOk, GetVersionRequest,
@@ -67,6 +67,14 @@ use crate::pb::raft5::client::{
     login_response, raft_error, read_request, read_response, redeem_invite_response,
     remove_snapshot_response, revoke_invite_response, transaction_aborted, write_response,
 };
+use crate::pb::raft5::client::{
+    CreateGroupRequest, CreateGroupResponse, DeleteAclRequest, DeleteAclResponse,
+    DeleteGroupRequest, DeleteGroupResponse, GetAclRequest, GetAclResponse, GetGroupRequest,
+    GetGroupResponse, ListAclsRequest, ListAclsResponse, ListGroupsRequest, ListGroupsResponse,
+    SetAclRequest, SetAclResponse, UpdateGroupRequest, UpdateGroupResponse, create_group_response,
+    delete_acl_response, delete_group_response, get_acl_response, get_group_response,
+    list_acls_response, list_groups_response, set_acl_response, update_group_response,
+};
 use crate::pb::raft5::cluster::{ClusterConfig, ClusterMember};
 use crate::pb::raft5::raft::raft_peer_server::RaftPeer;
 use crate::pb::raft5::raft::{
@@ -74,6 +82,7 @@ use crate::pb::raft5::raft::{
     GetLeaseResponse, InstallSnapshotResponse, RequestVoteRequest, RequestVoteResponse,
     SnapshotChunk, append_entries_chunk, snapshot_chunk,
 };
+use crate::perms::Right;
 use crate::raft::{
     self, AppendError, ClientHandle, ConfigChange, LeaderHandle, MAX_APPEND_ENTRIES_BYTES,
     RaftError, RaftPeerHandle, RoleHandle,
@@ -100,6 +109,15 @@ fn read_ok(found: Option<(u64, Vec<u8>)>) -> ReadOk {
             seq: 0,
             value: None,
         },
+    }
+}
+
+/// A scan's batch as the wire carries it.
+fn get_keys_ok(batch: ScanBatch) -> GetKeysOk {
+    GetKeysOk {
+        keys: batch.keys,
+        has_more: batch.has_more,
+        next_start_key: batch.next_start_key.unwrap_or_default(),
     }
 }
 
@@ -545,6 +563,18 @@ fn require_leader(role: &RoleHandle) -> Result<LeaderHandle, RaftError> {
     }
 }
 
+/// One batch of a key scan, and where the next one starts.
+///
+/// A struct rather than a tuple because `has_more` and `next_start_key`
+/// are two different facts now: a batch can be short, or empty, and
+/// still have keys after it -- see `RaftLog::scan_as_of`'s budget.
+struct ScanBatch {
+    keys: Vec<Vec<u8>>,
+    has_more: bool,
+    /// Where to resume, set whenever `has_more` is.
+    next_start_key: Option<Vec<u8>>,
+}
+
 pub struct KvService {
     store: Store,
     /// How this node's own identity reaches `Bootstrap` -- the
@@ -560,6 +590,11 @@ pub struct KvService {
     /// that the open case lives in one place rather than in each
     /// handler. See `crate::auth`.
     auth: Option<AuthConfig>,
+    /// Every group and ACL, as of the last permission change this node
+    /// has applied. Shared across the clones tonic makes of this
+    /// service, and rebuilt only when the permission epoch moves. See
+    /// `grpc::permissions`.
+    perms: permissions::PermsCache,
 }
 
 impl KvService {
@@ -575,6 +610,7 @@ impl KvService {
             client_handle,
             locks: Locks::new(),
             auth,
+            perms: permissions::new_cache(),
         }
     }
 
@@ -703,7 +739,8 @@ impl KvService {
         as_of: u64,
         limit: usize,
         buffered: &BufferedKeys,
-    ) -> Result<(Vec<Vec<u8>>, bool), StorageError> {
+        filter: &Option<permissions::ScanFilter>,
+    ) -> Result<ScanBatch, StorageError> {
         // A key this transaction has deleted doesn't exist as far as it
         // is concerned, so the scan skips it rather than returning it
         // and filtering after -- which would shorten the batch for a
@@ -718,8 +755,9 @@ impl KvService {
         // something this saw rather than something the caller infers
         // from a count -- see `GetKeysOk.has_more`.
         let want = limit.saturating_add(1);
-        let committed = {
+        let (committed, budget_cursor) = {
             let start = start.clone();
+            let filter = filter.clone();
             self.store
                 .run(move |log| {
                     // Folded into the skip closure rather than filtered
@@ -728,8 +766,17 @@ impl KvService {
                     // the caller no batch length. Both callers -- the
                     // transactional scan and the plain one -- come
                     // through here, so this is the whole of `GetKeys`.
-                    log.scan_as_of(&start, as_of, want, |key| {
-                        deleted.contains(key) || is_reserved(key)
+                    //
+                    // Keys an ACL hides join it on exactly those terms.
+                    // The filter is resolved before the walk, because
+                    // this closure runs on the blocking pool and cannot
+                    // read the store -- which is also why a walk that
+                    // hides nearly everything needs the budget below to
+                    // stop it walking the whole keyspace.
+                    log.scan_as_of(&start, as_of, want, permissions::SCAN_ROW_BUDGET, |key| {
+                        deleted.contains(key)
+                            || is_reserved(key)
+                            || filter.as_ref().is_some_and(|f| f.hides(key))
                     })
                 })
                 .await?
@@ -757,9 +804,26 @@ impl KvService {
         keys.sort_unstable();
         keys.dedup();
 
-        let has_more = keys.len() > limit;
+        // Two reasons to have more: the batch filled, or the walk ran
+        // out of budget before it could. The first derives its cursor
+        // from the last key kept; the second cannot -- there may be no
+        // key at all -- so it uses the one the walk stopped at.
+        let filled = keys.len() > limit;
         keys.truncate(limit);
-        Ok((keys, has_more))
+        let next_start_key = match &budget_cursor {
+            Some(cursor) => Some(cursor.clone()),
+            None if filled => keys.last().map(|last| {
+                let mut next = last.clone();
+                next.push(0);
+                next
+            }),
+            None => None,
+        };
+        Ok(ScanBatch {
+            keys,
+            has_more: filled || budget_cursor.is_some(),
+            next_start_key,
+        })
     }
 
     /// A transactional key scan: find the keys, lock them, then look
@@ -779,7 +843,8 @@ impl KvService {
         id: TxnId,
         start: Vec<u8>,
         limit: usize,
-    ) -> Result<(Vec<Vec<u8>>, bool), TxnError> {
+        filter: &Option<permissions::ScanFilter>,
+    ) -> Result<ScanBatch, TxnError> {
         let leader = self.transaction_leader(id)?;
         leader.await_caught_up().await?;
         if !leader.has_read_quorum() {
@@ -788,14 +853,15 @@ impl KvService {
 
         let buffered = self.locks.buffered_from(id, &start)?;
 
-        let (candidates, _) = self
-            .scan(start.clone(), u64::MAX, limit, &buffered)
+        let candidates = self
+            .scan(start.clone(), u64::MAX, limit, &buffered, filter)
             .await
-            .map_err(|e| TxnError::Raft(RaftError::Storage(e)))?;
+            .map_err(|e| TxnError::Raft(RaftError::Storage(e)))?
+            .keys;
         self.locks.read_many(id, &candidates)?;
 
-        let (keys, has_more) = self
-            .scan(start, u64::MAX, limit, &buffered)
+        let batch = self
+            .scan(start, u64::MAX, limit, &buffered, filter)
             .await
             .map_err(|e| TxnError::Raft(RaftError::Storage(e)))?;
 
@@ -806,11 +872,16 @@ impl KvService {
         // prevent.
         let locked: std::collections::HashSet<&[u8]> =
             candidates.iter().map(Vec::as_slice).collect();
-        let keys = keys
+        let keys = batch
+            .keys
             .into_iter()
             .filter(|key| locked.contains(key.as_slice()))
             .collect();
-        Ok((keys, has_more))
+        // The cursor comes from the second pass, which is the one whose
+        // answer this is. Filtering to what the locks cover can shorten
+        // the batch, which is one more reason the cursor is carried
+        // rather than derived from the last key returned.
+        Ok(ScanBatch { keys, ..batch })
     }
 
     /// Commit everything a transaction buffered, as one entry.
@@ -1137,6 +1208,38 @@ impl KvService {
         Ok(self.commit(id).await?)
     }
 
+    /// The body of `write`: the two checks, then the buffer.
+    ///
+    /// The ACL is consulted where the key is named rather than at
+    /// commit, so a caller learns which key it may not write, at the
+    /// moment it names one, instead of losing a whole transaction later
+    /// to an error that could not say. The cost is that a permission
+    /// withdrawn between here and the commit does not stop this write --
+    /// the same window a linearizable read has, and for the same reason:
+    /// nothing is held after an answer is given.
+    async fn write_inner(
+        &self,
+        extensions: &tonic::Extensions,
+        req: WriteRequest,
+    ) -> Result<(), AuthFailure> {
+        let id = txn_id(&req.transaction_id)?;
+        // The privilege-escalation guard. A client able to buffer a
+        // write to a reserved key could write its own account record,
+        // with `is_admin` set to whatever it liked.
+        reject_reserved(&req.key)?;
+        // A delete is a write of no value, so this covers both.
+        self.require_access(extensions, &req.key, Right::Write)
+            .await?;
+
+        // Purely in-memory: nothing reaches the log until `commit`. The
+        // leader handle is fetched only for the term check inside
+        // `transaction_leader` -- a transaction cannot be added to from
+        // anywhere but the leader that created it.
+        self.transaction_leader(id)?;
+        self.locks.buffer_write(id, &req.key, req.value)?;
+        Ok(())
+    }
+
     /// Checks that whoever sent this request is an administrator.
     ///
     /// The token says who they are; the store says what they may do.
@@ -1157,7 +1260,9 @@ impl KvService {
         // misconfiguration rather than a forged request, but the safe
         // reading of the two is the same.
         let Some(context) = extensions.get::<AuthContext>() else {
-            return Err(Status::unauthenticated("this request carried no verified identity").into());
+            return Err(
+                Status::unauthenticated("this request carried no verified identity").into(),
+            );
         };
         match self.load_user(&context.username).await? {
             Some(user) if user.is_admin => Ok(()),
@@ -1228,7 +1333,10 @@ impl KvService {
                 .filter(|admin| admin.username == username)
                 .map(|admin| admin.password_hash.clone()));
         }
-        Ok(self.load_user(username).await?.map(|user| user.password_hash))
+        Ok(self
+            .load_user(username)
+            .await?
+            .map(|user| user.password_hash))
     }
 
     /// Checks that whoever is bootstrapping this node is the
@@ -1341,7 +1449,9 @@ impl KvService {
     /// one more that goes uncounted and unswept, which costs a slot and
     /// a sweep, not correctness. Nothing here decides whether an invite
     /// may be *spent*; that happens under a lock in `redeem_invite`.
-    async fn read_invites(&self) -> Result<(Vec<(String, InviteRecord)>, Vec<String>), AuthFailure> {
+    async fn read_invites(
+        &self,
+    ) -> Result<(Vec<(String, InviteRecord)>, Vec<String>), AuthFailure> {
         let rows = self
             .store
             .run(|log| log.list_records_under(crate::keyspace::INVITE_PREFIX))
@@ -1419,10 +1529,9 @@ impl KvService {
                 // guarded against -- it is the invariant that a record
                 // is written once, stated where it could be violated.
                 if self.transactional_read(id, &key).await?.value.is_some() {
-                    return Err(Status::internal(
-                        "the invitation drawn already exists; try again",
-                    )
-                    .into());
+                    return Err(
+                        Status::internal("the invitation drawn already exists; try again").into(),
+                    );
                 }
                 // Lapsed invitations are swept here rather than by
                 // anything of their own. There is no timer in this
@@ -1522,7 +1631,12 @@ impl KvService {
             let record = InviteRecord::from_bytes(&bytes)?;
             check_invite(&record, &req.username)?;
 
-            if self.transactional_read(id, &user_key).await?.value.is_some() {
+            if self
+                .transactional_read(id, &user_key)
+                .await?
+                .value
+                .is_some()
+            {
                 // Deliberately not spent. The holder chose a name
                 // somebody already has, which is a thing they can fix by
                 // choosing another -- and burning their invitation for
@@ -1616,37 +1730,43 @@ impl Kv for KvService {
         &self,
         request: Request<WriteRequest>,
     ) -> Result<Response<WriteResponse>, Status> {
-        let req = request.into_inner();
-        let id = txn_id(&req.transaction_id)?;
-        // The privilege-escalation guard. A client able to buffer a
-        // write to a reserved key could write its own account record,
-        // with `is_admin` set to whatever it liked.
-        reject_reserved(&req.key)?;
-
-        // Purely in-memory: nothing reaches the log until `commit`. The
-        // leader handle is fetched only for the term check inside
-        // `transaction_leader` -- a transaction cannot be added to from
-        // anywhere but the leader that created it.
-        let result = self.transaction_leader(id).and_then(|_| {
-            self.locks
-                .buffer_write(id, &req.key, req.value)
-                .map_err(Into::into)
-        });
+        // `into_parts` rather than `into_inner`: who the caller is lives
+        // in the extensions, and an ACL is about them.
+        let (_, extensions, req) = request.into_parts();
+        let result = self.write_inner(&extensions, req).await;
 
         Ok(Response::new(WriteResponse {
             result: Some(match result {
                 Ok(()) => write_response::Result::Ok(true),
-                Err(e) => write_response::Result::Error(txn_error(e)?),
+                Err(e) => match auth_failure(e)? {
+                    AuthReply::Raft(e) => write_response::Result::Error(e),
+                    AuthReply::Auth(e) => write_response::Result::AuthError(e),
+                },
             }),
         }))
     }
 
     async fn read(&self, request: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {
-        let req = request.into_inner();
+        let (_, extensions, req) = request.into_parts();
         // Before the branch, so it covers the transactional read too.
         // Refused rather than answered as absent: a password hash handed
         // back is one to attack offline, at leisure.
         reject_reserved(&req.key)?;
+
+        // Likewise before the branch: every consistency reads the same
+        // key, and which one was asked for has no bearing on whether
+        // this caller may have it.
+        if let Err(e) = self
+            .require_access(&extensions, &req.key, Right::Read)
+            .await
+        {
+            return Ok(Response::new(ReadResponse {
+                result: Some(match auth_failure(e)? {
+                    AuthReply::Raft(e) => read_response::Result::Error(e),
+                    AuthReply::Auth(e) => read_response::Result::AuthError(e),
+                }),
+            }));
+        }
 
         // A transactional read is a different thing again: it takes a
         // lock, and it can be answered from what the transaction itself
@@ -1713,12 +1833,27 @@ impl Kv for KvService {
         &self,
         request: Request<GetVersionRequest>,
     ) -> Result<Response<GetVersionResponse>, Status> {
-        let req = request.into_inner();
+        let (_, extensions, req) = request.into_parts();
         // Before the branch, as in `read`, and for the same reason. The
         // seq of an account record is still a fact about the reserved
         // range, and "this key changed at seq N" is enough to watch the
         // administration of a cluster one has no business watching.
         reject_reserved(&req.key)?;
+
+        // The same reasoning carries to an ACL: "this key changed at
+        // seq N" is a fact about a key, and one the caller may not read
+        // is one they may not learn that about either.
+        if let Err(e) = self
+            .require_access(&extensions, &req.key, Right::Read)
+            .await
+        {
+            return Ok(Response::new(GetVersionResponse {
+                result: Some(match auth_failure(e)? {
+                    AuthReply::Raft(e) => get_version_response::Result::Error(e),
+                    AuthReply::Auth(e) => get_version_response::Result::AuthError(e),
+                }),
+            }));
+        }
 
         if let Some(get_version_request::Consistency::TransactionId(id)) = &req.consistency {
             let id = txn_id(id)?;
@@ -1775,13 +1910,19 @@ impl Kv for KvService {
         &self,
         request: Request<GetKeysRequest>,
     ) -> Result<Response<GetKeysResponse>, Status> {
-        let req = request.into_inner();
+        let (_, extensions, req) = request.into_parts();
         // `scan` would skip the whole reserved range anyway, so this
         // refusal protects nothing the filter doesn't. It is here to say
         // where the boundary is: a caller starting a walk at the very
         // beginning passes an empty key, which is not reserved, so
         // nothing legitimate asks for this.
         reject_reserved(&req.start_key)?;
+
+        // What this caller may not read, resolved once for the whole
+        // call. Unlike `read`, a walk is never refused for it: keys the
+        // caller may not see are left out, so a caller whose access is
+        // one subtree of a large store can still walk the store.
+        let filter = self.scan_filter(&extensions).await?;
 
         // Refused rather than shortened, so a caller paging in batches
         // of N finds out it isn't getting N instead of silently getting
@@ -1798,13 +1939,12 @@ impl Kv for KvService {
 
         if let Some(get_keys_request::Consistency::TransactionId(id)) = &req.consistency {
             let id = txn_id(id)?;
-            let result = self.transactional_scan(id, req.start_key, limit).await;
+            let result = self
+                .transactional_scan(id, req.start_key, limit, &filter)
+                .await;
             return Ok(Response::new(GetKeysResponse {
                 result: Some(match result {
-                    Ok((keys, has_more)) => get_keys_response::Result::Ok(GetKeysOk {
-                        keys,
-                        has_more,
-                    }),
+                    Ok(batch) => get_keys_response::Result::Ok(get_keys_ok(batch)),
                     Err(e) => get_keys_response::Result::Error(txn_error(e)?),
                 }),
             }));
@@ -1822,13 +1962,13 @@ impl Kv for KvService {
         // no locks, whoever received it. There is nothing to merge --
         // no transaction means no buffered writes -- and no second pass,
         // since there are no locks for one to be taken under.
-        let (keys, has_more) = self
-            .scan(req.start_key, as_of, limit, &BufferedKeys::new())
+        let batch = self
+            .scan(req.start_key, as_of, limit, &BufferedKeys::new(), &filter)
             .await
             .map_err(storage_err)?;
 
         Ok(Response::new(GetKeysResponse {
-            result: Some(get_keys_response::Result::Ok(GetKeysOk { keys, has_more })),
+            result: Some(get_keys_response::Result::Ok(get_keys_ok(batch))),
         }))
     }
 
@@ -2215,6 +2355,159 @@ impl Kv for KvService {
             }),
         }))
     }
+
+    async fn create_group(
+        &self,
+        request: Request<CreateGroupRequest>,
+    ) -> Result<Response<CreateGroupResponse>, Status> {
+        let (_, extensions, req) = request.into_parts();
+        let result = self.create_group_inner(&extensions, req).await;
+        Ok(Response::new(CreateGroupResponse {
+            result: Some(match result {
+                Ok(seq) => create_group_response::Result::Seq(seq),
+                Err(e) => match auth_failure(e)? {
+                    AuthReply::Raft(e) => create_group_response::Result::Error(e),
+                    AuthReply::Auth(e) => create_group_response::Result::AuthError(e),
+                },
+            }),
+        }))
+    }
+
+    async fn delete_group(
+        &self,
+        request: Request<DeleteGroupRequest>,
+    ) -> Result<Response<DeleteGroupResponse>, Status> {
+        let (_, extensions, req) = request.into_parts();
+        let result = self.delete_group_inner(&extensions, req).await;
+        Ok(Response::new(DeleteGroupResponse {
+            result: Some(match result {
+                Ok(seq) => delete_group_response::Result::Seq(seq),
+                Err(e) => match auth_failure(e)? {
+                    AuthReply::Raft(e) => delete_group_response::Result::Error(e),
+                    AuthReply::Auth(e) => delete_group_response::Result::AuthError(e),
+                },
+            }),
+        }))
+    }
+
+    async fn update_group(
+        &self,
+        request: Request<UpdateGroupRequest>,
+    ) -> Result<Response<UpdateGroupResponse>, Status> {
+        let (_, extensions, req) = request.into_parts();
+        let result = self.update_group_inner(&extensions, req).await;
+        Ok(Response::new(UpdateGroupResponse {
+            result: Some(match result {
+                Ok(seq) => update_group_response::Result::Seq(seq),
+                Err(e) => match auth_failure(e)? {
+                    AuthReply::Raft(e) => update_group_response::Result::Error(e),
+                    AuthReply::Auth(e) => update_group_response::Result::AuthError(e),
+                },
+            }),
+        }))
+    }
+
+    async fn get_group(
+        &self,
+        request: Request<GetGroupRequest>,
+    ) -> Result<Response<GetGroupResponse>, Status> {
+        let (_, extensions, req) = request.into_parts();
+        let result = self.get_group_inner(&extensions, req).await;
+        Ok(Response::new(GetGroupResponse {
+            result: Some(match result {
+                Ok(ok) => get_group_response::Result::Ok(ok),
+                Err(e) => match auth_failure(e)? {
+                    AuthReply::Raft(e) => get_group_response::Result::Error(e),
+                    AuthReply::Auth(e) => get_group_response::Result::AuthError(e),
+                },
+            }),
+        }))
+    }
+
+    async fn list_groups(
+        &self,
+        request: Request<ListGroupsRequest>,
+    ) -> Result<Response<ListGroupsResponse>, Status> {
+        let (_, extensions, _) = request.into_parts();
+        let result = self.list_groups_inner(&extensions).await;
+        Ok(Response::new(ListGroupsResponse {
+            result: Some(match result {
+                Ok(ok) => list_groups_response::Result::Ok(ok),
+                Err(e) => match auth_failure(e)? {
+                    AuthReply::Raft(e) => list_groups_response::Result::Error(e),
+                    AuthReply::Auth(e) => list_groups_response::Result::AuthError(e),
+                },
+            }),
+        }))
+    }
+
+    async fn set_acl(
+        &self,
+        request: Request<SetAclRequest>,
+    ) -> Result<Response<SetAclResponse>, Status> {
+        let (_, extensions, req) = request.into_parts();
+        let result = self.set_acl_inner(&extensions, req).await;
+        Ok(Response::new(SetAclResponse {
+            result: Some(match result {
+                Ok(seq) => set_acl_response::Result::Seq(seq),
+                Err(e) => match auth_failure(e)? {
+                    AuthReply::Raft(e) => set_acl_response::Result::Error(e),
+                    AuthReply::Auth(e) => set_acl_response::Result::AuthError(e),
+                },
+            }),
+        }))
+    }
+
+    async fn delete_acl(
+        &self,
+        request: Request<DeleteAclRequest>,
+    ) -> Result<Response<DeleteAclResponse>, Status> {
+        let (_, extensions, req) = request.into_parts();
+        let result = self.delete_acl_inner(&extensions, req).await;
+        Ok(Response::new(DeleteAclResponse {
+            result: Some(match result {
+                Ok(seq) => delete_acl_response::Result::Seq(seq),
+                Err(e) => match auth_failure(e)? {
+                    AuthReply::Raft(e) => delete_acl_response::Result::Error(e),
+                    AuthReply::Auth(e) => delete_acl_response::Result::AuthError(e),
+                },
+            }),
+        }))
+    }
+
+    async fn get_acl(
+        &self,
+        request: Request<GetAclRequest>,
+    ) -> Result<Response<GetAclResponse>, Status> {
+        let (_, extensions, req) = request.into_parts();
+        let result = self.get_acl_inner(&extensions, req).await;
+        Ok(Response::new(GetAclResponse {
+            result: Some(match result {
+                Ok(ok) => get_acl_response::Result::Ok(ok),
+                Err(e) => match auth_failure(e)? {
+                    AuthReply::Raft(e) => get_acl_response::Result::Error(e),
+                    AuthReply::Auth(e) => get_acl_response::Result::AuthError(e),
+                },
+            }),
+        }))
+    }
+
+    async fn list_acls(
+        &self,
+        request: Request<ListAclsRequest>,
+    ) -> Result<Response<ListAclsResponse>, Status> {
+        let (_, extensions, _) = request.into_parts();
+        let result = self.list_acls_inner(&extensions).await;
+        Ok(Response::new(ListAclsResponse {
+            result: Some(match result {
+                Ok(ok) => list_acls_response::Result::Ok(ok),
+                Err(e) => match auth_failure(e)? {
+                    AuthReply::Raft(e) => list_acls_response::Result::Error(e),
+                    AuthReply::Auth(e) => list_acls_response::Result::AuthError(e),
+                },
+            }),
+        }))
+    }
 }
 
 pub struct RaftPeerService {
@@ -2462,6 +2755,8 @@ impl RaftPeer for RaftPeerService {
         Ok(Response::new(installed.map_err(raft_err)?))
     }
 }
+
+mod permissions;
 
 #[cfg(test)]
 mod tests;

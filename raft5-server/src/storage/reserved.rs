@@ -15,6 +15,10 @@
 use super::codec::{Kind, chain_start, row_kind, row_seq, row_user_key};
 use super::{RaftLog, Result, StorageError};
 
+/// One record from a versioned listing: the part of its key after the
+/// prefix, the seq it was last written at, and its value.
+pub type VersionedRecord = (Vec<u8>, u64, Vec<u8>);
+
 impl RaftLog {
     /// Walk the head row of every record under `prefix` that currently
     /// exists, in key order, skipping ones whose head is a tombstone --
@@ -58,6 +62,35 @@ impl RaftLog {
             f(id, row_seq(&row)?, &row)?;
         }
         Ok(())
+    }
+
+    /// Every live record under `prefix`, as (key suffix, seq, value)
+    /// triples in key order.
+    ///
+    /// [`list_records_under`] without the seq, for the listings that do
+    /// not care; everything said there about bounds and about a record
+    /// vanishing mid-listing applies here.
+    ///
+    /// The seq is the one the record was last written at, which is what
+    /// lets a caller tell a record it has already seen from one that has
+    /// changed since -- and, for the permission snapshot, what it
+    /// reports so a client can do the same.
+    ///
+    /// [`list_records_under`]: RaftLog::list_records_under
+    pub fn list_versioned_records_under(&self, prefix: &[u8]) -> Result<Vec<VersionedRecord>> {
+        let mut rows = Vec::new();
+        self.for_each_live_record(prefix, |id, seq, row| {
+            rows.push((id, seq, row.to_vec()));
+            Ok(())
+        })?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, seq, row) in rows {
+            if let Some(value) = self.versions.get(&row)? {
+                out.push((id, seq, value.to_vec()));
+            }
+        }
+        Ok(out)
     }
 
     /// Every live record under `prefix`, as (key suffix, value) pairs in
