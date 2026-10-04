@@ -214,6 +214,7 @@ pub(crate) use leader::replication::append_entries_stream;
 pub(crate) use event::Role;
 use event::Transition;
 use peer::PeerConnections;
+pub(crate) use peer::peer_endpoint;
 pub(crate) use task::Task;
 use task::{send_event, until_cancelled};
 
@@ -820,6 +821,13 @@ impl Common {
             event_tx: self.event_tx.clone(),
             role_rx: self.role_tx.subscribe(),
         }
+    }
+
+    /// Dials every peer over mTLS from now on, rather than in plaintext.
+    /// Set before `run` consumes `Common`, so there are no plaintext
+    /// clients cached yet to replace.
+    pub fn set_peer_tls(&mut self, tls: tonic::transport::ClientTlsConfig) {
+        self.peer_conns = Arc::new(PeerConnections::new(Some(tls)));
     }
 
     fn publish_role(&self, handle: RoleHandle) {

@@ -45,6 +45,28 @@ service RaftPeer {
   // install_snapshot's reader as it arrives. Neither side ever needs the
   // whole snapshot in memory at once.
   rpc InstallSnapshot(stream SnapshotChunk) returns (InstallSnapshotResponse);
+
+  // Who this node is, asked by a leader about a server it is being told
+  // to add (client.proto's AddServer). Asked here rather than on the
+  // client API so that it travels over the same mTLS as the rest of the
+  // peer traffic: a leader always knows how to dial a peer, but a
+  // client API's certificate is the operator's business, not the
+  // cluster's.
+  rpc Identify(IdentifyRequest) returns (IdentifyResponse);
+}
+
+message IdentifyRequest {}
+
+// Spelled out rather than as a raft5.cluster.ClusterMember: that type
+// is generated in raft5-shared, and this file is compiled on its own.
+message IdentifyResponse {
+  string server_id = 1;
+  string address = 2;        // peer API, as this node advertises it
+  string client_address = 3; // client API, likewise
+  // Whether this node already has a configuration -- in which case it
+  // belongs to some cluster already, and adding it to another would
+  // make one node a member of two.
+  bool in_cluster = 4;
 }
 
 // One message of an AppendEntries stream: the header first, then the

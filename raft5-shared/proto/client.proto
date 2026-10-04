@@ -584,11 +584,17 @@ message GetKeysOk {
 }
 
 message AddServerRequest {
-  // The new server's client API address. The leader dials it for its
-  // `GetConfig` to learn the rest of what the configuration needs --
-  // server_id and peer API address -- straight from the server being
-  // added, rather than trusting the caller to supply them correctly.
-  string client_address = 1;
+  // Once the new server's client API address, dialed for its
+  // `GetConfig`. That made adding a server depend on the leader being
+  // able to dial a client API, whose TLS it has no say in.
+  reserved 1;
+  reserved "client_address";
+  // The new server's peer API address. The leader asks it (RaftPeer's
+  // `Identify`, over the peer mTLS it already uses) for the rest of
+  // what the configuration needs -- server_id and client API address --
+  // straight from the server being added, rather than trusting the
+  // caller to supply them correctly.
+  string peer_address = 2;
 }
 
 message RemoveServerRequest {

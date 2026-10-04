@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio_util::sync::CancellationToken;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 use raft5_server::pb::raft5::client::kv_client::KvClient;
 use raft5_server::pb::raft5::client::{
@@ -18,6 +18,8 @@ use raft5_server::pb::raft5::client::{
     config_change_response, read_response, write_response,
 };
 use raft5_server::pb::raft5::cluster::ClusterMember;
+
+pub mod certs;
 
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_DELAY: Duration = Duration::from_millis(20);
@@ -44,11 +46,27 @@ pub struct TestNode {
     /// keeps no accounts -- which is what every test that predates
     /// authentication gets, and why they need no changes.
     auth: Option<raft5_server::auth::AuthConfig>,
+    tls: TestTls,
     running: Option<RunningNode>,
     /// Private: reached only through the `client()` accessor, so a test
     /// that reaches for this while the node is down gets a clear panic
     /// instead of a `None` it has to unwrap itself.
     client: Option<Arc<Client>>,
+}
+
+/// How a test node uses TLS. The default is none at all, which is what
+/// every test that predates TLS gets.
+#[derive(Clone, Default)]
+pub struct TestTls {
+    pub peer: Option<raft5_server::PeerTls>,
+    pub client: Option<raft5_server::ClientApiTls>,
+    /// How this harness's own client dials the client API. Needed
+    /// whenever `client` is set.
+    pub dial: Option<ClientTlsConfig>,
+    /// Advertise both APIs as `http://` even with TLS on, the way a
+    /// cluster that predates TLS has its addresses recorded -- so a test
+    /// can check they are still dialed over TLS.
+    pub advertise_http: bool,
 }
 
 struct RunningNode {
@@ -58,16 +76,32 @@ struct RunningNode {
 
 impl TestNode {
     pub async fn new(id: &str) -> Self {
-        Self::start(id, None).await
+        Self::start(id, None, TestTls::default()).await
+    }
+
+    pub async fn with_tls(id: &str, tls: TestTls) -> Self {
+        Self::start(id, None, tls).await
+    }
+
+    pub async fn with_auth_and_tls(
+        id: &str,
+        auth: raft5_server::auth::AuthConfig,
+        tls: TestTls,
+    ) -> Self {
+        Self::start(id, Some(auth), tls).await
     }
 
     /// A node that requires a token on every RPC but `Login` and
     /// `GetConfig`.
     pub async fn with_auth(id: &str, auth: raft5_server::auth::AuthConfig) -> Self {
-        Self::start(id, Some(auth)).await
+        Self::start(id, Some(auth), TestTls::default()).await
     }
 
-    async fn start(id: &str, auth: Option<raft5_server::auth::AuthConfig>) -> Self {
+    async fn start(
+        id: &str,
+        auth: Option<raft5_server::auth::AuthConfig>,
+        tls: TestTls,
+    ) -> Self {
         // `try_init` rather than `init`: every test in the binary calls
         // this, all in the same process (possibly concurrently, since
         // tests run on their own threads by default), and `init` panics
@@ -84,6 +118,7 @@ impl TestNode {
             peer_addr: free_local_addr(),
             db_dir: temp_db_dir(id),
             auth,
+            tls,
             running: None,
             client: None,
         };
@@ -112,6 +147,15 @@ impl TestNode {
         let client_addr = self.client_addr;
         let peer_addr = self.peer_addr;
         let auth = self.auth.clone();
+        let tls = self.tls.clone();
+        let (advertise, advertise_client) = if tls.advertise_http {
+            (
+                Some(format!("http://{peer_addr}")),
+                Some(format!("http://{client_addr}")),
+            )
+        } else {
+            (None, None)
+        };
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
         let task = tokio::spawn(async move {
@@ -121,9 +165,11 @@ impl TestNode {
                     db: db_dir,
                     client_addr,
                     peer_addr,
-                    advertise: None,
-                    advertise_client: None,
+                    advertise,
+                    advertise_client,
                     auth,
+                    peer_tls: tls.peer,
+                    client_tls: tls.client,
                 },
                 cancel_clone,
             );
@@ -132,7 +178,7 @@ impl TestNode {
             }
         });
         self.running = Some(RunningNode { cancel, task });
-        self.client = Some(Arc::new(connect(self.client_addr).await));
+        self.client = Some(Arc::new(connect(self.client_addr, self.tls.dial.clone()).await));
     }
 
     /// Stops this node and waits for it to actually be gone -- sockets
@@ -204,10 +250,17 @@ fn deadline() -> Instant {
 /// coming up (the listener may not have bound yet right after spawning).
 /// Internal to `TestNode::start_up` -- callers elsewhere get a client via
 /// `TestNode::client` instead of dialing their own.
-async fn connect(addr: SocketAddr) -> Client {
+async fn connect(addr: SocketAddr, tls: Option<ClientTlsConfig>) -> Client {
     let until = deadline();
     loop {
-        match KvClient::connect(format!("http://{addr}")).await {
+        let endpoint = match &tls {
+            Some(tls) => Endpoint::from_shared(format!("https://{addr}"))
+                .unwrap()
+                .tls_config(tls.clone())
+                .expect("the test's TLS config should build"),
+            None => Endpoint::from_shared(format!("http://{addr}")).unwrap(),
+        };
+        match endpoint.connect().await.map(KvClient::new) {
             Ok(client) => return client,
             Err(e) if Instant::now() < until => {
                 tokio::time::sleep(RETRY_DELAY).await;
@@ -252,7 +305,7 @@ pub async fn add_server(client: &Arc<Client>, node: &TestNode) {
     loop {
         let resp = client
             .add_server(AddServerRequest {
-                client_address: format!("http://{}", node.client_addr),
+                peer_address: format!("http://{}", node.peer_addr),
             })
             .await;
         match resp {

@@ -12,6 +12,7 @@ pub mod raft5 {
 }
 
 mod config;
+pub mod tls;
 
 /// The most key/value data one transaction may buffer, in raw key and
 /// value bytes. Enforced by the server; it lives here because the client

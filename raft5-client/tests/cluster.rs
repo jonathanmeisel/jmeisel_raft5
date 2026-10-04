@@ -36,6 +36,24 @@ impl TestNode {
     }
 
     fn start_with(id: &str, auth: Option<raft5_server::auth::AuthConfig>) -> Self {
+        Self::start_full(id, auth, None, None)
+    }
+
+    /// A node serving both its APIs over TLS.
+    fn start_with_tls(
+        id: &str,
+        peer_tls: raft5_server::PeerTls,
+        client_tls: raft5_server::ClientApiTls,
+    ) -> Self {
+        Self::start_full(id, None, Some(peer_tls), Some(client_tls))
+    }
+
+    fn start_full(
+        id: &str,
+        auth: Option<raft5_server::auth::AuthConfig>,
+        peer_tls: Option<raft5_server::PeerTls>,
+        client_tls: Option<raft5_server::ClientApiTls>,
+    ) -> Self {
         let _ = env_logger::try_init();
         let node = Self {
             id: id.to_string(),
@@ -58,6 +76,8 @@ impl TestNode {
                     advertise: None,
                     advertise_client: None,
                     auth,
+                    peer_tls,
+                    client_tls,
                 },
                 cancel,
             );
@@ -71,6 +91,11 @@ impl TestNode {
 
     fn url(&self) -> String {
         format!("http://{}", self.client_addr)
+    }
+
+    /// What `add_server` is given: the peer API, not the client one.
+    fn peer_url(&self) -> String {
+        format!("http://{}", self.peer_addr)
     }
 }
 
@@ -145,8 +170,8 @@ async fn a_client_seeded_with_a_follower_finds_the_leader() {
 
     let admin = Client::new([n1.url()]).unwrap();
     bootstrap(&admin, "n1").await;
-    admin.add_server(&n2.url()).await.unwrap();
-    admin.add_server(&n3.url()).await.unwrap();
+    admin.add_server(&n2.peer_url()).await.unwrap();
+    admin.add_server(&n3.peer_url()).await.unwrap();
 
     let client = Client::new([n3.url()]).unwrap();
     client.write(b"k", Some(b"v")).await.unwrap();
@@ -173,8 +198,8 @@ async fn a_seed_that_leaves_the_cluster_is_dropped() {
 
     let client = Client::new([n1.url(), n2.url(), n3.url()]).unwrap();
     bootstrap(&client, "n1").await;
-    client.add_server(&n2.url()).await.unwrap();
-    client.add_server(&n3.url()).await.unwrap();
+    client.add_server(&n2.peer_url()).await.unwrap();
+    client.add_server(&n3.peer_url()).await.unwrap();
     assert_eq!(client.endpoints().len(), 3);
 
     client.remove_server("n3").await.unwrap();
@@ -1097,8 +1122,8 @@ async fn a_linearizable_read_sees_a_write_that_has_returned() {
 
     let admin = Client::new([n1.url()]).unwrap();
     bootstrap(&admin, "n1").await;
-    admin.add_server(&n2.url()).await.unwrap();
-    admin.add_server(&n3.url()).await.unwrap();
+    admin.add_server(&n2.peer_url()).await.unwrap();
+    admin.add_server(&n3.peer_url()).await.unwrap();
 
     let client = Client::new([n3.url()]).unwrap();
     let seq = client.write(b"k", Some(b"v")).await.unwrap();
@@ -1238,8 +1263,8 @@ async fn every_node_serves_the_same_snapshot_read() {
 
     let admin = Client::new([n1.url()]).unwrap();
     bootstrap(&admin, "n1").await;
-    admin.add_server(&n2.url()).await.unwrap();
-    admin.add_server(&n3.url()).await.unwrap();
+    admin.add_server(&n2.peer_url()).await.unwrap();
+    admin.add_server(&n3.peer_url()).await.unwrap();
 
     admin.write(b"k", Some(b"at-snapshot")).await.unwrap();
     let snap = admin.create_snapshot(Some(b"s1")).await.unwrap();
@@ -1701,4 +1726,102 @@ where
             Err(e) => panic!("unexpected failure: {e}"),
         }
     }
+}
+
+// --- TLS ----------------------------------------------------------------
+
+#[path = "../../raft5-server/tests/common/certs.rs"]
+mod certs;
+
+/// Waits until `n` voters show up in the configuration of the node at
+/// `addr`, dialed with `tls` -- so a test can take one down knowing the
+/// rest still make a majority.
+async fn wait_for_voters(addr: SocketAddr, tls: tonic::transport::ClientTlsConfig, n: usize) {
+    use raft5_shared::raft5::client::GetConfigRequest;
+    use raft5_shared::raft5::client::kv_client::KvClient;
+
+    let channel = tonic::transport::Endpoint::from_shared(format!("https://{addr}"))
+        .unwrap()
+        .tls_config(tls)
+        .unwrap()
+        .connect_lazy();
+    let mut kv = KvClient::new(channel);
+    let until = Instant::now() + BOOTSTRAP_TIMEOUT;
+    loop {
+        if let Ok(resp) = kv.get_config(GetConfigRequest {}).await
+            && resp.into_inner().members.iter().filter(|m| m.voting).count() == n
+        {
+            return;
+        }
+        assert!(Instant::now() < until, "never saw {n} voters");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A client that only knows one seed -- spelled `http://`, as an
+/// address from before TLS would be -- finds the rest of a TLS cluster
+/// through its configuration, and still reaches them once the seed is
+/// gone. Every node past the first is one it dialed from an address the
+/// cluster handed it, so every one of those dials had to get TLS too.
+#[tokio::test]
+async fn a_tls_client_follows_the_cluster_through_losing_its_seed() {
+    let ca = certs::TestCa::new();
+    let shared = ca.leaf(&["localhost", "127.0.0.1"]);
+    let client_cert = ca.leaf(&["some-client"]);
+    let node = |id| {
+        TestNode::start_with_tls(
+            id,
+            raft5_server::PeerTls {
+                identity: shared.identity(),
+                ca: ca.certificate(),
+                server_name: None,
+            },
+            raft5_server::ClientApiTls {
+                identity: shared.identity(),
+                client_ca: Some(ca.certificate()),
+            },
+        )
+    };
+    let n1 = node("n1");
+    let n2 = node("n2");
+    let n3 = node("n3");
+
+    let client = Client::with_tls(
+        [n1.url()],
+        raft5_client::ClientTls::new(ca.certificate()).identity(client_cert.identity()),
+    )
+    .unwrap();
+    bootstrap(&client, "n1").await;
+    client.add_server(&n2.peer_url()).await.unwrap();
+    client.add_server(&n3.peer_url()).await.unwrap();
+    wait_for_voters(
+        n2.client_addr,
+        tonic::transport::ClientTlsConfig::new()
+            .ca_certificate(ca.certificate())
+            .identity(client_cert.identity()),
+        3,
+    )
+    .await;
+    client.write(b"k", Some(b"before")).await.unwrap();
+
+    drop(n1);
+
+    client.write(b"k", Some(b"after")).await.unwrap();
+    assert_eq!(
+        client.read(b"k").await.unwrap().value.as_deref(),
+        Some(&b"after"[..])
+    );
+}
+
+#[test]
+fn a_tls_client_with_an_unusable_identity_is_refused_up_front() {
+    let ca = certs::TestCa::new();
+    let garbage = raft5_client::Identity::from_pem("not a cert", "not a key");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _guard = runtime.enter();
+    let result = Client::with_tls(
+        ["https://127.0.0.1:1"],
+        raft5_client::ClientTls::new(ca.certificate()).identity(garbage),
+    );
+    assert!(matches!(result, Err(Error::Tls(_))), "{:?}", result.err());
 }

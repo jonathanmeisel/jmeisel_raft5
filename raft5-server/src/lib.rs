@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
-use tonic::transport::Server;
+use tonic::transport::{Certificate, ClientTlsConfig, Identity, Server, ServerTlsConfig};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer};
 use tower_http::validate_request::ValidateRequestHeaderLayer;
 use tracing::{info, Level};
@@ -141,6 +141,50 @@ pub struct ServerConfig {
     /// cluster behaved before authentication existed. See
     /// [`crate::auth`].
     pub auth: Option<AuthConfig>,
+    /// mTLS for the peer API, both as served here and as this node dials
+    /// every other member's. `None` is plaintext both ways -- and a
+    /// cluster must agree on this, since a plaintext node and a TLS one
+    /// cannot talk to each other at all.
+    pub peer_tls: Option<PeerTls>,
+    /// TLS for the client API, or `None` to serve it in plaintext.
+    pub client_tls: Option<ClientApiTls>,
+}
+
+/// How a node proves itself to its peers, and how it decides to believe
+/// theirs.
+///
+/// One identity plays both parts: the certificate a node serves the peer
+/// API with is the one it presents as a client when it dials another
+/// node's. So it needs both the `serverAuth` and `clientAuth` extended
+/// key usages, if it lists any.
+///
+/// Any certificate `ca` vouches for is a peer. Nothing ties a
+/// certificate to a particular `server_id` -- with one certificate
+/// shared across the whole cluster, there is no per-node identity to
+/// tie it to.
+#[derive(Clone)]
+pub struct PeerTls {
+    pub identity: Identity,
+    /// What a peer's certificate must chain to. May be a self-signed
+    /// leaf trusted as its own anchor, in which case it must not be
+    /// marked `CA:TRUE` -- webpki refuses a CA certificate used as an
+    /// end entity.
+    pub ca: Certificate,
+    /// The name to check every peer's certificate against, instead of
+    /// the host in its address. What lets one certificate, with one
+    /// name, serve every node however they are addressed.
+    pub server_name: Option<String>,
+}
+
+/// How the client API is served over TLS.
+#[derive(Clone)]
+pub struct ClientApiTls {
+    pub identity: Identity,
+    /// If set, every client must present a certificate that chains to
+    /// this -- mTLS -- or the handshake fails before any RPC is seen.
+    /// That gate is all it is: who the caller *is* is still the token's
+    /// business (see [`crate::auth`]), not the certificate's.
+    pub client_ca: Option<Certificate>,
 }
 
 /// `run`, for a caller that already has a token to shut this node down
@@ -168,6 +212,8 @@ pub async fn serve(
             advertise,
             advertise_client,
             auth: None,
+            peer_tls: None,
+            client_tls: None,
         },
         cancel,
     )
@@ -184,12 +230,18 @@ pub async fn serve_config(config: ServerConfig, cancel: CancellationToken) -> Re
         advertise,
         advertise_client,
         auth,
+        peer_tls,
+        client_tls,
     } = config;
     let log = Arc::new(RaftLog::open(&db)?);
     let identity = ClusterMember {
         server_id: id.clone(),
-        address: advertise.unwrap_or_else(|| format!("http://{peer_addr}")),
-        client_address: advertise_client.unwrap_or_else(|| format!("http://{client_addr}")),
+        address: advertise.unwrap_or_else(|| {
+            raft5_shared::tls::with_scheme(&peer_addr.to_string(), peer_tls.is_some())
+        }),
+        client_address: advertise_client.unwrap_or_else(|| {
+            raft5_shared::tls::with_scheme(&client_addr.to_string(), client_tls.is_some())
+        }),
         voting: true,
     };
 
@@ -198,20 +250,53 @@ pub async fn serve_config(config: ServerConfig, cancel: CancellationToken) -> Re
     let uninitialized = log.current_config()?.is_none();
 
     let NodeHandles {
-        common,
+        mut common,
         peer_handle,
         ..
     } = Common::new(id.clone(), Arc::clone(&log), cancel.clone())?;
+    // Built before either server starts, so a certificate rustls won't
+    // accept fails the node at startup rather than at its first dial.
+    let mut client_builder = Server::builder();
+    let mut peer_builder = Server::builder();
+    let mut peer_dial = None;
+    if let Some(tls) = client_tls {
+        let mut config = ServerTlsConfig::new().identity(tls.identity);
+        if let Some(ca) = tls.client_ca {
+            // Required, not optional: tonic's default. An optional
+            // client certificate would gate nothing, since nothing
+            // here reads who it names.
+            config = config.client_ca_root(ca);
+        }
+        client_builder = client_builder.tls_config(config)?;
+    }
+    if let Some(tls) = peer_tls {
+        peer_builder = peer_builder.tls_config(
+            ServerTlsConfig::new()
+                .identity(tls.identity.clone())
+                .client_ca_root(tls.ca.clone()),
+        )?;
+        let mut dial = ClientTlsConfig::new()
+            .identity(tls.identity)
+            .ca_certificate(tls.ca);
+        if let Some(name) = tls.server_name {
+            dial = dial.domain_name(name);
+        }
+        common.set_peer_tls(dial.clone());
+        peer_dial = Some(dial);
+    }
     let client_handle = common.client_handle();
 
     // KvService's read/write path still bypasses the state machine (see
     // its module doc); `client_handle` is what `Bootstrap` goes through.
-    let kv_service = KvService::new(
+    let mut kv_service = KvService::new(
         Store::new(Arc::clone(&log)),
-        identity,
+        identity.clone(),
         client_handle,
         auth.clone(),
     );
+    if let Some(dial) = peer_dial {
+        kv_service = kv_service.with_peer_tls(dial);
+    }
     spawn_transaction_sweeper(kv_service.locks(), cancel.clone());
     // A whole transaction may be a single value, so one `BufferWrite`
     // can legitimately be as large as `MAX_TRANSACTION_BYTES`. Without
@@ -220,7 +305,9 @@ pub async fn serve_config(config: ServerConfig, cancel: CancellationToken) -> Re
     // to explain itself.
     let kv_server = KvServer::new(kv_service)
         .max_decoding_message_size(raft5_shared::MAX_KV_MESSAGE_BYTES);
-    let raft_peer_server = RaftPeerServer::new(RaftPeerService::new(peer_handle));
+    let raft_peer_server = RaftPeerServer::new(
+        RaftPeerService::new(peer_handle).identify_as(identity, Store::new(Arc::clone(&log))),
+    );
 
     if uninitialized {
         info!(
@@ -242,7 +329,7 @@ pub async fn serve_config(config: ServerConfig, cancel: CancellationToken) -> Re
     // failure on one port brings the whole node down rather than leaving
     // a half-reachable one behind.
     let client_server = async {
-        let result = Server::builder()
+        let result = client_builder
             .layer(trace_layer())
             // Inside the trace layer, so a request turned away for want
             // of a token is still one of the spans this node logs --
@@ -256,7 +343,7 @@ pub async fn serve_config(config: ServerConfig, cancel: CancellationToken) -> Re
         result
     };
     let peer_server = async {
-        let result = Server::builder()
+        let result = peer_builder
             .layer(trace_layer())
             // Matches the peer clients (see `raft::PeerConnections`):
             // without it, h2's default 65535-byte window caps

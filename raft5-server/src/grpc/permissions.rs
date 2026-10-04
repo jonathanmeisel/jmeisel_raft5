@@ -422,10 +422,7 @@ impl KvService {
     /// For the management RPCs, which run on the leader and already pay
     /// a raft round trip, so they can afford the authoritative answer
     /// that the data path cannot.
-    async fn is_cluster_admin(
-        &self,
-        extensions: &tonic::Extensions,
-    ) -> Result<bool, AuthFailure> {
+    async fn is_cluster_admin(&self, extensions: &tonic::Extensions) -> Result<bool, AuthFailure> {
         match self.require_admin(extensions).await {
             Ok(()) => Ok(true),
             Err(AuthFailure::Refused(auth_error::Kind::NotAdmin, _)) => Ok(false),
@@ -464,10 +461,7 @@ impl KvService {
     /// one landed between the lock and the read. Retryable, and left to
     /// the caller to retry rather than papered over here.
     async fn locked_permissions(&self, id: TxnId) -> Result<Arc<Permissions>, AuthFailure> {
-        let locked = self
-            .transactional_read(id, keyspace::EPOCH_KEY)
-            .await?
-            .seq;
+        let locked = self.transactional_read(id, keyspace::EPOCH_KEY).await?.seq;
         let perms = self.permissions().await?;
         if perms.epoch() != locked {
             return Err(Status::unavailable(
@@ -635,10 +629,9 @@ impl KvService {
                 ));
             }
             if self.would_create_a_cycle(id, &req.name, &members).await? {
-                return Err(Status::invalid_argument(
-                    "that would put the group inside itself",
-                )
-                .into());
+                return Err(
+                    Status::invalid_argument("that would put the group inside itself").into(),
+                );
             }
             self.commit_permission_change(id, &key, Some(record.to_bytes()?))
                 .await
@@ -707,10 +700,9 @@ impl KvService {
                     .would_create_a_cycle(id, &req.name, &group.members)
                     .await?
             {
-                return Err(Status::invalid_argument(
-                    "that would put the group inside itself",
-                )
-                .into());
+                return Err(
+                    Status::invalid_argument("that would put the group inside itself").into(),
+                );
             }
 
             self.commit_permission_change(id, &key, Some(group.to_bytes()?))
@@ -868,11 +860,15 @@ impl KvService {
                     .to_string()
             }
             _ => {
-                let governed_by = perms
-                    .governing(prefix)
-                    .map_or_else(String::new, |(prefix, _)| {
-                        format!(" (governed by the ACL on {})", String::from_utf8_lossy(prefix))
-                    });
+                let governed_by =
+                    perms
+                        .governing(prefix)
+                        .map_or_else(String::new, |(prefix, _)| {
+                            format!(
+                                " (governed by the ACL on {})",
+                                String::from_utf8_lossy(prefix)
+                            )
+                        });
                 format!("this account does not hold write on that prefix{governed_by}")
             }
         }))

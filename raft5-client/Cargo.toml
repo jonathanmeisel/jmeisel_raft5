@@ -22,4 +22,5 @@ rpassword = "7.5.4"
 
 [dev-dependencies]
 raft5-server = { path = "../raft5-server" }
+rcgen = "0.14.10"
 tokio-util = "0.7.19"

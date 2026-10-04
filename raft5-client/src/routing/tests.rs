@@ -10,17 +10,17 @@ fn member(id: &str, client_address: &str) -> ClusterMember {
 }
 
 fn router(seeds: &[&str]) -> Router {
-    Router::new(seeds).expect("seeds are valid addresses")
+    Router::new(seeds, None).expect("seeds are valid addresses")
 }
 
 #[test]
 fn a_client_needs_somewhere_to_start() {
     assert!(matches!(
-        Router::new(Vec::<String>::new()),
+        Router::new(Vec::<String>::new(), None),
         Err(Error::NoSeeds)
     ));
     assert!(matches!(
-        Router::new(["not a url"]),
+        Router::new(["not a url"], None),
         Err(Error::InvalidAddress(_))
     ));
 }

@@ -672,11 +672,11 @@ async fn a_follower_enforces_an_acl_written_on_the_leader() {
     retry("adding the follower", || {
         let mut lead = lead.clone();
         let root = root.clone();
-        let address = format!("http://{}", follower.client_addr);
+        let address = format!("http://{}", follower.peer_addr);
         async move {
             matches!(
                 lead.add_server(with_token(&root, AddServerRequest {
-                    client_address: address,
+                    peer_address: address,
                 }))
                 .await
                 .map(|r| r.into_inner().result),

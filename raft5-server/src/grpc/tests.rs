@@ -192,40 +192,46 @@ fn kv_service_with_auth(
     )
 }
 
-/// A `KvService` for `node_id`, served on a real listener at an ephemeral
-/// port -- for tests where another node's `add_server` has to reach it
-/// for real (it calls `GetConfig` on whatever `client_address` it's
-/// given). The peer address stays a fake, unreachable one, same as
-/// `kv_service` -- nothing here needs this node reachable over the
-/// *peer* API, only the client one. Torn down by cancelling the
-/// returned token.
-async fn spawn_reachable_kv_service(
+/// A `RaftPeerService` for `node_id`, served on a real listener at an
+/// ephemeral port -- for tests where another node's `add_server` has to
+/// reach it for real (it calls `Identify` on whatever `peer_address`
+/// it's given).
+///
+/// The address it *reports* is still a fake, unreachable one, same as
+/// `kv_service`: it is what the leader records and replicates to, so
+/// the new node never catches up and stays a learner, which is what
+/// lets a lone leader go on committing -- and remove it again -- by
+/// itself. Torn down by cancelling the returned token.
+async fn spawn_reachable_peer_service(
     log: Arc<RaftLog>,
     node_id: &str,
 ) -> (std::net::SocketAddr, CancellationToken) {
-    let raft::NodeHandles { common, .. } = raft::Common::new(
+    let raft::NodeHandles {
+        common,
+        peer_handle,
+        ..
+    } = raft::Common::new(
         node_id.to_string(),
         Arc::clone(&log),
         CancellationToken::new(),
     )
     .unwrap();
-    let client_handle = common.client_handle();
     tokio::spawn(raft::run(common));
 
     let addr = free_local_addr();
     let identity = ClusterMember {
         server_id: node_id.to_string(),
         address: format!("http://127.0.0.1:1/{node_id}"),
-        client_address: format!("http://{addr}"),
+        client_address: format!("http://127.0.0.1:1/{node_id}-client"),
         voting: true,
     };
-    let svc = KvService::new(Store::new(log), identity, client_handle, None);
+    let svc = RaftPeerService::new(peer_handle).identify_as(identity, Store::new(log));
 
     let cancel = CancellationToken::new();
     let shutdown = cancel.clone();
     tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
-            .add_service(crate::pb::raft5::client::kv_server::KvServer::new(svc))
+            .add_service(crate::pb::raft5::raft::raft_peer_server::RaftPeerServer::new(svc))
             .serve_with_shutdown(addr, shutdown.cancelled())
             .await;
     });
@@ -340,11 +346,11 @@ async fn writes_to_a_non_leader_come_back_as_not_leader() {
     }
 
     // Membership changes take the same route. The leader check happens
-    // before `add_server` ever dials `client_address`, so a bystander
+    // before `add_server` ever dials `peer_address`, so a bystander
     // answers `NotLeader` without needing it to be reachable.
     let add = svc
         .add_server(Request::new(AddServerRequest {
-            client_address: "http://127.0.0.1:9998".to_string(),
+            peer_address: "http://127.0.0.1:9998".to_string(),
         }))
         .await
         .unwrap()
@@ -442,14 +448,14 @@ async fn add_server_then_remove_server_round_trip_through_the_kv_service() {
     let (log, path) = open_temp();
     let svc = leader_kv_service(Arc::clone(&log), "solo").await;
 
-    // A real, reachable "new" node -- `add_server` now calls `GetConfig`
-    // on it to learn its identity, so it has to actually answer.
+    // A real, reachable "new" node -- `add_server` calls `Identify` on
+    // it to learn its identity, so it has to actually answer.
     let (new_log, new_path) = open_temp();
-    let (new_addr, new_cancel) = spawn_reachable_kv_service(new_log, "new").await;
+    let (new_addr, new_cancel) = spawn_reachable_peer_service(new_log, "new").await;
 
     let resp = svc
         .add_server(Request::new(AddServerRequest {
-            client_address: format!("http://{new_addr}"),
+            peer_address: format!("http://{new_addr}"),
         }))
         .await
         .unwrap()
@@ -543,10 +549,10 @@ async fn get_config_reports_empty_before_bootstrap_and_the_new_member_right_afte
     );
 
     let (new_log, new_path) = open_temp();
-    let (new_addr, new_cancel) = spawn_reachable_kv_service(new_log, "new").await;
+    let (new_addr, new_cancel) = spawn_reachable_peer_service(new_log, "new").await;
 
     svc.add_server(Request::new(AddServerRequest {
-        client_address: format!("http://{new_addr}"),
+        peer_address: format!("http://{new_addr}"),
     }))
     .await
     .unwrap();
@@ -1845,7 +1851,7 @@ async fn an_ordinary_account_may_not_change_cluster_membership() {
         .add_server(as_user(
             "alice",
             AddServerRequest {
-                client_address: "http://127.0.0.1:1".to_string(),
+                peer_address: "http://127.0.0.1:1".to_string(),
             },
         ))
         .await

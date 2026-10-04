@@ -36,6 +36,10 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use tonic::Status;
+use tonic::transport::ClientTlsConfig;
+/// Re-exported so a caller can build a [`ClientTls`] without depending
+/// on tonic itself.
+pub use tonic::transport::{Certificate, Identity};
 
 use raft5_shared::raft5::client::{
     AddServerRequest, BootstrapRequest, CommitTransactionRequest, CommitTransactionResponse,
@@ -111,6 +115,12 @@ pub enum Error {
     /// A seed address (or one the cluster advertised) that isn't a
     /// usable URI. Addresses look like `http://host:port`.
     InvalidAddress(String),
+    /// The TLS configuration was refused -- a certificate or key that
+    /// isn't usable PEM, say. Not a handshake failure: those happen per
+    /// connection, and are reported as [`Unavailable`].
+    ///
+    /// [`Unavailable`]: Error::Unavailable
+    Tls(String),
     /// A client was constructed with no seeds, so it has nowhere to send
     /// anything.
     NoSeeds,
@@ -471,6 +481,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidAddress(address) => write!(f, "not a usable address: {address:?}"),
+            Self::Tls(why) => write!(f, "unusable TLS configuration: {why}"),
             Self::NoSeeds => write!(f, "a client needs at least one seed address"),
             Self::InvalidArgument(why) => write!(f, "{why}"),
             Self::Rejected(why) => write!(f, "the cluster refused the request: {why}"),
@@ -618,6 +629,60 @@ impl<T> Reply<T> {
     }
 }
 
+/// How a [`Client`] dials the cluster over TLS.
+///
+/// There is no default trust: the certificates to trust are whatever
+/// `ca` holds, and nothing else -- not the system's roots. So a cluster
+/// with a self-signed certificate is trusted by handing that certificate
+/// here, and a client built for one cluster can't be pointed at some
+/// other server that merely has a publicly-valid certificate.
+#[derive(Clone)]
+pub struct ClientTls {
+    ca: Certificate,
+    identity: Option<Identity>,
+    server_name: Option<String>,
+}
+
+impl ClientTls {
+    /// Trusts servers whose certificate chains to `ca` -- which may be a
+    /// self-signed leaf trusted as its own anchor, as long as it is not
+    /// marked `CA:TRUE`.
+    pub fn new(ca: Certificate) -> Self {
+        Self {
+            ca,
+            identity: None,
+            server_name: None,
+        }
+    }
+
+    /// Presents `identity` to the server, for a cluster whose client API
+    /// requires mTLS. It needs the `clientAuth` extended key usage if it
+    /// lists any.
+    pub fn identity(mut self, identity: Identity) -> Self {
+        self.identity = Some(identity);
+        self
+    }
+
+    /// Checks every server's certificate against `name` instead of the
+    /// host in its address -- for one certificate, with one name, shared
+    /// by every node.
+    pub fn server_name(mut self, name: impl Into<String>) -> Self {
+        self.server_name = Some(name.into());
+        self
+    }
+
+    fn into_config(self) -> ClientTlsConfig {
+        let mut config = ClientTlsConfig::new().ca_certificate(self.ca);
+        if let Some(identity) = self.identity {
+            config = config.identity(identity);
+        }
+        if let Some(name) = self.server_name {
+            config = config.domain_name(name);
+        }
+        config
+    }
+}
+
 /// A handle on a raft5 cluster.
 ///
 /// Cheap to clone -- clones share one connection to the leader and one
@@ -637,7 +702,25 @@ impl Client {
     /// Must be called from within a Tokio runtime: it spawns the task
     /// that keeps that configuration up to date.
     pub fn new(seeds: impl IntoIterator<Item = impl AsRef<str>>) -> Result<Self, Error> {
-        let router = Arc::new(Router::new(seeds)?);
+        Self::build(seeds, None)
+    }
+
+    /// [`Client::new`], for a cluster whose client API is served over
+    /// TLS. Every node is dialed over TLS, whatever scheme its address
+    /// names -- `http://` included, which is what a cluster that
+    /// predates TLS still advertises.
+    pub fn with_tls(
+        seeds: impl IntoIterator<Item = impl AsRef<str>>,
+        tls: ClientTls,
+    ) -> Result<Self, Error> {
+        Self::build(seeds, Some(tls.into_config()))
+    }
+
+    fn build(
+        seeds: impl IntoIterator<Item = impl AsRef<str>>,
+        tls: Option<ClientTlsConfig>,
+    ) -> Result<Self, Error> {
+        let router = Arc::new(Router::new(seeds, tls)?);
         spawn_config_refresh(Arc::downgrade(&router));
         Ok(Self { router })
     }
@@ -1020,19 +1103,22 @@ impl Client {
         .await
     }
 
-    /// Adds a server to the cluster, at the address its client API is
-    /// reachable on. The leader dials it for its own `GetConfig` to learn
-    /// its server id and peer address, so the caller only has to know
-    /// where its client API is. It joins as a non-voting learner and is
-    /// promoted automatically once it has caught up (Raft §4.2.1), so
-    /// this one call is the whole operation.
+    /// Adds a server to the cluster, at the address its *peer* API is
+    /// reachable on -- the one other nodes replicate to, which the
+    /// leader dials (over the cluster's peer mTLS, if it has any) to ask
+    /// the server its id and client address. It joins as a non-voting
+    /// learner and is promoted automatically once it has caught up (Raft
+    /// §4.2.1), so this one call is the whole operation.
+    ///
+    /// The scheme of `peer_address` doesn't matter: the leader dials it
+    /// over TLS or not according to its own configuration.
     ///
     /// Returns once the change has committed. Only one membership change
     /// may be in flight at a time; a call that collides with another is
     /// retried like any other transient refusal.
-    pub async fn add_server(&self, client_address: &str) -> Result<(), Error> {
+    pub async fn add_server(&self, peer_address: &str) -> Result<(), Error> {
         let request = AddServerRequest {
-            client_address: client_address.to_string(),
+            peer_address: peer_address.to_string(),
         };
         self.change_config(|mut kv: Kv| {
             let request = request.clone();

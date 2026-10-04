@@ -6,7 +6,7 @@ use clap::Parser;
 use tracing::info;
 
 use raft5_server::auth::{AuthConfig, InitialAdmin};
-use raft5_server::{ServerConfig, serve_config};
+use raft5_server::{ClientApiTls, PeerTls, ServerConfig, serve_config};
 use tokio_util::sync::CancellationToken;
 
 /// A single Raft node.
@@ -91,6 +91,57 @@ struct Args {
     /// startup, and kept only as a hash.
     #[arg(long, requires = "initial_admin_user")]
     initial_admin_password_file: Option<PathBuf>,
+
+    /// PEM certificate (chain) this node serves the peer API with, and
+    /// presents when it dials other nodes'. Turns on mTLS for the peer
+    /// API, which every node in the cluster must then also have.
+    ///
+    /// Being both a server and a client certificate, it needs the
+    /// `serverAuth` and `clientAuth` extended key usages if it lists
+    /// any, and a subjectAltName matching how peers address this node
+    /// (or `--peer-tls-server-name`) -- the common name is ignored.
+    ///
+    /// Without this the peer API is plaintext, and anyone who can reach
+    /// the port can speak Raft to this node.
+    #[arg(long, requires_all = ["peer_tls_key", "peer_tls_ca"])]
+    peer_tls_cert: Option<PathBuf>,
+
+    /// PEM private key for `--peer-tls-cert`.
+    #[arg(long, requires = "peer_tls_cert")]
+    peer_tls_key: Option<PathBuf>,
+
+    /// PEM certificate(s) a peer's certificate must chain to. Anything
+    /// it vouches for is accepted as a peer.
+    ///
+    /// For a self-signed certificate shared by the whole cluster, this
+    /// is that certificate itself -- which then must not be marked
+    /// `CA:TRUE`, or it will be refused as a CA used as an end entity.
+    #[arg(long, requires = "peer_tls_cert")]
+    peer_tls_ca: Option<PathBuf>,
+
+    /// Check every peer's certificate against this name instead of the
+    /// host in its address. Lets one certificate with one name serve
+    /// every node, however each happens to be addressed.
+    #[arg(long, requires = "peer_tls_cert")]
+    peer_tls_server_name: Option<String>,
+
+    /// PEM certificate (chain) to serve the client API with. Turns on
+    /// TLS for the client API; clients then dial `https://`.
+    #[arg(long, requires = "client_tls_key")]
+    client_tls_cert: Option<PathBuf>,
+
+    /// PEM private key for `--client-tls-cert`.
+    #[arg(long, requires = "client_tls_cert")]
+    client_tls_key: Option<PathBuf>,
+
+    /// PEM certificate(s) a client's certificate must chain to. Turns
+    /// TLS into mTLS: a client without such a certificate cannot
+    /// connect at all.
+    ///
+    /// Only a gate on connecting. Who a client is, and what it may do,
+    /// is still decided by its token (see `--jwt-secret-file`).
+    #[arg(long, requires = "client_tls_cert")]
+    client_tls_ca: Option<PathBuf>,
 }
 
 /// Builds this node's authentication configuration from the flags, or
@@ -142,6 +193,32 @@ async fn auth_config(args: &Args) -> Result<Option<AuthConfig>, raft5_server::Er
     )))
 }
 
+/// This node's peer and client TLS configuration, from the flags.
+///
+/// Read here, at startup, so that a missing or unreadable file stops the
+/// node with its path in the error rather than surfacing later as a
+/// handshake every peer refuses.
+fn tls_config(args: &Args) -> Result<(Option<PeerTls>, Option<ClientApiTls>), String> {
+    use raft5_shared::tls::{load_ca, load_identity};
+
+    let peer = match (&args.peer_tls_cert, &args.peer_tls_key, &args.peer_tls_ca) {
+        (Some(cert), Some(key), Some(ca)) => Some(PeerTls {
+            identity: load_identity(cert, key)?,
+            ca: load_ca(ca)?,
+            server_name: args.peer_tls_server_name.clone(),
+        }),
+        _ => None,
+    };
+    let client = match (&args.client_tls_cert, &args.client_tls_key) {
+        (Some(cert), Some(key)) => Some(ClientApiTls {
+            identity: load_identity(cert, key)?,
+            client_ca: args.client_tls_ca.as_deref().map(load_ca).transpose()?,
+        }),
+        _ => None,
+    };
+    Ok((peer, client))
+}
+
 /// The shortest signing secret this server will accept, matching the
 /// output width of the hash HS256 is built on.
 const MIN_SECRET_BYTES: usize = 32;
@@ -184,6 +261,17 @@ async fn main() -> Result<(), raft5_server::Error> {
              every request it can serve, it will serve"
         );
     }
+    let (peer_tls, client_tls) = tls_config(&args)?;
+    if peer_tls.is_none() {
+        info!(
+            "no --peer-tls-cert: this node's peer API is plaintext -- anyone who can reach \
+             {} can speak Raft to it",
+            args.peer_addr
+        );
+    }
+    if client_tls.is_none() {
+        info!("no --client-tls-cert: this node's client API is plaintext");
+    }
     let cancel = CancellationToken::new();
     let node = serve_config(
         ServerConfig {
@@ -194,6 +282,8 @@ async fn main() -> Result<(), raft5_server::Error> {
             advertise: args.advertise,
             advertise_client: args.advertise_client,
             auth,
+            peer_tls,
+            client_tls,
         },
         cancel.clone(),
     );

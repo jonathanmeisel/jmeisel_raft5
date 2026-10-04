@@ -1,0 +1,292 @@
+RAFT5 TLS: GENERATING CERTIFICATES AND RUNNING THE SERVER
+=========================================================
+
+raft5 serves two ports, and each can be secured separately:
+
+  * Peer API   (--peer-addr)    node <-> node Raft traffic. Uses mTLS:
+                                every node presents a certificate and checks
+                                the other node's.
+  * Client API (--client-addr)  clients <-> nodes. Uses TLS, or mTLS if you
+                                also give a client CA.
+
+Both are optional. A node started with no TLS flags behaves exactly as
+before (plaintext). Every node in a cluster must use the same peer TLS
+setting: a TLS node and a plaintext node cannot talk to each other.
+
+TLS works alongside the JWT login (--jwt-secret-file), it doesn't replace
+it. A client certificate only decides whether a client may connect. Who the
+client is, and what it may do, still comes from its login token.
+
+There are two ways to set up certificates:
+
+  Option A: one self-signed certificate shared by every node. Simplest, and
+            fine for a cluster you control end to end.
+  Option B: your own private CA, which signs node and client certificates.
+            Use this if you want separate client certificates, or to
+            replace one node's certificate without touching the others.
+
+Every command below uses openssl (any 1.1.1+ or 3.x).
+
+
+-------------------------------------------------------------------------
+REQUIREMENTS EVERY CERTIFICATE MUST MEET
+-------------------------------------------------------------------------
+
+raft5 uses rustls, which is stricter than many tools:
+
+  1. Host names are checked against the subjectAltName (SAN) only, never
+     the CN. The SAN must cover the host part of the address other nodes
+     or clients dial, e.g. DNS:raft5-0.raft5 or IP:10.0.0.5. You can skip
+     this for the peer port with --peer-tls-server-name (see Option A).
+
+  2. Peer certificates need BOTH extended key usages, serverAuth and
+     clientAuth, because each node is a server and also a client of the
+     other nodes.
+
+  3. A self-signed certificate that is trusted as itself (Option A) must
+     have basicConstraints CA:FALSE. Plain "openssl req -x509" marks it
+     CA:TRUE by default, and rustls then rejects it with
+     "CaUsedAsEndEntity". The commands below set CA:FALSE explicitly.
+
+  4. Only the CA file(s) you pass are trusted. System or public CAs are
+     never trusted.
+
+
+-------------------------------------------------------------------------
+OPTION A: ONE SELF-SIGNED CERTIFICATE FOR THE WHOLE CLUSTER
+-------------------------------------------------------------------------
+
+1. Generate the certificate. List every name or IP that nodes and clients
+   will dial in subjectAltName:
+
+     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+       -nodes -days 365 -subj "/CN=raft5" \
+       -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+       -addext "basicConstraints=critical,CA:FALSE" \
+       -addext "extendedKeyUsage=serverAuth,clientAuth" \
+       -keyout raft5.key -out raft5.pem
+
+   This produces:
+     raft5.pem   the certificate (it also serves as the "CA" to trust)
+     raft5.key   its private key. Keep it secret: anyone who has it can act
+                 as a cluster node.
+
+   Check it:
+     openssl x509 -in raft5.pem -noout \
+       -ext basicConstraints,subjectAltName,extendedKeyUsage
+
+2. Start each node, with the same three files on every node. Example of
+   three nodes on one machine:
+
+     raft5-server --id n1 --db ./data1 \
+       --client-addr 127.0.0.1:50101 --peer-addr 127.0.0.1:50201 \
+       --peer-tls-cert raft5.pem --peer-tls-key raft5.key --peer-tls-ca raft5.pem \
+       --client-tls-cert raft5.pem --client-tls-key raft5.key
+
+     raft5-server --id n2 --db ./data2 \
+       --client-addr 127.0.0.1:50102 --peer-addr 127.0.0.1:50202 \
+       --peer-tls-cert raft5.pem --peer-tls-key raft5.key --peer-tls-ca raft5.pem \
+       --client-tls-cert raft5.pem --client-tls-key raft5.key
+
+     raft5-server --id n3 --db ./data3 \
+       --client-addr 127.0.0.1:50103 --peer-addr 127.0.0.1:50203 \
+       --peer-tls-cert raft5.pem --peer-tls-key raft5.key --peer-tls-ca raft5.pem \
+       --client-tls-cert raft5.pem --client-tls-key raft5.key
+
+   To require client certificates as well (mTLS on the client port), add
+   to every node:
+       --client-tls-ca raft5.pem
+   Clients must then present raft5.pem/raft5.key. Since that is also the
+   peer key, Option B is better if clients should not hold it.
+
+   Variant, one fixed name: if your nodes' addresses are hard to list in
+   the SAN (dynamic IPs, many pods), put one made-up name in the cert,
+   e.g. -addext "subjectAltName=DNS:raft5-peer", and start every node with
+       --peer-tls-server-name raft5-peer
+   Each node then checks the other nodes' certificates against that name,
+   whatever address it dialed. This only affects the peer port. Clients
+   can do the same with the CLI's --tls-server-name.
+
+3. Form the cluster and use it with the CLI (see "USING THE CLIENT" below):
+
+     raft --nodes 127.0.0.1:50101 --ca-cert raft5.pem
+     raft> bootstrap n1
+     raft> add_server 127.0.0.1:50202
+     raft> add_server 127.0.0.1:50203
+     raft> write k hello
+     raft> read k
+
+
+-------------------------------------------------------------------------
+OPTION B: A PRIVATE CA SIGNING NODE AND CLIENT CERTIFICATES
+-------------------------------------------------------------------------
+
+1. Create the CA, once. Keep ca.key offline or locked away; only ca.pem
+   is distributed.
+
+     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+       -nodes -days 3650 -subj "/CN=raft5 CA" \
+       -addext "basicConstraints=critical,CA:TRUE" \
+       -addext "keyUsage=critical,keyCertSign,cRLSign" \
+       -keyout ca.key -out ca.pem
+
+2. Create the node certificate. One certificate whose SAN covers every
+   node is simplest; repeat this step per node if you prefer separate
+   ones.
+
+     openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+       -subj "/CN=raft5-node" -keyout node.key -out node.csr
+
+     printf '%s\n' \
+       'basicConstraints=critical,CA:FALSE' \
+       'keyUsage=critical,digitalSignature' \
+       'extendedKeyUsage=serverAuth,clientAuth' \
+       'subjectAltName=DNS:localhost,IP:127.0.0.1' > node.ext
+
+     openssl x509 -req -in node.csr -CA ca.pem -CAkey ca.key \
+       -CAcreateserial -days 365 -extfile node.ext -out node.pem
+
+   (Put your real node hostnames/IPs in subjectAltName, e.g.
+   DNS:raft5-0.raft5,DNS:raft5-1.raft5,DNS:raft5-2.raft5)
+
+3. Optional, only for client mTLS: create one certificate per client.
+
+     openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+       -subj "/CN=alice-laptop" -keyout client.key -out client.csr
+
+     printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n' > client.ext
+
+     openssl x509 -req -in client.csr -CA ca.pem -CAkey ca.key \
+       -CAcreateserial -days 365 -extfile client.ext -out client.pem
+
+   Check everything:
+     openssl verify -CAfile ca.pem node.pem client.pem
+
+   Clients can also come from a different CA than the nodes: just point
+   --client-tls-ca at that CA instead.
+
+4. Start each node (shown for n1; n2 and n3 differ only in --id, --db and
+   their addresses):
+
+     raft5-server --id n1 --db ./data1 \
+       --client-addr 127.0.0.1:50101 --peer-addr 127.0.0.1:50201 \
+       --peer-tls-cert node.pem --peer-tls-key node.key --peer-tls-ca ca.pem \
+       --client-tls-cert node.pem --client-tls-key node.key \
+       --client-tls-ca ca.pem
+
+   Leave out --client-tls-ca for plain TLS on the client port (no client
+   certificates needed).
+
+5. Connect:
+
+     raft --nodes 127.0.0.1:50101 --ca-cert ca.pem \
+          --cert client.pem --key client.key
+
+
+-------------------------------------------------------------------------
+SERVER FLAG REFERENCE
+-------------------------------------------------------------------------
+
+  --peer-tls-cert <pem>         Node certificate (chain), for serving the
+                                peer API and for dialing other nodes.
+  --peer-tls-key <pem>          Its private key.
+  --peer-tls-ca <pem>           What other nodes' certificates must chain
+                                to. The first three flags go together.
+  --peer-tls-server-name <name> Optional. Check other nodes' certificates
+                                against this name instead of the dialed
+                                host.
+
+  --client-tls-cert <pem>       Certificate for the client API. Turns on
+                                TLS for it.
+  --client-tls-key <pem>        Its private key. Required with the cert.
+  --client-tls-ca <pem>         Optional. Turns on mTLS: clients must
+                                present a certificate that chains to this.
+
+Files are read once at startup. A missing or unreadable file stops the
+node with the path in the error. To rotate certificates, replace the
+files and restart the nodes one at a time.
+
+At startup a node logs "no --peer-tls-cert: ... plaintext" and/or
+"no --client-tls-cert: ... plaintext" for any port it is NOT securing.
+Look for those lines to confirm your flags took effect.
+
+
+-------------------------------------------------------------------------
+USING THE CLIENT
+-------------------------------------------------------------------------
+
+CLI (raft):
+  --ca-cert <pem>          Turns on TLS; trust servers whose certificate
+                           chains to this.
+  --cert <pem> --key <pem> Client certificate, if the cluster uses mTLS.
+  --tls-server-name <name> Optional; check against this name instead of
+                           the host.
+
+  With --ca-cert set, addresses without a scheme are dialed as https://.
+  Any http:// address the cluster reports is dialed over TLS too.
+
+Library (raft5_client):
+
+  use raft5_client::{Certificate, Client, ClientTls, Identity};
+
+  let ca = Certificate::from_pem(std::fs::read("ca.pem")?);
+  let tls = ClientTls::new(ca)
+      .identity(Identity::from_pem(std::fs::read("client.pem")?,
+                                   std::fs::read("client.key")?)); // mTLS only
+  let client = Client::with_tls(["https://127.0.0.1:50101"], tls)?;
+
+
+-------------------------------------------------------------------------
+ADDING SERVERS: USE THE PEER ADDRESS
+-------------------------------------------------------------------------
+
+add_server takes the new node's PEER address (its --peer-addr, or
+--advertise), not its client address:
+
+  raft> add_server 127.0.0.1:50202
+
+The leader connects to that address over the cluster's peer mTLS to ask
+the node for its ID and client address. If the leader can't reach the new
+node that way, the add fails straight away, before the node is added.
+
+
+-------------------------------------------------------------------------
+KUBERNETES NOTES
+-------------------------------------------------------------------------
+
+  * Put the node cert, key and CA in one Secret and mount it read-only
+    into every pod, e.g. at /etc/raft5/tls/. Pass the mounted paths to the
+    flags above.
+  * In a StatefulSet, give the node certificate SANs for the pod DNS
+    names (raft5-0.raft5.<ns>.svc.cluster.local, ...), or use
+    --peer-tls-server-name with one fixed name.
+  * Set --advertise / --advertise-client to those DNS names so the
+    addresses stored in the cluster match the certificate.
+
+
+-------------------------------------------------------------------------
+TROUBLESHOOTING
+-------------------------------------------------------------------------
+
+  "CaUsedAsEndEntity"
+      A self-signed cert marked CA:TRUE is being used as a node cert.
+      Regenerate it with basicConstraints=critical,CA:FALSE (Option A), or
+      use a separate CA (Option B).
+
+  "certificate not valid for name ..." / "NotValidForName"
+      The SAN doesn't include the host being dialed. Add it to the SAN, or
+      use --peer-tls-server-name / --tls-server-name.
+
+  "UnknownIssuer"
+      The other side's certificate doesn't chain to the CA file you gave.
+      Check you passed the right --peer-tls-ca / --ca-cert.
+
+  Client says "... did not answer"
+      Often a TLS failure on the client side: the server requires a client
+      certificate (--client-tls-ca) and none was given, or the client
+      doesn't trust the server's CA. Run with RUST_LOG=debug to see the
+      underlying error.
+
+  Nodes come up but never replicate
+      Check every node has the same peer TLS setting, and that peer certs
+      have both serverAuth and clientAuth.

@@ -6,10 +6,11 @@
 //! already found.
 
 use std::io::{self, IsTerminal, Write};
+use std::path::PathBuf;
 
 use clap::Parser;
 
-use raft5_client::{Client, Error, Invite, Principal, Right};
+use raft5_client::{Client, ClientTls, Error, Invite, Principal, Right};
 
 /// Opens an interactive session against a raft5 cluster.
 #[derive(Parser)]
@@ -19,7 +20,7 @@ struct Args {
     /// members to start from, e.g.
     /// `127.0.0.1:52005,127.0.0.1:52006`. A starting point rather than a
     /// fixed list -- see [`Client::new`]. An address with no scheme is
-    /// taken to be `http://`.
+    /// taken to be `http://`, or `https://` with `--ca-cert`.
     #[arg(long, value_delimiter = ',')]
     nodes: Vec<String>,
 
@@ -31,6 +32,42 @@ struct Args {
     /// nothing to log in to, and this is not needed.
     #[arg(long)]
     user: Option<String>,
+
+    /// PEM certificate(s) to trust the cluster's client API with. Turns
+    /// on TLS. Only these are trusted -- not the system's roots -- so for
+    /// a self-signed cluster this is that certificate (or its CA).
+    #[arg(long)]
+    ca_cert: Option<PathBuf>,
+
+    /// PEM certificate to present, for a cluster that requires mTLS.
+    #[arg(long, requires_all = ["key", "ca_cert"])]
+    cert: Option<PathBuf>,
+
+    /// PEM private key for `--cert`.
+    #[arg(long, requires = "cert")]
+    key: Option<PathBuf>,
+
+    /// Check the servers' certificate against this name instead of the
+    /// host in each address.
+    #[arg(long, requires = "ca_cert")]
+    tls_server_name: Option<String>,
+}
+
+/// The TLS configuration the flags describe, or `None` for plaintext.
+fn tls(args: &Args) -> Result<Option<ClientTls>, String> {
+    use raft5_shared::tls::{load_ca, load_identity};
+
+    let Some(ca) = &args.ca_cert else {
+        return Ok(None);
+    };
+    let mut tls = ClientTls::new(load_ca(ca)?);
+    if let (Some(cert), Some(key)) = (&args.cert, &args.key) {
+        tls = tls.identity(load_identity(cert, key)?);
+    }
+    if let Some(name) = &args.tls_server_name {
+        tls = tls.server_name(name);
+    }
+    Ok(Some(tls))
 }
 
 /// Asks for a password, without echoing it when there is an echo to
@@ -65,6 +102,14 @@ async fn log_in(client: &Client, username: &str) -> Result<(), String> {
 async fn main() {
     env_logger::init();
     let args = Args::parse();
+    let tls = match tls(&args) {
+        Ok(tls) => tls,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    let scheme = if tls.is_some() { "https" } else { "http" };
 
     let seeds: Vec<String> = args
         .nodes
@@ -76,12 +121,16 @@ async fn main() {
             if s.contains("://") {
                 s.to_string()
             } else {
-                format!("http://{s}")
+                format!("{scheme}://{s}")
             }
         })
         .collect();
 
-    let client = match Client::new(seeds) {
+    let client = match tls {
+        Some(tls) => Client::with_tls(seeds, tls),
+        None => Client::new(seeds),
+    };
+    let client = match client {
         Ok(client) => client,
         Err(e) => {
             eprintln!("could not create client: {e}");
@@ -272,8 +321,8 @@ async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
             }
         }
         "add_server" => {
-            let [client_address] = fixed_args(args, "add_server <client_address>")?;
-            match client.add_server(client_address).await {
+            let [peer_address] = fixed_args(args, "add_server <peer_address>")?;
+            match client.add_server(peer_address).await {
                 Ok(()) => println!("ok"),
                 Err(e) => println!("error: {e}"),
             }
@@ -726,7 +775,7 @@ fn print_help() {
             "read_at <snapshot> <key>         read a key as it was when the snapshot was taken",
             "version_at <snapshot> <key>      the seq a key was at when the snapshot was taken",
             "keys_at <snapshot> [start_key]   list the keys that existed at the snapshot",
-            "add_server <client_addr>         add a server as a learner, by its client address",
+            "add_server <peer_addr>           add a server as a learner, by its peer address",
             "remove_server <id>               remove a server",
             "bootstrap <id>                   form a single-node cluster around <id>",
             "endpoints                        list the client API addresses this client knows of",

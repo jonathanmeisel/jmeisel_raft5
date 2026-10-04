@@ -17,7 +17,7 @@ use log::{debug, warn};
 use tonic::Status;
 use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 use raft5_shared::raft5::client::kv_client::KvClient;
 use raft5_shared::raft5::client::GetConfigRequest;
@@ -83,9 +83,21 @@ pub(crate) struct Node {
 }
 
 impl Node {
-    fn new(address: &str, token: BearerToken) -> Result<Self, Error> {
-        let endpoint = Endpoint::from_shared(address.to_string())
-            .map_err(|_| Error::InvalidAddress(address.to_string()))?;
+    /// With `tls`, the node is dialed over TLS whatever scheme `address`
+    /// names -- the cluster advertises whatever its members were
+    /// configured with, which for a cluster that predates TLS is
+    /// `http://`, and tonic would dial that in plaintext (see
+    /// `raft5_shared::tls`). Normalizing before `key` is taken also keeps
+    /// a seed and the configuration's spelling of it one node, not two.
+    fn new(address: &str, token: BearerToken, tls: Option<&ClientTlsConfig>) -> Result<Self, Error> {
+        let mut endpoint =
+            Endpoint::from_shared(raft5_shared::tls::with_scheme(address, tls.is_some()))
+                .map_err(|_| Error::InvalidAddress(address.to_string()))?;
+        if let Some(tls) = tls {
+            endpoint = endpoint
+                .tls_config(tls.clone())
+                .map_err(|e| Error::Tls(e.to_string()))?;
+        }
         Ok(Self {
             key: endpoint.uri().to_string(),
             endpoint,
@@ -122,6 +134,9 @@ pub(crate) struct Router {
     /// request, from inside the connection, with no way to reach this
     /// lock.
     token: BearerToken,
+    /// How every node is dialed over TLS, or `None` for plaintext --
+    /// the seeds and every member learned afterwards alike.
+    tls: Option<ClientTlsConfig>,
 }
 
 struct State {
@@ -143,11 +158,14 @@ struct State {
 }
 
 impl Router {
-    pub(crate) fn new(seeds: impl IntoIterator<Item = impl AsRef<str>>) -> Result<Self, Error> {
+    pub(crate) fn new(
+        seeds: impl IntoIterator<Item = impl AsRef<str>>,
+        tls: Option<ClientTlsConfig>,
+    ) -> Result<Self, Error> {
         let token = BearerToken::default();
         let endpoints = seeds
             .into_iter()
-            .map(|s| Node::new(s.as_ref(), token.clone()))
+            .map(|s| Node::new(s.as_ref(), token.clone(), tls.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
         if endpoints.is_empty() {
             return Err(Error::NoSeeds);
@@ -160,6 +178,7 @@ impl Router {
                 credentials: None,
             }),
             token,
+            tls,
         })
     }
 
@@ -292,7 +311,7 @@ impl Router {
         let mut endpoints = Vec::new();
         let mut by_id = HashMap::new();
         for member in members {
-            match Node::new(&member.client_address, self.token.clone()) {
+            match Node::new(&member.client_address, self.token.clone(), self.tls.as_ref()) {
                 Ok(node) => {
                     endpoints.push(node.clone());
                     by_id.insert(member.server_id, node);

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 use crate::pb::raft5::cluster::ClusterMember;
 use crate::pb::raft5::raft::raft_peer_client::RaftPeerClient;
@@ -50,8 +50,15 @@ impl From<&ClusterMember> for PeerInfo {
 /// lock. A leader could lose its read quorum because a single unrelated
 /// follower was unreachable. Building the client can't block now, so
 /// there is no window to queue behind.
+///
+/// `Default` dials in plaintext; [`PeerConnections::new`] with a TLS
+/// config dials every peer over mTLS instead.
 #[derive(Default)]
 pub(super) struct PeerConnections {
+    /// How to dial peers over TLS, or `None` for plaintext. Decides the
+    /// scheme too, whatever the stored address says: see
+    /// `raft5_shared::tls`.
+    tls: Option<ClientTlsConfig>,
     /// For `AppendEntries`, `InstallSnapshot` and `RequestVote`.
     clients: std::sync::Mutex<HashMap<String, RaftPeerClient<Channel>>>,
     /// For `GetLease` alone. See the type's doc.
@@ -59,6 +66,13 @@ pub(super) struct PeerConnections {
 }
 
 impl PeerConnections {
+    pub(super) fn new(tls: Option<ClientTlsConfig>) -> Self {
+        Self {
+            tls,
+            ..Self::default()
+        }
+    }
+
     /// A client for `peer`'s bulk traffic, building (and remembering) one
     /// if this is the first call. Never blocks: `connect_lazy` performs
     /// no I/O, it just describes how to reach the peer, and the returned
@@ -67,20 +81,22 @@ impl PeerConnections {
     /// `Channel`, cheap to clone and safe to use concurrently from many
     /// tasks at once.
     ///
-    /// `None` only for an address that isn't a valid URI at all -- a
-    /// permanent configuration error rather than an unreachable peer, and
-    /// one there is nothing useful to do about here.
+    /// `None` only for an address that isn't a valid URI at all, or a
+    /// TLS config rustls won't build -- permanent configuration errors
+    /// rather than an unreachable peer, and ones there is nothing useful
+    /// to do about here.
     pub(super) fn client(&self, peer: &PeerInfo) -> Option<RaftPeerClient<Channel>> {
-        Self::client_from(&self.clients, peer)
+        self.client_from(&self.clients, peer)
     }
 
     /// A client for `peer`'s lease probes, on its own connection so that
     /// a probe is never queued behind a replication batch.
     pub(super) fn lease_client(&self, peer: &PeerInfo) -> Option<RaftPeerClient<Channel>> {
-        Self::client_from(&self.lease_clients, peer)
+        self.client_from(&self.lease_clients, peer)
     }
 
     fn client_from(
+        &self,
         cache: &std::sync::Mutex<HashMap<String, RaftPeerClient<Channel>>>,
         peer: &PeerInfo,
     ) -> Option<RaftPeerClient<Channel>> {
@@ -88,7 +104,7 @@ impl PeerConnections {
         if let Some(client) = clients.get(&peer.id) {
             return Some(client.clone());
         }
-        let channel = Endpoint::from_shared(peer.address.clone())
+        let channel = peer_endpoint(&peer.address, self.tls.as_ref())
             .ok()?
             // Without this, throughput is bounded by h2's default
             // 65535-byte window divided by the round trip -- a few MB/s
@@ -109,5 +125,25 @@ impl PeerConnections {
     pub(super) fn forget(&self, peer_id: &str) {
         self.clients.lock().unwrap().remove(peer_id);
         self.lease_clients.lock().unwrap().remove(peer_id);
+    }
+}
+
+/// How to dial a peer API at `address`: over TLS with `tls`, whatever
+/// scheme `address` names (see `raft5_shared::tls`), and in plaintext
+/// without it. No I/O -- the rustls config is built on the spot, but
+/// nothing is dialed until the endpoint is connected.
+///
+/// Shared by `PeerConnections` and `AddServer`'s `Identify`, which dials
+/// a server that is not a peer *yet* but must be reached exactly as one
+/// will be.
+pub(crate) fn peer_endpoint(
+    address: &str,
+    tls: Option<&ClientTlsConfig>,
+) -> Result<Endpoint, tonic::transport::Error> {
+    let endpoint =
+        Endpoint::from_shared(raft5_shared::tls::with_scheme(address, tls.is_some()))?;
+    match tls {
+        Some(tls) => endpoint.tls_config(tls.clone()),
+        None => Ok(endpoint),
     }
 }

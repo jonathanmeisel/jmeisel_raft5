@@ -3,7 +3,7 @@ resolver = "3"
 members = ["raft5-server", "raft5-shared", "raft5-client"]
 
 [workspace.dependencies]
-tonic = "0.14"
+tonic = { version = "0.14", features = ["tls-ring"] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 prost = "0.14"

@@ -39,8 +39,7 @@
 //! `RaftPeerHandle`, same as everything else.
 
 use prost::Message;
-use raft5_shared::raft5::client::kv_client::KvClient;
-use tonic::transport::Endpoint;
+use tonic::transport::ClientTlsConfig;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::Instrument;
 
@@ -79,9 +78,10 @@ use crate::pb::raft5::cluster::{ClusterConfig, ClusterMember};
 use crate::pb::raft5::raft::raft_peer_server::RaftPeer;
 use crate::pb::raft5::raft::{
     AppendEntriesChunk, AppendEntriesRequest, AppendEntriesResponse, EntryBatch, GetLeaseRequest,
-    GetLeaseResponse, InstallSnapshotResponse, RequestVoteRequest, RequestVoteResponse,
-    SnapshotChunk, append_entries_chunk, snapshot_chunk,
+    GetLeaseResponse, IdentifyRequest, IdentifyResponse, InstallSnapshotResponse,
+    RequestVoteRequest, RequestVoteResponse, SnapshotChunk, append_entries_chunk, snapshot_chunk,
 };
+use crate::pb::raft5::raft::raft_peer_client::RaftPeerClient;
 use crate::perms::Right;
 use crate::raft::{
     self, AppendError, ClientHandle, ConfigChange, LeaderHandle, MAX_APPEND_ENTRIES_BYTES,
@@ -595,6 +595,9 @@ pub struct KvService {
     /// service, and rebuilt only when the permission epoch moves. See
     /// `grpc::permissions`.
     perms: permissions::PermsCache,
+    /// How `AddServer` dials the server it is asked to add: over the
+    /// same mTLS as every other peer, or `None` for plaintext.
+    peer_tls: Option<ClientTlsConfig>,
 }
 
 impl KvService {
@@ -611,7 +614,17 @@ impl KvService {
             locks: Locks::new(),
             auth,
             perms: permissions::new_cache(),
+            peer_tls: None,
         }
+    }
+
+    /// Dials the servers `AddServer` is asked to add over mTLS, the way
+    /// the cluster's peers dial each other. Must match how this node's
+    /// own peer connections are configured: a server this node can't
+    /// reach the way it reaches peers would never get past being added.
+    pub fn with_peer_tls(mut self, tls: ClientTlsConfig) -> Self {
+        self.peer_tls = Some(tls);
+        self
     }
 
     /// The lock table, for the shutdown-scoped sweeper `serve` spawns.
@@ -2053,31 +2066,37 @@ impl Kv for KvService {
             return config_change_refusal(e);
         }
 
-        // First, send an RPC to the new server to get its configuration.
-        let mut client = KvClient::new(
-            Endpoint::from_shared(req.client_address.clone())
+        // First, ask the new server who it is -- over its peer API,
+        // dialed exactly as it will be once it is a peer, so a server
+        // this node can't replicate to fails here rather than after
+        // it has been added.
+        let mut client = RaftPeerClient::new(
+            raft::peer_endpoint(&req.peer_address, self.peer_tls.as_ref())
                 .map_err(|e| Status::invalid_argument(format!("invalid address: {e}")))?
                 .connect_lazy(),
         );
         let response = client
-            .get_config(Request::new(GetConfigRequest {}))
+            .identify(Request::new(IdentifyRequest {}))
             .await
             .map_err(|e| {
                 Status::unavailable(format!(
                     "failed to reach the new server at {}: {e}",
-                    req.client_address
+                    req.peer_address
                 ))
             })?
             .into_inner();
 
-        let identity = response.identity.ok_or_else(|| {
-            Status::invalid_argument("the new server did not report its identity")
-        })?;
-        if !response.members.is_empty() {
+        if response.in_cluster {
             return Err(Status::invalid_argument(
                 "the new server is already part of a cluster",
             ));
         }
+        let identity = ClusterMember {
+            server_id: response.server_id,
+            address: response.address,
+            client_address: response.client_address,
+            voting: true,
+        };
 
         // Check that the new server hasn't already been added to the configuration.
         let members = self.get_config_internal().await.map_err(storage_err)?;
@@ -2512,11 +2531,26 @@ impl Kv for KvService {
 
 pub struct RaftPeerService {
     peer_handle: RaftPeerHandle,
+    /// What `Identify` answers with: this node's identity, and the store
+    /// that says whether it has a configuration yet. `None` on a service
+    /// built without them, which then can't be added to a cluster -- only
+    /// tests that drive the Raft RPCs directly build one that way.
+    identity: Option<(ClusterMember, Store)>,
 }
 
 impl RaftPeerService {
     pub fn new(peer_handle: RaftPeerHandle) -> Self {
-        Self { peer_handle }
+        Self {
+            peer_handle,
+            identity: None,
+        }
+    }
+
+    /// Answers `Identify` as `identity`, reporting whether `store` holds
+    /// a configuration yet.
+    pub fn identify_as(mut self, identity: ClusterMember, store: Store) -> Self {
+        self.identity = Some((identity, store));
+        self
     }
 }
 
@@ -2692,6 +2726,26 @@ impl RaftPeer for RaftPeerService {
         Ok(Response::new(
             self.peer_handle.get_lease(request.into_inner()),
         ))
+    }
+
+    async fn identify(
+        &self,
+        _request: Request<IdentifyRequest>,
+    ) -> Result<Response<IdentifyResponse>, Status> {
+        let Some((identity, store)) = &self.identity else {
+            return Err(Status::unimplemented("this node has no identity to report"));
+        };
+        let in_cluster = store
+            .run(RaftLog::current_config)
+            .await
+            .map_err(storage_err)?
+            .is_some();
+        Ok(Response::new(IdentifyResponse {
+            server_id: identity.server_id.clone(),
+            address: identity.address.clone(),
+            client_address: identity.client_address.clone(),
+            in_cluster,
+        }))
     }
 
     async fn install_snapshot(
