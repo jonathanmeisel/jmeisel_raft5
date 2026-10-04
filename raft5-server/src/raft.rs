@@ -170,9 +170,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tracing::{info, warn};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
 
 use crate::pb::raft5::cluster::ClusterConfig;
 use crate::pb::raft5::common::LogEntry;
@@ -202,17 +202,17 @@ use leader::Leader;
 // here, so splitting this file didn't touch a single role.
 pub use event::{ConfigChange, Event, RaftError};
 pub use handles::{
-    AppendError,
-    ClientHandle, FollowerHandle, LeaderHandle, RaftPeerHandle, RoleHandle, leader_hint_of,
+    AppendError, ClientHandle, FollowerHandle, LeaderHandle, RaftPeerHandle, RoleHandle,
+    leader_hint_of,
 };
 pub use peer::PeerInfo;
 
+pub(crate) use event::Role;
+use event::Transition;
 /// The wire form of an `AppendEntries`, for the one test that has to
 /// speak it over a real socket -- see `grpc::tests`.
 #[cfg(test)]
 pub(crate) use leader::replication::append_entries_stream;
-pub(crate) use event::Role;
-use event::Transition;
 use peer::PeerConnections;
 pub(crate) use peer::peer_endpoint;
 pub(crate) use task::Task;
@@ -325,7 +325,7 @@ const _: () = assert!(
 /// than `AppendEntries`: this moves the *entire* current state, not just a
 /// batch of new entries, so it can take much longer on a large log or a
 /// slow link.
-const SNAPSHOT_RPC_TIMEOUT: Duration = Duration::from_secs(300);
+const SNAPSHOT_RPC_TIMEOUT: Duration = Duration::from_secs(7200);
 
 /// How much of an encoded entry batch goes into each `AppendEntriesChunk`
 /// on the wire.

@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::{Certificate, ClientTlsConfig, Identity, Server, ServerTlsConfig};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer};
 use tower_http::validate_request::ValidateRequestHeaderLayer;
-use tracing::{info, Level};
+use tracing::{Level, info};
 
 use auth::{AuthConfig, RequireToken};
 use grpc::{KvService, RaftPeerService};
@@ -303,8 +303,8 @@ pub async fn serve_config(config: ServerConfig, cancel: CancellationToken) -> Re
     // this, tonic's 4MB default would refuse it -- and refuse it in the
     // transport, where the transaction size limit has no say and no way
     // to explain itself.
-    let kv_server = KvServer::new(kv_service)
-        .max_decoding_message_size(raft5_shared::MAX_KV_MESSAGE_BYTES);
+    let kv_server =
+        KvServer::new(kv_service).max_decoding_message_size(raft5_shared::MAX_KV_MESSAGE_BYTES);
     let raft_peer_server = RaftPeerServer::new(
         RaftPeerService::new(peer_handle).identify_as(identity, Store::new(Arc::clone(&log))),
     );
@@ -386,11 +386,10 @@ pub async fn serve_config(config: ServerConfig, cancel: CancellationToken) -> Re
 /// ordinary traffic -- to match the level the rest of this crate's
 /// logging defaults to (see `main`'s `EnvFilter`).
 fn trace_layer()
--> TraceLayer<tower_http::classify::SharedClassifier<tower_http::classify::GrpcErrorsAsFailures>>
-{
+-> TraceLayer<tower_http::classify::SharedClassifier<tower_http::classify::GrpcErrorsAsFailures>> {
     TraceLayer::new_for_grpc()
-        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
-        .on_response(DefaultOnResponse::new().level(Level::INFO))
+        .make_span_with(DefaultMakeSpan::new().level(Level::TRACE))
+        .on_response(DefaultOnResponse::new().level(Level::TRACE))
         .on_failure(DefaultOnFailure::new().level(Level::WARN))
 }
 
