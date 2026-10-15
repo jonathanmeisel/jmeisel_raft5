@@ -181,10 +181,10 @@ async fn repl(client: &Client) {
             continue;
         }
 
-        let words = match shell_words::split(line) {
+        let words = match split_line(line) {
             Ok(words) => words,
             Err(e) => {
-                eprintln!("unmatched quote: {e}");
+                eprintln!("{e}");
                 continue;
             }
         };
@@ -197,6 +197,118 @@ async fn repl(client: &Client) {
     }
 }
 
+/// Splits a command line into words, each of them bytes.
+///
+/// Not `shell_words`: POSIX quoting eats a backslash outside quotes and
+/// turns `\\` into `\` inside double ones, so `"k\xff"` as [`quote_bytes`]
+/// prints it would not come back as the key it named. Here a backslash
+/// escape means the same thing wherever it appears, and covers everything
+/// `quote_bytes` emits -- so any key or value this shell prints can be
+/// pasted back in as an argument.
+///
+/// Whitespace separates words; `"..."` and `'...'` keep it from doing so,
+/// and `""` is a word of its own -- the empty one, which `acl_set` needs.
+fn split_line(line: &str) -> Result<Vec<Vec<u8>>, String> {
+    let mut words = Vec::new();
+    let mut word = Vec::new();
+    // Whether there is a word in progress, which `word.is_empty()` cannot
+    // say once `""` is allowed to be one.
+    let mut in_word = false;
+    let mut quote = None;
+    let mut chars = line.chars();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                unescape(&mut chars, &mut word)?;
+                in_word = true;
+            }
+            '"' | '\'' if quote.is_none() => {
+                quote = Some(c);
+                in_word = true;
+            }
+            c if quote == Some(c) => quote = None,
+            c if quote.is_none() && c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            c => {
+                word.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+                in_word = true;
+            }
+        }
+    }
+    if let Some(q) = quote {
+        return Err(format!("unmatched {q}"));
+    }
+    if in_word {
+        words.push(word);
+    }
+    Ok(words)
+}
+
+/// Decodes the escape following a backslash onto the end of `word`.
+fn unescape(chars: &mut std::str::Chars, word: &mut Vec<u8>) -> Result<(), String> {
+    let c = match chars.next().ok_or("trailing \\ escapes nothing")? {
+        '\\' => '\\',
+        '"' => '"',
+        '\'' => '\'',
+        ' ' => ' ',
+        'n' => '\n',
+        't' => '\t',
+        'r' => '\r',
+        '0' => '\0',
+        'x' => {
+            let hex: String = chars.take(2).collect();
+            let byte = (hex.len() == 2)
+                .then(|| u8::from_str_radix(&hex, 16).ok())
+                .flatten()
+                .ok_or_else(|| format!("\\x{hex} is not \\x followed by two hex digits"))?;
+            word.push(byte);
+            return Ok(());
+        }
+        'u' => {
+            let bad = || "\\u takes a Unicode scalar value in braces, like \\u{7f}".to_string();
+            if chars.next() != Some('{') {
+                return Err(bad());
+            }
+            let rest = chars.as_str();
+            let (hex, after) = rest.split_once('}').ok_or_else(bad)?;
+            *chars = after.chars();
+            u32::from_str_radix(hex, 16)
+                .ok()
+                .and_then(char::from_u32)
+                .ok_or_else(bad)?
+        }
+        other => return Err(format!("unknown escape \\{other}")),
+    };
+    word.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+    Ok(())
+}
+
+/// Bytes as this shell prints them: quoted, with valid UTF-8 shown as
+/// text and every byte that is not part of any escaped as `\xNN`.
+/// [`split_line`] reads the result back as the same bytes.
+fn quote_bytes(bytes: &[u8]) -> String {
+    let mut out = String::from("\"");
+    for chunk in bytes.utf8_chunks() {
+        out.extend(chunk.valid().escape_debug());
+        for byte in chunk.invalid() {
+            out.push_str(&format!("\\x{byte:02x}"));
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// An argument that has to be text -- a username, a server id -- rather
+/// than the bytes a key or value can be.
+fn text(arg: &[u8]) -> Result<&str, String> {
+    std::str::from_utf8(arg).map_err(|_| format!("{} is not UTF-8", quote_bytes(arg)))
+}
+
 /// Runs one already-tokenized command. Returns `Ok(false)` for `quit` /
 /// `exit`, which is the only thing that ends the session.
 ///
@@ -206,12 +318,13 @@ async fn repl(client: &Client) {
 /// than not -- along with the locks it was holding on everyone else's
 /// behalf. `write` and `delete` still commit through a transaction; the
 /// client opens and closes it inside the one call.
-async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
+async fn run(client: &Client, words: &[Vec<u8>]) -> Result<bool, String> {
     let Some((cmd, args)) = words.split_first() else {
         return Ok(true);
     };
+    let cmd = text(cmd)?;
 
-    match cmd.as_str() {
+    match cmd {
         "help" | "?" => print_help(),
         "quit" | "exit" => return Ok(false),
         "endpoints" => {
@@ -221,42 +334,38 @@ async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
         }
         "write" => {
             let [key, value] = fixed_args(args, "write <key> <value>")?;
-            print_seq(client.write(key.as_bytes(), Some(value.as_bytes())).await);
+            print_seq(client.write(key, Some(value)).await);
         }
         "delete" => {
             let [key] = fixed_args(args, "delete <key>")?;
-            print_seq(client.write(key.as_bytes(), None).await);
+            print_seq(client.write(key, None).await);
         }
         "read" => {
             let [key] = fixed_args(args, "read <key>")?;
-            print_read(client.read(key.as_bytes()).await);
+            print_read(client.read(key).await);
         }
         "read_current" => {
             let [key] = fixed_args(args, "read_current <key>")?;
-            print_read(client.read_linearizable(key.as_bytes()).await);
+            print_read(client.read_linearizable(key).await);
         }
         "version" => {
             let [key] = fixed_args(args, "version <key>")?;
-            print_version(client.get_version(key.as_bytes()).await);
+            print_version(client.get_version(key).await);
         }
         "version_current" => {
             let [key] = fixed_args(args, "version_current <key>")?;
-            print_version(client.get_version_linearizable(key.as_bytes()).await);
+            print_version(client.get_version_linearizable(key).await);
         }
         "snapshot" => {
             // An id is optional: with none, the client stamps its own
             // clock, which is where a clock belongs.
             let id = match args {
                 [] => None,
-                [id] => Some(id.as_bytes()),
+                [id] => Some(id.as_slice()),
                 _ => return Err("usage: snapshot [id]".to_string()),
             };
             match client.create_snapshot(id).await {
-                Ok(s) => println!(
-                    "created {} at seq={}",
-                    String::from_utf8_lossy(&s.id),
-                    s.seq
-                ),
+                Ok(s) => println!("created {} at seq={}", quote_bytes(&s.id), s.seq),
                 Err(e) => println!("error: {e}"),
             }
         }
@@ -264,41 +373,37 @@ async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
             Ok(list) if list.is_empty() => println!("(no snapshots)"),
             Ok(list) => {
                 for s in list {
-                    println!("{} seq={}", String::from_utf8_lossy(&s.id), s.seq);
+                    println!("{} seq={}", quote_bytes(&s.id), s.seq);
                 }
             }
             Err(e) => println!("error: {e}"),
         },
         "drop_snapshot" => {
             let [id] = fixed_args(args, "drop_snapshot <id>")?;
-            match client.remove_snapshot(id.as_bytes()).await {
+            match client.remove_snapshot(id).await {
                 Ok(seq) => println!("ok, seq={seq}"),
                 Err(e) => println!("error: {e}"),
             }
         }
         "read_at" => {
             let [id, key] = fixed_args(args, "read_at <snapshot> <key>")?;
-            print_read(client.read_at(id.as_bytes(), key.as_bytes()).await);
+            print_read(client.read_at(id, key).await);
         }
         "version_at" => {
             let [id, key] = fixed_args(args, "version_at <snapshot> <key>")?;
-            print_version(client.get_version_at(id.as_bytes(), key.as_bytes()).await);
+            print_version(client.get_version_at(id, key).await);
         }
         "keys_at" => {
             let (id, start) = match args {
-                [id] => (id.as_str(), ""),
-                [id, start] => (id.as_str(), start.as_str()),
+                [id] => (id.as_slice(), &[][..]),
+                [id, start] => (id.as_slice(), start.as_slice()),
                 _ => return Err("usage: keys_at <snapshot> [start_key]".to_string()),
             };
-            match client
-                .key_iterator_at(id.as_bytes(), start.as_bytes())
-                .collect()
-                .await
-            {
+            match client.key_iterator_at(id, start).collect().await {
                 Ok(keys) if keys.is_empty() => println!("(no keys)"),
                 Ok(keys) => {
                     for key in keys {
-                        println!("{}", String::from_utf8_lossy(&key));
+                        println!("{}", quote_bytes(&key));
                     }
                 }
                 Err(e) => println!("error: {e}"),
@@ -306,36 +411,36 @@ async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
         }
         "keys" => {
             let start = match args {
-                [] => "",
-                [start] => start.as_str(),
+                [] => &[][..],
+                [start] => start.as_slice(),
                 _ => return Err("usage: keys [start_key]".to_string()),
             };
-            match client.key_iterator(start.as_bytes()).collect().await {
+            match client.key_iterator(start).collect().await {
                 Ok(keys) if keys.is_empty() => println!("(no keys)"),
                 Ok(keys) => {
                     for key in keys {
-                        println!("{}", String::from_utf8_lossy(&key));
+                        println!("{}", quote_bytes(&key));
                     }
                 }
                 Err(e) => println!("error: {e}"),
             }
         }
         "add_server" => {
-            let [peer_address] = fixed_args(args, "add_server <peer_address>")?;
+            let [peer_address] = fixed_text_args(args, "add_server <peer_address>")?;
             match client.add_server(peer_address).await {
                 Ok(()) => println!("ok"),
                 Err(e) => println!("error: {e}"),
             }
         }
         "remove_server" => {
-            let [server_id] = fixed_args(args, "remove_server <server_id>")?;
+            let [server_id] = fixed_text_args(args, "remove_server <server_id>")?;
             match client.remove_server(server_id).await {
                 Ok(()) => println!("ok"),
                 Err(e) => println!("error: {e}"),
             }
         }
         "bootstrap" => {
-            let [server_id] = fixed_args(args, "bootstrap <server_id>")?;
+            let [server_id] = fixed_text_args(args, "bootstrap <server_id>")?;
             match client.bootstrap(server_id).await {
                 Ok(()) => println!("ok"),
                 Err(e) => println!("error: {e}"),
@@ -343,15 +448,15 @@ async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
         }
         "login" => {
             let username = match args {
-                [username] => username.clone(),
+                [username] => text(username)?.to_string(),
                 // Prompted rather than defaulted: whose session this is
                 // is not something to guess at.
                 [] => read_line("username: ")?,
                 _ => return Err("usage: login [username]".to_string()),
             };
-            // The password is never a positional argument: `shell_words`
-            // would put it in this shell's history, where it would
-            // outlive the session.
+            // The password is never a positional argument: it would end
+            // up in this shell's history, where it would outlive the
+            // session.
             if let Err(e) = log_in(client, &username).await {
                 println!("{e}");
             }
@@ -367,8 +472,8 @@ async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
         },
         "create_user" => {
             let (username, is_admin) = match args {
-                [username] => (username.as_str(), false),
-                [username, flag] if flag == "--admin" => (username.as_str(), true),
+                [username] => (text(username)?, false),
+                [username, flag] if flag == b"--admin" => (text(username)?, true),
                 _ => return Err("usage: create_user <username> [--admin]".to_string()),
             };
             let password = prompt_password(username)?;
@@ -378,7 +483,7 @@ async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
             }
         }
         "delete_user" => {
-            let [username] = fixed_args(args, "delete_user <username>")?;
+            let [username] = fixed_text_args(args, "delete_user <username>")?;
             print_seq(client.delete_user(username).await);
         }
         "invite" => {
@@ -398,8 +503,8 @@ async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
             // single-use and stops being a secret the moment it is
             // spent, which is the same moment this command spends it.
             let (token, username) = match args {
-                [token] => (token.clone(), read_line("username: ")?),
-                [token, username] => (token.clone(), username.clone()),
+                [token] => (text(token)?.to_string(), read_line("username: ")?),
+                [token, username] => (text(token)?.to_string(), text(username)?.to_string()),
                 _ => return Err("usage: redeem <token> [username]".to_string()),
             };
             let password = prompt_password(&username)?;
@@ -419,7 +524,7 @@ async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
             Err(e) => println!("error: {e}"),
         },
         "revoke_invite" => {
-            let [invite_id] = fixed_args(args, "revoke_invite <invite_id>")?;
+            let [invite_id] = fixed_text_args(args, "revoke_invite <invite_id>")?;
             print_seq(client.revoke_invite(invite_id).await);
         }
         "groups" => match client.list_groups().await {
@@ -432,18 +537,18 @@ async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
             Err(e) => println!("error: {e}"),
         },
         "group" => {
-            let [name] = fixed_args(args, "group <name>")?;
+            let [name] = fixed_text_args(args, "group <name>")?;
             match client.get_group(name).await {
                 Ok(group) => println!("{}", describe_group(&group)),
                 Err(e) => println!("error: {e}"),
             }
         }
         "group_create" => {
-            let [name] = fixed_args(args, "group_create <name>")?;
+            let [name] = fixed_text_args(args, "group_create <name>")?;
             print_seq(client.create_group(name, &[], &[]).await);
         }
         "group_delete" => {
-            let [name] = fixed_args(args, "group_delete <name>")?;
+            let [name] = fixed_text_args(args, "group_delete <name>")?;
             print_seq(client.delete_group(name).await);
         }
         "group_add" | "group_remove" => {
@@ -451,6 +556,7 @@ async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
             let Some((name, rest)) = args.split_first() else {
                 return Err(format!("usage: {usage}"));
             };
+            let name = text(name)?;
             if rest.is_empty() {
                 return Err(format!("usage: {usage}"));
             }
@@ -459,12 +565,12 @@ async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
             // members. The two lists are separate everywhere else, and
             // collapsing them here would be the one place they were not.
             let (as_admin, names) = match rest.split_first() {
-                Some((flag, names)) if flag == "--admin" && !names.is_empty() => (true, names),
+                Some((flag, names)) if flag == b"--admin" && !names.is_empty() => (true, names),
                 _ => (false, rest),
             };
             let principals = names
                 .iter()
-                .map(|name| parse_principal(name))
+                .map(|name| parse_principal(text(name)?))
                 .collect::<Result<Vec<_>, _>>()?;
             let none: &[Principal] = &[];
             let result = if cmd == "group_add" {
@@ -491,7 +597,7 @@ async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
         },
         "acl" => {
             let [key] = fixed_args(args, "acl <key>")?;
-            match client.get_acl(key.as_bytes()).await {
+            match client.get_acl(key).await {
                 Ok(raft5_client::AclFor { acl: None, .. }) => {
                     println!("(no ACL governs that key -- it is open to every account)");
                 }
@@ -523,13 +629,13 @@ async fn run(client: &Client, words: &[String]) -> Result<bool, String> {
             }
             let entries = grants
                 .iter()
-                .map(|grant| parse_grant(grant))
+                .map(|grant| parse_grant(text(grant)?))
                 .collect::<Result<Vec<_>, _>>()?;
-            print_seq(client.set_acl(prefix.as_bytes(), &entries).await);
+            print_seq(client.set_acl(prefix, &entries).await);
         }
         "acl_delete" => {
             let [prefix] = fixed_args(args, "acl_delete <prefix>")?;
-            print_seq(client.delete_acl(prefix.as_bytes()).await);
+            print_seq(client.delete_acl(prefix).await);
         }
         other => println!("unknown command {other:?}; type `help` for a list"),
     }
@@ -550,7 +656,7 @@ struct InviteOptions {
 
 /// `invite`'s flags, which are enough of them to want parsing rather
 /// than matching on shapes the way the fixed-arity commands do.
-fn invite_options(args: &[String]) -> Result<InviteOptions, String> {
+fn invite_options(args: &[Vec<u8>]) -> Result<InviteOptions, String> {
     const USAGE: &str = "usage: invite [--admin] [--user <name>] [--hours <n>]";
     let mut options = InviteOptions {
         is_admin: false,
@@ -559,15 +665,14 @@ fn invite_options(args: &[String]) -> Result<InviteOptions, String> {
     };
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
-        match arg.as_str() {
+        match text(arg)? {
             "--admin" => options.is_admin = true,
             "--user" => {
-                options.username = Some(rest.next().ok_or_else(|| USAGE.to_string())?.clone());
+                options.username =
+                    Some(text(rest.next().ok_or_else(|| USAGE.to_string())?)?.to_string());
             }
             "--hours" => {
-                let hours: u64 = rest
-                    .next()
-                    .ok_or_else(|| USAGE.to_string())?
+                let hours: u64 = text(rest.next().ok_or_else(|| USAGE.to_string())?)?
                     .parse()
                     .map_err(|_| "--hours takes a whole number of hours".to_string())?;
                 options.ttl = std::time::Duration::from_secs(hours * 60 * 60);
@@ -686,7 +791,7 @@ fn describe_acl(acl: &raft5_client::Acl) -> String {
     let prefix = if acl.prefix.is_empty() {
         "(every key)".to_string()
     } else {
-        format!("{:?}", String::from_utf8_lossy(&acl.prefix))
+        quote_bytes(&acl.prefix)
     };
     let grants = acl
         .entries
@@ -716,9 +821,24 @@ fn read_line(prompt: &str) -> Result<String, String> {
 /// Matches `args` against exactly `N` positional arguments, so each
 /// command above can destructure straight into named bindings instead of
 /// indexing.
-fn fixed_args<'a, const N: usize>(args: &'a [String], usage: &str) -> Result<[&'a str; N], String> {
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+fn fixed_args<'a, const N: usize>(
+    args: &'a [Vec<u8>],
+    usage: &str,
+) -> Result<[&'a [u8]; N], String> {
+    let refs: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
     refs.try_into().map_err(|_| format!("usage: {usage}"))
+}
+
+/// [`fixed_args`], for commands whose arguments are all [`text`].
+fn fixed_text_args<'a, const N: usize>(
+    args: &'a [Vec<u8>],
+    usage: &str,
+) -> Result<[&'a str; N], String> {
+    let mut out = [""; N];
+    for (out, arg) in out.iter_mut().zip(fixed_args::<N>(args, usage)?) {
+        *out = text(arg)?;
+    }
+    Ok(out)
 }
 
 fn print_seq(result: Result<u64, Error>) {
@@ -734,7 +854,7 @@ fn print_read(result: Result<raft5_client::ReadResult, Error>) {
             seq,
             value: Some(value),
         }) => {
-            println!("seq={seq} value={:?}", String::from_utf8_lossy(&value));
+            println!("seq={seq} value={}", quote_bytes(&value));
         }
         Ok(raft5_client::ReadResult { seq, value: None }) => {
             println!("seq={seq} (no value)");
@@ -810,7 +930,79 @@ fn print_help() {
             "acl_delete <prefix>              remove one, so a shorter prefix governs instead",
             "help                             show this message",
             "quit                             end the session",
+            "",
+            "keys, values, prefixes and snapshot ids are bytes. quote an argument with \"...\"",
+            "or '...' to keep spaces in it, and write any byte as \\xNN; \\n \\t \\r \\0 \\\\",
+            "\\\" \\' and \\u{...} also work, quoted or not. they are printed the same way, so",
+            "anything printed can be pasted back in as an argument",
         ]
         .join("\n")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn words(line: &str) -> Vec<Vec<u8>> {
+        split_line(line).unwrap()
+    }
+
+    #[test]
+    fn every_byte_round_trips() {
+        for byte in 0..=u8::MAX {
+            let quoted = quote_bytes(&[byte]);
+            assert_eq!(words(&quoted), vec![vec![byte]], "{quoted}");
+        }
+    }
+
+    #[test]
+    fn mixed_bytes_round_trip() {
+        for bytes in [&b"caf\xc3\xa9\xff\x00\"\\ '\n#"[..], b"", b"\xc3", b"a b"] {
+            assert_eq!(words(&quote_bytes(bytes)), vec![bytes.to_vec()]);
+        }
+    }
+
+    #[test]
+    fn valid_utf8_prints_as_text() {
+        assert_eq!(quote_bytes("café".as_bytes()), "\"café\"");
+        assert_eq!(quote_bytes(b"k\xff"), r#""k\xff""#);
+        assert_eq!(quote_bytes(b"v\x00\xfe"), r#""v\0\xfe""#);
+    }
+
+    #[test]
+    fn splits_words() {
+        assert_eq!(
+            words("  write a   b "),
+            vec![b"write".to_vec(), b"a".to_vec(), b"b".to_vec()]
+        );
+        assert_eq!(
+            words(r#"acl_set "" x"#),
+            vec![b"acl_set".to_vec(), vec![], b"x".to_vec()]
+        );
+        assert_eq!(words(r#"a"b c"d"#), vec![b"ab cd".to_vec()]);
+        assert_eq!(words(r"a\xffb"), vec![b"a\xffb".to_vec()]);
+        assert_eq!(words(r"'it\'s'"), vec![b"it's".to_vec()]);
+        assert_eq!(words(r#"'say "hi"'"#), vec![br#"say "hi""#.to_vec()]);
+        assert_eq!(words(r"a\ b"), vec![b"a b".to_vec()]);
+        assert_eq!(words(r"\u{e9}#"), vec!["é#".as_bytes().to_vec()]);
+        assert!(words("").is_empty());
+    }
+
+    #[test]
+    fn rejects_malformed_lines() {
+        for line in [
+            r#"read "abc"#,
+            "read 'abc",
+            r"read \q",
+            r"read \xZ1",
+            r"read \x1",
+            r"read \u{d800}",
+            r"read \u{41",
+            r"read \u41",
+            "read abc\\",
+        ] {
+            assert!(split_line(line).is_err(), "{line}");
+        }
+    }
 }
