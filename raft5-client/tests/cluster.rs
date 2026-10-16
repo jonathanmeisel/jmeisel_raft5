@@ -1362,6 +1362,28 @@ async fn a_snapshot_id_defaults_to_a_timestamp() {
     }
 }
 
+/// An id nobody created is reported as such straight away, rather than
+/// retried until the deadline and surfaced as the cluster being busy.
+#[tokio::test]
+async fn a_read_at_a_missing_snapshot_fails_fast() {
+    let n1 = TestNode::start("n1");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "n1").await;
+
+    let started = std::time::Instant::now();
+    let read = client.read_at(b"no-such-snapshot", b"k").await;
+    assert!(matches!(read, Err(Error::NotFound(_))), "{read:?}");
+    let version = client.get_version_at(b"no-such-snapshot", b"k").await;
+    assert!(matches!(version, Err(Error::NotFound(_))), "{version:?}");
+    let removed = client.remove_snapshot(b"no-such-snapshot").await;
+    assert!(matches!(removed, Err(Error::NotFound(_))), "{removed:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "took {:?}",
+        started.elapsed()
+    );
+}
+
 /// A snapshot walk pages like any other, across a batch boundary, with
 /// keys deleted after the snapshot still in the walk.
 #[tokio::test]

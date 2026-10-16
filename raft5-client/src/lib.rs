@@ -169,6 +169,11 @@ pub enum Error {
     /// The cluster knows who this client is and will not let them do
     /// this. Never retried: time does not grant permissions.
     PermissionDenied(String),
+    /// The thing the request names does not exist: a snapshot id nobody
+    /// created (or that has since been removed), an invitation already
+    /// redeemed. Never retried -- the leader answered, and asking it
+    /// again would only spend the deadline collecting the same answer.
+    NotFound(String),
     /// An account request the cluster understood and refused. Never
     /// retried, for the same reason -- a wrong password does not come
     /// right on the second attempt.
@@ -503,6 +508,7 @@ impl std::fmt::Display for Error {
                 write!(f, "the cluster did not accept this client's identity: {why}")
             }
             Self::PermissionDenied(why) => write!(f, "not permitted: {why}"),
+            Self::NotFound(why) => write!(f, "not found: {why}"),
             Self::Denied { reason, detail } if detail.is_empty() => write!(f, "{reason}"),
             Self::Denied { detail, .. } => f.write_str(detail),
         }
@@ -1750,6 +1756,9 @@ impl Client {
                         Ok(Err(status)) if status.code() == tonic::Code::PermissionDenied => {
                             return Err(Error::PermissionDenied(status.message().to_string()));
                         }
+                        Ok(Err(status)) if status.code() == tonic::Code::NotFound => {
+                            return Err(Error::NotFound(status.message().to_string()));
+                        }
                         // A refusal that time cannot fix. Retrying it
                         // would only spend the whole deadline arriving at
                         // the same answer, and then report it as though
@@ -1785,9 +1794,10 @@ impl Client {
 /// list: anything not named here is retried, because treating a
 /// transient failure as permanent is the worse mistake of the two.
 ///
-/// `Unauthenticated` and `PermissionDenied` belong on that list too and
-/// are absent only because `call_inner` has already returned on both,
-/// with error types that say more than `Rejected` would.
+/// `Unauthenticated`, `PermissionDenied` and `NotFound` belong on that
+/// list too and are absent only because `call_inner` has already
+/// returned on all three, with error types that say more than
+/// `Rejected` would.
 fn is_permanent(status: &Status) -> bool {
     matches!(
         status.code(),
