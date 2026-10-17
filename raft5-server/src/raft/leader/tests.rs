@@ -255,6 +255,92 @@ async fn the_last_voter_cannot_be_removed() {
     cleanup(&path);
 }
 
+/// A heartbeat change is a configuration change that leaves the
+/// membership alone -- and, since every running task re-reads its
+/// timing, it reaches them without any being restarted (which would
+/// cost each replication task its hard-won `next_index`).
+#[tokio::test]
+async fn set_heartbeat_retimes_the_leader_without_touching_membership() {
+    let members = [("n0", true), ("v1", true), ("v2", true)];
+    let (_log, mut leader, _rq, path) = ready_leader(&members).await;
+    let timing_rx = leader.common.timing_tx.subscribe();
+    assert_eq!(*timing_rx.borrow(), Timing::default());
+    let replication = leader.replication_tasks["v1"].id();
+    let lease = leader.lease_tasks["v1"].id();
+
+    leader
+        .propose_config(ConfigChange::SetHeartbeat { millis: 200 })
+        .await
+        .unwrap();
+
+    assert_eq!(*timing_rx.borrow(), Timing::from_millis(200));
+    assert_eq!(leader.common.timing().lease(), Duration::from_millis(800));
+    assert_eq!(
+        leader.common.config.members,
+        cluster_config(&members).members
+    );
+    assert!(
+        leader.pending_config_seq.is_some(),
+        "it is a config change like any other, one at a time"
+    );
+    assert_eq!(leader.replication_tasks["v1"].id(), replication);
+    assert_eq!(leader.lease_tasks["v1"].id(), lease);
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn an_out_of_range_heartbeat_is_refused() {
+    let (_log, mut leader, _rq, path) = ready_leader(&[("n0", true)]).await;
+    for millis in [0, 9, 10_001, u64::MAX] {
+        let err = leader
+            .propose_config(ConfigChange::SetHeartbeat { millis })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RaftError::InvalidConfigChange(_)),
+            "{millis}ms should be refused"
+        );
+    }
+    assert!(leader.pending_config_seq.is_none());
+    assert_eq!(leader.common.timing(), Timing::default());
+    cleanup(&path);
+}
+
+/// A grant counts until the deadline its probe computed from when it
+/// was *sent*, not from when the answer happened to arrive: the
+/// follower started its promise on receipt, so anything later than the
+/// send would let the leader count a lease the follower had already
+/// let go of -- by as much as a whole round trip on a slow link.
+#[tokio::test]
+async fn a_lease_grant_counts_only_until_its_probes_deadline() {
+    let config = cluster_config(&[("n0", true), ("v1", true), ("v2", true)]);
+    let (_log, NodeHandles { common, .. }, path) = open_temp_log_with_config("n0", &config);
+    let (mut leader, read_quorum_rx) = bare_leader(common);
+    let granted = || GetLeaseResponse {
+        lease_granted: true,
+    };
+
+    // Already over by the time it arrived.
+    leader
+        .handle_event(Event::GetLeaseResponse {
+            from: "v1".to_string(),
+            resp: granted(),
+            expires_at: Instant::now() - Duration::from_millis(1),
+        })
+        .await;
+    assert!(!*read_quorum_rx.borrow());
+
+    leader
+        .handle_event(Event::GetLeaseResponse {
+            from: "v1".to_string(),
+            resp: granted(),
+            expires_at: Instant::now() + Timing::default().lease(),
+        })
+        .await;
+    assert!(*read_quorum_rx.borrow());
+    cleanup(&path);
+}
+
 /// Raft §4.2.2: a leader removing *itself* is the only node that can
 /// get that entry committed, so it keeps serving until it does --
 /// and steps down the instant it commits, not before.
@@ -336,7 +422,7 @@ async fn a_learner_that_lags_starts_another_round_instead() {
         "l1".to_string(),
         CatchUpState {
             round_start_index: tail,
-            round_started_at: Instant::now() - (LEASE_DURATION * 2),
+            round_started_at: Instant::now() - (Timing::default().lease() * 2),
         },
     );
     leader.peer_match_index.insert("l1".to_string(), tail);
@@ -345,7 +431,7 @@ async fn a_learner_that_lags_starts_another_round_instead() {
     assert!(!leader.common.config.is_voter("l1"));
     let state = &leader.catch_up["l1"];
     assert!(
-        state.round_started_at.elapsed() < LEASE_DURATION,
+        state.round_started_at.elapsed() < Timing::default().lease(),
         "a fresh round should have started"
     );
 
@@ -529,7 +615,7 @@ async fn read_quorum_counts_voters_only() {
     let (_log, NodeHandles { common, .. }, path) = open_temp_log_with_config("n0", &config);
 
     let (mut leader, read_quorum_rx) = bare_leader(common);
-    let live = Instant::now() + LEASE_DURATION;
+    let live = Instant::now() + Timing::default().lease();
 
     // Us plus a learner: two of four members, but only one of three
     // voters -- short of the two a quorum needs.
@@ -1103,10 +1189,10 @@ async fn leader_sends_a_real_snapshot_to_a_peer_that_has_fallen_behind_compactio
 }
 
 /// Replication is woken by the log and the commit watermark rather than
-/// polled on a `HEARTBEAT` timer: an entry appended at an arbitrary moment
+/// polled on a `Timing::default().heartbeat()` timer: an entry appended at an arbitrary moment
 /// reaches the peer, and the resulting commit index reaches it too,
 /// without waiting out a tick. On a poll-based loop each of those costs up
-/// to `HEARTBEAT`, so 20 sequential writes could not finish this fast.
+/// to `Timing::default().heartbeat()`, so 20 sequential writes could not finish this fast.
 #[tokio::test]
 async fn replication_is_woken_by_new_entries_rather_than_polled() {
     use crate::grpc::RaftPeerService;
@@ -1196,17 +1282,18 @@ async fn replication_is_woken_by_new_entries_rather_than_polled() {
     }
     let sleeping: u64 = (0..WRITES).map(|i| u64::from(i % 7) * 3).sum();
     let in_writes = started.elapsed() - Duration::from_millis(sleeping);
+    let heartbeat = Timing::default().heartbeat();
     assert!(
-        in_writes < HEARTBEAT * WRITES / 4,
+        in_writes < heartbeat * WRITES / 4,
         "{WRITES} writes took {in_writes:?} of commit wait; a loop that polls every \
-         {HEARTBEAT:?} would average at least {:?} per write",
-        HEARTBEAT / 2
+         {heartbeat:?} would average at least {:?} per write",
+        heartbeat / 2
     );
 
     // Both nodes learn the commit index promptly, the follower included --
     // it only hears it via `leader_commit` on an `AppendEntries`.
     for rx in [&mut commit_rx_a, &mut commit_rx_b] {
-        tokio::time::timeout(HEARTBEAT / 2, async {
+        tokio::time::timeout(Timing::default().heartbeat() / 2, async {
             while *rx.borrow_and_update() < last_seq {
                 rx.changed().await.unwrap();
             }

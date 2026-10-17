@@ -367,8 +367,9 @@ async fn send_snapshot_to_peer(
 /// on `AppendEntries`) -- the task sleeps until one of them changes. It
 /// is deliberately *not* a heartbeat: leader liveness is the lease
 /// prober's job. A connect/RPC failure or timeout is retried every
-/// `HEARTBEAT`, and a caught-up peer is still contacted every
-/// `IDLE_REPLICATION_INTERVAL` so a silently restarted one is noticed.
+/// heartbeat, and a caught-up peer is still contacted every
+/// `Timing::idle_replication_interval` so a silently restarted one is
+/// noticed. Both are re-read from `timing_rx` on every wait.
 // Each parameter is an independent piece of context this task owns for
 // its whole lifetime (or a channel it reads/writes) -- there's no
 // natural subgroup to bundle into a struct that wouldn't just move the
@@ -381,6 +382,7 @@ pub(super) fn spawn_replication(
     term: u64,
     store: Store,
     conns: Arc<PeerConnections>,
+    timing_rx: watch::Receiver<Timing>,
     mut log_rx: watch::Receiver<u64>,
     mut commit_rx: watch::Receiver<u64>,
     mut compact_rx: watch::Receiver<u64>,
@@ -395,7 +397,7 @@ pub(super) fn spawn_replication(
         // encoding a whole batch that a `conflict_index` is about to
         // throw away. Without this, an unreachable peer costs a full
         // `MAX_REPLICATION_BATCH_BYTES` of log reads and encoding every
-        // `HEARTBEAT`, forever, per peer.
+        // heartbeat, forever, per peer.
         let mut confirmed = false;
         let mut consecutive_failures = 0u32;
         // When the current run of failures started, so the escalation
@@ -547,15 +549,16 @@ pub(super) fn spawn_replication(
             // A batch cut short by the byte budget means there is more
             // for this peer right now. Waiting out a heartbeat between
             // every round would make catching up take
-            // `backlog / batch × HEARTBEAT` of pure sleeping, which is
+            // `backlog / batch × heartbeat` of pure sleeping, which is
             // the difference between a learner catching up inside an
             // election timeout and not.
             if more_to_send {
                 continue;
             }
+            let timing = *timing_rx.borrow();
             let woke = until_cancelled(&cancel, async {
                 if retry_soon {
-                    tokio::time::sleep(HEARTBEAT).await;
+                    tokio::time::sleep(timing.heartbeat()).await;
                     return true;
                 }
                 // A closed channel means the node is shutting down.
@@ -563,7 +566,7 @@ pub(super) fn spawn_replication(
                     r = log_rx.changed() => r.is_ok(),
                     r = commit_rx.changed() => r.is_ok(),
                     r = compact_rx.changed() => r.is_ok(),
-                    _ = tokio::time::sleep(IDLE_REPLICATION_INTERVAL) => true,
+                    _ = tokio::time::sleep(timing.idle_replication_interval()) => true,
                 }
             })
             .await;

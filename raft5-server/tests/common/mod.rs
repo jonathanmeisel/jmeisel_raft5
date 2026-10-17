@@ -282,6 +282,7 @@ pub async fn bootstrap(client: &Arc<Client>, server_id: &str) {
         let resp = client
             .bootstrap(BootstrapRequest {
                 server_id: server_id.to_string(),
+                heartbeat_millis: 0,
             })
             .await;
         match resp {

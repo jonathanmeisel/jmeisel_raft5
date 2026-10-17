@@ -44,6 +44,12 @@ struct Args {
     /// secrets. A missing or empty one gets a new cluster; one this
     /// tool bootstrapped before has that cluster started again.
     dir: PathBuf,
+    /// Heartbeat interval for a new cluster, in milliseconds (default:
+    /// the server's, 50). Ignored when starting an existing cluster,
+    /// whose heartbeat is part of its replicated configuration --
+    /// change that one with the CLI's `heartbeat <ms>`.
+    #[arg(long)]
+    heartbeat_ms: Option<u64>,
 }
 
 /// How many nodes a new cluster gets: the fewest that survive losing one.
@@ -113,6 +119,12 @@ async fn main() -> Result<(), Error> {
     let dir = args.dir;
 
     let fresh = is_empty_or_missing(&dir)?;
+    if !fresh && args.heartbeat_ms.is_some() {
+        tracing::warn!(
+            "--heartbeat-ms only applies to a new cluster; {} already has one",
+            dir.display()
+        );
+    }
     let manifest = if fresh {
         info!(
             "{} is empty -- bootstrapping a new cluster there",
@@ -150,7 +162,7 @@ async fn main() -> Result<(), Error> {
 
     if fresh {
         let formed = tokio::select! {
-            result = form_cluster(&dir, &manifest, &auth) => result,
+            result = form_cluster(&dir, &manifest, &auth, args.heartbeat_ms) => result,
             // A node that fails to start (a port taken in the meantime,
             // say) would otherwise leave bootstrapping to time out.
             Some(Ok(Err(e))) = nodes.join_next() => Err(e.into()),
@@ -363,7 +375,12 @@ fn client_url(node: &NodeSpec) -> String {
 
 /// Bootstraps the first node into a single-node cluster, then adds the
 /// rest to it.
-async fn form_cluster(dir: &Path, manifest: &Manifest, auth: &AuthConfig) -> Result<(), Error> {
+async fn form_cluster(
+    dir: &Path,
+    manifest: &Manifest,
+    auth: &AuthConfig,
+    heartbeat_ms: Option<u64>,
+) -> Result<(), Error> {
     let first = &manifest.nodes[0];
     let client = Client::with_tls(
         [client_url(first)],
@@ -380,7 +397,7 @@ async fn form_cluster(dir: &Path, manifest: &Manifest, auth: &AuthConfig) -> Res
     // so keep asking until it answers.
     let deadline = Instant::now() + BOOTSTRAP_TIMEOUT;
     loop {
-        match client.bootstrap(&first.id).await {
+        match client.bootstrap(&first.id, heartbeat_ms).await {
             Ok(()) => break,
             Err(raft5_client::Error::Unavailable(e)) if Instant::now() < deadline => {
                 tracing::debug!("{} not ready to bootstrap yet: {e}", first.id);

@@ -239,7 +239,7 @@ async fn a_learner_never_campaigns() {
     tokio::spawn(run(common));
     wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Follower(_))).await;
 
-    // Comfortably past the LEASE_DURATION + fuzz window (200-400ms)
+    // Comfortably past the Timing::default().lease() + fuzz window (200-400ms)
     // in which a voter with unreachable peers would have campaigned.
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert!(
@@ -599,7 +599,7 @@ async fn cancelling_a_leader_stops_every_task_under_it() {
     // `AppendEntries` one: the peer-facing tasks are cut short rather
     // than waited out.
     assert!(
-        took < LEASE_DURATION,
+        took < Timing::default().lease(),
         "shutting down took {took:?}, which means something was waited out rather than cancelled"
     );
 
@@ -648,4 +648,54 @@ async fn a_node_cancelled_before_it_starts_stops_immediately() {
     assert_eq!(Arc::strong_count(&log), 1);
 
     cleanup(&path);
+}
+
+#[test]
+fn timing_derives_everything_from_the_heartbeat() {
+    let t = Timing::from_millis(200);
+    assert_eq!(t.heartbeat(), Duration::from_millis(200));
+    assert_eq!(t.lease(), Duration::from_millis(800));
+    assert_eq!(t.lightweight_rpc_timeout(), Duration::from_millis(400));
+    assert_eq!(t.idle_replication_interval(), Duration::from_millis(2_000));
+
+    // Unset (a config from before the setting existed, or none at all)
+    // means the default; anything else is held to the allowed range.
+    assert_eq!(Timing::from_millis(0), Timing::default());
+    assert_eq!(Timing::default().heartbeat_ms(), DEFAULT_HEARTBEAT_MS);
+    assert_eq!(Timing::from_millis(1).heartbeat_ms(), 10);
+    assert_eq!(Timing::from_millis(u64::MAX).heartbeat_ms(), 10_000);
+    assert_eq!(Timing::of(&ClusterConfig::default()), Timing::default());
+}
+
+#[test]
+fn election_timeouts_keep_their_jitter_at_a_long_heartbeat() {
+    for ms in [DEFAULT_HEARTBEAT_MS, 2_000, 10_000] {
+        let t = Timing::from_millis(ms);
+        let first = t.election_timeout_for_attempt(0);
+        assert!(
+            t.lease() <= first && first < t.lease() * 2,
+            "{ms}ms: {first:?} is outside [lease, 2*lease)"
+        );
+        // Enough draws that all of them landing on one value would mean
+        // the window had collapsed -- as it did when the backoff cap
+        // sat below a long heartbeat's first window.
+        let draws: std::collections::HashSet<_> =
+            (0..32).map(|_| t.election_timeout_for_attempt(0)).collect();
+        assert!(draws.len() > 1, "{ms}ms: no jitter in the first window");
+    }
+    // Backoff still tops out.
+    let cap = Duration::from_millis(MAX_ELECTION_BACKOFF_MS);
+    assert_eq!(
+        Timing::default().election_timeout_for_attempt(u32::MAX),
+        cap
+    );
+}
+
+#[test]
+fn heartbeat_bounds_are_checked_where_one_is_asked_for() {
+    assert!(check_heartbeat_ms(10).is_ok());
+    assert!(check_heartbeat_ms(10_000).is_ok());
+    assert!(check_heartbeat_ms(0).is_err());
+    assert!(check_heartbeat_ms(9).is_err());
+    assert!(check_heartbeat_ms(10_001).is_err());
 }

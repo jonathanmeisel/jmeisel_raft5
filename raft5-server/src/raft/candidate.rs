@@ -10,8 +10,8 @@ use tracing::info;
 use super::*;
 
 /// Requests a vote (real or pre-vote, per `req.dry_run`) from `peer`,
-/// over `conns`' shared client for it, bounded by
-/// `LIGHTWEIGHT_RPC_TIMEOUT`. `None` on any failure -- connect error, RPC
+/// over `conns`' shared client for it, bounded by `timeout`
+/// (`Timing::lightweight_rpc_timeout`). `None` on any failure -- connect error, RPC
 /// error, or timeout -- which is always safe to just ignore: the
 /// campaign's own election timer is Raft's built-in retry mechanism, so
 /// there's nothing else to do with a peer that didn't answer in time.
@@ -19,10 +19,11 @@ async fn request_vote_from_peer(
     peer: &PeerInfo,
     req: RequestVoteRequest,
     conns: &PeerConnections,
+    timeout: Duration,
 ) -> Option<RequestVoteResponse> {
     let mut client = conns.client(peer)?;
     let attempt = client.request_vote(req);
-    match tokio::time::timeout(LIGHTWEIGHT_RPC_TIMEOUT, attempt).await {
+    match tokio::time::timeout(timeout, attempt).await {
         Ok(Ok(resp)) => Some(resp.into_inner()),
         _ => None,
     }
@@ -98,6 +99,7 @@ impl Campaign {
                     last_log_term,
                     dry_run,
                     Arc::clone(&common.peer_conns),
+                    common.timing().lightweight_rpc_timeout(),
                     common.event_tx.clone(),
                 )
             })
@@ -107,6 +109,7 @@ impl Campaign {
         // campaign stuck forever with nothing left to wait on.
         let election_timer = spawn_election_timer(
             common.cancel_token(),
+            common.timing(),
             common.election_attempt,
             common.event_tx.clone(),
         );
@@ -151,6 +154,7 @@ impl Campaign {
         last_log_term: u64,
         dry_run: bool,
         conns: Arc<PeerConnections>,
+        timeout: Duration,
         event_tx: mpsc::Sender<Event>,
     ) -> Task {
         Task::spawn(cancel, move |cancel| async move {
@@ -162,10 +166,11 @@ impl Campaign {
                 dry_run,
             };
             // Wrapped rather than simply awaited: `request_vote_from_peer`
-            // is bounded by `LIGHTWEIGHT_RPC_TIMEOUT`, but an abandoned
-            // campaign shouldn't have to wait out even that much before
-            // this task is gone.
-            let resp = until_cancelled(&cancel, request_vote_from_peer(&peer, req, &conns)).await;
+            // is bounded by `timeout`, but an abandoned campaign
+            // shouldn't have to wait out even that much before this task
+            // is gone.
+            let resp =
+                until_cancelled(&cancel, request_vote_from_peer(&peer, req, &conns, timeout)).await;
             let Some(Some(resp)) = resp else {
                 return;
             };

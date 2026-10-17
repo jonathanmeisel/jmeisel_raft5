@@ -151,6 +151,11 @@ message RequestVoteResponse {
 message GetLeaseRequest {
   string leader_id = 1;
   uint64 term = 2;
+  // How long the leader will count this grant toward its read quorum, so
+  // the follower promises exactly that rather than its own idea of a
+  // lease -- the two can differ while a heartbeat change is replicating.
+  // 0 (a leader that predates this field) means the follower's own.
+  uint64 lease_millis = 3;
 }
 
 message GetLeaseResponse {

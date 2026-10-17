@@ -93,6 +93,7 @@ async fn an_authenticated_cluster_can_be_bootstrapped_and_then_used() {
             &token,
             BootstrapRequest {
                 server_id: node.id.clone(),
+                heartbeat_millis: 0,
             },
         ))
         .await
@@ -354,6 +355,7 @@ async fn an_invitation_creates_an_account_with_no_token_anywhere() {
             &token,
             BootstrapRequest {
                 server_id: node.id.clone(),
+                heartbeat_millis: 0,
             },
         ))
         .await
@@ -441,6 +443,7 @@ async fn a_redemption_without_a_real_invitation_creates_nothing() {
             &token,
             BootstrapRequest {
                 server_id: node.id.clone(),
+                heartbeat_millis: 0,
             },
         ))
         .await
@@ -558,6 +561,7 @@ async fn an_acl_is_enforced_against_the_identity_the_token_carries() {
     client
         .bootstrap(with_token(&startup, BootstrapRequest {
             server_id: node.id.clone(),
+            heartbeat_millis: 0,
         }))
         .await
         .expect("the startup administrator may bootstrap");
@@ -664,6 +668,7 @@ async fn a_follower_enforces_an_acl_written_on_the_leader() {
     let mut lead = leader.client().as_ref().clone();
     lead.bootstrap(with_token(&startup, BootstrapRequest {
         server_id: leader.id.clone(),
+        heartbeat_millis: 0,
     }))
     .await
     .expect("the startup administrator may bootstrap");

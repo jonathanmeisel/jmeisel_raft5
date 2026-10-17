@@ -131,9 +131,13 @@ fn temp_db_dir(label: &str) -> PathBuf {
 /// yet -- so a test that bootstraps the instant it spawns a node has to
 /// wait for that itself.
 async fn bootstrap(client: &Client, server_id: &str) {
+    bootstrap_with_heartbeat(client, server_id, None).await;
+}
+
+async fn bootstrap_with_heartbeat(client: &Client, server_id: &str, heartbeat_ms: Option<u64>) {
     let until = Instant::now() + BOOTSTRAP_TIMEOUT;
     loop {
-        match client.bootstrap(server_id).await {
+        match client.bootstrap(server_id, heartbeat_ms).await {
             Ok(()) => return,
             Err(e) => {
                 assert!(Instant::now() < until, "bootstrap never succeeded: {e}");
@@ -212,6 +216,42 @@ async fn a_seed_that_leaves_the_cluster_is_dropped() {
             .any(|e| e.contains(&n3.client_addr.to_string())),
         "a removed server should not still be in the endpoint list: {endpoints:?}"
     );
+}
+
+/// The heartbeat is chosen at bootstrap, replicated to every member
+/// that joins, and can be changed on a running cluster without it
+/// losing its leader or its ability to commit.
+#[tokio::test]
+async fn the_heartbeat_is_set_at_bootstrap_and_changeable_while_running() {
+    let n1 = TestNode::start("n1");
+    let n2 = TestNode::start("n2");
+    let n3 = TestNode::start("n3");
+
+    let client = Client::new([n1.url(), n2.url(), n3.url()]).unwrap();
+    bootstrap_with_heartbeat(&client, "n1", Some(100)).await;
+    client.add_server(&n2.peer_url()).await.unwrap();
+    client.add_server(&n3.peer_url()).await.unwrap();
+    assert_eq!(client.heartbeat_ms().await.unwrap(), 100);
+
+    client.set_heartbeat(250).await.unwrap();
+    assert_eq!(client.heartbeat_ms().await.unwrap(), 250);
+    // Every member, not just whichever one the client asked: n3 joined
+    // under the old value and learned the new one by replication.
+    for node in [&n1, &n2, &n3] {
+        let direct = Client::new([node.url()]).unwrap();
+        assert_eq!(direct.heartbeat_ms().await.unwrap(), 250, "{}", node.url());
+    }
+
+    client.write(b"k", Some(b"v")).await.unwrap();
+    assert_eq!(fresh(&client, b"k").await.value.as_deref(), Some(&b"v"[..]));
+
+    // Refused up front, not retried until the deadline.
+    let err = client.set_heartbeat(5).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Rejected(why) if why.contains("heartbeat")),
+        "{err:?}"
+    );
+    assert_eq!(client.heartbeat_ms().await.unwrap(), 250);
 }
 
 /// The read-modify-write the store cannot do on its own. A transaction

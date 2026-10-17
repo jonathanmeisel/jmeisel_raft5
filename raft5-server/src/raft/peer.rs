@@ -35,10 +35,10 @@ impl From<&ClusterMember> for PeerInfo {
 /// watch channel, and false of the transport underneath. A replication
 /// batch large enough to fill the socket's send buffer delays everything
 /// queued behind it on that connection, and a probe is answered inside
-/// `LIGHTWEIGHT_RPC_TIMEOUT` or not at all. Miss enough of them and the
-/// follower's lease expires and it campaigns -- a healthy leader deposed
-/// by its own replication traffic. Separate connections are what make
-/// the claim hold end to end.
+/// `Timing::lightweight_rpc_timeout` or not at all. Miss enough of them
+/// and the follower's lease expires and it campaigns -- a healthy leader
+/// deposed by its own replication traffic. Separate connections are what
+/// make the claim hold end to end.
 ///
 /// Deliberately a *synchronous* mutex around maps of already-built
 /// clients, with no `.await` anywhere under the lock. An earlier version

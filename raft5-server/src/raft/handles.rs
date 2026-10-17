@@ -10,7 +10,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::instrument;
@@ -23,7 +23,7 @@ use crate::pb::raft5::raft::{
 use crate::storage::Mutation;
 use crate::store::Store;
 
-use super::{ConfigChange, Event, LEASE_DURATION, RaftError};
+use super::{ConfigChange, Event, RaftError, Timing};
 
 /// Why an append didn't finish, split by the one distinction a caller
 /// can't recover without: whether the entry reached the log.
@@ -374,6 +374,8 @@ pub struct RaftPeerHandle {
     /// mid-disk-write. See the module doc.
     pub(super) role_rx: watch::Receiver<RoleHandle>,
     pub(super) term_rx: watch::Receiver<u64>,
+    /// Only for a lease request that names no duration -- see `get_lease`.
+    pub(super) timing_rx: watch::Receiver<Timing>,
     pub(super) lease_expires_at_tx: Arc<watch::Sender<Option<Instant>>>,
 }
 
@@ -456,8 +458,21 @@ impl RaftPeerHandle {
         }
         let granted = req.term == *self.term_rx.borrow();
         if granted {
+            // Exactly as long as the leader asked for, since that is how
+            // long it will count this grant -- not however long this
+            // node's own configuration says, which can briefly differ
+            // from the leader's while a heartbeat change is replicating.
+            // Clamped so no request, however wrong, can silence this
+            // node's elections indefinitely. Zero is a leader that
+            // predates the field, and was assuming our lease all along.
+            let lease = if req.lease_millis == 0 {
+                self.timing_rx.borrow().lease()
+            } else {
+                Duration::from_millis(req.lease_millis)
+                    .clamp(Timing::min_lease(), Timing::max_lease())
+            };
             self.lease_expires_at_tx
-                .send_replace(Some(Instant::now() + LEASE_DURATION));
+                .send_replace(Some(Instant::now() + lease));
         }
         GetLeaseResponse {
             lease_granted: granted,

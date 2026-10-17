@@ -46,12 +46,14 @@ use raft5_shared::raft5::client::{
     ConfigChangeResponse, CreateSnapshotRequest, CreateSnapshotResponse, CreateTransactionRequest,
     CreateInviteRequest, CreateInviteResponse, CreateTransactionResponse, CreateUserRequest,
     CreateUserResponse, DeleteUserRequest,
-    DeleteUserResponse, DropTransactionRequest, GetKeysRequest, GetKeysResponse, GetVersionRequest,
+    DeleteUserResponse, DropTransactionRequest, GetConfigRequest, GetKeysRequest, GetKeysResponse,
+    GetVersionRequest,
     GetVersionResponse, ListInvitesRequest, ListInvitesResponse, ListSnapshotsRequest,
     ListSnapshotsResponse, LoginRequest, LoginResponse, RedeemInviteRequest, RedeemInviteResponse,
     RevokeInviteRequest, RevokeInviteResponse,
     RaftError as PbRaftError, ReadRequest, ReadResponse, RemoveServerRequest,
-    RemoveSnapshotRequest, RemoveSnapshotResponse, WriteRequest, WriteResponse, auth_error,
+    RemoveSnapshotRequest, RemoveSnapshotResponse, SetHeartbeatRequest, WriteRequest,
+    WriteResponse, auth_error,
     commit_transaction_response, config_change_response, create_snapshot_response,
     create_invite_response, create_transaction_response, create_user_response,
     delete_user_response, get_keys_request, get_keys_response, get_version_request,
@@ -1146,6 +1148,34 @@ impl Client {
         .await
     }
 
+    /// Changes the cluster's heartbeat interval, which every election
+    /// and lease timeout is derived from. Returns once the change has
+    /// committed. Raise it for nodes far apart: it should comfortably
+    /// exceed the round trip between any two servers.
+    pub async fn set_heartbeat(&self, heartbeat_ms: u64) -> Result<(), Error> {
+        let request = SetHeartbeatRequest {
+            heartbeat_millis: heartbeat_ms,
+        };
+        self.change_config(
+            |mut kv: Kv| async move { kv.set_heartbeat(request).await.map(config_reply) },
+        )
+        .await
+    }
+
+    /// The heartbeat interval the cluster is running at, as the node
+    /// this client is talking to sees it -- which, like [`read`], may
+    /// briefly lag a change that has only just been made.
+    ///
+    /// [`read`]: Client::read
+    pub async fn heartbeat_ms(&self) -> Result<u64, Error> {
+        self.call(|mut kv: Kv| async move {
+            kv.get_config(GetConfigRequest {})
+                .await
+                .map(|resp| Reply::Ok(resp.into_inner().heartbeat_millis))
+        })
+        .await
+    }
+
     /// Forms a single-node cluster around the node called `server_id`
     /// (Raft §4.4), which must be one of this client's endpoints. Every
     /// other node joins that cluster through [`add_server`] instead.
@@ -1157,8 +1187,12 @@ impl Client {
     /// irreversible, and a node that has only just started may need a
     /// moment before it can accept one.
     ///
+    /// `heartbeat_ms` is the new cluster's heartbeat interval -- `None`
+    /// for the server's default. See [`set_heartbeat`].
+    ///
     /// [`add_server`]: Client::add_server
-    pub async fn bootstrap(&self, server_id: &str) -> Result<(), Error> {
+    /// [`set_heartbeat`]: Client::set_heartbeat
+    pub async fn bootstrap(&self, server_id: &str, heartbeat_ms: Option<u64>) -> Result<(), Error> {
         if server_id.is_empty() {
             return Err(Error::InvalidArgument(
                 "bootstrap needs the id of the node to bootstrap",
@@ -1167,6 +1201,7 @@ impl Client {
 
         let request = BootstrapRequest {
             server_id: server_id.to_string(),
+            heartbeat_millis: heartbeat_ms.unwrap_or(0),
         };
         let mut last: Option<String> = None;
         for node in self.router.nodes() {

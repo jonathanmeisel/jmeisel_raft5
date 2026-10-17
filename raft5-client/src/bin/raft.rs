@@ -440,12 +440,32 @@ async fn run(client: &Client, words: &[Vec<u8>]) -> Result<bool, String> {
             }
         }
         "bootstrap" => {
-            let [server_id] = fixed_text_args(args, "bootstrap <server_id>")?;
-            match client.bootstrap(server_id).await {
+            const USAGE: &str = "usage: bootstrap <server_id> [heartbeat_ms]";
+            let (server_id, heartbeat_ms) = match args {
+                [server_id] => (text(server_id)?, None),
+                [server_id, ms] => (text(server_id)?, Some(parse_millis(ms, USAGE)?)),
+                _ => return Err(USAGE.to_string()),
+            };
+            match client.bootstrap(server_id, heartbeat_ms).await {
                 Ok(()) => println!("ok"),
                 Err(e) => println!("error: {e}"),
             }
         }
+        "heartbeat" => match args {
+            [] => match client.heartbeat_ms().await {
+                Ok(0) => println!("(not part of a cluster yet)"),
+                Ok(ms) => println!("{ms}ms"),
+                Err(e) => println!("error: {e}"),
+            },
+            [ms] => {
+                let ms = parse_millis(ms, "usage: heartbeat [ms]")?;
+                match client.set_heartbeat(ms).await {
+                    Ok(()) => println!("ok"),
+                    Err(e) => println!("error: {e}"),
+                }
+            }
+            _ => return Err("usage: heartbeat [ms]".to_string()),
+        },
         "login" => {
             let username = match args {
                 [username] => text(username)?.to_string(),
@@ -841,6 +861,11 @@ fn fixed_text_args<'a, const N: usize>(
     Ok(out)
 }
 
+/// A millisecond count, for the commands that take one.
+fn parse_millis(arg: &[u8], usage: &str) -> Result<u64, String> {
+    text(arg)?.parse().map_err(|_| usage.to_string())
+}
+
 fn print_seq(result: Result<u64, Error>) {
     match result {
         Ok(seq) => println!("ok, seq={seq}"),
@@ -897,7 +922,11 @@ fn print_help() {
             "keys_at <snapshot> [start_key]   list the keys that existed at the snapshot",
             "add_server <peer_addr>           add a server as a learner, by its peer address",
             "remove_server <id>               remove a server",
-            "bootstrap <id>                   form a single-node cluster around <id>",
+            "bootstrap <id> [heartbeat_ms]    form a single-node cluster around <id>; the",
+            "                                  heartbeat defaults to 50ms",
+            "heartbeat [ms]                   show the cluster's heartbeat interval, or set it.",
+            "                                  raise it for nodes far apart: it should well",
+            "                                  exceed the round trip between any two. admins only",
             "endpoints                        list the client API addresses this client knows of",
             "login [username]                 log in; the password is always prompted for",
             "logout                           forget the token, on every connection this client holds",

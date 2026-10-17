@@ -67,6 +67,12 @@ service Kv {
   // server can cost a cluster its quorum.
   rpc AddServer(AddServerRequest) returns (ConfigChangeResponse);
   rpc RemoveServer(RemoveServerRequest) returns (ConfigChangeResponse);
+  // Change the cluster's heartbeat interval, and every timeout derived
+  // from it. Replicated like a membership change, and subject to the
+  // same one-change-at-a-time rule. Administrators only, for the same
+  // reason: too short a heartbeat for the network between the nodes
+  // leaves the cluster unable to keep a leader.
+  rpc SetHeartbeat(SetHeartbeatRequest) returns (ConfigChangeResponse);
 
   // Form a single-node cluster around this node (Raft §4.4). Refused by
   // any node that already has a configuration or a non-empty log:
@@ -601,11 +607,20 @@ message RemoveServerRequest {
   string server_id = 1;
 }
 
+message SetHeartbeatRequest {
+  // 10 to 10000. Should comfortably exceed the round trip between any
+  // two servers: votes and lease probes time out after two heartbeats.
+  uint64 heartbeat_millis = 1;
+}
+
 message BootstrapRequest {
   // Optional guard: if set, the node refuses unless this is its own id.
   // Bootstrapping is irreversible, so it is worth being able to say out
   // loud which node you believe you are talking to.
   string server_id = 1;
+  // The new cluster's heartbeat interval; 0 means the default (50ms).
+  // Can be changed later with SetHeartbeat.
+  uint64 heartbeat_millis = 2;
 }
 
 message ConfigChangeResponse {
@@ -640,6 +655,10 @@ message GetConfigResponse {
   // client seeded with one follower learns where everyone else is from
   // the same answer that tells it this node is not the one.
   bool is_leader = 3;
+  // The heartbeat interval this node is running at, from the same
+  // configuration as `members`. 0 from a node that has no configuration
+  // yet.
+  uint64 heartbeat_millis = 4;
 }
 
 // `ttl_ms` is how long the transaction may hold its locks. A value past

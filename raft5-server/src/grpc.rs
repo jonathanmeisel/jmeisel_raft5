@@ -57,6 +57,7 @@ use crate::pb::raft5::client::{
     ListSnapshotsRequest, ListSnapshotsResponse, LoginOk, LoginRequest, LoginResponse, NotLeader,
     RaftError as PbRaftError, ReadOk, ReadRequest, ReadResponse, RedeemInviteOk,
     RedeemInviteRequest, RedeemInviteResponse, RemoveServerRequest, RemoveSnapshotRequest,
+    SetHeartbeatRequest,
     RemoveSnapshotResponse, RevokeInviteRequest, RevokeInviteResponse, Snapshot as PbSnapshot,
     SnapshotList, TransactionAborted, WriteRequest, WriteResponse, auth_error,
     commit_transaction_response, config_change_response, create_invite_response,
@@ -1720,20 +1721,16 @@ impl KvService {
         .await
     }
 
-    async fn get_config_internal(&self) -> Result<Vec<ClusterMember>, StorageError> {
+    async fn get_config_internal(&self) -> Result<ClusterConfig, StorageError> {
         let bytes = self.store.run(RaftLog::current_config).await?;
 
-        let members = match bytes {
-            Some(bytes) => {
-                ClusterConfig::from_bytes(&bytes)
-                    .map_err(|_| StorageError::Corrupt("stored cluster config was corrupt"))?
-                    .members
-            }
+        match bytes {
+            Some(bytes) => ClusterConfig::from_bytes(&bytes)
+                .map_err(|_| StorageError::Corrupt("stored cluster config was corrupt")),
             // Not bootstrapped or added to a cluster yet -- not an error,
-            // just an empty membership list.
-            None => Vec::new(),
-        };
-        Ok(members)
+            // just an empty configuration.
+            None => Ok(ClusterConfig::default()),
+        }
     }
 }
 
@@ -2099,8 +2096,8 @@ impl Kv for KvService {
         };
 
         // Check that the new server hasn't already been added to the configuration.
-        let members = self.get_config_internal().await.map_err(storage_err)?;
-        for member in &members {
+        let config = self.get_config_internal().await.map_err(storage_err)?;
+        for member in &config.members {
             if member.server_id == identity.server_id
                 || member.address == identity.address
                 || member.client_address == identity.client_address
@@ -2137,6 +2134,23 @@ impl Kv for KvService {
         .await
     }
 
+    async fn set_heartbeat(
+        &self,
+        request: Request<SetHeartbeatRequest>,
+    ) -> Result<Response<ConfigChangeResponse>, Status> {
+        let (_, extensions, req) = request.into_parts();
+        if let Err(e) = self.require_admin(&extensions).await {
+            return config_change_refusal(e);
+        }
+        // Checked here as well as by the leader, so an operator who typed
+        // a bad value is told so plainly rather than as a refused change.
+        raft::check_heartbeat_ms(req.heartbeat_millis).map_err(Status::invalid_argument)?;
+        self.propose(ConfigChange::SetHeartbeat {
+            millis: req.heartbeat_millis,
+        })
+        .await
+    }
+
     async fn bootstrap(
         &self,
         request: Request<BootstrapRequest>,
@@ -2148,6 +2162,13 @@ impl Kv for KvService {
                 self.identity.server_id, req.server_id
             )));
         }
+        let heartbeat_millis = match req.heartbeat_millis {
+            0 => raft::DEFAULT_HEARTBEAT_MS,
+            ms => {
+                raft::check_heartbeat_ms(ms).map_err(Status::invalid_argument)?;
+                ms
+            }
+        };
         self.require_startup_admin(&extensions)?;
 
         // A cluster of exactly one: the node is its own sole voter, so it
@@ -2155,7 +2176,7 @@ impl Kv for KvService {
         // to grow from there.
         let config = ClusterConfig {
             members: vec![self.identity.clone()],
-            heartbeat_millis: raft::HEARTBEAT_MS,
+            heartbeat_millis,
         };
         self.client_handle
             .bootstrap(config)
@@ -2175,7 +2196,7 @@ impl Kv for KvService {
         &self,
         _request: Request<GetConfigRequest>,
     ) -> Result<Response<GetConfigResponse>, Status> {
-        let members = self.get_config_internal().await.map_err(storage_err)?;
+        let config = self.get_config_internal().await.map_err(storage_err)?;
 
         // Both checks are non-blocking on purpose. `is_caught_up` is the
         // same question `await_caught_up` waits for an answer to, asked
@@ -2189,8 +2210,9 @@ impl Kv for KvService {
 
         Ok(Response::new(GetConfigResponse {
             identity: Some(self.identity.clone()),
-            members,
+            members: config.members,
             is_leader,
+            heartbeat_millis: config.heartbeat_millis,
         }))
     }
 

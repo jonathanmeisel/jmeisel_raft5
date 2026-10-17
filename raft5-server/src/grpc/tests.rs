@@ -585,6 +585,7 @@ async fn bootstrap_refuses_when_the_named_node_is_someone_else() {
     let err = svc
         .bootstrap(Request::new(BootstrapRequest {
             server_id: "some-other-node".to_string(),
+            heartbeat_millis: 0,
         }))
         .await
         .unwrap_err();

@@ -81,26 +81,26 @@
 //! real vote at `current_term + 1`" without either side changing any
 //! state. Only once a majority say yes does it become a real `Candidate`.
 //! This keeps a node that's been partitioned (and so can't possibly win)
-//! from inflating its term every 150-300ms and disrupting a healthy
+//! from inflating its term every election timeout and disrupting a healthy
 //! cluster the moment it reconnects. `Common::election_attempt` counts
 //! consecutive failed cycles (pre-vote or real) since this node last had
 //! reason to believe a leader existed, and backs off the retry timeout
-//! exponentially (`election_timeout_for_attempt`) so a persistently
+//! exponentially (`Timing::election_timeout_for_attempt`) so a persistently
 //! undecided cluster doesn't hammer itself forever; it resets to 0 the
 //! moment a fresh `Follower` starts (see `follower::Follower::new`).
 //! `PreCandidate` and `Candidate` share nearly all of this machinery --
 //! see `candidate::Campaign`.
 //!
-//! Every other timing constant derives from one `HEARTBEAT` (a future
-//! user-configurable knob): `LEASE_DURATION` is `4 * HEARTBEAT`, and a
-//! follower's own election timeout (the "am I sure there's no leader"
-//! wait) is `LEASE_DURATION` plus an additional `fuzz(0, LEASE_DURATION)`
-//! on top -- see `follower::spawn_lease_expiration_watcher` for why that's
-//! two sequential phases (one deterministic, one randomized) rather than
-//! one combined random draw. `PreCandidate`/`Candidate`'s own
-//! campaign-retry timeout starts at that same `[LEASE_DURATION,
-//! 2*LEASE_DURATION)` range for their first attempt and backs off
-//! exponentially from there (`election_timeout_for_attempt`).
+//! Every other timing value derives from one heartbeat, a per-cluster
+//! setting carried in the replicated configuration (see `Timing`): the
+//! lease is `4 * heartbeat`, and a follower's own election timeout (the
+//! "am I sure there's no leader" wait) is one lease plus an additional
+//! `fuzz(0, lease)` on top -- see `follower::spawn_lease_expiration_watcher`
+//! for why that's two sequential phases (one deterministic, one
+//! randomized) rather than one combined random draw.
+//! `PreCandidate`/`Candidate`'s own campaign-retry timeout starts at that
+//! same `[lease, 2*lease)` range for their first attempt and backs off
+//! exponentially from there (`Timing::election_timeout_for_attempt`).
 //!
 //! Leader leasing (`GetLease`, deliberately a separate RPC from
 //! `AppendEntries` since that one can be slow -- it does real log-append
@@ -218,33 +218,127 @@ pub(crate) use peer::peer_endpoint;
 pub(crate) use task::Task;
 use task::{send_event, until_cancelled};
 
-/// The one base timing unit everything else derives from (see the module
-/// doc). A `u64` millisecond count alongside the `Duration` form since a
-/// couple of derived constants need to do integer arithmetic on it (in a
-/// `const` context, before a `Duration` value could be decomposed back
-/// out again). Will become a user-configurable, per-cluster setting;
-/// hardcoded for now.
-pub(crate) const HEARTBEAT_MS: u64 = 50;
-const HEARTBEAT: Duration = Duration::from_millis(HEARTBEAT_MS);
+/// The heartbeat a cluster runs at unless it was bootstrapped with (or
+/// later set to) something else -- and what a node with no configuration
+/// yet runs at. Comfortable on a LAN; see `Timing` for what to raise it
+/// for.
+pub(crate) const DEFAULT_HEARTBEAT_MS: u64 = 50;
 
-/// How long a caught-up replication task waits with nothing to do before
-/// sending its peer an empty `AppendEntries` anyway. Not a liveness
-/// heartbeat -- leases do that -- but a safety net: replication otherwise
-/// only runs when the log or a watermark changes, so a follower that
-/// silently restarted would go unnoticed until the next write.
-const IDLE_REPLICATION_INTERVAL: Duration = Duration::from_millis(HEARTBEAT_MS * 10);
+/// The range a cluster's heartbeat may be set to. The floor keeps a typo
+/// from turning every peer into a busy-loop of probes; the ceiling keeps
+/// one from making a dead leader take the better part of a minute to
+/// notice (a follower waits up to `2 * lease`, i.e. 8 heartbeats).
+pub(crate) const HEARTBEAT_MS_RANGE: std::ops::RangeInclusive<u64> = 10..=10_000;
 
-/// How long a granted lease (see `RaftPeerHandle::get_lease`) stays valid,
-/// on both sides: how long a follower keeps refusing other vote requests
-/// after its last confirmed contact with the leader, and how long a
-/// leader keeps counting a peer's last grant toward its own lease quorum.
-const LEASE_DURATION_MS: u64 = HEARTBEAT_MS * 4;
-const LEASE_DURATION: Duration = Duration::from_millis(LEASE_DURATION_MS);
+/// Whether `ms` is a heartbeat a cluster may be set to -- checked where
+/// one is asked for (bootstrap, `ConfigChange::SetHeartbeat`), so an
+/// operator hears about a bad value instead of having it quietly clamped.
+pub(crate) fn check_heartbeat_ms(ms: u64) -> Result<(), &'static str> {
+    if HEARTBEAT_MS_RANGE.contains(&ms) {
+        Ok(())
+    } else {
+        Err("heartbeat must be between 10ms and 10000ms")
+    }
+}
 
-/// Timeout for a cheap, no-disk-I/O peer RPC (`RequestVote`, `GetLease`) --
-/// including connecting, if there's no cached client yet. Tight, since
-/// these should always be fast; a slow reply is as good as no reply.
-const LIGHTWEIGHT_RPC_TIMEOUT: Duration = Duration::from_millis(HEARTBEAT_MS * 2);
+/// Every timeout and interval the consensus core runs on, all derived
+/// from one heartbeat (see the module doc).
+///
+/// The heartbeat is a per-cluster setting carried in the replicated
+/// `ClusterConfig` (`heartbeat_millis`), so it takes effect on every node
+/// the moment the entry setting it is appended, like any membership
+/// change. Raise it when nodes are far apart: the lightweight-RPC timeout
+/// is only `2 * heartbeat`, so a heartbeat much below the peer round trip
+/// (plus a TLS handshake, on a cold connection) means lease probes and
+/// votes time out, leases lapse, and elections churn.
+///
+/// `Copy` and cheap: the event loop publishes the current one through a
+/// `watch` (see `Common::timing_tx`), and a long-lived task re-reads it
+/// on each iteration so a change applies on its next tick without
+/// anything being respawned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Timing {
+    heartbeat_ms: u64,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Self::from_millis(DEFAULT_HEARTBEAT_MS)
+    }
+}
+
+impl Timing {
+    /// `ms`, clamped into `HEARTBEAT_MS_RANGE` -- except 0, which is what
+    /// an unset proto field reads as, and means the default.
+    pub(crate) fn from_millis(ms: u64) -> Self {
+        let heartbeat_ms = if ms == 0 {
+            DEFAULT_HEARTBEAT_MS
+        } else {
+            ms.clamp(*HEARTBEAT_MS_RANGE.start(), *HEARTBEAT_MS_RANGE.end())
+        };
+        Self { heartbeat_ms }
+    }
+
+    /// The timing `config` asks for.
+    pub(crate) fn of(config: &ClusterConfig) -> Self {
+        Self::from_millis(config.heartbeat_millis)
+    }
+
+    pub(crate) fn heartbeat_ms(self) -> u64 {
+        self.heartbeat_ms
+    }
+
+    /// How often the leader ticks, probes leases, and retries an
+    /// unreachable peer.
+    fn heartbeat(self) -> Duration {
+        Duration::from_millis(self.heartbeat_ms)
+    }
+
+    /// How long a caught-up replication task waits with nothing to do
+    /// before sending its peer an empty `AppendEntries` anyway. Not a
+    /// liveness heartbeat -- leases do that -- but a safety net:
+    /// replication otherwise only runs when the log or a watermark
+    /// changes, so a follower that silently restarted would go unnoticed
+    /// until the next write.
+    fn idle_replication_interval(self) -> Duration {
+        self.heartbeat() * 10
+    }
+
+    /// How long a lease (see `RaftPeerHandle::get_lease`) is asked for:
+    /// how long a follower keeps refusing other vote requests after its
+    /// last confirmed contact with the leader, and how long a leader
+    /// keeps counting a peer's grant toward its own lease quorum. The two
+    /// sides agree because the leader names the duration in each request
+    /// rather than each assuming its own -- see `GetLeaseRequest`.
+    fn lease_ms(self) -> u64 {
+        self.heartbeat_ms * 4
+    }
+
+    fn lease(self) -> Duration {
+        Duration::from_millis(self.lease_ms())
+    }
+
+    /// Timeout for a cheap, no-disk-I/O peer RPC (`RequestVote`,
+    /// `GetLease`) -- including connecting, if there's no cached client
+    /// yet. Tight, since these should always be fast; a slow reply is as
+    /// good as no reply.
+    fn lightweight_rpc_timeout(self) -> Duration {
+        self.heartbeat() * 2
+    }
+
+    /// The longest a lease request can ask for: the lease a cluster at
+    /// the top of `HEARTBEAT_MS_RANGE` uses. A follower clamps to this
+    /// so no leader, however misconfigured, can silence its elections
+    /// for longer.
+    fn max_lease() -> Duration {
+        Timing::from_millis(*HEARTBEAT_MS_RANGE.end()).lease()
+    }
+
+    /// The shortest, likewise.
+    fn min_lease() -> Duration {
+        Timing::from_millis(*HEARTBEAT_MS_RANGE.start()).lease()
+    }
+}
 
 /// Timeout for `AppendEntries` specifically, which -- unlike the above --
 /// does real log-append work on the follower and so can legitimately take
@@ -370,44 +464,46 @@ const VERSION_GC_INTERVAL: Duration = Duration::from_secs(60);
 /// approximate.
 const VERSION_GC_BUDGET: usize = 50_000;
 
-/// How many consecutive failed election cycles it takes to reach this.
+/// How long a persistently failing campaign backs off to, at most -- or
+/// `4 * lease`, if that is longer, so a cluster with a long heartbeat
+/// still gets a jitter window on its first couple of attempts rather than
+/// every node retrying at exactly the cap.
 const MAX_ELECTION_BACKOFF_MS: u64 = 30_000;
 
-/// The jitter window for the `attempt`-th consecutive *campaign* cycle
-/// (`PreCandidate`/`Candidate` waiting on vote responses) since this node
-/// last had reason to believe a leader existed -- see
-/// `Common::election_attempt`. Attempt 0 is `[LEASE_DURATION,
-/// 2*LEASE_DURATION)`, doubling per attempt from there, capped at
-/// `MAX_ELECTION_BACKOFF_MS`, so a persistently undecided cluster (or a
-/// node that genuinely can't reach anyone) backs off instead of retrying
-/// forever at the same tight interval.
-///
-/// This is *not* what a `Follower` uses to decide it's time to stop
-/// trusting its leader in the first place -- that's
-/// `follower::spawn_lease_expiration_watcher`'s two-phase wait, which
-/// happens to total the same `[LEASE_DURATION, 2*LEASE_DURATION)` range
-/// for different reasons (a deterministic detection phase plus a
-/// randomized settle phase, rather than a single random draw).
-fn election_timeout_for_attempt(attempt: u32) -> Duration {
-    // Cap the shift itself (not just its result) so this can't panic on a
-    // pathologically large attempt count -- 2^20 already blows past the
-    // millisecond cap by many orders of magnitude, so nothing above that
-    // ever changes the (already-capped) outcome.
-    let scale = 1u64 << attempt.min(20);
-    let min = LEASE_DURATION_MS
-        .saturating_mul(scale)
-        .min(MAX_ELECTION_BACKOFF_MS);
-    let max = LEASE_DURATION_MS
-        .saturating_mul(2)
-        .saturating_mul(scale)
-        .min(MAX_ELECTION_BACKOFF_MS);
-    let jitter_range = max.saturating_sub(min);
-    let jitter = if jitter_range == 0 {
-        0
-    } else {
-        random_jitter_millis(jitter_range)
-    };
-    Duration::from_millis(min + jitter)
+impl Timing {
+    /// The jitter window for the `attempt`-th consecutive *campaign*
+    /// cycle (`PreCandidate`/`Candidate` waiting on vote responses) since
+    /// this node last had reason to believe a leader existed -- see
+    /// `Common::election_attempt`. Attempt 0 is `[lease, 2*lease)`,
+    /// doubling per attempt from there, capped at
+    /// `MAX_ELECTION_BACKOFF_MS`, so a persistently undecided cluster (or
+    /// a node that genuinely can't reach anyone) backs off instead of
+    /// retrying forever at the same tight interval.
+    ///
+    /// This is *not* what a `Follower` uses to decide it's time to stop
+    /// trusting its leader in the first place -- that's
+    /// `follower::spawn_lease_expiration_watcher`'s two-phase wait, which
+    /// happens to total the same `[lease, 2*lease)` range for different
+    /// reasons (a deterministic detection phase plus a randomized settle
+    /// phase, rather than a single random draw).
+    fn election_timeout_for_attempt(self, attempt: u32) -> Duration {
+        let lease_ms = self.lease_ms();
+        let cap = MAX_ELECTION_BACKOFF_MS.max(lease_ms.saturating_mul(4));
+        // Cap the shift itself (not just its result) so this can't panic
+        // on a pathologically large attempt count -- 2^20 already blows
+        // past the millisecond cap by many orders of magnitude, so
+        // nothing above that ever changes the (already-capped) outcome.
+        let scale = 1u64 << attempt.min(20);
+        let min = lease_ms.saturating_mul(scale).min(cap);
+        let max = lease_ms.saturating_mul(2).saturating_mul(scale).min(cap);
+        let jitter_range = max.saturating_sub(min);
+        let jitter = if jitter_range == 0 {
+            0
+        } else {
+            random_jitter_millis(jitter_range)
+        };
+        Duration::from_millis(min + jitter)
+    }
 }
 
 /// Both `Follower` (waiting for a leader) and `PreCandidate`/`Candidate`
@@ -423,11 +519,12 @@ fn election_timeout_for_attempt(attempt: u32) -> Duration {
 /// repeated failures; a fresh `Follower` always passes 0.
 fn spawn_election_timer(
     cancel: &CancellationToken,
+    timing: Timing,
     attempt: u32,
     event_tx: mpsc::Sender<Event>,
 ) -> Task {
     Task::spawn(cancel, move |cancel| async move {
-        let timeout = election_timeout_for_attempt(attempt);
+        let timeout = timing.election_timeout_for_attempt(attempt);
         if until_cancelled(&cancel, tokio::time::sleep(timeout))
             .await
             .is_some()
@@ -561,7 +658,7 @@ fn seed_config(node_id: &str, peers: &[PeerInfo]) -> ClusterConfig {
         members: std::iter::once(member(node_id, ""))
             .chain(peers.iter().map(|p| member(&p.id, &p.address)))
             .collect(),
-        heartbeat_millis: HEARTBEAT_MS,
+        heartbeat_millis: DEFAULT_HEARTBEAT_MS,
     }
 }
 
@@ -582,6 +679,12 @@ pub struct Common {
     /// re-read whenever a `Config` entry is appended or rolled back --
     /// on *append*, not on commit, per Raft §4.1.
     config: ClusterConfig,
+    /// `Timing::of(&config)`, published whenever `config` changes it.
+    /// Long-lived tasks hold a receiver and re-read it on every
+    /// iteration, so a heartbeat change reaches a running leader's probes
+    /// and replication without anything being respawned; `RaftPeerHandle`
+    /// reads it for an old leader's lease request that names no duration.
+    timing_tx: watch::Sender<Timing>,
     store: Store,
     peer_conns: Arc<PeerConnections>,
 
@@ -745,17 +848,20 @@ impl Common {
         let lease_expires_at_tx = Arc::new(lease_expires_at_tx);
         let (event_tx, event_rx) = mpsc::channel(256);
         let (role_tx, role_rx) = watch::channel(RoleHandle::Starting);
+        let (timing_tx, timing_rx) = watch::channel(Timing::of(&config));
 
         let peer_handle = RaftPeerHandle {
             event_tx: event_tx.clone(),
             role_rx: role_tx.subscribe(),
             term_rx,
+            timing_rx,
             lease_expires_at_tx: Arc::clone(&lease_expires_at_tx),
         };
 
         let common = Self {
             node_id,
             config,
+            timing_tx,
             store: Store::new(log),
             peer_conns: Arc::new(PeerConnections::default()),
             current_term,
@@ -916,9 +1022,19 @@ impl Common {
         // configuration has ever been established here, so there's
         // nothing to switch to -- keep operating under what we have.
         if let Some(config) = loaded {
+            let timing = Timing::of(&config);
             self.config = config;
+            if *self.timing_tx.borrow() != timing {
+                info!("heartbeat is now {}ms", timing.heartbeat_ms());
+                self.timing_tx.send_replace(timing);
+            }
         }
         was_voter != self.is_voter()
+    }
+
+    /// The timing this node is currently running at -- see `Timing`.
+    fn timing(&self) -> Timing {
+        *self.timing_tx.borrow()
     }
 
     /// Advance to a higher term, discarding any vote already cast (Raft

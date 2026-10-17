@@ -20,10 +20,15 @@ use replication::spawn_replication;
 
 /// Periodically pushes `Event::LeaderTick` -- see the variant's doc for why
 /// the leader needs this in addition to reacting to peer responses.
-fn spawn_leader_tick(cancel: &CancellationToken, event_tx: mpsc::Sender<Event>) -> Task {
+fn spawn_leader_tick(
+    cancel: &CancellationToken,
+    timing_rx: watch::Receiver<Timing>,
+    event_tx: mpsc::Sender<Event>,
+) -> Task {
     Task::spawn(cancel, move |cancel| async move {
         loop {
-            if until_cancelled(&cancel, tokio::time::sleep(HEARTBEAT))
+            let heartbeat = timing_rx.borrow().heartbeat();
+            if until_cancelled(&cancel, tokio::time::sleep(heartbeat))
                 .await
                 .is_none()
                 || !send_event(&cancel, &event_tx, Event::LeaderTick).await
@@ -51,7 +56,8 @@ pub struct Leader {
     /// peer as 0 rather than requiring this to be pre-seeded.
     peer_match_index: HashMap<String, u64>,
     /// When each peer's last granted lease stops counting toward quorum
-    /// (`Instant::now() + LEASE_DURATION` at the time it was granted).
+    /// (the probe's send time plus the lease it asked for -- see
+    /// `Event::GetLeaseResponse`).
     /// Missing entry means "never granted (or already known-stale)" --
     /// treated as expired, same as an entry whose deadline has passed.
     peer_lease_expiry: HashMap<String, Instant>,
@@ -123,7 +129,11 @@ impl Leader {
             log_tx: Arc::clone(&common.log_tx),
         }));
 
-        let tick_timer = spawn_leader_tick(common.cancel_token(), common.event_tx.clone());
+        let tick_timer = spawn_leader_tick(
+            common.cancel_token(),
+            common.timing_tx.subscribe(),
+            common.event_tx.clone(),
+        );
 
         let mut leader = Leader {
             common,
@@ -257,10 +267,16 @@ impl Leader {
                 Transition::Continue
             }
             Event::RequestVoteResponse { .. } => Transition::Continue, // stray, ignore
-            Event::GetLeaseResponse { from, resp } => {
+            Event::GetLeaseResponse {
+                from,
+                resp,
+                expires_at,
+            } => {
                 if resp.lease_granted {
-                    self.peer_lease_expiry
-                        .insert(from, Instant::now() + LEASE_DURATION);
+                    // Kept, not maxed against the old deadline: probes
+                    // go out one at a time per peer, so a later response
+                    // is always for a later send.
+                    self.peer_lease_expiry.insert(from, expires_at);
                 } else {
                     // An explicit denial is stronger evidence than mere
                     // silence -- this peer no longer trusts us right now,
@@ -392,7 +408,7 @@ impl Leader {
                     );
                 }
                 Some(state) if matched >= state.round_start_index => {
-                    if now.duration_since(state.round_started_at) <= LEASE_DURATION {
+                    if now.duration_since(state.round_started_at) <= self.common.timing().lease() {
                         promote = Some(id);
                         break;
                     }
@@ -447,6 +463,7 @@ impl Leader {
                         self.common.current_term,
                         self.common.store.clone(),
                         Arc::clone(&self.common.peer_conns),
+                        self.common.timing_tx.subscribe(),
                         self.common.log_tx.subscribe(),
                         self.common.commit_tx.subscribe(),
                         self.common.compact_tx.subscribe(),
@@ -465,6 +482,7 @@ impl Leader {
                         self.common.node_id.clone(),
                         self.common.current_term,
                         Arc::clone(&self.common.peer_conns),
+                        self.common.timing_tx.subscribe(),
                         self.common.event_tx.clone(),
                     ),
                 );

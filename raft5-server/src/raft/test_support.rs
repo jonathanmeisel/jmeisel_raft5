@@ -46,7 +46,7 @@ pub(crate) fn cluster_config(members: &[(&str, bool)]) -> ClusterConfig {
                 voting: *voting,
             })
             .collect(),
-        heartbeat_millis: HEARTBEAT_MS,
+        heartbeat_millis: DEFAULT_HEARTBEAT_MS,
     }
 }
 

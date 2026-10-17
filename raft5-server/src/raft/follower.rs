@@ -156,11 +156,12 @@ fn apply_append_entries_sync(
 /// (by `Follower::renew_lease`, from *either* the event loop or
 /// `RaftPeerHandle::get_lease`'s fully independent fast path -- see the
 /// module doc on why that one specifically must never be blockable) for a
-/// full `LEASE_DURATION` -- *and* an additional random `fuzz(0,
-/// LEASE_DURATION)` on top of that.
+/// full lease -- *and* an additional random `fuzz(0, lease)` on top of
+/// that. The lease length is re-read on every pass, so a heartbeat change
+/// applies from the next deadline on.
 ///
 /// Two sequential phases rather than one combined random draw,
-/// deliberately: the first (`LEASE_DURATION`, no jitter) is a clean,
+/// deliberately: the first (one lease, no jitter) is a clean,
 /// deterministic detection that contact was actually lost, not muddied by
 /// randomness; only the second phase is randomized, to stagger multiple
 /// followers' actual campaign start times and avoid a synchronized
@@ -181,12 +182,14 @@ fn apply_append_entries_sync(
 fn spawn_lease_expiration_watcher(
     cancel: &CancellationToken,
     mut lease_rx: watch::Receiver<Option<Instant>>,
+    timing_rx: watch::Receiver<Timing>,
     event_tx: mpsc::Sender<Event>,
 ) -> Task {
     Task::spawn(cancel, move |cancel| async move {
         let started_at = Instant::now();
         loop {
-            let deadline = (*lease_rx.borrow()).unwrap_or(started_at + LEASE_DURATION);
+            let timing = *timing_rx.borrow();
+            let deadline = (*lease_rx.borrow()).unwrap_or(started_at + timing.lease());
             let now = Instant::now();
             if now < deadline {
                 tokio::select! {
@@ -202,7 +205,7 @@ fn spawn_lease_expiration_watcher(
                 continue;
             }
 
-            let fuzz = Duration::from_millis(random_jitter_millis(LEASE_DURATION_MS));
+            let fuzz = Duration::from_millis(random_jitter_millis(timing.lease_ms()));
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => return,
@@ -271,6 +274,7 @@ impl Follower {
             spawn_lease_expiration_watcher(
                 common.cancel_token(),
                 common.lease_expires_at_rx.clone(),
+                common.timing_tx.subscribe(),
                 common.event_tx.clone(),
             )
         } else {
@@ -361,13 +365,13 @@ impl Follower {
     /// granting our own vote to someone else (give them a chance to win
     /// before also jumping in ourselves) -- these three cases are folded
     /// into one shared deadline, so granting a vote also means refusing
-    /// *other* vote requests for one `LEASE_DURATION`, same as genuine
+    /// *other* vote requests for one lease, same as genuine
     /// leader contact would. Just publishes a fresh deadline; the
     /// reactive watcher task picks it up on its own.
     fn renew_lease(&mut self) {
         self.common
             .lease_expires_at_tx
-            .send_replace(Some(Instant::now() + LEASE_DURATION));
+            .send_replace(Some(Instant::now() + self.common.timing().lease()));
     }
 
     /// Whether we should refuse *any* vote request (real or pre-vote) for

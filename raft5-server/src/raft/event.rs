@@ -41,9 +41,17 @@ pub enum Event {
     /// answering an inbound `GetLease` never goes through this event loop
     /// at all (see `RaftPeerHandle::get_lease`), specifically so it can
     /// never get stuck behind a slow in-progress `AppendEntries`.
+    ///
+    /// `expires_at` is when a grant stops counting: the duration the
+    /// probe asked for, timed from when it was *sent*. The follower
+    /// starts the same duration only once it receives the request, so
+    /// timing it from the send keeps the leader's view strictly inside
+    /// the follower's promise, by however long the request took to
+    /// arrive.
     GetLeaseResponse {
         from: String,
         resp: GetLeaseResponse,
+        expires_at: std::time::Instant,
     },
     /// `body` yields the byte stream `RaftLog::export_snapshot` produced
     /// (magic/version/seq/term header included) as it arrives off the
@@ -213,6 +221,13 @@ pub enum ConfigChange {
     Promote {
         server_id: String,
     },
+    /// Change the cluster's heartbeat, and with it every timeout derived
+    /// from it (see `Timing`). Membership is untouched. Goes through the
+    /// log like any other configuration change, so it takes effect on
+    /// each node as that node appends it.
+    SetHeartbeat {
+        millis: u64,
+    },
 }
 
 impl ConfigChange {
@@ -252,6 +267,13 @@ impl ConfigChange {
                     return invalid("that server is not a member of this cluster");
                 }
                 Ok(config.with_voter(server_id))
+            }
+            Self::SetHeartbeat { millis } => {
+                super::check_heartbeat_ms(*millis).map_err(RaftError::InvalidConfigChange)?;
+                Ok(ClusterConfig {
+                    heartbeat_millis: *millis,
+                    ..config.clone()
+                })
             }
         }
     }

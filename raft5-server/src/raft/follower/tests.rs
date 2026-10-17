@@ -17,7 +17,7 @@ async fn wait_for_vote_grant_or_role_change(
     role_rx: &mut watch::Receiver<RoleHandle>,
     req: &RequestVoteRequest,
 ) -> Option<RequestVoteResponse> {
-    let deadline = std::time::Instant::now() + LEASE_DURATION * 10;
+    let deadline = std::time::Instant::now() + Timing::default().lease() * 10;
     loop {
         if !matches!(&*role_rx.borrow(), RoleHandle::Follower(_)) {
             return None;
@@ -640,6 +640,7 @@ async fn get_lease_grants_when_term_matches_and_denies_otherwise() {
     let resp = peer_handle.get_lease(GetLeaseRequest {
         leader_id: "leader-1".to_string(),
         term: 0,
+        lease_millis: Timing::default().lease_ms(),
     });
     assert!(resp.lease_granted);
 
@@ -647,8 +648,49 @@ async fn get_lease_grants_when_term_matches_and_denies_otherwise() {
     let resp = peer_handle.get_lease(GetLeaseRequest {
         leader_id: "leader-1".to_string(),
         term: 5,
+        lease_millis: Timing::default().lease_ms(),
     });
     assert!(!resp.lease_granted);
+
+    cleanup(&path);
+}
+
+/// A follower promises exactly the lease the leader asked for -- that
+/// is how long the leader will count it -- rather than whatever its own
+/// configuration says, which can briefly differ mid heartbeat change.
+/// Within limits: no request can silence its elections for longer than
+/// the longest heartbeat allows, and a leader that names no duration at
+/// all (one that predates the field) gets this node's own.
+#[tokio::test]
+async fn get_lease_promises_the_requested_duration_within_limits() {
+    let (mut role_rx, peer_handle, path) = spawn_test_node(vec![]);
+    wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Follower(_))).await;
+
+    let promised_for = |lease_millis: u64| {
+        let before = Instant::now();
+        let resp = peer_handle.get_lease(GetLeaseRequest {
+            leader_id: "leader-1".to_string(),
+            term: 0,
+            lease_millis,
+        });
+        assert!(resp.lease_granted);
+        let after = Instant::now();
+        let deadline = peer_handle.lease_expires_at_tx.borrow().expect("granted");
+        (deadline - after, deadline - before)
+    };
+    let assert_promised = |lease_millis: u64, expected: Duration| {
+        let (at_least, at_most) = promised_for(lease_millis);
+        assert!(
+            at_least <= expected && expected <= at_most,
+            "asked for {lease_millis}ms, expected {expected:?}, got {at_least:?}..{at_most:?}"
+        );
+    };
+
+    assert_promised(3_000, Duration::from_millis(3_000));
+    assert_promised(0, Timing::default().lease());
+    assert_promised(1, Timing::min_lease());
+    // Would overflow `Instant` unclamped.
+    assert_promised(u64::MAX, Timing::max_lease());
 
     cleanup(&path);
 }
@@ -661,6 +703,7 @@ async fn a_granted_lease_blocks_a_vote_request_for_someone_else() {
     let resp = peer_handle.get_lease(GetLeaseRequest {
         leader_id: "leader-1".to_string(),
         term: 0,
+        lease_millis: Timing::default().lease_ms(),
     });
     assert!(resp.lease_granted);
 
@@ -703,6 +746,7 @@ async fn a_vote_request_is_granted_normally_once_the_lease_expires() {
     peer_handle.get_lease(GetLeaseRequest {
         leader_id: "leader-1".to_string(),
         term: 0,
+        lease_millis: Timing::default().lease_ms(),
     });
 
     // Wait for the lease to naturally expire -- or, since it's the
@@ -732,14 +776,15 @@ async fn periodic_lease_grants_prevent_becoming_a_candidate() {
     let (mut role_rx, peer_handle, path) = spawn_test_node(vec![]);
     wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Follower(_))).await;
 
-    let deadline = std::time::Instant::now() + LEASE_DURATION * 3;
+    let deadline = std::time::Instant::now() + Timing::default().lease() * 3;
     while std::time::Instant::now() < deadline {
         let resp = peer_handle.get_lease(GetLeaseRequest {
             leader_id: "leader-1".to_string(),
             term: 0,
+            lease_millis: Timing::default().lease_ms(),
         });
         assert!(resp.lease_granted);
-        tokio::time::sleep(HEARTBEAT).await;
+        tokio::time::sleep(Timing::default().heartbeat()).await;
     }
 
     assert!(matches!(&*role_rx.borrow(), RoleHandle::Follower(_)));
