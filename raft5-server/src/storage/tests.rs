@@ -1704,3 +1704,189 @@ fn the_budget_counts_keys_examined_and_the_limit_counts_keys_kept() {
 
     cleanup(&path);
 }
+
+// --- read_many -----------------------------------------------------------
+
+fn rows(read: MultiRead) -> (u64, Vec<ReadRow>) {
+    match read {
+        MultiRead::Ok { as_of, rows } => (as_of, rows),
+        MultiRead::NoSuchCheckpoint => panic!("expected rows, got NoSuchCheckpoint"),
+    }
+}
+
+fn fetch_all(keys: &[&[u8]], fetch: Fetch) -> Vec<(Vec<u8>, Fetch)> {
+    keys.iter().map(|key| (key.to_vec(), fetch)).collect()
+}
+
+/// Positional, duplicates and all, with a missing or deleted key as an
+/// empty position -- and `as_of` the applied watermark.
+#[test]
+fn read_many_answers_each_key_in_the_order_asked() {
+    let (log, path) = open_temp();
+    let a = log.append(1, b"a", Some(b"1")).unwrap();
+    let b = log.append(1, b"b", Some(b"2")).unwrap();
+    log.append(1, b"gone", Some(b"x")).unwrap();
+    let last = log.append(1, b"gone", None).unwrap();
+    log.apply_committed(last).unwrap();
+
+    let keys: [&[u8]; 5] = [b"b", b"missing", b"a", b"gone", b"b"];
+    let (as_of, found) = rows(
+        log.read_many(&fetch_all(&keys, Fetch::Value), ReadPoint::Latest, NO_BUDGET)
+            .unwrap(),
+    );
+    assert_eq!(as_of, last);
+    assert_eq!(
+        found,
+        vec![
+            Some((b, Some(b"2".to_vec()))),
+            None,
+            Some((a, Some(b"1".to_vec()))),
+            None,
+            Some((b, Some(b"2".to_vec()))),
+        ]
+    );
+
+    let (_, versions) = rows(
+        log.read_many(&fetch_all(&keys, Fetch::VersionOnly), ReadPoint::Latest, NO_BUDGET)
+            .unwrap(),
+    );
+    assert_eq!(versions, vec![Some((b, None)), None, Some((a, None)), None, Some((b, None))]);
+    cleanup(&path);
+}
+
+/// A checkpoint read is as of the checkpoint, and reports its seq; an
+/// unknown or removed one is said to be missing rather than read as
+/// empty.
+#[test]
+fn read_many_at_a_checkpoint_reads_as_of_it() {
+    let (log, path) = open_temp();
+    let old = log.append(1, b"k", Some(b"old")).unwrap();
+    let cp = log
+        .append(1, &checkpoint_key(b"cp"), Some(&encode_record(0).unwrap()))
+        .unwrap();
+    let new = log.append(1, b"k", Some(b"new")).unwrap();
+    log.apply_committed(new).unwrap();
+
+    let keys = fetch_all(&[b"k"], Fetch::Value);
+    let (as_of, found) = rows(
+        log.read_many(&keys, ReadPoint::Checkpoint(b"cp".to_vec()), NO_BUDGET)
+            .unwrap(),
+    );
+    assert_eq!(as_of, cp);
+    assert_eq!(found, vec![Some((old, Some(b"old".to_vec())))]);
+
+    assert!(matches!(
+        log.read_many(&keys, ReadPoint::Checkpoint(b"nope".to_vec()), NO_BUDGET)
+            .unwrap(),
+        MultiRead::NoSuchCheckpoint
+    ));
+
+    let removed = log.append(1, &checkpoint_key(b"cp"), None).unwrap();
+    log.apply_committed(removed).unwrap();
+    assert!(matches!(
+        log.read_many(&keys, ReadPoint::Checkpoint(b"cp".to_vec()), NO_BUDGET)
+            .unwrap(),
+        MultiRead::NoSuchCheckpoint
+    ));
+    cleanup(&path);
+}
+
+/// The budget cuts the answer to a prefix, never to nothing; a charged
+/// position counts though nothing was read for it; versions alone are
+/// never cut.
+#[test]
+fn read_many_stops_at_the_value_budget_but_always_answers_the_first_key() {
+    let (log, path) = open_temp();
+    for key in [&b"a"[..], b"b", b"c"] {
+        log.append(1, key, Some(&[7u8; 10])).unwrap();
+    }
+    log.apply_committed(3).unwrap();
+    let keys: [&[u8]; 3] = [b"a", b"b", b"c"];
+
+    let (_, found) = rows(
+        log.read_many(&fetch_all(&keys, Fetch::Value), ReadPoint::Latest, 25)
+            .unwrap(),
+    );
+    assert_eq!(found.len(), 2, "20 bytes fit in 25; the third would make 30");
+
+    let (_, found) = rows(
+        log.read_many(&fetch_all(&keys, Fetch::Value), ReadPoint::Latest, 5)
+            .unwrap(),
+    );
+    assert_eq!(found.len(), 1, "the first key comes back even alone over budget");
+    assert_eq!(found[0], Some((1, Some(vec![7u8; 10]))));
+
+    let charged = vec![
+        (b"a".to_vec(), Fetch::Charge(20)),
+        (b"b".to_vec(), Fetch::Value),
+    ];
+    let (_, found) = rows(log.read_many(&charged, ReadPoint::Latest, 25).unwrap());
+    assert_eq!(found, vec![Some((1, None))], "a charge counts, and reads nothing");
+
+    let (_, found) = rows(
+        log.read_many(&fetch_all(&keys, Fetch::VersionOnly), ReadPoint::Latest, 0)
+            .unwrap(),
+    );
+    assert_eq!(found.len(), 3);
+    cleanup(&path);
+}
+
+/// What `read_many` is for: keys written by one entry are never seen at
+/// two different entries, even while `apply_committed` is mid-way
+/// through a run of entries -- and `as_of` names exactly the last entry
+/// the snapshot can see.
+///
+/// Every entry here writes `x` and `y` together, plus enough filler to
+/// pass `WRITE_CHUNK`, so `apply_committed` flushes after each one. A
+/// reader racing it must find `x` and `y` at the same seq, and that seq
+/// must be `as_of`: every entry writes `x`, so `x`'s head is the last
+/// entry applied. A watermark written only with the final batch would
+/// let a mid-way snapshot see `x` past `as_of`.
+#[test]
+fn read_many_never_sees_an_entry_or_the_watermark_half_applied() {
+    let (log, path) = open_temp();
+    const ENTRIES: usize = 12;
+    let mut last = 0;
+    for round in 0..ENTRIES {
+        let value = round.to_be_bytes().to_vec();
+        let mut writes = vec![
+            Mutation::new(b"x".to_vec(), Some(value.clone())),
+            Mutation::new(b"y".to_vec(), Some(value)),
+        ];
+        for filler in 0..WRITE_CHUNK {
+            writes.push(Mutation::new(
+                format!("filler/{filler:05}").into_bytes(),
+                Some(vec![round as u8]),
+            ));
+        }
+        last = log.append_writes(1, writes).unwrap();
+    }
+
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            log.apply_committed(last).unwrap();
+            done.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let keys = fetch_all(&[b"x", b"y"], Fetch::Value);
+        let mut observed = std::collections::BTreeSet::new();
+        loop {
+            let finished = done.load(std::sync::atomic::Ordering::Acquire);
+            let (as_of, found) = rows(log.read_many(&keys, ReadPoint::Latest, NO_BUDGET).unwrap());
+            match (&found[0], &found[1]) {
+                (None, None) => assert_eq!(as_of, 0, "nothing applied, so nothing seen"),
+                (Some(x), Some(y)) => {
+                    assert_eq!(x, y, "x and y were written by one entry");
+                    assert_eq!(x.0, as_of, "as_of names the last entry the snapshot sees");
+                    observed.insert(as_of);
+                }
+                torn => panic!("one entry's keys seen apart: {torn:?}"),
+            }
+            if finished {
+                break;
+            }
+        }
+        assert!(observed.contains(&last));
+    });
+    cleanup(&path);
+}

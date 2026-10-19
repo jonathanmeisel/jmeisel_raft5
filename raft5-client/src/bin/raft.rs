@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use raft5_client::{Client, ClientTls, Error, Invite, Principal, Right};
+use raft5_client::{Client, ClientTls, Consistency, Error, Invite, Principal, Right};
 
 /// Opens an interactive session against a raft5 cluster.
 #[derive(Parser)]
@@ -340,21 +340,16 @@ async fn run(client: &Client, words: &[Vec<u8>]) -> Result<bool, String> {
             let [key] = fixed_args(args, "delete <key>")?;
             print_seq(client.write(key, None).await);
         }
-        "read" => {
-            let [key] = fixed_args(args, "read <key>")?;
-            print_read(client.read(key).await);
-        }
-        "read_current" => {
-            let [key] = fixed_args(args, "read_current <key>")?;
-            print_read(client.read_linearizable(key).await);
-        }
-        "version" => {
-            let [key] = fixed_args(args, "version <key>")?;
-            print_version(client.get_version(key).await);
-        }
-        "version_current" => {
-            let [key] = fixed_args(args, "version_current <key>")?;
-            print_version(client.get_version_linearizable(key).await);
+        "read" | "read_current" | "version" | "version_current" => {
+            if args.is_empty() {
+                return Err(format!("usage: {cmd} <key>..."));
+            }
+            let consistency = if cmd.ends_with("_current") {
+                Consistency::Linearizable
+            } else {
+                Consistency::Stale
+            };
+            print_reads(client, args, consistency, cmd.starts_with("version")).await;
         }
         "snapshot" => {
             // An id is optional: with none, the client stamps its own
@@ -385,13 +380,12 @@ async fn run(client: &Client, words: &[Vec<u8>]) -> Result<bool, String> {
                 Err(e) => println!("error: {e}"),
             }
         }
-        "read_at" => {
-            let [id, key] = fixed_args(args, "read_at <snapshot> <key>")?;
-            print_read(client.read_at(id, key).await);
-        }
-        "version_at" => {
-            let [id, key] = fixed_args(args, "version_at <snapshot> <key>")?;
-            print_version(client.get_version_at(id, key).await);
+        "read_at" | "version_at" => {
+            let Some((id, keys)) = args.split_first().filter(|(_, keys)| !keys.is_empty()) else {
+                return Err(format!("usage: {cmd} <snapshot> <key>..."));
+            };
+            let versions_only = cmd.starts_with("version");
+            print_reads(client, keys, Consistency::Snapshot(id), versions_only).await;
         }
         "keys_at" => {
             let (id, start) = match args {
@@ -873,28 +867,61 @@ fn print_seq(result: Result<u64, Error>) {
     }
 }
 
-fn print_read(result: Result<raft5_client::ReadResult, Error>) {
-    match result {
-        Ok(raft5_client::ReadResult {
-            seq,
-            value: Some(value),
-        }) => {
-            println!("seq={seq} value={}", quote_bytes(&value));
+/// Reads `keys` and prints them, one line each under the `as_of` they
+/// were read at.
+///
+/// A response the cluster cut short is reissued for the rest, and each
+/// batch prints its own `as_of`: two batches of a stale or current read
+/// are two moments, and printing them under one heading would hide that.
+async fn print_reads(
+    client: &Client,
+    keys: &[Vec<u8>],
+    consistency: Consistency<'_>,
+    versions_only: bool,
+) {
+    let mut rest = keys;
+    while !rest.is_empty() {
+        if rest.len() < keys.len() {
+            println!("(cut short by the response size limit; reading the other {})", rest.len());
         }
-        Ok(raft5_client::ReadResult { seq, value: None }) => {
-            println!("seq={seq} (no value)");
+        let answered = if versions_only {
+            client.read_versions(rest, consistency).await.map(|read| {
+                println!("as_of={}", read.as_of);
+                for v in &read.entries {
+                    match v.seq {
+                        // Seq 0 is the "no current value" sentinel, so it
+                        // is spelled out rather than printed as a number
+                        // that looks like a real version.
+                        0 => println!("{} (no value)", quote_bytes(&v.key)),
+                        seq => println!("{} seq={seq}", quote_bytes(&v.key)),
+                    }
+                }
+                read.entries.len()
+            })
+        } else {
+            client.read(rest, consistency).await.map(|read| {
+                println!("as_of={}", read.as_of);
+                for e in &read.entries {
+                    match &e.value {
+                        Some(value) => println!(
+                            "{} seq={} value={}",
+                            quote_bytes(&e.key),
+                            e.seq,
+                            quote_bytes(value)
+                        ),
+                        None => println!("{} seq={} (no value)", quote_bytes(&e.key), e.seq),
+                    }
+                }
+                read.entries.len()
+            })
+        };
+        match answered {
+            Ok(n) => rest = &rest[n..],
+            Err(e) => {
+                println!("error: {e}");
+                return;
+            }
         }
-        Err(e) => println!("error: {e}"),
-    }
-}
-
-/// Seq 0 is the "no current value" sentinel, so it is spelled out rather
-/// than printed as a number that looks like a real version.
-fn print_version(result: Result<u64, raft5_client::Error>) {
-    match result {
-        Ok(0) => println!("(no value)"),
-        Ok(seq) => println!("seq={seq}"),
-        Err(e) => println!("error: {e}"),
     }
 }
 
@@ -904,21 +931,22 @@ fn print_help() {
         [
             "write <key> <value>             write value to key, retrying until it lands",
             "delete <key>                     same as write, with no value",
-            "read <key>                       read from whichever node is currently connected,",
-            "                                  without confirming it still leads -- so it may",
-            "                                  miss a write that just returned",
-            "read_current <key>               read from the leader, confirming it still leads",
-            "version <key>                    the seq a key was last written at, without its",
-            "                                  value -- same cost whatever the value weighs;",
+            "read <key>...                    read keys, all as of one moment, from whichever",
+            "                                  node is currently connected, without confirming",
+            "                                  it still leads -- so it may miss a write that",
+            "                                  just returned; as_of says how far it had applied",
+            "read_current <key>...            read from the leader, confirming it still leads",
+            "version <key>...                 the seqs keys were last written at, without their",
+            "                                  values -- same cost whatever the values weigh;",
             "                                  stale like `read`",
-            "version_current <key>            the same, confirmed by the leader",
+            "version_current <key>...         the same, confirmed by the leader",
             "keys [start_key]                list every key from <start_key> on, stale like `read`",
             "snapshot [id]                    pin the current sequence as a snapshot; the id",
             "                                  defaults to this machine's clock. admins only",
             "snapshots                        list every snapshot that exists",
             "drop_snapshot <id>               release a snapshot. admins only",
-            "read_at <snapshot> <key>         read a key as it was when the snapshot was taken",
-            "version_at <snapshot> <key>      the seq a key was at when the snapshot was taken",
+            "read_at <snapshot> <key>...      read keys as they were when the snapshot was taken",
+            "version_at <snapshot> <key>...   the seqs keys were at when the snapshot was taken",
             "keys_at <snapshot> [start_key]   list the keys that existed at the snapshot",
             "add_server <peer_addr>           add a server as a learner, by its peer address",
             "remove_server <id>               remove a server",

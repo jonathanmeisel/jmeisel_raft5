@@ -538,32 +538,20 @@ impl Locks {
         }
     }
 
-    /// Take a read lock on `key` for `id` and record it in the read set.
-    ///
-    /// Returns the value this transaction has already buffered for the
-    /// key, if any -- read-your-own-writes, answered from the buffer
-    /// because the log knows nothing about it yet.
-    pub fn read(&self, id: TxnId, key: &[u8]) -> Result<Option<Option<Vec<u8>>>, Refused> {
-        self.with_open(id, |shared| {
-            if let Some(buffered) = shared.txns[&id].writes.get(key) {
-                return Ok(Some(buffered.clone()));
-            }
-            shared.acquire(key, id, Mode::Read, Instant::now())?;
-            // `acquire` can wound *this* transaction only if it is
-            // younger than a holder, in which case it returned an error
-            // above; so the entry is still here and still open.
-            shared
-                .txns
-                .get_mut(&id)
-                .expect("an open transaction cannot vanish under its own read")
-                .reads
-                .insert(key.to_vec());
-            Ok(None)
-        })
-    }
-
     /// Take read locks on every one of `keys` for `id` and record them
-    /// in the read set -- `read`, in bulk, for a key scan.
+    /// in the read set.
+    ///
+    /// Returns, position for position, what this transaction has already
+    /// buffered for each key -- read-your-own-writes, answered from the
+    /// buffer because the log knows nothing about it yet. `Some(None)` is
+    /// a buffered delete; `None` is a key this transaction has not
+    /// written.
+    ///
+    /// With `want_values` unset that answer is all `None`, and nothing
+    /// is cloned. A caller asking only for versions, or scanning for
+    /// keys, has no use for a buffered value -- a question about
+    /// committed state, which a buffered write cannot answer -- and
+    /// cloning one to throw it away is megabytes spent on nothing.
     ///
     /// Not atomic, and deliberately so: a refusal part-way leaves the
     /// locks already taken in place. They belong to the read set now,
@@ -572,25 +560,37 @@ impl Locks {
     /// transaction may have *wounded* someone to get one, and handing it
     /// back would not undo that.
     ///
-    /// A key this transaction has already buffered a write for is
-    /// skipped: it holds the stronger exclusive lock on it already, and
-    /// `read` skips the same case for the same reason.
-    pub fn read_many(&self, id: TxnId, keys: &[Vec<u8>]) -> Result<(), Refused> {
+    /// A key this transaction has already buffered a write for takes no
+    /// read lock: it holds the stronger exclusive one already, and
+    /// asking for a shared lock on top would be asking to upgrade
+    /// against itself.
+    pub fn read_many(
+        &self,
+        id: TxnId,
+        keys: &[Vec<u8>],
+        want_values: bool,
+    ) -> Result<Vec<Option<Option<Vec<u8>>>>, Refused> {
         let now = Instant::now();
         self.with_open(id, |shared| {
+            let mut buffered = Vec::with_capacity(keys.len());
             for key in keys {
-                if shared.txns[&id].writes.contains_key(key) {
+                if let Some(value) = shared.txns[&id].writes.get(key) {
+                    buffered.push(want_values.then(|| value.clone()));
                     continue;
                 }
                 shared.acquire(key, id, Mode::Read, now)?;
+                // `acquire` can wound *this* transaction only if it is
+                // younger than a holder, in which case it returned an
+                // error above; so the entry is still here and still open.
                 shared
                     .txns
                     .get_mut(&id)
                     .expect("an open transaction cannot vanish under its own read")
                     .reads
                     .insert(key.clone());
+                buffered.push(None);
             }
-            Ok(())
+            Ok(buffered)
         })
     }
 

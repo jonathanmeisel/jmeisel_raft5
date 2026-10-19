@@ -175,7 +175,8 @@ async fn every_other_rpc_is_refused_without_a_token() {
         .as_ref()
         .clone()
         .read(Request::new(ReadRequest {
-            key: b"k".to_vec(),
+            keys: vec![b"k".to_vec()],
+            versions_only: false,
             consistency: None,
         }))
         .await
@@ -266,7 +267,8 @@ async fn a_token_signed_with_another_secret_is_refused() {
         .read(with_token(
             &foreign,
             ReadRequest {
-                key: b"k".to_vec(),
+                keys: vec![b"k".to_vec()],
+                versions_only: false,
                 consistency: None,
             },
         ))
@@ -281,7 +283,8 @@ async fn a_malformed_authorization_header_is_refused() {
 
     for header in ["", "Bearer", "Basic abc123", "Bearer not.a.token"] {
         let mut request = Request::new(ReadRequest {
-            key: b"k".to_vec(),
+            keys: vec![b"k".to_vec()],
+            versions_only: false,
             consistency: None,
         });
         request
@@ -314,7 +317,8 @@ async fn a_node_without_a_secret_requires_and_ignores_tokens_alike() {
         .as_ref()
         .clone()
         .read(Request::new(ReadRequest {
-            key: b"k".to_vec(),
+            keys: vec![b"k".to_vec()],
+            versions_only: false,
             consistency: None,
         }))
         .await
@@ -326,7 +330,8 @@ async fn a_node_without_a_secret_requires_and_ignores_tokens_alike() {
         .read(with_token(
             "not.a.real.token",
             ReadRequest {
-                key: b"k".to_vec(),
+                keys: vec![b"k".to_vec()],
+                versions_only: false,
                 consistency: None,
             },
         ))
@@ -605,7 +610,8 @@ async fn an_acl_is_enforced_against_the_identity_the_token_carries() {
     // Now the same call is refused, and refused in band.
     let refused = client
         .read(with_token(&alice, ReadRequest {
-            key: b"app/config".to_vec(),
+            keys: vec![b"app/config".to_vec()],
+            versions_only: false,
             consistency: None,
         }))
         .await
@@ -625,7 +631,8 @@ async fn an_acl_is_enforced_against_the_identity_the_token_carries() {
     // And root, whose token names an administrator, still gets through.
     let allowed = client
         .read(with_token(&root, ReadRequest {
-            key: b"app/config".to_vec(),
+            keys: vec![b"app/config".to_vec()],
+            versions_only: false,
             consistency: None,
         }))
         .await
@@ -716,7 +723,8 @@ async fn a_follower_enforces_an_acl_written_on_the_leader() {
             matches!(
                 follow
                     .read(with_token(&alice, ReadRequest {
-                        key: b"app/config".to_vec(),
+                        keys: vec![b"app/config".to_vec()],
+                        versions_only: false,
                         consistency: None,
                     }))
                     .await
@@ -747,7 +755,8 @@ async fn a_follower_enforces_an_acl_written_on_the_leader() {
             matches!(
                 follow
                     .read(with_token(&alice, ReadRequest {
-                        key: b"app/config".to_vec(),
+                        keys: vec![b"app/config".to_vec()],
+                        versions_only: false,
                         consistency: None,
                     }))
                     .await
@@ -762,7 +771,8 @@ async fn a_follower_enforces_an_acl_written_on_the_leader() {
     // account records, so it works there too.
     let answered = follow
         .read(with_token(&root, ReadRequest {
-            key: b"app/config".to_vec(),
+            keys: vec![b"app/config".to_vec()],
+            versions_only: false,
             consistency: None,
         }))
         .await

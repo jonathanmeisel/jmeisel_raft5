@@ -9,9 +9,52 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio_util::sync::CancellationToken;
 
-use raft5_client::{Client, Error, ReadResult};
+use raft5_client::{Client, Consistency, Entry, Error, Transaction};
 
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The single-key reads most of these tests make, on the many-key API.
+/// A one-key read is never cut short, so there is always one entry.
+trait ReadOne {
+    async fn read_one(&self, key: &[u8]) -> Result<Entry, Error>;
+    async fn version_one(&self, key: &[u8]) -> Result<u64, Error>;
+}
+
+impl ReadOne for Client {
+    async fn read_one(&self, key: &[u8]) -> Result<Entry, Error> {
+        self.read_one_at(key, Consistency::Stale).await
+    }
+
+    async fn version_one(&self, key: &[u8]) -> Result<u64, Error> {
+        self.version_one_at(key, Consistency::Stale).await
+    }
+}
+
+impl ReadOne for Transaction {
+    async fn read_one(&self, key: &[u8]) -> Result<Entry, Error> {
+        Ok(self.read(&[key]).await?.entries.remove(0))
+    }
+
+    async fn version_one(&self, key: &[u8]) -> Result<u64, Error> {
+        Ok(self.read_versions(&[key]).await?.entries[0].seq)
+    }
+}
+
+/// `ReadOne` at a consistency other than stale.
+trait ReadOneAt {
+    async fn read_one_at(&self, key: &[u8], consistency: Consistency<'_>) -> Result<Entry, Error>;
+    async fn version_one_at(&self, key: &[u8], consistency: Consistency<'_>) -> Result<u64, Error>;
+}
+
+impl ReadOneAt for Client {
+    async fn read_one_at(&self, key: &[u8], consistency: Consistency<'_>) -> Result<Entry, Error> {
+        Ok(self.read(&[key], consistency).await?.entries.remove(0))
+    }
+
+    async fn version_one_at(&self, key: &[u8], consistency: Consistency<'_>) -> Result<u64, Error> {
+        Ok(self.read_versions(&[key], consistency).await?.entries[0].seq)
+    }
+}
 
 /// A node started for a test: fresh database directory, ephemeral
 /// ports, and the real server loop running in the background. Stopped
@@ -154,12 +197,12 @@ async fn write_read_and_delete_round_trip() {
     bootstrap(&client, "n1").await;
 
     let seq = client.write(b"k", Some(b"v")).await.unwrap();
-    let read = client.read(b"k").await.unwrap();
+    let read = client.read_one(b"k").await.unwrap();
     assert_eq!(read.value.as_deref(), Some(&b"v"[..]));
     assert_eq!(read.seq, seq);
 
     client.write(b"k", None).await.unwrap();
-    assert_eq!(client.read(b"k").await.unwrap().value, None);
+    assert_eq!(client.read_one(b"k").await.unwrap().value, None);
 }
 
 /// The redirect path: a client that has only ever been told about a
@@ -180,7 +223,7 @@ async fn a_client_seeded_with_a_follower_finds_the_leader() {
     let client = Client::new([n3.url()]).unwrap();
     client.write(b"k", Some(b"v")).await.unwrap();
     assert_eq!(
-        client.read(b"k").await.unwrap().value.as_deref(),
+        client.read_one(b"k").await.unwrap().value.as_deref(),
         Some(&b"v"[..])
     );
     assert_eq!(
@@ -329,7 +372,7 @@ async fn a_transaction_that_buffers_nothing_writes_nothing() {
     let before = fresh(&client, b"k").await;
 
     let txn = client.transaction(Duration::from_secs(2)).await.unwrap();
-    txn.read(b"k").await.unwrap();
+    txn.read_one(b"k").await.unwrap();
     assert_eq!(txn.commit().await.unwrap(), 0);
 
     assert_eq!(fresh(&client, b"k").await, before);
@@ -345,7 +388,7 @@ async fn a_transactional_write_of_nothing_deletes_the_key() {
     client.write(b"k", Some(b"v")).await.unwrap();
 
     let txn = client.transaction(Duration::from_secs(2)).await.unwrap();
-    txn.read(b"k").await.unwrap();
+    txn.read_one(b"k").await.unwrap();
     txn.write(b"k", None).await.unwrap();
     txn.commit().await.unwrap();
 
@@ -356,7 +399,7 @@ async fn a_transactional_write_of_nothing_deletes_the_key() {
 /// more than that, in a single transaction.
 async fn increment(client: &Client) -> Result<u64, Error> {
     let txn = client.transaction(Duration::from_secs(2)).await?;
-    let current = txn.read(b"hits").await?;
+    let current = txn.read_one(b"hits").await?;
     let n: u64 = current
         .value
         .map(|bytes| String::from_utf8(bytes).unwrap().parse().unwrap())
@@ -373,9 +416,9 @@ async fn increment(client: &Client) -> Result<u64, Error> {
 /// to hand back, just the leader proving it still leads before it
 /// answers. Nothing here needs the key held afterwards -- these are
 /// assertions, not read-modify-writes.
-async fn fresh(client: &Client, key: &[u8]) -> ReadResult {
+async fn fresh(client: &Client, key: &[u8]) -> Entry {
     client
-        .read_linearizable(key)
+        .read_one_at(key, Consistency::Linearizable)
         .await
         .expect("a linearizable read")
 }
@@ -383,9 +426,9 @@ async fn fresh(client: &Client, key: &[u8]) -> ReadResult {
 /// `fresh`, for the version alone.
 async fn fresh_version(client: &Client, key: &[u8]) -> u64 {
     client
-        .get_version_linearizable(key)
+        .version_one_at(key, Consistency::Linearizable)
         .await
-        .expect("a linearizable get_version")
+        .expect("a linearizable versions-only read")
 }
 
 // --- transactions -----------------------------------------------------
@@ -403,14 +446,14 @@ async fn a_transaction_commits_every_key_at_one_seq() {
     client.write(b"bob", Some(b"10")).await.unwrap();
 
     let txn = client.transaction(Duration::from_secs(2)).await.unwrap();
-    assert_eq!(txn.read(b"alice").await.unwrap().value.as_deref(), Some(&b"10"[..]));
-    assert_eq!(txn.read(b"bob").await.unwrap().value.as_deref(), Some(&b"10"[..]));
+    assert_eq!(txn.read_one(b"alice").await.unwrap().value.as_deref(), Some(&b"10"[..]));
+    assert_eq!(txn.read_one(b"bob").await.unwrap().value.as_deref(), Some(&b"10"[..]));
     txn.write(b"alice", Some(b"9")).await.unwrap();
     txn.write(b"bob", Some(b"11")).await.unwrap();
     let seq = txn.commit().await.unwrap();
 
-    let alice = client.read(b"alice").await.unwrap();
-    let bob = client.read(b"bob").await.unwrap();
+    let alice = client.read_one(b"alice").await.unwrap();
+    let bob = client.read_one(b"bob").await.unwrap();
     assert_eq!(alice.value.as_deref(), Some(&b"9"[..]));
     assert_eq!(bob.value.as_deref(), Some(&b"11"[..]));
     assert_eq!(
@@ -436,7 +479,7 @@ async fn a_dropped_transaction_writes_nothing_and_frees_its_keys() {
     txn.abort().await.unwrap();
 
     assert_eq!(
-        client.read(b"k").await.unwrap().value.as_deref(),
+        client.read_one(b"k").await.unwrap().value.as_deref(),
         Some(&b"original"[..])
     );
     // And the key is writable again, which is the half a stale lock
@@ -456,21 +499,21 @@ async fn a_transaction_reads_back_its_own_buffered_writes() {
 
     let txn = client.transaction(Duration::from_secs(2)).await.unwrap();
     txn.write(b"k", Some(b"buffered")).await.unwrap();
-    let read = txn.read(b"k").await.unwrap();
+    let read = txn.read_one(b"k").await.unwrap();
     assert_eq!(read.value.as_deref(), Some(&b"buffered"[..]));
     assert_eq!(read.seq, committed, "seq describes committed state, not the buffer");
 
     // A buffered delete reads back as absent, the same way.
     txn.write(b"k", None).await.unwrap();
-    assert_eq!(txn.read(b"k").await.unwrap().value, None);
+    assert_eq!(txn.read_one(b"k").await.unwrap().value, None);
 
     // ...and none of that is visible to anyone else until it commits.
     assert_eq!(
-        client.read(b"k").await.unwrap().value.as_deref(),
+        client.read_one(b"k").await.unwrap().value.as_deref(),
         Some(&b"committed"[..])
     );
     txn.commit().await.unwrap();
-    assert_eq!(client.read(b"k").await.unwrap().value, None);
+    assert_eq!(client.read_one(b"k").await.unwrap().value, None);
 }
 
 /// A transaction's read lock is what makes its read set mean something:
@@ -485,7 +528,7 @@ async fn a_plain_write_cannot_change_a_key_a_transaction_has_read() {
     client.write(b"k", Some(b"v")).await.unwrap();
 
     let txn = client.transaction(Duration::from_secs(5)).await.unwrap();
-    txn.read(b"k").await.unwrap();
+    txn.read_one(b"k").await.unwrap();
 
     // `write` retries a contended key until the client's own deadline,
     // so bound it here: what is being asserted is that it does *not*
@@ -501,7 +544,7 @@ async fn a_plain_write_cannot_change_a_key_a_transaction_has_read() {
     // Once the lock is gone the same write goes through.
     client.write(b"k", Some(b"allowed")).await.unwrap();
     assert_eq!(
-        client.read(b"k").await.unwrap().value.as_deref(),
+        client.read_one(b"k").await.unwrap().value.as_deref(),
         Some(&b"allowed"[..])
     );
 }
@@ -533,7 +576,7 @@ async fn an_older_transaction_wounds_a_younger_one_holding_its_key() {
 
     older.commit().await.unwrap();
     assert_eq!(
-        client.read(b"k").await.unwrap().value.as_deref(),
+        client.read_one(b"k").await.unwrap().value.as_deref(),
         Some(&b"mine"[..])
     );
 }
@@ -564,7 +607,7 @@ async fn a_transaction_past_its_deadline_cannot_commit() {
         other => panic!("an expired transaction must not commit, got {other:?}"),
     }
     assert_eq!(
-        client.read(b"k").await.unwrap().value.as_deref(),
+        client.read_one(b"k").await.unwrap().value.as_deref(),
         Some(&b"original"[..])
     );
 }
@@ -582,7 +625,7 @@ async fn a_read_only_transaction_commits_at_no_sequence_number() {
     client.write(b"k", Some(b"v")).await.unwrap();
 
     let txn = client.transaction(Duration::from_secs(2)).await.unwrap();
-    assert_eq!(txn.read(b"k").await.unwrap().value.as_deref(), Some(&b"v"[..]));
+    assert_eq!(txn.read_one(b"k").await.unwrap().value.as_deref(), Some(&b"v"[..]));
     assert_eq!(txn.commit().await.unwrap(), 0);
 
     // Its read lock is gone with it.
@@ -637,8 +680,8 @@ async fn concurrent_transactions_keep_two_keys_consistent() {
 /// one transaction.
 async fn transfer_one(client: &Client) -> Result<(), raft5_client::Error> {
     let txn = client.transaction(Duration::from_secs(5)).await?;
-    let a: i64 = parse(txn.read(b"a").await?.value.as_deref());
-    let b: i64 = parse(txn.read(b"b").await?.value.as_deref());
+    let a: i64 = parse(txn.read_one(b"a").await?.value.as_deref());
+    let b: i64 = parse(txn.read_one(b"b").await?.value.as_deref());
     txn.write(b"a", Some((a - 1).to_string().as_bytes()))
         .await?;
     txn.write(b"b", Some((b + 1).to_string().as_bytes()))
@@ -647,7 +690,7 @@ async fn transfer_one(client: &Client) -> Result<(), raft5_client::Error> {
 }
 
 async fn number(client: &Client, key: &[u8]) -> i64 {
-    parse(client.read(key).await.unwrap().value.as_deref())
+    parse(client.read_one(key).await.unwrap().value.as_deref())
 }
 
 fn parse(bytes: Option<&[u8]>) -> i64 {
@@ -700,7 +743,7 @@ async fn dropping_the_handle_releases_the_transactions_locks() {
         // A deadline far longer than this test will wait, so that what
         // frees the key can only be the drop.
         let txn = client.transaction(Duration::from_secs(5)).await.unwrap();
-        txn.read(b"k").await.unwrap();
+        txn.read_one(b"k").await.unwrap();
     }
 
     let until = Instant::now() + Duration::from_secs(4);
@@ -719,7 +762,7 @@ async fn dropping_the_handle_releases_the_transactions_locks() {
         }
     }
     assert_eq!(
-        client.read(b"k").await.unwrap().value.as_deref(),
+        client.read_one(b"k").await.unwrap().value.as_deref(),
         Some(&b"after"[..])
     );
 }
@@ -927,7 +970,7 @@ async fn a_client_can_log_in_bootstrap_and_then_work() {
     // The token from before the cluster existed is still good, and the
     // account bootstrapping wrote is what backs it from here on.
     client.write(b"k", Some(b"v")).await.unwrap();
-    assert_eq!(client.read(b"k").await.unwrap().value, Some(b"v".to_vec()));
+    assert_eq!(client.read_one(b"k").await.unwrap().value, Some(b"v".to_vec()));
 
     client
         .create_user("alice", "correct horse", false)
@@ -936,7 +979,7 @@ async fn a_client_can_log_in_bootstrap_and_then_work() {
 
     let alice = Client::new([n1.url()]).unwrap();
     alice.login("alice", "correct horse").await.unwrap();
-    assert_eq!(alice.read(b"k").await.unwrap().value, Some(b"v".to_vec()));
+    assert_eq!(alice.read_one(b"k").await.unwrap().value, Some(b"v".to_vec()));
 }
 
 /// The regression that matters most for how this *feels*: an
@@ -956,7 +999,7 @@ async fn a_call_without_a_token_fails_immediately_rather_than_retrying() {
 
     let started = Instant::now();
     let error = client
-        .read(b"k")
+        .read_one(b"k")
         .await
         .expect_err("a read with no token should be refused");
     assert!(
@@ -1064,7 +1107,7 @@ async fn logging_out_stops_existing_connections_using_the_token() {
     assert!(!client.is_logged_in());
 
     let error = client
-        .read(b"k")
+        .read_one(b"k")
         .await
         .expect_err("after logging out there is no token to send");
     assert!(
@@ -1110,7 +1153,7 @@ async fn an_ordinary_account_is_refused_membership_changes() {
 // --- versions ---------------------------------------------------------
 
 #[tokio::test]
-async fn get_version_tracks_writes_and_deletes() {
+async fn version_read_tracks_writes_and_deletes() {
     let n1 = TestNode::start("n1");
     let client = Client::new([n1.url()]).unwrap();
     bootstrap(&client, "n1").await;
@@ -1137,7 +1180,7 @@ async fn get_version_tracks_writes_and_deletes() {
 /// because that is the case the RPC exists for -- and the one where the
 /// two answers come from physically different places.
 #[tokio::test]
-async fn get_version_agrees_with_read_on_a_large_value() {
+async fn version_read_agrees_with_read_on_a_large_value() {
     let n1 = TestNode::start("n1");
     let client = Client::new([n1.url()]).unwrap();
     bootstrap(&client, "n1").await;
@@ -1168,15 +1211,15 @@ async fn a_linearizable_read_sees_a_write_that_has_returned() {
     let client = Client::new([n3.url()]).unwrap();
     let seq = client.write(b"k", Some(b"v")).await.unwrap();
 
-    let read = client.read_linearizable(b"k").await.unwrap();
+    let read = client.read_one_at(b"k", Consistency::Linearizable).await.unwrap();
     assert_eq!(read.seq, seq);
     assert_eq!(read.value.as_deref(), Some(&b"v"[..]));
-    assert_eq!(client.get_version_linearizable(b"k").await.unwrap(), seq);
+    assert_eq!(client.version_one_at(b"k", Consistency::Linearizable).await.unwrap(), seq);
 }
 
 /// The shape the RPC exists for: check the version, decide, write, and
 /// have the commit fail if anyone touched the key in between. The read
-/// lock a transactional `get_version` takes is what makes that safe, so
+/// lock a transactional versions-only read takes is what makes that safe, so
 /// a later transaction must be refused the key rather than silently
 /// winning it.
 ///
@@ -1186,7 +1229,7 @@ async fn a_linearizable_read_sees_a_write_that_has_returned() {
 /// which is the behaviour it is supposed to have and says nothing about
 /// whether the lock was ever taken.
 #[tokio::test]
-async fn a_transactional_get_version_locks_out_a_later_write() {
+async fn a_transactional_version_read_locks_out_a_later_write() {
     let n1 = TestNode::start("n1");
     let client = Client::new([n1.url()]).unwrap();
     bootstrap(&client, "n1").await;
@@ -1195,7 +1238,7 @@ async fn a_transactional_get_version_locks_out_a_later_write() {
     // The checker opens first, so it is the *older* transaction: a
     // younger one that wants its key dies rather than wounding it.
     let checker = client.transaction(Duration::from_secs(5)).await.unwrap();
-    assert_eq!(checker.get_version(b"k").await.unwrap(), written);
+    assert_eq!(checker.version_one(b"k").await.unwrap(), written);
 
     let later = client.transaction(Duration::from_secs(5)).await.unwrap();
     match later.write(b"k", Some(b"stolen")).await {
@@ -1217,7 +1260,7 @@ async fn a_transactional_get_version_locks_out_a_later_write() {
 /// committed version, not a guess at the one its own write will land at
 /// -- that number does not exist until the commit assigns it.
 #[tokio::test]
-async fn a_transactional_get_version_reports_committed_state() {
+async fn a_transactional_version_read_reports_committed_state() {
     let n1 = TestNode::start("n1");
     let client = Client::new([n1.url()]).unwrap();
     bootstrap(&client, "n1").await;
@@ -1225,7 +1268,7 @@ async fn a_transactional_get_version_reports_committed_state() {
 
     let txn = client.transaction(Duration::from_secs(2)).await.unwrap();
     txn.write(b"k", Some(b"buffered")).await.unwrap();
-    assert_eq!(txn.get_version(b"k").await.unwrap(), committed);
+    assert_eq!(txn.version_one(b"k").await.unwrap(), committed);
 
     let landed = txn.commit().await.unwrap();
     assert!(landed > committed);
@@ -1257,7 +1300,7 @@ async fn a_snapshot_holds_the_store_as_it_was_taken() {
     // The snapshot is unmoved by any of it.
     assert_eq!(
         client
-            .read_at(b"s1", b"kept")
+            .read_one_at(b"kept", Consistency::Snapshot(b"s1"))
             .await
             .unwrap()
             .value
@@ -1266,7 +1309,7 @@ async fn a_snapshot_holds_the_store_as_it_was_taken() {
     );
     assert_eq!(
         client
-            .read_at(b"s1", b"doomed")
+            .read_one_at(b"doomed", Consistency::Snapshot(b"s1"))
             .await
             .unwrap()
             .value
@@ -1274,7 +1317,7 @@ async fn a_snapshot_holds_the_store_as_it_was_taken() {
         Some(&b"here"[..]),
         "a key deleted after the snapshot is still visible through it"
     );
-    assert_eq!(client.read_at(b"s1", b"fresh").await.unwrap().value, None);
+    assert_eq!(client.read_one_at(b"fresh", Consistency::Snapshot(b"s1")).await.unwrap().value, None);
 
     // The key set as of the snapshot, too.
     let keys = client.key_iterator_at(b"s1", b"").collect().await.unwrap();
@@ -1288,7 +1331,7 @@ async fn a_snapshot_holds_the_store_as_it_was_taken() {
 
     // Once released, reads at it fail rather than silently drifting.
     client.remove_snapshot(b"s1").await.unwrap();
-    assert!(client.read_at(b"s1", b"kept").await.is_err());
+    assert!(client.read_one_at(b"kept", Consistency::Snapshot(b"s1")).await.is_err());
     assert!(client.list_snapshots().await.unwrap().is_empty());
 }
 
@@ -1321,7 +1364,7 @@ async fn every_node_serves_the_same_snapshot_read() {
         let mut seen = None;
         let deadline = Instant::now() + BOOTSTRAP_TIMEOUT;
         while Instant::now() < deadline {
-            if let Ok(r) = client.read_at(b"s1", b"k").await {
+            if let Ok(r) = client.read_one_at(b"k", Consistency::Snapshot(b"s1")).await {
                 seen = Some(r);
                 break;
             }
@@ -1356,7 +1399,7 @@ async fn snapshots_at_different_points_hold_different_views() {
         let client = client.clone();
         async move {
             client
-                .read_at(id, b"k")
+                .read_one_at(b"k", Consistency::Snapshot(id))
                 .await
                 .unwrap()
                 .value
@@ -1392,7 +1435,7 @@ async fn a_snapshot_id_defaults_to_a_timestamp() {
     for snap in [&a, &b] {
         assert_eq!(
             client
-                .read_at(&snap.id, b"k")
+                .read_one_at(b"k", Consistency::Snapshot(&snap.id))
                 .await
                 .unwrap()
                 .value
@@ -1411,9 +1454,9 @@ async fn a_read_at_a_missing_snapshot_fails_fast() {
     bootstrap(&client, "n1").await;
 
     let started = std::time::Instant::now();
-    let read = client.read_at(b"no-such-snapshot", b"k").await;
+    let read = client.read_one_at(b"k", Consistency::Snapshot(b"no-such-snapshot")).await;
     assert!(matches!(read, Err(Error::NotFound(_))), "{read:?}");
-    let version = client.get_version_at(b"no-such-snapshot", b"k").await;
+    let version = client.version_one_at(b"k", Consistency::Snapshot(b"no-such-snapshot")).await;
     assert!(matches!(version, Err(Error::NotFound(_))), "{version:?}");
     let removed = client.remove_snapshot(b"no-such-snapshot").await;
     assert!(matches!(removed, Err(Error::NotFound(_))), "{removed:?}");
@@ -1487,7 +1530,7 @@ async fn an_acl_written_by_an_admin_is_enforced_against_another_account() {
     // Before the ACL, alice reaches everything -- which is the state
     // every cluster upgrades into.
     assert_eq!(
-        alice.read(b"app/config").await.unwrap().value,
+        alice.read_one(b"app/config").await.unwrap().value,
         Some(b"v".to_vec())
     );
 
@@ -1497,7 +1540,7 @@ async fn an_acl_written_by_an_admin_is_enforced_against_another_account() {
         .unwrap();
 
     let error = alice
-        .read(b"app/config")
+        .read_one(b"app/config")
         .await
         .expect_err("the ACL does not name alice");
     assert!(
@@ -1518,7 +1561,7 @@ async fn an_acl_written_by_an_admin_is_enforced_against_another_account() {
 
     // A key the ACL does not govern is untouched.
     assert_eq!(
-        alice.read(b"other/config").await.unwrap().value,
+        alice.read_one(b"other/config").await.unwrap().value,
         Some(b"v".to_vec())
     );
 
@@ -1574,7 +1617,7 @@ async fn a_nested_group_carries_a_grant_to_its_members() {
     bob.login("bob", "correct horse").await.unwrap();
 
     assert_eq!(
-        alice.read(b"app/config").await.unwrap().value,
+        alice.read_one(b"app/config").await.unwrap().value,
         Some(b"v".to_vec()),
         "membership of a nested group should carry the outer group's grant"
     );
@@ -1589,7 +1632,7 @@ async fn a_nested_group_carries_a_grant_to_its_members() {
     ));
     // Bob is in nothing.
     assert!(matches!(
-        bob.read(b"app/config").await,
+        bob.read_one(b"app/config").await,
         Err(Error::Denied { reason: Denial::NotPermitted, .. })
     ));
 
@@ -1600,7 +1643,7 @@ async fn a_nested_group_carries_a_grant_to_its_members() {
         .await
         .unwrap();
     assert!(matches!(
-        alice.read(b"app/config").await,
+        alice.read_one(b"app/config").await,
         Err(Error::Denied { reason: Denial::NotPermitted, .. })
     ));
 
@@ -1870,7 +1913,7 @@ async fn a_tls_client_follows_the_cluster_through_losing_its_seed() {
 
     client.write(b"k", Some(b"after")).await.unwrap();
     assert_eq!(
-        client.read(b"k").await.unwrap().value.as_deref(),
+        client.read_one(b"k").await.unwrap().value.as_deref(),
         Some(&b"after"[..])
     );
 }
@@ -1886,4 +1929,101 @@ fn a_tls_client_with_an_unusable_identity_is_refused_up_front() {
         raft5_client::ClientTls::new(ca.certificate()).identity(garbage),
     );
     assert!(matches!(result, Err(Error::Tls(_))), "{:?}", result.err());
+}
+
+// --- many-key reads -----------------------------------------------------
+
+/// One read, many keys, every consistency: each answers in the order
+/// asked, with a missing key at seq 0 and `as_of` no older than anything
+/// it read.
+#[tokio::test]
+async fn a_many_key_read_works_at_every_consistency() {
+    let n1 = TestNode::start("n1");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "n1").await;
+
+    let a = client.write(b"a", Some(b"1")).await.unwrap();
+    let snap = client.create_snapshot(Some(b"s1")).await.unwrap();
+    let b = client.write(b"b", Some(b"2")).await.unwrap();
+    let keys: [&[u8]; 3] = [b"b", b"missing", b"a"];
+
+    for consistency in [Consistency::Stale, Consistency::Linearizable] {
+        let read = client.read(&keys, consistency).await.unwrap();
+        assert!(read.is_complete(keys.len()));
+        let got: Vec<_> = read
+            .entries
+            .iter()
+            .map(|e| (e.key.as_slice(), e.seq, e.value.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (&b"b"[..], b, Some(&b"2"[..])),
+                (b"missing", 0, None),
+                (b"a", a, Some(&b"1"[..])),
+            ]
+        );
+        assert!(read.as_of >= b);
+
+        let versions = client.read_versions(&keys, consistency).await.unwrap();
+        let seqs: Vec<_> = versions.entries.iter().map(|v| v.seq).collect();
+        assert_eq!(seqs, [b, 0, a]);
+    }
+
+    let at = client.read(&keys, Consistency::Snapshot(b"s1")).await.unwrap();
+    assert_eq!(at.as_of, snap.seq);
+    let seqs: Vec<_> = at.entries.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, [0, 0, a], "b did not exist yet at the snapshot");
+
+    let txn = client.transaction(Duration::from_secs(5)).await.unwrap();
+    txn.write(b"a", Some(b"mine")).await.unwrap();
+    let mine = txn.read(&keys).await.unwrap();
+    assert_eq!(mine.entries[2].value.as_deref(), Some(&b"mine"[..]));
+    assert_eq!(mine.entries[2].seq, a, "a buffered write keeps the committed seq");
+    let versions = txn.read_versions(&keys).await.unwrap();
+    let seqs: Vec<_> = versions.entries.iter().map(|v| v.seq).collect();
+    assert_eq!(seqs, [b, 0, a]);
+    txn.abort().await.unwrap();
+}
+
+/// Past the value budget the client hands back the prefix the cluster
+/// answered rather than stitching reissues together, and reissuing for
+/// the rest finishes the job.
+#[tokio::test]
+async fn a_read_past_the_value_budget_is_returned_short_for_the_caller_to_finish() {
+    let n1 = TestNode::start("n1");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "n1").await;
+
+    let big = vec![5u8; 6 * 1024 * 1024];
+    for key in [&b"a"[..], b"b"] {
+        client.write(key, Some(&big)).await.unwrap();
+    }
+    let keys: [&[u8]; 2] = [b"a", b"b"];
+
+    let first = client.read(&keys, Consistency::Linearizable).await.unwrap();
+    assert!(!first.is_complete(keys.len()));
+    assert_eq!(first.entries.len(), 1);
+    assert_eq!(first.entries[0].key, b"a");
+
+    let rest = client
+        .read(&keys[first.entries.len()..], Consistency::Linearizable)
+        .await
+        .unwrap();
+    assert!(rest.is_complete(1));
+    assert_eq!(rest.entries[0].key, b"b");
+    assert_eq!(rest.entries[0].value.as_deref(), Some(big.as_slice()));
+
+    let versions = client.read_versions(&keys, Consistency::Stale).await.unwrap();
+    assert!(versions.is_complete(keys.len()), "versions alone are never cut short");
+}
+
+/// Too many keys is refused here, before anything is sent.
+#[tokio::test]
+async fn a_read_of_too_many_keys_is_refused_by_the_client() {
+    let n1 = TestNode::start("n1");
+    let client = Client::new([n1.url()]).unwrap();
+    let keys = vec![b"k".to_vec(); raft5_shared::MAX_KEYS_PER_READ + 1];
+    let read = client.read(&keys, Consistency::Stale).await;
+    assert!(matches!(read, Err(Error::InvalidArgument(_))), "{read:?}");
 }

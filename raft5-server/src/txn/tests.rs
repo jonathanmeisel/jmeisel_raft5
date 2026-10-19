@@ -12,6 +12,14 @@ fn txn(locks: &Locks) -> TxnId {
         .expect("a fresh transaction should open")
 }
 
+/// One key's `read_many`, values and all -- what a single-key
+/// transactional read asks of the table.
+fn read(locks: &Locks, t: TxnId, key: &[u8]) -> Result<Option<Option<Vec<u8>>>, Refused> {
+    locks
+        .read_many(t, &[key.to_vec()], true)
+        .map(|mut buffered| buffered.remove(0))
+}
+
 fn conflict<T: std::fmt::Debug>(r: Result<T, Refused>) -> Vec<u8> {
     match r {
         Err(Refused::Conflict { key }) => key,
@@ -27,7 +35,7 @@ fn many_transactions_can_read_the_same_key() {
     let (a, b, c) = (txn(&locks), txn(&locks), txn(&locks));
 
     for t in [a, b, c] {
-        assert_eq!(locks.read(t, b"k"), Ok(None));
+        assert_eq!(read(&locks, t, b"k"), Ok(None));
     }
     assert!(locks.is_locked(b"k"));
 }
@@ -40,10 +48,10 @@ fn the_sole_reader_of_a_key_can_upgrade_to_a_write() {
     let locks = locks();
     let t = txn(&locks);
 
-    locks.read(t, b"k").unwrap();
+    read(&locks, t, b"k").unwrap();
     assert_eq!(locks.buffer_write(t, b"k", Some(b"v".to_vec())), Ok(()));
     // And the write is visible to the transaction that made it.
-    assert_eq!(locks.read(t, b"k"), Ok(Some(Some(b"v".to_vec()))));
+    assert_eq!(read(&locks, t, b"k"), Ok(Some(Some(b"v".to_vec()))));
 }
 
 /// The regression for encoding shared holders as a set rather than a
@@ -54,8 +62,8 @@ fn reading_the_same_key_twice_still_allows_an_upgrade() {
     let locks = locks();
     let t = txn(&locks);
 
-    locks.read(t, b"k").unwrap();
-    locks.read(t, b"k").unwrap();
+    read(&locks, t, b"k").unwrap();
+    read(&locks, t, b"k").unwrap();
     assert_eq!(
         locks.buffer_write(t, b"k", Some(b"v".to_vec())),
         Ok(()),
@@ -72,8 +80,8 @@ fn a_younger_transaction_cannot_take_a_key_an_older_one_is_reading() {
     let older = txn(&locks);
     let younger = txn(&locks);
 
-    locks.read(older, b"k").unwrap();
-    locks.read(younger, b"k").unwrap();
+    read(&locks, older, b"k").unwrap();
+    read(&locks, younger, b"k").unwrap();
 
     assert_eq!(
         conflict(locks.buffer_write(younger, b"k", Some(b"v".to_vec()))),
@@ -105,7 +113,7 @@ fn an_older_transaction_wounds_a_younger_holder_and_takes_the_key() {
         Some(TxnState::Aborted(AbortReason::Wounded))
     );
     assert_eq!(
-        locks.read(younger, b"k"),
+        read(&locks, younger, b"k"),
         Err(Refused::Aborted(AbortReason::Wounded)),
         "the wounded transaction learns why, not just that it failed"
     );
@@ -241,7 +249,7 @@ fn committing_yields_the_buffered_writes_and_the_guard_releases_them() {
     locks.buffer_write(t, b"b", Some(b"2".to_vec())).unwrap();
     locks.buffer_write(t, b"a", Some(b"1".to_vec())).unwrap();
     locks.buffer_write(t, b"gone", None).unwrap();
-    locks.read(t, b"witness").unwrap();
+    read(&locks, t, b"witness").unwrap();
 
     let (writes, guard) = locks.begin_commit(t, 1).unwrap();
     assert_eq!(
@@ -402,17 +410,16 @@ fn discarding_an_unknown_transaction_is_not_an_error() {
 
 // --- bulk reads and the buffer view, for key scans --------------------
 
-/// `read_many` is `read` for a whole batch: every key ends up in the
-/// read set and held, so a scan's keys are as protected as a single
-/// read's.
+/// Every key a batch names ends up in the read set and held, so a
+/// many-key read's keys are as protected as a single one's.
 #[test]
 fn read_many_locks_every_key_it_is_given() {
     let locks = locks();
     let scanner = txn(&locks);
 
     assert_eq!(
-        locks.read_many(scanner, &[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]),
-        Ok(())
+        locks.read_many(scanner, &[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()], true),
+        Ok(vec![None, None, None])
     );
     for key in [&b"a"[..], b"b", b"c"] {
         assert!(locks.is_locked(key));
@@ -438,7 +445,7 @@ fn read_many_keeps_the_locks_it_took_before_being_refused() {
     locks.buffer_write(older, b"b", Some(b"v".to_vec())).unwrap();
 
     assert_eq!(
-        conflict(locks.read_many(younger, &[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()])),
+        conflict(locks.read_many(younger, &[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()], true)),
         b"b".to_vec()
     );
     assert!(locks.is_locked(b"a"), "the key it got before the refusal is still held");
@@ -454,11 +461,33 @@ fn read_many_leaves_a_key_this_transaction_already_wrote_alone() {
     let t = txn(&locks);
     locks.buffer_write(t, b"k", Some(b"mine".to_vec())).unwrap();
 
-    assert_eq!(locks.read_many(t, &[b"k".to_vec()]), Ok(()));
+    assert_eq!(
+        locks.read_many(t, &[b"k".to_vec()], true),
+        Ok(vec![Some(Some(b"mine".to_vec()))])
+    );
 
     // Still exclusive: another transaction cannot read it.
     let other = txn(&locks);
-    assert_eq!(conflict(locks.read(other, b"k")), b"k".to_vec());
+    assert_eq!(conflict(read(&locks, other, b"k")), b"k".to_vec());
+}
+
+/// Positional, with buffered values only when asked for: a read that
+/// wants versions alone gets no clone of a buffered value it would only
+/// throw away -- and still takes every lock.
+#[test]
+fn read_many_answers_by_position_and_clones_only_when_asked() {
+    let locks = locks();
+    let t = txn(&locks);
+    locks.buffer_write(t, b"w", Some(b"mine".to_vec())).unwrap();
+    locks.buffer_write(t, b"d", None).unwrap();
+    let keys = [b"a".to_vec(), b"w".to_vec(), b"d".to_vec(), b"a".to_vec()];
+
+    assert_eq!(
+        locks.read_many(t, &keys, true),
+        Ok(vec![None, Some(Some(b"mine".to_vec())), Some(None), None])
+    );
+    assert_eq!(locks.read_many(t, &keys, false), Ok(vec![None; 4]));
+    assert!(locks.is_locked(b"a"));
 }
 
 /// What a scan needs to fold in its own uncommitted changes: the

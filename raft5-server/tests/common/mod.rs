@@ -423,14 +423,15 @@ pub async fn read(client: &Arc<Client>, key: &[u8]) -> Option<Vec<u8>> {
     let mut client = (**client).clone();
     let resp = client
         .read(ReadRequest {
-            key: key.to_vec(),
+            keys: vec![key.to_vec()],
+            versions_only: false,
             consistency: None,
         })
         .await
         .expect("read RPC failed")
         .into_inner();
     match resp.result {
-        Some(read_response::Result::Ok(ok)) => ok.value,
+        Some(read_response::Result::Ok(ok)) => ok.entries.into_iter().next().and_then(|e| e.value),
         other => panic!("expected a successful read, got {other:?}"),
     }
 }
@@ -481,15 +482,17 @@ pub async fn assert_eventually_reads(client: &Arc<Client>, key: &[u8], value: &[
     loop {
         let resp = client
             .read(ReadRequest {
-                key: key.to_vec(),
+                keys: vec![key.to_vec()],
+                versions_only: false,
                 consistency: None,
             })
             .await
             .expect("read RPC failed")
             .into_inner();
         if let Some(read_response::Result::Ok(ok)) = &resp.result
-            && ok.seq >= min_seq
-            && ok.value.as_deref() == Some(value)
+            && let [entry] = ok.entries.as_slice()
+            && entry.seq >= min_seq
+            && entry.value.as_deref() == Some(value)
         {
             return;
         }

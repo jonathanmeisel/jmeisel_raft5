@@ -220,3 +220,49 @@ async fn a_transaction_larger_than_one_grpc_message_replicates_to_every_node() {
         }
     }
 }
+
+/// A stale read on a follower says how far that follower had applied,
+/// which is how a caller gets read-your-writes there without paying for
+/// a linearizable read: until `as_of` reaches the seq its own commit
+/// returned, the answer may not include that commit -- and once it has,
+/// it must. Both keys of the one entry move together either way.
+#[tokio::test]
+async fn a_followers_stale_read_says_whether_it_has_caught_up() {
+    use raft5_server::pb::raft5::client::{ReadRequest, read_response};
+
+    let (n1, n2, _n3) = three_node_cluster("f").await;
+    let c1 = n1.client();
+    let id = begin(&c1, std::time::Duration::from_secs(5)).await;
+    txn_write(&c1, &id, b"a", Some(b"1")).await;
+    txn_write(&c1, &id, b"b", Some(b"1")).await;
+    let seq = commit(&c1, &id).await.expect("the commit should land");
+
+    let mut follower = (*n2.client()).clone();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let resp = follower
+            .read(ReadRequest {
+                keys: vec![b"a".to_vec(), b"b".to_vec()],
+                versions_only: false,
+                consistency: None,
+            })
+            .await
+            .expect("read RPC failed")
+            .into_inner();
+        let Some(read_response::Result::Ok(ok)) = resp.result else {
+            panic!("a stale read is always served: {resp:?}");
+        };
+        let [a, b] = ok.entries.as_slice() else {
+            panic!("two keys, two entries: {ok:?}");
+        };
+        assert_eq!(a, b, "one entry wrote both");
+        if ok.as_of >= seq {
+            assert_eq!(a.seq, seq);
+            assert_eq!(a.value.as_deref(), Some(&b"1"[..]));
+            return;
+        }
+        assert!(a.seq < seq, "as_of {} is behind a write it shows: {a:?}", ok.as_of);
+        assert!(std::time::Instant::now() < until, "the follower never caught up");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}

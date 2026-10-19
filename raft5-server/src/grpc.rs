@@ -20,8 +20,8 @@
 //! whole of a read-modify-write be one atomic thing instead of two round
 //! trips with a race between them.
 //!
-//! Both `commit` and the transactional reads (`transactional_read` for
-//! one key, `transactional_scan` for a range of them) establish the same
+//! Both `commit` and the transactional reads (`transactional_multi_read`
+//! for named keys, `transactional_scan` for a range of them) establish the same
 //! two things before answering: this leader's `latest` must be complete
 //! (`LeaderHandle::await_caught_up`), since `latest` reflects only
 //! *applied* entries and a fresh leader may still be catching up on a
@@ -52,8 +52,7 @@ use crate::pb::raft5::client::{
     CreateInviteResponse, CreateSnapshotRequest, CreateSnapshotResponse, CreateTransactionRequest,
     CreateTransactionResponse, CreateUserRequest, CreateUserResponse, DeleteUserRequest,
     DeleteUserResponse, DropTransactionRequest, DropTransactionResponse, GetConfigRequest,
-    GetConfigResponse, GetKeysOk, GetKeysRequest, GetKeysResponse, GetVersionOk, GetVersionRequest,
-    GetVersionResponse, Invite as PbInvite, InviteList, ListInvitesRequest, ListInvitesResponse,
+    GetConfigResponse, GetKeysOk, GetKeysRequest, GetKeysResponse, Invite as PbInvite, KeyVersion, InviteList, ListInvitesRequest, ListInvitesResponse,
     ListSnapshotsRequest, ListSnapshotsResponse, LoginOk, LoginRequest, LoginResponse, NotLeader,
     RaftError as PbRaftError, ReadOk, ReadRequest, ReadResponse, RedeemInviteOk,
     RedeemInviteRequest, RedeemInviteResponse, RemoveServerRequest, RemoveSnapshotRequest,
@@ -63,7 +62,7 @@ use crate::pb::raft5::client::{
     commit_transaction_response, config_change_response, create_invite_response,
     create_snapshot_response, create_transaction_response, create_user_response,
     delete_user_response, drop_transaction_response, get_keys_request, get_keys_response,
-    get_version_request, get_version_response, list_invites_response, list_snapshots_response,
+    list_invites_response, list_snapshots_response,
     login_response, raft_error, read_request, read_response, redeem_invite_response,
     remove_snapshot_response, revoke_invite_response, transaction_aborted, write_response,
 };
@@ -88,29 +87,44 @@ use crate::raft::{
     self, AppendError, ClientHandle, ConfigChange, LeaderHandle, MAX_APPEND_ENTRIES_BYTES,
     RaftError, RaftPeerHandle, RoleHandle,
 };
-use crate::storage::{Checkpoint, MAX_LIVE_CHECKPOINTS, Mutation, checkpoint_key};
+use crate::storage::{
+    Checkpoint, Fetch, MAX_LIVE_CHECKPOINTS, MultiRead, Mutation, ReadPoint, ReadRow,
+    checkpoint_key,
+};
 use crate::storage::{RaftLog, StorageError};
 use crate::store::ChunkReader;
 use crate::store::Store;
 use crate::txn::{AbortReason, BufferedKeys, Locks, Refused, TxnId};
 
-/// What storage found, as a `ReadOk`.
+/// What `RaftLog::read_many` found, as the wire carries it.
 ///
 /// A never-written key and a deleted key both read as "no value"
-/// (storage's `get_latest` already collapses the two -- see its doc); seq
-/// 0 is never assigned, since sequencing starts at 1, so it doubles as
-/// the "never written" sentinel here.
-fn read_ok(found: Option<(u64, Vec<u8>)>) -> ReadOk {
-    match found {
-        Some((seq, value)) => ReadOk {
-            seq,
-            value: Some(value),
-        },
-        None => ReadOk {
-            seq: 0,
-            value: None,
-        },
-    }
+/// (storage's `head_as_of` already collapses the two); seq 0 is never
+/// assigned, since sequencing starts at 1, so it doubles as the "never
+/// written" sentinel here.
+///
+/// `buffered` is a transaction's own writes, position for position, laid
+/// over what storage said -- empty outside one. A buffered value takes
+/// the place of the committed one but not its seq: a buffered write has
+/// none until the commit assigns it.
+fn read_ok(
+    as_of: u64,
+    rows: Vec<ReadRow>,
+    buffered: Vec<Option<Option<Vec<u8>>>>,
+) -> ReadOk {
+    let mut buffered = buffered.into_iter();
+    let entries = rows
+        .into_iter()
+        .map(|row| {
+            let (seq, committed) = row.unwrap_or((0, None));
+            let value = match buffered.next().flatten() {
+                Some(mine) => mine,
+                None => committed,
+            };
+            KeyVersion { seq, value }
+        })
+        .collect();
+    ReadOk { as_of, entries }
 }
 
 /// A scan's batch as the wire carries it.
@@ -455,6 +469,20 @@ const MAX_SNAPSHOT_ID_LEN: usize = 128;
 /// has to be excluded here rather than handled there. The set is wider
 /// than a username's only by `:` and `+`, so that an RFC-3339 timestamp
 /// is a legal id, which is what the client defaults to.
+fn require_snapshot_id(id: &[u8]) -> Result<(), Status> {
+    if id.is_empty() {
+        return Err(Status::invalid_argument(
+            "a snapshot id cannot be empty; leave `consistency` unset for a current read",
+        ));
+    }
+    Ok(())
+}
+
+/// A read pointed at a snapshot this node does not have.
+fn no_such_snapshot() -> Status {
+    Status::not_found("no such snapshot; it may have been removed, or not reached this node yet")
+}
+
 fn validate_snapshot_id(id: &[u8]) -> Result<(), Status> {
     if id.is_empty() {
         return Err(Status::invalid_argument("a snapshot id cannot be empty"));
@@ -665,35 +693,93 @@ impl KvService {
         Ok(leader)
     }
 
-    /// A transactional read: take the shared lock, then answer.
+    /// A transactional read of many keys: lock every one, then answer
+    /// them all from one storage snapshot.
     ///
-    /// `require_leader` and `await_caught_up` come *before* the lock: a
-    /// leader still catching up should not be holding keys nobody can
-    /// write while it does it.
-    async fn transactional_read(&self, id: TxnId, key: &[u8]) -> Result<ReadOk, TxnError> {
+    /// Every key is locked before any is read, including any the value
+    /// budget ends up leaving out of the answer -- which is what makes a
+    /// caller's reissue for the rest see exactly what this call would
+    /// have. Nothing it names can change until the transaction ends.
+    ///
+    /// The snapshot is not what makes the keys agree with each other --
+    /// the locks are -- but it costs nothing, and it is what makes
+    /// `as_of` a point every committed value here is true at.
+    async fn transactional_multi_read(
+        &self,
+        id: TxnId,
+        keys: Vec<Vec<u8>>,
+        versions_only: bool,
+    ) -> Result<ReadOk, TxnError> {
         self.transaction_read_quorum(id).await?;
 
-        let buffered = self.locks.read(id, key)?;
+        let buffered = self.locks.read_many(id, &keys, !versions_only)?;
 
-        let key = key.to_vec();
-        let committed = self
-            .store
-            .run(move |log| log.get_latest(&key))
+        // A buffered value is the transaction's to supply, so storage is
+        // spared reading the committed one it would replace -- but it
+        // still counts toward the budget, which is about the response.
+        let fetches = keys
+            .into_iter()
+            .zip(&buffered)
+            .map(|(key, mine)| {
+                let fetch = match (versions_only, mine) {
+                    (true, _) => Fetch::VersionOnly,
+                    (false, Some(value)) => Fetch::Charge(value.as_ref().map_or(0, Vec::len)),
+                    (false, None) => Fetch::Value,
+                };
+                (key, fetch)
+            })
+            .collect();
+        match self.read_store(fetches, ReadPoint::Latest).await {
+            Ok(MultiRead::Ok { as_of, rows }) => Ok(read_ok(as_of, rows, buffered)),
+            // `Latest` names no checkpoint to be missing.
+            Ok(MultiRead::NoSuchCheckpoint) => {
+                Err(TxnError::Internal(Status::internal("a latest read found no checkpoint")))
+            }
+            Err(e) => Err(TxnError::Raft(RaftError::Storage(e))),
+        }
+    }
+
+    /// One key, inside a transaction, value and all -- for the server's
+    /// own read-modify-writes, which read one record at a time.
+    async fn transactional_read(&self, id: TxnId, key: &[u8]) -> Result<KeyVersion, TxnError> {
+        let mut ok = self
+            .transactional_multi_read(id, vec![key.to_vec()], false)
+            .await?;
+        // One key always fits: the budget never leaves out the first.
+        Ok(ok.entries.remove(0))
+    }
+
+    /// `RaftLog::read_many`, on the blocking pool, with the response's
+    /// value budget.
+    async fn read_store(
+        &self,
+        keys: Vec<(Vec<u8>, Fetch)>,
+        point: ReadPoint,
+    ) -> Result<MultiRead, StorageError> {
+        self.store
+            .run(move |log| log.read_many(&keys, point, raft5_shared::MAX_READ_VALUE_BYTES))
             .await
-            .map_err(|e| TxnError::Raft(RaftError::Storage(e)))?;
+    }
 
-        // `seq` always describes committed state, even when the value
-        // doesn't: a buffered write has no sequence number yet, because
-        // nothing has been appended. Reading back one's own buffered
-        // write therefore gives the new value at the old key's seq,
-        // which is the honest answer -- the seq this write will land at
-        // does not exist until the commit assigns one.
-        let seq = committed.as_ref().map_or(0, |(seq, _)| *seq);
-        let value = match buffered {
-            Some(buffered) => buffered,
-            None => committed.map(|(_, value)| value),
+    /// A read of many keys outside a transaction, at `point` -- the
+    /// storage half of every non-transactional mode, whatever the caller
+    /// had to prove first.
+    async fn multi_read(
+        &self,
+        keys: Vec<Vec<u8>>,
+        versions_only: bool,
+        point: ReadPoint,
+    ) -> Result<ReadOk, Status> {
+        let fetch = if versions_only {
+            Fetch::VersionOnly
+        } else {
+            Fetch::Value
         };
-        Ok(ReadOk { seq, value })
+        let keys = keys.into_iter().map(|key| (key, fetch)).collect();
+        match self.read_store(keys, point).await.map_err(storage_err)? {
+            MultiRead::Ok { as_of, rows } => Ok(read_ok(as_of, rows, Vec::new())),
+            MultiRead::NoSuchCheckpoint => Err(no_such_snapshot()),
+        }
     }
 
     /// What a transaction must establish before it may answer a read:
@@ -710,35 +796,6 @@ impl KvService {
             return Err(RaftError::NotLeader { leader_hint: None }.into());
         }
         Ok(())
-    }
-
-    /// A transactional `GetVersion`: take the shared lock, then answer
-    /// from the index.
-    ///
-    /// `read_many` of a single key rather than `read`, which is otherwise
-    /// the obvious call. Both take the lock and record the read; `read`
-    /// additionally clones whatever this transaction has buffered for the
-    /// key, which is megabytes to answer an eight-byte question -- and a
-    /// question about committed state at that, which the buffered value
-    /// could not answer even if it were free. `read_many` also skips a
-    /// key the transaction already holds a write lock on, which is what
-    /// makes asking about one's own buffered write work rather than
-    /// deadlock on the upgrade.
-    async fn transactional_version(&self, id: TxnId, key: &[u8]) -> Result<GetVersionOk, TxnError> {
-        self.transaction_read_quorum(id).await?;
-
-        let keys = [key.to_vec()];
-        self.locks.read_many(id, &keys)?;
-
-        let [key] = keys;
-        let seq = self
-            .store
-            .run(move |log| log.get_version(&key))
-            .await
-            .map_err(|e| TxnError::Raft(RaftError::Storage(e)))?;
-        Ok(GetVersionOk {
-            seq: seq.unwrap_or(0),
-        })
     }
 
     /// One pass of a key scan: up to `limit` keys at or after `start`,
@@ -872,7 +929,7 @@ impl KvService {
             .await
             .map_err(|e| TxnError::Raft(RaftError::Storage(e)))?
             .keys;
-        self.locks.read_many(id, &candidates)?;
+        self.locks.read_many(id, &candidates, false)?;
 
         let batch = self
             .scan(start, u64::MAX, limit, &buffered, filter)
@@ -1002,18 +1059,6 @@ impl KvService {
         Ok(self.linearizable_read(key).await?.map(|(_, value)| value))
     }
 
-    /// The seq alone, linearizably -- `linearizable_read` without the
-    /// read of the value, which is the whole saving.
-    async fn linearizable_version(&self, key: Vec<u8>) -> Result<u64, RaftError> {
-        self.read_quorum().await?;
-        Ok(self
-            .store
-            .run(move |log| log.get_version(&key))
-            .await
-            .map_err(RaftError::Storage)?
-            .unwrap_or(0))
-    }
-
     /// Resolve a snapshot id to the seq it reads at.
     ///
     /// A local read, deliberately: the record's existence on this node
@@ -1021,22 +1066,14 @@ impl KvService {
     /// snapshot could need (see `storage::checkpoint`), so there is
     /// nothing a leader could add.
     async fn checkpoint_seq(&self, id: &[u8]) -> Result<u64, Status> {
-        if id.is_empty() {
-            return Err(Status::invalid_argument(
-                "a snapshot id cannot be empty; leave `consistency` unset for a current read",
-            ));
-        }
+        require_snapshot_id(id)?;
         let owned = id.to_vec();
         let found = self
             .store
             .run(move |log| log.checkpoint_seq(&owned))
             .await
             .map_err(storage_err)?;
-        found.ok_or_else(|| {
-            Status::not_found(
-                "no such snapshot; it may have been removed, or not reached this node yet",
-            )
-        })
+        found.ok_or_else(no_such_snapshot)
     }
 
     /// Create a checkpoint: write its record, once, and report the seq
@@ -1758,16 +1795,29 @@ impl Kv for KvService {
 
     async fn read(&self, request: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {
         let (_, extensions, req) = request.into_parts();
+        // Refused rather than shortened: unlike the value budget, this
+        // is a number the caller chose and could have known.
+        if req.keys.len() > raft5_shared::MAX_KEYS_PER_READ {
+            return Err(Status::resource_exhausted(
+                "that is more keys than this server will read in one call",
+            ));
+        }
+
         // Before the branch, so it covers the transactional read too.
         // Refused rather than answered as absent: a password hash handed
-        // back is one to attack offline, at leisure.
-        reject_reserved(&req.key)?;
+        // back is one to attack offline, at leisure -- and even the seq
+        // of an account record is enough to watch the administration of
+        // a cluster one has no business watching.
+        for key in &req.keys {
+            reject_reserved(key)?;
+        }
 
         // Likewise before the branch: every consistency reads the same
-        // key, and which one was asked for has no bearing on whether
-        // this caller may have it.
+        // keys, and which one was asked for has no bearing on whether
+        // this caller may have them. All or nothing, since a positional
+        // answer cannot leave a key out without saying which.
         if let Err(e) = self
-            .require_access(&extensions, &req.key, Right::Read)
+            .require_access_all(&extensions, &req.keys, Right::Read)
             .await
         {
             return Ok(Response::new(ReadResponse {
@@ -1778,141 +1828,59 @@ impl Kv for KvService {
             }));
         }
 
-        // A transactional read is a different thing again: it takes a
-        // lock, and it can be answered from what the transaction itself
-        // has buffered -- only this transaction's own leader, still
-        // holding a read quorum, will serve one.
-        if let Some(read_request::Consistency::TransactionId(id)) = &req.consistency {
-            let id = txn_id(id)?;
-            let result = self.transactional_read(id, &req.key).await;
-            return Ok(Response::new(ReadResponse {
-                result: Some(match result {
-                    Ok(ok) => read_response::Result::Ok(ok),
-                    Err(e) => read_response::Result::Error(txn_error(e)?),
-                }),
-            }));
-        }
+        let result = match req.consistency {
+            // A transactional read is a different thing again: it takes
+            // locks, and it can be answered from what the transaction
+            // itself has buffered -- only this transaction's own leader,
+            // still holding a read quorum, will serve one.
+            Some(read_request::Consistency::TransactionId(id)) => {
+                let id = txn_id(&id)?;
+                match self
+                    .transactional_multi_read(id, req.keys, req.versions_only)
+                    .await
+                {
+                    Ok(ok) => Ok(ok),
+                    Err(e) => Err(txn_error(e)?),
+                }
+            }
 
-        // Linearizable without a transaction: this node proves it still
-        // leads and still holds a read quorum, and then answers. No lock,
-        // so nothing is held once the answer is given -- the key is free
-        // to change the moment after.
-        if let Some(read_request::Consistency::Linearizable(true)) = req.consistency {
-            return Ok(Response::new(ReadResponse {
-                result: Some(match self.linearizable_read(req.key).await {
-                    Ok(found) => read_response::Result::Ok(read_ok(found)),
-                    Err(e) => read_response::Result::Error(client_err(e)?),
-                }),
-            }));
-        }
+            // Linearizable without a transaction: this node proves it
+            // still leads and still holds a read quorum, and then
+            // answers. No lock, so nothing is held once the answer is
+            // given -- the keys are free to change the moment after.
+            Some(read_request::Consistency::Linearizable(_)) => match self.read_quorum().await {
+                Ok(()) => Ok(self
+                    .multi_read(req.keys, req.versions_only, ReadPoint::Latest)
+                    .await?),
+                Err(e) => Err(client_err(e)?),
+            },
 
-        // A snapshot read. Stale by construction -- it describes a
-        // moment that has already passed -- so any node serves it, with
-        // no leader check and no quorum round.
-        if let Some(read_request::Consistency::SnapshotId(id)) = &req.consistency {
-            let as_of = self.checkpoint_seq(id).await?;
-            let key = req.key;
-            let found = self
-                .store
-                .run(move |log| log.get_as_of(&key, as_of))
-                .await
-                .map_err(storage_err)?;
-            return Ok(Response::new(ReadResponse {
-                result: Some(read_response::Result::Ok(read_ok(found))),
-            }));
-        }
+            // A snapshot read. Stale by construction -- it describes a
+            // moment that has already passed -- so any node serves it,
+            // with no leader check and no quorum round.
+            Some(read_request::Consistency::SnapshotId(id)) => {
+                require_snapshot_id(&id)?;
+                Ok(self
+                    .multi_read(req.keys, req.versions_only, ReadPoint::Checkpoint(id))
+                    .await?)
+            }
 
-        // Everything else: `consistency` unset, or `linearizable: false`,
-        // which says the caller asked for no guarantee rather than failed
-        // to ask. Answered from local state by whoever received it,
-        // leader or not, with no read-quorum round and no wait to catch
-        // up. So it can be behind -- by a write still replicating on the
-        // leader, or by however far this node has fallen behind.
-        let found = self
-            .store
-            .run(move |log| log.get_latest(&req.key))
-            .await
-            .map_err(storage_err)?;
+            // `consistency` unset. Answered from local state by whoever
+            // received it, leader or not, with no read-quorum round and
+            // no wait to catch up. So it can be behind -- by a write
+            // still replicating on the leader, or by however far this
+            // node has fallen behind -- which `as_of` lets the caller
+            // see.
+            None => Ok(self
+                .multi_read(req.keys, req.versions_only, ReadPoint::Latest)
+                .await?),
+        };
 
         Ok(Response::new(ReadResponse {
-            result: Some(read_response::Result::Ok(read_ok(found))),
-        }))
-    }
-
-    async fn get_version(
-        &self,
-        request: Request<GetVersionRequest>,
-    ) -> Result<Response<GetVersionResponse>, Status> {
-        let (_, extensions, req) = request.into_parts();
-        // Before the branch, as in `read`, and for the same reason. The
-        // seq of an account record is still a fact about the reserved
-        // range, and "this key changed at seq N" is enough to watch the
-        // administration of a cluster one has no business watching.
-        reject_reserved(&req.key)?;
-
-        // The same reasoning carries to an ACL: "this key changed at
-        // seq N" is a fact about a key, and one the caller may not read
-        // is one they may not learn that about either.
-        if let Err(e) = self
-            .require_access(&extensions, &req.key, Right::Read)
-            .await
-        {
-            return Ok(Response::new(GetVersionResponse {
-                result: Some(match auth_failure(e)? {
-                    AuthReply::Raft(e) => get_version_response::Result::Error(e),
-                    AuthReply::Auth(e) => get_version_response::Result::AuthError(e),
-                }),
-            }));
-        }
-
-        if let Some(get_version_request::Consistency::TransactionId(id)) = &req.consistency {
-            let id = txn_id(id)?;
-            let result = self.transactional_version(id, &req.key).await;
-            return Ok(Response::new(GetVersionResponse {
-                result: Some(match result {
-                    Ok(ok) => get_version_response::Result::Ok(ok),
-                    Err(e) => get_version_response::Result::Error(txn_error(e)?),
-                }),
-            }));
-        }
-
-        if let Some(get_version_request::Consistency::Linearizable(true)) = req.consistency {
-            return Ok(Response::new(GetVersionResponse {
-                result: Some(match self.linearizable_version(req.key).await {
-                    Ok(seq) => get_version_response::Result::Ok(GetVersionOk { seq }),
-                    Err(e) => get_version_response::Result::Error(client_err(e)?),
-                }),
-            }));
-        }
-
-        if let Some(get_version_request::Consistency::SnapshotId(id)) = &req.consistency {
-            let as_of = self.checkpoint_seq(id).await?;
-            let key = req.key;
-            let seq = self
-                .store
-                .run(move |log| log.version_as_of(&key, as_of))
-                .await
-                .map_err(storage_err)?;
-            return Ok(Response::new(GetVersionResponse {
-                result: Some(get_version_response::Result::Ok(GetVersionOk {
-                    seq: seq.unwrap_or(0),
-                })),
-            }));
-        }
-
-        // Stale, as `read` is stale, and cheap in the way this RPC exists
-        // to be: the seq is part of the row key, so the value behind it
-        // is never read whatever it weighs.
-        let seq = self
-            .store
-            .run(move |log| log.get_version(&req.key))
-            .await
-            .map_err(storage_err)?;
-
-        Ok(Response::new(GetVersionResponse {
-            result: Some(get_version_response::Result::Ok(GetVersionOk {
-                seq: seq.unwrap_or(0),
-            })),
+            result: Some(match result {
+                Ok(ok) => read_response::Result::Ok(ok),
+                Err(e) => read_response::Result::Error(e),
+            }),
         }))
     }
 

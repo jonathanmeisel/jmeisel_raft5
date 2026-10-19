@@ -129,7 +129,10 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use fjall::{Database, Keyspace, KeyspaceCreateOptions, KvSeparationOptions, OwnedWriteBatch};
+use fjall::{
+    Database, Keyspace, KeyspaceCreateOptions, KvSeparationOptions, OwnedWriteBatch, Readable,
+    Snapshot,
+};
 use serde::{Deserialize, Serialize};
 
 mod checkpoint;
@@ -350,6 +353,51 @@ pub struct CappedEntries {
 /// [`RaftLog::scan_as_of`].
 pub type ScanPage = (Vec<Vec<u8>>, Option<Vec<u8>>);
 
+/// Which moment [`RaftLog::read_many`] reads at.
+#[derive(Debug, Clone)]
+pub enum ReadPoint {
+    /// Everything this node has applied.
+    Latest,
+    /// As of the checkpoint with this id.
+    Checkpoint(Vec<u8>),
+}
+
+/// What [`RaftLog::read_many`] should do about one key's value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fetch {
+    /// Resolve it, and count its length against the budget.
+    Value,
+    /// Leave it unread -- under key-value separation, its blob file
+    /// untouched -- and count nothing.
+    VersionOnly,
+    /// Leave it unread, but count this many bytes against the budget:
+    /// the caller has a value of its own to put in this position (a
+    /// transaction's buffered write), and the budget is about the
+    /// response, not about what storage happened to read.
+    Charge(usize),
+}
+
+/// One key as [`RaftLog::read_many`] found it: the seq its value was
+/// written at, and the value if it was fetched -- or `None` for a key
+/// with no value.
+pub type ReadRow = Option<(u64, Option<Vec<u8>>)>;
+
+/// What [`RaftLog::read_many`] found.
+#[derive(Debug)]
+pub enum MultiRead {
+    Ok {
+        /// The seq every row was read as of.
+        as_of: u64,
+        /// One per key, in order -- a prefix of the keys if the budget
+        /// ran out, but never empty when there were keys. `None` is a key
+        /// with no value as of `as_of`; a value is present only for
+        /// `Fetch::Value`.
+        rows: Vec<ReadRow>,
+    },
+    /// There is no checkpoint by that id on this node.
+    NoSuchCheckpoint,
+}
+
 pub struct RaftLog {
     db: Database,
     log: Keyspace,
@@ -561,14 +609,21 @@ impl RaftLog {
     /// separation declining is what keeps a large value's blob file
     /// unread -- so `version_as_of` asks for no value and pays for none,
     /// and nobody ever pays to read a tombstone's (empty) one.
+    ///
+    /// Through `snap` rather than the live keyspace, so that `read_many`
+    /// can answer many keys from one point in time. A single-key caller
+    /// opens a snapshot of its own, which is what the live keyspace would
+    /// have done anyway -- there is one head lookup, not two to keep in
+    /// step.
     fn head_as_of(
         &self,
+        snap: &Snapshot,
         key: &[u8],
         as_of: u64,
         want_value: bool,
     ) -> Result<Option<(u64, Kind, Option<fjall::UserValue>)>> {
         let range = seek_as_of(key, as_of)..chain_end(key);
-        match self.versions.range(range).next() {
+        match snap.range(&self.versions, range).next() {
             Some(guard) => {
                 let (row, value) = guard.into_inner_if(|row| {
                     want_value && matches!(codec::row_kind(row), Ok(Kind::Value))
@@ -587,7 +642,7 @@ impl RaftLog {
     /// Never reflects an appended-but-not-yet-committed write; see
     /// `apply_committed`.
     pub fn get_as_of(&self, key: &[u8], as_of: u64) -> Result<Option<(u64, Vec<u8>)>> {
-        match self.head_as_of(key, as_of, true)? {
+        match self.head_as_of(&self.db.snapshot(), key, as_of, true)? {
             Some((seq, Kind::Value, Some(value))) => Ok(Some((seq, value.to_vec()))),
             // A value row whose value did not come back cannot happen:
             // `head_as_of` was asked for one and the predicate admits
@@ -617,7 +672,7 @@ impl RaftLog {
     /// the seq is part of the row *key*, and `Guard::key` resolves it
     /// without touching the blob file the value may live in.
     pub fn version_as_of(&self, key: &[u8], as_of: u64) -> Result<Option<u64>> {
-        match self.head_as_of(key, as_of, false)? {
+        match self.head_as_of(&self.db.snapshot(), key, as_of, false)? {
             Some((seq, Kind::Value, _)) => Ok(Some(seq)),
             Some((_, Kind::Tombstone, _)) | None => Ok(None),
         }
@@ -626,6 +681,92 @@ impl RaftLog {
     /// The seq `key`'s current committed value was written at.
     pub fn get_version(&self, key: &[u8]) -> Result<Option<u64>> {
         self.version_as_of(key, u64::MAX)
+    }
+
+    /// Many keys, every one as of the same moment, and what that moment
+    /// is.
+    ///
+    /// **One snapshot for all of them.** Reading the keys one
+    /// `get_as_of` at a time would take a fresh point in time per key,
+    /// and an entry that wrote two of them could land in between (see
+    /// the module doc's note on visibility). A `fjall::Snapshot` reads at
+    /// the seqno fjall publishes only once a batch has finished
+    /// inserting, so it can never see part of one -- and an entry is
+    /// never split across batches (`apply_committed`).
+    ///
+    /// The moment is resolved inside the same snapshot as the keys:
+    ///
+    /// - `Latest` reads the applied watermark, which `apply_committed`
+    ///   writes into every batch it flushes, so it names exactly the
+    ///   entries whose rows the snapshot can see. The keys are read at
+    ///   their heads rather than by seeking to the watermark: equivalent,
+    ///   given the above, and immune to the version GC having collected
+    ///   a row the seek would have wanted.
+    /// - `Checkpoint` looks the record up in the snapshot too, so a
+    ///   `RemoveSnapshot` and the collection it permits cannot land
+    ///   between finding the checkpoint and reading through it.
+    ///
+    /// `value_budget` bounds the value bytes handed back, counted in key
+    /// order. A key that would take the total past it is not returned,
+    /// nor is anything after it -- `rows` is then a prefix of `keys` --
+    /// except that the first key always is, so a caller reissuing for
+    /// the rest always makes progress. A value's length is only known
+    /// once it has been resolved, so the one that tips the total over is
+    /// read and dropped; that is at most one value per call.
+    pub fn read_many(
+        &self,
+        keys: &[(Vec<u8>, Fetch)],
+        point: ReadPoint,
+        value_budget: usize,
+    ) -> Result<MultiRead> {
+        let snap = self.db.snapshot();
+        let (as_of, seek) = match point {
+            ReadPoint::Latest => {
+                let applied = match snap.get(&self.meta, META_APPLIED_SEQ)? {
+                    Some(bytes) => from_be_bytes(&bytes)?,
+                    None => 0,
+                };
+                (applied, u64::MAX)
+            }
+            ReadPoint::Checkpoint(id) => {
+                match self.head_as_of(&snap, &checkpoint_key(&id), u64::MAX, false)? {
+                    Some((seq, Kind::Value, _)) => (seq, seq),
+                    Some((_, Kind::Tombstone, _)) | None => {
+                        return Ok(MultiRead::NoSuchCheckpoint);
+                    }
+                }
+            }
+        };
+
+        let mut rows = Vec::with_capacity(keys.len());
+        let mut spent = 0usize;
+        for (key, fetch) in keys {
+            let want_value = matches!(fetch, Fetch::Value);
+            let row = match self.head_as_of(&snap, key, seek, want_value)? {
+                Some((seq, Kind::Value, value)) => {
+                    if want_value && value.is_none() {
+                        // As in `get_as_of`: asked for, and a value row.
+                        return Err(StorageError::Corrupt("a value row resolved to no value"));
+                    }
+                    Some((seq, value.map(|v| v.to_vec())))
+                }
+                Some((_, Kind::Tombstone, _)) | None => None,
+            };
+            let cost = match fetch {
+                Fetch::Value => row
+                    .as_ref()
+                    .and_then(|(_, value)| value.as_ref())
+                    .map_or(0, Vec::len),
+                Fetch::VersionOnly => 0,
+                Fetch::Charge(bytes) => *bytes,
+            };
+            spent = spent.saturating_add(cost);
+            if spent > value_budget && !rows.is_empty() {
+                break;
+            }
+            rows.push(row);
+        }
+        Ok(MultiRead::Ok { as_of, rows })
     }
 
     /// Up to `limit` keys at or after `start` that had a value as of
@@ -815,6 +956,17 @@ impl RaftLog {
             // Deliberately outside the mutation loop: flushing between
             // two mutations of one entry is exactly the tear this is
             // meant to prevent.
+            //
+            // Every batch carries the watermark of the last entry in it,
+            // not only the final one, so that a reader's snapshot always
+            // finds the watermark naming exactly the rows it can see --
+            // which is what lets `read_many` report the moment it read
+            // at. Only here, at a flush, and never per entry: the same
+            // key written twice into one batch shares a seqno, and which
+            // write wins is then not something to rely on.
+            if pending >= WRITE_CHUNK {
+                batch.insert(&self.meta, META_APPLIED_SEQ, be_bytes(seq));
+            }
             self.flush_if_full(&mut batch, &mut pending)?;
         }
 

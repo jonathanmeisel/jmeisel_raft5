@@ -47,17 +47,15 @@ use raft5_shared::raft5::client::{
     CreateInviteRequest, CreateInviteResponse, CreateTransactionResponse, CreateUserRequest,
     CreateUserResponse, DeleteUserRequest,
     DeleteUserResponse, DropTransactionRequest, GetConfigRequest, GetKeysRequest, GetKeysResponse,
-    GetVersionRequest,
-    GetVersionResponse, ListInvitesRequest, ListInvitesResponse, ListSnapshotsRequest,
+    Linearizable, ListInvitesRequest, ListInvitesResponse, ListSnapshotsRequest,
     ListSnapshotsResponse, LoginRequest, LoginResponse, RedeemInviteRequest, RedeemInviteResponse,
     RevokeInviteRequest, RevokeInviteResponse,
-    RaftError as PbRaftError, ReadRequest, ReadResponse, RemoveServerRequest,
+    RaftError as PbRaftError, ReadOk, ReadRequest, ReadResponse, RemoveServerRequest,
     RemoveSnapshotRequest, RemoveSnapshotResponse, SetHeartbeatRequest, WriteRequest,
     WriteResponse, auth_error,
     commit_transaction_response, config_change_response, create_snapshot_response,
     create_invite_response, create_transaction_response, create_user_response,
-    delete_user_response, get_keys_request, get_keys_response, get_version_request,
-    get_version_response, list_invites_response, list_snapshots_response, login_response,
+    delete_user_response, get_keys_request, get_keys_response, list_invites_response, list_snapshots_response, login_response,
     raft_error, read_request, read_response, redeem_invite_response, remove_snapshot_response,
     revoke_invite_response, transaction_aborted, write_response,
 };
@@ -519,13 +517,130 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// What a key currently holds. `seq` is the sequence number the value
-/// was written at; a key that has never been written (or has been
-/// deleted) reads as `None` at seq 0, since sequencing starts at 1.
+/// Which moment a read outside a transaction describes, and what was
+/// proved about it. A read inside one is [`Transaction::read`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Consistency<'a> {
+    /// From whichever node the client is currently talking to, without
+    /// checking that it still leads. Cheap -- one round trip and no
+    /// read-quorum round -- at the price of possibly missing recent
+    /// writes, including ones this client itself just made. [`Read::as_of`]
+    /// says how far behind: anything below the seq a commit of yours
+    /// returned means this node has not applied it yet.
+    Stale,
+    /// As of the moment the call is answered, reflecting everything
+    /// committed anywhere in the cluster. The node answering proves it
+    /// still leads and still holds a quorum of leases first, which costs
+    /// a round of lease checks that [`Consistency::Stale`] does not.
+    ///
+    /// Nothing is locked, so the answer describes an instant that has
+    /// already passed: the keys may change immediately after. That is
+    /// the difference from reading inside a [`Transaction`], which holds
+    /// them against conflicting writes until it ends.
+    Linearizable,
+    /// As the keys were when the snapshot with this id was created --
+    /// whatever has happened to them since, including being deleted.
+    ///
+    /// Stale in the same sense [`Consistency::Stale`] is, and
+    /// deliberately so: it describes a moment that has already passed, so
+    /// any node can serve it without proving it still leads. What it
+    /// *does* guarantee is stability: the same read against the same
+    /// snapshot gives the same answer for as long as that snapshot exists.
+    Snapshot(&'a [u8]),
+}
+
+impl Consistency<'_> {
+    fn to_pb(self) -> Option<read_request::Consistency> {
+        match self {
+            Consistency::Stale => None,
+            Consistency::Linearizable => {
+                Some(read_request::Consistency::Linearizable(Linearizable {}))
+            }
+            Consistency::Snapshot(id) => Some(read_request::Consistency::SnapshotId(id.to_vec())),
+        }
+    }
+}
+
+/// What a read found: one entry per key, in the order they were asked
+/// for, every one of them as of the same moment.
+///
+/// **Possibly fewer entries than keys.** Once the values in one response
+/// would pass [`raft5_shared::MAX_READ_VALUE_BYTES`] the cluster stops,
+/// and `entries` answers a prefix of the keys -- never an empty one, so
+/// reissuing for `&keys[entries.len()..]` always makes progress. A
+/// versions-only read is never cut short.
+///
+/// The reissue is a read of its own, with an `as_of` of its own. In a
+/// [`Transaction`] or at a [`Consistency::Snapshot`] that changes nothing
+/// -- the keys are locked, or the moment is fixed -- but a stale or
+/// linearizable reissue describes a later moment than the first half
+/// did, and comparing the two `as_of`s says whether anything was applied
+/// in between. That is why this library never reissues on your behalf:
+/// stitching the halves together would claim one moment for two.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReadResult {
+pub struct Read<T> {
+    /// The sequence number every entry describes the store as of.
+    ///
+    /// In a transaction: committed state as of this point, with the
+    /// transaction's own buffered writes laid over it.
+    pub as_of: u64,
+    pub entries: Vec<T>,
+}
+
+/// One key's value. `seq` is the sequence number the value was written
+/// at; a key that has never been written (or has been deleted) reads as
+/// `None` at seq 0, since sequencing starts at 1.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Entry {
+    pub key: Vec<u8>,
     pub seq: u64,
     pub value: Option<Vec<u8>>,
+}
+
+/// One key's version alone: the seq its value was written at, or 0 if it
+/// has no value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Version {
+    pub key: Vec<u8>,
+    pub seq: u64,
+}
+
+impl<T> Read<T> {
+    /// Whether every key asked for was answered -- false when the value
+    /// budget cut the response short. `asked` is how many keys the read
+    /// named.
+    pub fn is_complete(&self, asked: usize) -> bool {
+        self.entries.len() == asked
+    }
+}
+
+fn entries(keys: Vec<Vec<u8>>, ok: ReadOk) -> Read<Entry> {
+    Read {
+        as_of: ok.as_of,
+        entries: keys
+            .into_iter()
+            .zip(ok.entries)
+            .map(|(key, found)| Entry {
+                key,
+                seq: found.seq,
+                value: found.value,
+            })
+            .collect(),
+    }
+}
+
+fn versions(keys: Vec<Vec<u8>>, ok: ReadOk) -> Read<Version> {
+    Read {
+        as_of: ok.as_of,
+        entries: keys
+            .into_iter()
+            .zip(ok.entries)
+            .map(|(key, found)| Version {
+                key,
+                seq: found.seq,
+            })
+            .collect(),
+    }
 }
 
 /// A point-in-time view of the store, pinned until it is removed.
@@ -812,12 +927,11 @@ impl Client {
     /// # async fn f(client: raft5_client::Client) -> Result<(), raft5_client::Error> {
     /// # use std::time::Duration;
     /// let txn = client.transaction(Duration::from_secs(1)).await?;
-    /// let alice = txn.read(b"alice").await?;
-    /// let bob = txn.read(b"bob").await?;
+    /// let balances = txn.read(&["alice", "bob"]).await?;
     /// txn.write(b"alice", Some(b"9")).await?;
     /// txn.write(b"bob", Some(b"11")).await?;
     /// txn.commit().await?;
-    /// # let _ = (alice, bob);
+    /// # let _ = balances;
     /// # Ok(()) }
     /// ```
     ///
@@ -842,98 +956,42 @@ impl Client {
         })
     }
 
-    /// Reads `key` from whichever node the client is currently talking
-    /// to, without checking that it still leads. Cheap -- one round trip
-    /// and no read-quorum round -- at the price of possibly missing
-    /// recent writes, including ones this client itself just made.
+    /// Reads `keys`, every one as of the same moment, at `consistency`.
     ///
-    /// For a read that is guaranteed current, use
-    /// [`read_linearizable`], or open a [`transaction`] and read inside
-    /// it if the key must also *stay* as it was read.
+    /// Duplicates are fine and are answered at each position. At most
+    /// [`raft5_shared::MAX_KEYS_PER_READ`] keys; more is refused before
+    /// anything is sent. The whole read is refused if any one key is one
+    /// this account may not read.
     ///
-    /// [`read_linearizable`]: Client::read_linearizable
-    /// [`transaction`]: Client::transaction
-    pub async fn read(&self, key: &[u8]) -> Result<ReadResult, Error> {
-        self.read_inner(key, None).await
+    /// The answer may cover only a prefix of `keys` -- see [`Read`] for
+    /// when, and why a reissue is left to you. For a read whose keys must
+    /// also *stay* as read, use [`Transaction::read`].
+    pub async fn read(
+        &self,
+        keys: &[impl AsRef<[u8]>],
+        consistency: Consistency<'_>,
+    ) -> Result<Read<Entry>, Error> {
+        let (keys, ok) = self.read_inner(keys, false, consistency.to_pb()).await?;
+        Ok(entries(keys, ok))
     }
 
-    /// Reads `key` as of the moment the call is answered, reflecting
-    /// everything committed anywhere in the cluster. The node answering
-    /// proves it still leads and still holds a quorum of leases first,
-    /// which costs a round of lease checks that [`read`] does not.
+    /// [`read`], for the sequence numbers alone -- 0 for a key with no
+    /// value.
     ///
-    /// Nothing is locked, so the answer describes an instant that has
-    /// already passed: the key may change immediately after. That is the
-    /// difference from reading inside a [`transaction`], which holds the
-    /// key against conflicting writes until the transaction ends.
+    /// Answered from an index of seqs without reading any value, so it
+    /// costs the same whatever the values weigh, and is never cut short.
+    /// This is the call for "has this changed since I last looked?";
+    /// [`read`] can answer that only by sending the whole value back for
+    /// you to discard.
     ///
     /// [`read`]: Client::read
-    /// [`transaction`]: Client::transaction
-    pub async fn read_linearizable(&self, key: &[u8]) -> Result<ReadResult, Error> {
-        self.read_inner(key, Some(read_request::Consistency::Linearizable(true)))
-            .await
-    }
-
-    /// The sequence number `key`'s current value was written at, without
-    /// fetching the value -- 0 if it has no current value.
-    ///
-    /// Answered from an index of seqs alone, so it costs the same
-    /// whatever the value weighs. This is the call for "has this changed
-    /// since I last looked?"; [`read`] can answer that only by sending
-    /// the whole value back for you to discard.
-    ///
-    /// Stale on exactly the terms [`read`] is stale. See
-    /// [`get_version_linearizable`] and [`Transaction::get_version`].
-    ///
-    /// [`read`]: Client::read
-    /// [`get_version_linearizable`]: Client::get_version_linearizable
-    pub async fn get_version(&self, key: &[u8]) -> Result<u64, Error> {
-        self.get_version_inner(key, None).await
-    }
-
-    /// [`get_version`], as of the moment the call is answered, on the
-    /// same terms (and at the same cost) as [`read_linearizable`].
-    ///
-    /// [`get_version`]: Client::get_version
-    /// [`read_linearizable`]: Client::read_linearizable
-    pub async fn get_version_linearizable(&self, key: &[u8]) -> Result<u64, Error> {
-        self.get_version_inner(
-            key,
-            Some(get_version_request::Consistency::Linearizable(true)),
-        )
-        .await
-    }
-
-    /// Reads `key` as it was when snapshot `snapshot_id` was created --
-    /// whatever has happened to it since, including being deleted.
-    ///
-    /// Stale in the same sense [`read`] is, and deliberately so: it
-    /// describes a moment that has already passed, so any node can
-    /// serve it without proving it still leads. What it *does*
-    /// guarantee is stability: the same call against the same snapshot
-    /// gives the same answer for as long as that snapshot exists.
-    ///
-    /// [`read`]: Client::read
-    pub async fn read_at(&self, snapshot_id: &[u8], key: &[u8]) -> Result<ReadResult, Error> {
-        self.read_inner(
-            key,
-            Some(read_request::Consistency::SnapshotId(snapshot_id.to_vec())),
-        )
-        .await
-    }
-
-    /// [`get_version`] as of a snapshot. See [`read_at`].
-    ///
-    /// [`get_version`]: Client::get_version
-    /// [`read_at`]: Client::read_at
-    pub async fn get_version_at(&self, snapshot_id: &[u8], key: &[u8]) -> Result<u64, Error> {
-        self.get_version_inner(
-            key,
-            Some(get_version_request::Consistency::SnapshotId(
-                snapshot_id.to_vec(),
-            )),
-        )
-        .await
+    pub async fn read_versions(
+        &self,
+        keys: &[impl AsRef<[u8]>],
+        consistency: Consistency<'_>,
+    ) -> Result<Read<Version>, Error> {
+        let (keys, ok) = self.read_inner(keys, true, consistency.to_pb()).await?;
+        Ok(versions(keys, ok))
     }
 
     /// Walks the keys that had a value when `snapshot_id` was created --
@@ -948,9 +1006,9 @@ impl Client {
         )
     }
 
-    /// Pins the current sequence number as a snapshot, so that
-    /// [`read_at`] and friends can later see the store exactly as it is
-    /// now.
+    /// Pins the current sequence number as a snapshot, so that reads at
+    /// [`Consistency::Snapshot`] and [`key_iterator_at`] can later see
+    /// the store exactly as it is now.
     ///
     /// `id` must be unique; creating one that already exists is refused
     /// rather than moving the existing snapshot forward. Passing `None`
@@ -964,7 +1022,7 @@ impl Client {
     /// Administrators only: until it is removed, a snapshot holds every
     /// version of every key that has changed since it was taken.
     ///
-    /// [`read_at`]: Client::read_at
+    /// [`key_iterator_at`]: Client::key_iterator_at
     /// [`create_snapshot`]: Client::create_snapshot
     pub async fn create_snapshot(&self, id: Option<&[u8]>) -> Result<SnapshotInfo, Error> {
         let now = unix_millis();
@@ -1079,36 +1137,44 @@ impl Client {
         .await
     }
 
+    /// The one `Read` call underneath every read method, handing back the
+    /// keys it was asked about alongside the answer so the caller can
+    /// pair them up.
+    ///
+    /// Checks the answer's shape: it may cover fewer keys than were
+    /// asked about, but never more, and never none of a non-empty list
+    /// -- the cluster always answers at least the first key.
     async fn read_inner(
         &self,
-        key: &[u8],
+        keys: &[impl AsRef<[u8]>],
+        versions_only: bool,
         consistency: Option<read_request::Consistency>,
-    ) -> Result<ReadResult, Error> {
+    ) -> Result<(Vec<Vec<u8>>, ReadOk), Error> {
+        if keys.len() > raft5_shared::MAX_KEYS_PER_READ {
+            return Err(Error::InvalidArgument(
+                "that is more keys than one read may name",
+            ));
+        }
         let request = ReadRequest {
-            key: key.to_vec(),
+            keys: keys.iter().map(|key| key.as_ref().to_vec()).collect(),
+            versions_only,
             consistency,
         };
-        self.call(|mut kv: Kv| {
-            let request = request.clone();
-            async move { kv.read(request).await.map(read_reply) }
-        })
-        .await
-    }
-
-    async fn get_version_inner(
-        &self,
-        key: &[u8],
-        consistency: Option<get_version_request::Consistency>,
-    ) -> Result<u64, Error> {
-        let request = GetVersionRequest {
-            key: key.to_vec(),
-            consistency,
-        };
-        self.call(|mut kv: Kv| {
-            let request = request.clone();
-            async move { kv.get_version(request).await.map(get_version_reply) }
-        })
-        .await
+        let ok = self
+            .call(|mut kv: Kv| {
+                let request = request.clone();
+                async move { kv.read(request).await.map(read_reply) }
+            })
+            .await?;
+        if ok.entries.len() > request.keys.len() || (ok.entries.is_empty() && !request.keys.is_empty())
+        {
+            return Err(Error::Unavailable(format!(
+                "malformed read response: {} entries for {} keys",
+                ok.entries.len(),
+                request.keys.len()
+            )));
+        }
+        Ok((request.keys, ok))
     }
 
     /// Adds a server to the cluster, at the address its *peer* API is
@@ -1896,12 +1962,9 @@ fn get_keys_reply(resp: tonic::Response<GetKeysResponse>) -> Reply<KeyBatch> {
     }
 }
 
-fn read_reply(resp: tonic::Response<ReadResponse>) -> Reply<ReadResult> {
+fn read_reply(resp: tonic::Response<ReadResponse>) -> Reply<ReadOk> {
     match resp.into_inner().result {
-        Some(read_response::Result::Ok(ok)) => Reply::Ok(ReadResult {
-            seq: ok.seq,
-            value: ok.value,
-        }),
+        Some(read_response::Result::Ok(ok)) => Reply::Ok(ok),
         Some(read_response::Result::Error(e)) => Reply::from_error(e),
         Some(read_response::Result::AuthError(e)) => denied(e),
         None => empty_response(),
@@ -1959,15 +2022,6 @@ fn unix_millis() -> u64 {
 /// character set accepts and that sorts chronologically.
 fn timestamp_id(unix_ms: u64) -> String {
     format!("t{unix_ms}")
-}
-
-fn get_version_reply(resp: tonic::Response<GetVersionResponse>) -> Reply<u64> {
-    match resp.into_inner().result {
-        Some(get_version_response::Result::Ok(ok)) => Reply::Ok(ok.seq),
-        Some(get_version_response::Result::Error(e)) => Reply::from_error(e),
-        Some(get_version_response::Result::AuthError(e)) => denied(e),
-        None => empty_response(),
-    }
 }
 
 fn create_transaction_reply(resp: tonic::Response<CreateTransactionResponse>) -> Reply<Vec<u8>> {
@@ -2225,44 +2279,48 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 impl Transaction {
-    /// Reads `key` as part of this transaction, holding it against
-    /// conflicting writes until the transaction finishes.
+    /// Reads `keys` as part of this transaction, holding every one of
+    /// them against conflicting writes until the transaction finishes.
     ///
     /// A key this transaction has already buffered a write for reads
     /// back as that write -- a transaction sees its own changes. `seq`
     /// always describes *committed* state even then, since a buffered
     /// write has no sequence number yet.
-    pub async fn read(&self, key: &[u8]) -> Result<ReadResult, Error> {
-        self.client
-            .read_inner(
-                key,
-                Some(read_request::Consistency::TransactionId(self.id.clone())),
-            )
-            .await
+    ///
+    /// Every key is locked before any is read, including any the answer
+    /// leaves out when it is cut short (see [`Read`]) -- so reissuing for
+    /// the rest sees exactly the state this call would have.
+    pub async fn read(&self, keys: &[impl AsRef<[u8]>]) -> Result<Read<Entry>, Error> {
+        let (keys, ok) = self
+            .client
+            .read_inner(keys, false, self.consistency())
+            .await?;
+        Ok(entries(keys, ok))
     }
 
-    /// The sequence number `key`'s current value was written at, without
-    /// fetching the value -- 0 if it has no current value.
+    /// The sequence numbers `keys`' values were written at, without
+    /// fetching the values -- 0 for a key with no value.
     ///
-    /// Holds `key` against conflicting writes for the rest of the
+    /// Holds the keys against conflicting writes for the rest of the
     /// transaction exactly as [`read`] does, so this is the cheap half of
-    /// a check-then-write: take the version, decide, write, commit, and
-    /// the commit fails if anyone else touched the key in between.
+    /// a check-then-write: take the versions, decide, write, commit, and
+    /// nobody else can have touched the keys in between.
     ///
     /// The answer describes *committed* state even for a key this
     /// transaction has itself buffered a write for -- a buffered write
     /// has no sequence number until the commit assigns one.
     ///
     /// [`read`]: Transaction::read
-    pub async fn get_version(&self, key: &[u8]) -> Result<u64, Error> {
-        self.client
-            .get_version_inner(
-                key,
-                Some(get_version_request::Consistency::TransactionId(
-                    self.id.clone(),
-                )),
-            )
-            .await
+    pub async fn read_versions(&self, keys: &[impl AsRef<[u8]>]) -> Result<Read<Version>, Error> {
+        let (keys, ok) = self
+            .client
+            .read_inner(keys, true, self.consistency())
+            .await?;
+        Ok(versions(keys, ok))
+    }
+
+    fn consistency(&self) -> Option<read_request::Consistency> {
+        Some(read_request::Consistency::TransactionId(self.id.clone()))
     }
 
     /// Walks every key that currently has a value, in order, from

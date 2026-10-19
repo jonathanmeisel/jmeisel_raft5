@@ -17,30 +17,27 @@ service Kv {
   // the whole protocol rather than a special case of it.
   rpc Write(WriteRequest) returns (WriteResponse);
 
-  // Read the current value for a key, at whichever of the three
-  // consistencies `ReadRequest.consistency` asks for -- stale by
-  // default, linearizable on request, or as part of a transaction.
-  rpc Read(ReadRequest) returns (ReadResponse);
-
-  // The sequence number the key's current value was written at, and
-  // nothing else. Takes the same `consistency` choice Read does, and
-  // means the same thing by it.
+  // Read any number of keys, every one of them as of the same moment,
+  // at whichever consistency `ReadRequest.consistency` asks for -- stale
+  // by default, linearizable on request, as part of a transaction, or as
+  // of a snapshot.
   //
-  // Answered without ever reading the value, so what it costs does not
-  // depend on how large the value is. That is the entire point of it:
-  // Read can answer "has this changed since I last looked?" only by
+  // `versions_only` asks for the sequence numbers alone, answered
+  // without ever reading a value, so what it costs does not depend on
+  // how large the values are. That is the cheap way to ask "has this
+  // changed since I last looked?": a full read can answer it only by
   // sending back the whole value for the caller to discard, which for a
   // large one is megabytes over the wire to learn eight bytes.
-  rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
+  rpc Read(ReadRequest) returns (ReadResponse);
 
   // Walk the keys that currently have a value, in order, starting at
-  // `start_key`. Consistency follows Read: inside a transaction every
+  // `start_key`. Consistency follows Read's: inside a transaction every
   // key handed back is read-locked, at a snapshot it is the key set as
   // of that snapshot, and otherwise it is a possibly-stale local read.
   rpc GetKeys(GetKeysRequest) returns (GetKeysResponse);
 
-  // Pin the current sequence number under `snapshot_id`, so that Read,
-  // GetKeys and GetVersion can later be pointed at it and see the store
+  // Pin the current sequence number under `snapshot_id`, so that Read
+  // and GetKeys can later be pointed at it and see the store
   // exactly as it was at this moment -- however much it changes
   // afterwards.
   //
@@ -360,23 +357,40 @@ message WriteResponse {
 }
 
 message ReadRequest {
-  reserved 2; // a bare `linearizable` bool, before `consistency` held it
-  bytes key = 1;
-
-  // What the caller wants guaranteed. Leaving the whole field unset is a
-  // possibly-stale read, answered from local state by whichever node
-  // received it, with no check that it still leads -- the cheapest thing
-  // this service does, and the default because most reads can take it.
+  // What to read. Answered positionally -- `ReadOk.entries[i]` is about
+  // `keys[i]` -- so a key may appear more than once and is answered at
+  // each position it appears in. At most `MAX_KEYS_PER_READ` (1024);
+  // more is refused rather than shortened, since it is a number the
+  // caller chose.
   //
-  // Field 3 was `optional bytes transaction_id` before this oneof
-  // existed. A proto3 `optional` is already a synthetic oneof, so the
-  // encoding did not change and a transactional read written against
-  // either version is the same bytes on the wire.
+  // The whole call is refused if any one key is reserved, or is one an
+  // ACL denies this caller `read` on. There is no partial answer to give
+  // in that case: a positional response cannot leave a key out without
+  // saying which, and saying which is the refusal.
+  repeated bytes keys = 1;
+
+  // The sequence numbers alone. No value is read -- not merely left out
+  // of the response, but never resolved from storage -- so this costs
+  // the same whatever the values weigh, and is never cut short.
+  bool versions_only = 2;
+
+  // What the caller wants guaranteed. Every mode reads all of `keys` as
+  // of one moment, `ReadOk.as_of`; they differ in what that moment is and
+  // in what happens afterwards.
+  //
+  // Leaving the whole field unset is a possibly-stale read, answered
+  // from local state by whichever node received it, with no check that
+  // it still leads -- the cheapest thing this service does, and the
+  // default because most reads can take it.
   oneof consistency {
-    // Read as part of this transaction: the key joins its read set and
+    // Read as part of this transaction: every key joins its read set and
     // is held against conflicting writes until it finishes, and a key it
     // has already buffered a write for reads back as that write. Only
     // the transaction's own leader will serve one.
+    //
+    // Every key named is locked before any is read -- including any a
+    // shortened response leaves out -- so a reissue for the rest sees
+    // exactly what this call would have.
     bytes transaction_id = 3;
 
     // Linearizable, without a transaction and without a lock. The node
@@ -384,15 +398,12 @@ message ReadRequest {
     // the answer reflects everything committed anywhere in the cluster
     // as of the moment it was given -- but nothing is held afterwards,
     // so it may be stale by the time the caller acts on it. A caller
-    // that needs the key to *stay* that way wants a transaction.
-    //
-    // `false` is explicitly the same as leaving `consistency` unset: a
-    // present field saying no guarantee was asked for.
-    bool linearizable = 4;
+    // that needs the keys to *stay* that way wants a transaction.
+    Linearizable linearizable = 4;
 
-    // Read as of the snapshot with this id: the value the key held at
-    // the sequence number that snapshot was created at, whatever has
-    // happened to it since -- including being deleted.
+    // Read as of the snapshot with this id: what the keys held at the
+    // sequence number that snapshot was created at, whatever has
+    // happened to them since -- including being deleted.
     //
     // Stale in the same sense an unset `consistency` is, and for a
     // stronger reason: it deliberately describes a moment that has
@@ -405,55 +416,76 @@ message ReadRequest {
   }
 }
 
+// A marker: a message rather than a bool so that "linearizable: false"
+// -- a present field asking for no guarantee -- is not something a
+// request can say.
+message Linearizable {}
+
 message ReadResponse {
   oneof result {
     ReadOk ok = 1;
     RaftError error = 2;
-    // An ACL governs this key and does not grant the caller `read`.
-    // Refused rather than answered as absent, for the reason a reserved
-    // key is: "there is nothing here" is itself something to learn.
+    // An ACL governs one of the keys and does not grant the caller
+    // `read`; `detail` says which, by position. Refused rather than
+    // answered as absent, for the reason a reserved key is: "there is
+    // nothing here" is itself something to learn -- and so is "this key
+    // changed at seq N", which is why `versions_only` is refused too.
     AuthError auth_error = 3;
   }
 }
 
 message ReadOk {
-  uint64 seq = 1;
-  optional bytes value = 2; // unset = key doesn't currently exist
-}
-
-message GetVersionRequest {
-  bytes key = 1;
-  // Exactly as in ReadRequest, including what an unset field means. A
-  // key the transaction has already buffered a write for still answers
-  // with the *committed* seq: a buffered write has no sequence number
-  // until the commit assigns one, so there is no other honest answer.
-  oneof consistency {
-    bytes transaction_id = 2;
-    bool linearizable = 3;
-    bytes snapshot_id = 4;
-  }
-}
-
-message GetVersionResponse {
-  oneof result {
-    GetVersionOk ok = 1;
-    RaftError error = 2;
-    // As ReadResponse's, and for the same reason: "this key changed at
-    // seq N" is a fact about a key the caller may not read.
-    AuthError auth_error = 3;
-  }
-}
-
-message GetVersionOk {
-  // The seq the key's current value was written at, or 0 if it has no
-  // current value -- never written, or deleted, which are the same thing
-  // here as they are to Read. Sequencing starts at 1, so 0 is free to
-  // mean that.
+  // The sequence number every entry was read as of: each one is what
+  // its key held once every entry up to and including `as_of` had been
+  // applied, and nothing after.
   //
-  // Deliberately the only field. An `exists` bool would carry nothing
-  // `seq` does not already say, and a value size would have to be exact
-  // to be worth having.
+  // Unset or linearizable, that is the point this node had applied to
+  // when it answered. A stale reader can compare it with the seq its
+  // own last commit returned: anything lower means this node has not
+  // caught up with that write yet, and asking elsewhere (or again) gets
+  // read-your-writes without paying for a linearizable read.
+  //
+  // At a snapshot, it is the snapshot's seq.
+  //
+  // In a transaction it is committed state as of this point, with the
+  // transaction's own buffered writes laid over it -- the keys are all
+  // locked, so it stays true until the transaction ends.
+  uint64 as_of = 1;
+
+  // One per key, in the order `keys` named them.
+  //
+  // Possibly fewer: once the values in a response would pass
+  // `MAX_READ_VALUE_BYTES` (10 MiB) it stops, and `entries` is a prefix
+  // of `keys`. The caller reissues for `keys[entries.len()..]`. There is
+  // always at least one entry -- no value that could have been written
+  // is larger than the budget -- so every call makes progress.
+  //
+  // A reissue is a new read with an `as_of` of its own. In a transaction
+  // and at a snapshot that makes no difference: the keys are locked, or
+  // the moment is fixed, so both halves describe the same state. Unset
+  // or linearizable it does -- the two halves are two moments, and
+  // comparing their `as_of`s says whether anything was applied between
+  // them.
+  //
+  // No `has_more` field: a positional prefix already says exactly which
+  // keys are missing, which a key scan's batch length cannot.
+  repeated KeyVersion entries = 2;
+}
+
+message KeyVersion {
+  // The seq the key's value was written at, or 0 if it had no value --
+  // never written, or deleted, which are the same thing here. Sequencing
+  // starts at 1, so 0 is free to mean that.
+  //
+  // Always committed state. A key a transaction has buffered a write for
+  // reads back with the value it buffered and the seq of the value it is
+  // replacing: a buffered write has no sequence number until the commit
+  // assigns one, so there is no other honest answer.
   uint64 seq = 1;
+
+  // Unset when the key has no value, and always unset for a
+  // `versions_only` read.
+  optional bytes value = 2;
 }
 
 message GetKeysRequest {

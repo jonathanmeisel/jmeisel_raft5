@@ -341,6 +341,21 @@ impl KvService {
         key: &[u8],
         wanted: Right,
     ) -> Result<(), AuthFailure> {
+        self.require_access_all(extensions, &[key], wanted).await
+    }
+
+    /// `require_access` for every one of `keys`, refusing if any is
+    /// refused and naming the first such by its position.
+    ///
+    /// The permission picture is loaded once and the caller resolved
+    /// once, however many keys there are, and the admin check -- a store
+    /// read -- is made at most once, and only if some key needs it.
+    pub(super) async fn require_access_all(
+        &self,
+        extensions: &tonic::Extensions,
+        keys: &[impl AsRef<[u8]>],
+        wanted: Right,
+    ) -> Result<(), AuthFailure> {
         if self.auth.is_none() {
             return Ok(());
         }
@@ -351,15 +366,20 @@ impl KvService {
             return Ok(());
         }
         let who = caller(extensions)?;
-        if perms.decide(&who, key).permits(wanted) {
+        let Some(denied) = keys
+            .iter()
+            .position(|key| !perms.decide(&who, key.as_ref()).permits(wanted))
+        else {
             return Ok(());
-        }
+        };
         if self.is_admin_locally(&who).await? {
             return Ok(());
         }
-        Err(not_permitted(format!(
-            "this account may not {wanted} that key"
-        )))
+        Err(not_permitted(if keys.len() == 1 {
+            format!("this account may not {wanted} that key")
+        } else {
+            format!("this account may not {wanted} keys[{denied}]")
+        }))
     }
 
     /// What a scan should hide, or `None` when it should hide nothing.

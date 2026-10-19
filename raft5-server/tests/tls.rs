@@ -308,7 +308,8 @@ async fn mtls_does_not_stand_in_for_a_token() {
         .as_ref()
         .clone()
         .read(ReadRequest {
-            key: b"k".to_vec(),
+            keys: vec![b"k".to_vec()],
+            versions_only: false,
             consistency: None,
         })
         .await

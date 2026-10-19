@@ -26,3 +26,22 @@ pub const MAX_TRANSACTION_BYTES: usize = 10 * 1024 * 1024;
 /// payload limit says is fine. tonic's 4 MiB default would refuse it in
 /// the transport, where the transaction limit has no way to explain itself.
 pub const MAX_KV_MESSAGE_BYTES: usize = MAX_TRANSACTION_BYTES + 1024 * 1024;
+
+/// The most keys one `Read` may name. Refused past this rather than
+/// shortened: it is a number the caller chose, and knows in advance.
+///
+/// Inside a transaction it is also a cap on how many read locks one call
+/// can take, which is the reason it isn't larger -- every key a
+/// transactional read names is held until that transaction ends, the
+/// same argument the server's cap on a key scan makes.
+pub const MAX_KEYS_PER_READ: usize = 1024;
+
+/// How many value bytes one `Read` response will carry before it is cut
+/// short, handing back a prefix of the keys asked for.
+///
+/// Equal to `MAX_TRANSACTION_BYTES` on purpose: no value that could have
+/// been written is larger, so the first key always fits on its own and
+/// every call makes progress. What `MAX_KV_MESSAGE_BYTES` allows beyond
+/// this covers the framing of `MAX_KEYS_PER_READ` entries many times
+/// over.
+pub const MAX_READ_VALUE_BYTES: usize = MAX_TRANSACTION_BYTES;
