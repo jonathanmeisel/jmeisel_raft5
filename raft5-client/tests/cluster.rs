@@ -297,6 +297,43 @@ async fn the_heartbeat_is_set_at_bootstrap_and_changeable_while_running() {
     assert_eq!(client.heartbeat_ms().await.unwrap(), 250);
 }
 
+/// `members` lists every server, says which leads, and shows one added
+/// with `add_server` becoming a voter once it has caught up.
+#[tokio::test]
+async fn members_shows_new_servers_and_their_promotion() {
+    let n1 = TestNode::start("n1");
+    let n2 = TestNode::start("n2");
+
+    let client = Client::new([n1.url(), n2.url()]).unwrap();
+    bootstrap(&client, "n1").await;
+    let alone = client.members().await.unwrap();
+    assert_eq!(alone.leader.as_deref(), Some("n1"));
+    assert_eq!(alone.members.len(), 1);
+    assert!(alone.members[0].voting);
+    assert_eq!(alone.members[0].client_address, n1.url());
+
+    client.write(b"k", Some(b"v")).await.unwrap();
+    client.add_server(&n2.peer_url()).await.unwrap();
+    // Promotion is the leader's own follow-up to the add, so it may not
+    // have happened yet when `add_server` returns.
+    let until = Instant::now() + BOOTSTRAP_TIMEOUT;
+    let joined = loop {
+        let membership = client.members().await.unwrap();
+        let n2_member = membership.members.iter().find(|m| m.server_id == "n2");
+        let n2_member = n2_member.expect("n2 is a member as soon as add_server returns");
+        if n2_member.voting {
+            break membership;
+        }
+        assert!(Instant::now() < until, "n2 was never promoted");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(joined.members.len(), 2);
+    assert!(joined.members.iter().all(|m| m.voting));
+    let n2_member = joined.members.iter().find(|m| m.server_id == "n2").unwrap();
+    assert_eq!(n2_member.peer_address, n2.peer_url());
+    assert_eq!(n2_member.client_address, n2.url());
+}
+
 /// The read-modify-write the store cannot do on its own. A transaction
 /// reads the counter, writes one more than that, and commits; nobody
 /// else can write the key between the read and the commit, so no

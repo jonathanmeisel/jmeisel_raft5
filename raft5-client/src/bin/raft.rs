@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use raft5_client::{Client, ClientTls, Consistency, Error, Invite, Principal, Right};
+use raft5_client::{Client, ClientTls, Consistency, Error, Invite, Membership, Principal, Right};
 
 /// Opens an interactive session against a raft5 cluster.
 #[derive(Parser)]
@@ -442,6 +442,18 @@ async fn run(client: &Client, words: &[Vec<u8>]) -> Result<bool, String> {
             };
             match client.bootstrap(server_id, heartbeat_ms).await {
                 Ok(()) => println!("ok"),
+                Err(e) => println!("error: {e}"),
+            }
+        }
+        "members" => {
+            if !args.is_empty() {
+                return Err("usage: members".to_string());
+            }
+            match client.members().await {
+                Ok(membership) if membership.members.is_empty() => {
+                    println!("(not part of a cluster yet)")
+                }
+                Ok(membership) => print_members(&membership),
                 Err(e) => println!("error: {e}"),
             }
         }
@@ -925,6 +937,29 @@ async fn print_reads(
     }
 }
 
+/// One line a member, ids padded to line up:
+/// `n1  voter    leader  peer=... client=...`.
+fn print_members(membership: &Membership) {
+    let width = membership
+        .members
+        .iter()
+        .map(|m| m.server_id.len())
+        .max()
+        .unwrap_or(0);
+    for m in &membership.members {
+        let role = if m.voting { "voter" } else { "learner" };
+        let leads = if membership.leader.as_deref() == Some(m.server_id.as_str()) {
+            "leader"
+        } else {
+            ""
+        };
+        println!(
+            "{:width$}  {role:7}  {leads:6}  peer={} client={}",
+            m.server_id, m.peer_address, m.client_address
+        );
+    }
+}
+
 fn print_help() {
     println!(
         "{}",
@@ -952,6 +987,9 @@ fn print_help() {
             "remove_server <id>               remove a server",
             "bootstrap <id> [heartbeat_ms]    form a single-node cluster around <id>; the",
             "                                  heartbeat defaults to 50ms",
+            "members                          list the cluster's members: each one's id, whether",
+            "                                  it votes yet or is a learner still catching up,",
+            "                                  which leads, and its peer and client addresses",
             "heartbeat [ms]                   show the cluster's heartbeat interval, or set it.",
             "                                  raise it for nodes far apart: it should well",
             "                                  exceed the round trip between any two. admins only",

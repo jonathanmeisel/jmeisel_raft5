@@ -657,6 +657,34 @@ pub struct SnapshotInfo {
     pub created_unix_ms: u64,
 }
 
+/// The cluster's membership, as [`Client::members`] reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Membership {
+    /// The id of the member that answered, if it was leading when it did
+    /// -- which, asked through a [`Client`], it nearly always is: the
+    /// client sends the question to the leader. `None` from a leader not
+    /// yet ready to say so (see `GetConfigResponse.is_leader`).
+    pub leader: Option<String>,
+    pub members: Vec<Member>,
+}
+
+/// One member of the cluster.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Member {
+    pub server_id: String,
+    /// Where the other servers replicate to it: its peer API, the
+    /// address [`Client::add_server`] was given.
+    pub peer_address: String,
+    /// Where clients reach it.
+    pub client_address: String,
+    /// Whether it votes and counts toward the commit quorum. A server
+    /// added with [`Client::add_server`] starts as a non-voting learner,
+    /// and the leader promotes it once it has caught up quickly enough
+    /// to keep up in real time -- so `true` here for a new server is
+    /// what "it has caught up" looks like from outside.
+    pub voting: bool,
+}
+
 /// One outstanding invitation, as an administrator sees it.
 ///
 /// Everything about an invitation except the secret, which exists only
@@ -1238,6 +1266,38 @@ impl Client {
             kv.get_config(GetConfigRequest {})
                 .await
                 .map(|resp| Reply::Ok(resp.into_inner().heartbeat_millis))
+        })
+        .await
+    }
+
+    /// Every member of the cluster, and whether each votes yet, as the
+    /// leader has the configuration -- which a follower's may briefly
+    /// lag. A server added with [`add_server`] shows as non-voting until
+    /// it has caught up.
+    ///
+    /// [`add_server`]: Client::add_server
+    pub async fn members(&self) -> Result<Membership, Error> {
+        self.call(|mut kv: Kv| async move {
+            kv.get_config(GetConfigRequest {}).await.map(|resp| {
+                let resp = resp.into_inner();
+                let leader = resp
+                    .is_leader
+                    .then(|| resp.identity.map(|me| me.server_id))
+                    .flatten();
+                Reply::Ok(Membership {
+                    leader,
+                    members: resp
+                        .members
+                        .into_iter()
+                        .map(|m| Member {
+                            server_id: m.server_id,
+                            peer_address: m.address,
+                            client_address: m.client_address,
+                            voting: m.voting,
+                        })
+                        .collect(),
+                })
+            })
         })
         .await
     }
