@@ -160,6 +160,7 @@ fn no_two_reserved_prefixes_can_ever_meet() {
         // Not a range: the whole key, treated as one so the "nothing under
         // another" check covers it too.
         ("epoch", EPOCH_KEY),
+        ("backup operators", BACKUP_OPERATORS_KEY),
     ];
     for (i, (one, a)) in ranges.iter().enumerate() {
         assert!(is_reserved(a), "{one} prefix should be reserved");

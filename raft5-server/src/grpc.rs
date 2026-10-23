@@ -71,6 +71,10 @@ use crate::pb::raft5::client::{
     delete_acl_response, delete_group_response, get_acl_response, get_group_response,
     list_acls_response, list_groups_response, set_acl_response, update_group_response,
 };
+use crate::pb::raft5::client::{
+    GetBackupOperatorsRequest, GetBackupOperatorsResponse, SetBackupOperatorsRequest,
+    SetBackupOperatorsResponse, get_backup_operators_response, set_backup_operators_response,
+};
 use crate::pb::raft5::cluster::{ClusterConfig, ClusterMember};
 use crate::pb::raft5::raft::raft_peer_server::RaftPeer;
 use crate::pb::raft5::raft::{
@@ -1047,7 +1051,7 @@ impl KvService {
         extensions: &tonic::Extensions,
         req: CreateSnapshotRequest,
     ) -> Result<Checkpoint, AuthFailure> {
-        self.require_admin(extensions).await?;
+        self.require_snapshot_rights(extensions).await?;
         validate_snapshot_id(&req.snapshot_id)?;
 
         let live = self
@@ -1082,7 +1086,7 @@ impl KvService {
         extensions: &tonic::Extensions,
         req: RemoveSnapshotRequest,
     ) -> Result<u64, AuthFailure> {
-        self.require_admin(extensions).await?;
+        self.require_snapshot_rights(extensions).await?;
         validate_snapshot_id(&req.snapshot_id)?;
 
         let key = checkpoint_key(&req.snapshot_id);
@@ -1390,24 +1394,43 @@ impl KvService {
         })
     }
 
-    /// Check that the caller may take a backup: an administrator, by this
-    /// node's own account records.
+    /// Check that the caller may take a backup: an administrator or a backup
+    /// operator, by this node's own records.
     ///
     /// A local check, like the data path's, so a follower can serve backups.
-    /// The cost: an administrator demoted a moment ago can still take a
-    /// backup from a follower that has not applied the change yet. A node
+    /// The cost: a caller whose right was withdrawn a moment ago can still take
+    /// a backup from a follower that has not applied the change yet. A node
     /// with no secret keeps no accounts, so it lets anyone back up.
     async fn require_backup_rights(&self, extensions: &tonic::Extensions) -> Result<(), AuthFailure> {
         if self.auth.is_none() {
             return Ok(());
         }
         let who = caller(extensions)?;
-        if self.is_admin_locally(&who).await? {
+        if self.is_admin_locally(&who).await? || self.is_backup_operator(extensions).await? {
             return Ok(());
         }
         Err(AuthFailure::refused(
             auth_error::Kind::NotAdmin,
-            "only an administrator may take a backup",
+            "only an administrator or a backup operator may take a backup",
+        ))
+    }
+
+    /// Check that the caller may create or remove a snapshot: an
+    /// administrator or a backup operator.
+    ///
+    /// The same people who may take a backup, because a snapshot exists to
+    /// back up from. The admin check is the authoritative one `require_admin`
+    /// makes; these calls write through the leader anyway.
+    async fn require_snapshot_rights(
+        &self,
+        extensions: &tonic::Extensions,
+    ) -> Result<(), AuthFailure> {
+        if self.is_cluster_admin(extensions).await? || self.is_backup_operator(extensions).await? {
+            return Ok(());
+        }
+        Err(AuthFailure::refused(
+            auth_error::Kind::NotAdmin,
+            "only an administrator or a backup operator may manage snapshots",
         ))
     }
 
@@ -2576,6 +2599,40 @@ impl Kv for KvService {
                 Err(e) => match auth_failure(e)? {
                     AuthReply::Raft(e) => list_acls_response::Result::Error(e),
                     AuthReply::Auth(e) => list_acls_response::Result::AuthError(e),
+                },
+            }),
+        }))
+    }
+
+    async fn set_backup_operators(
+        &self,
+        request: Request<SetBackupOperatorsRequest>,
+    ) -> Result<Response<SetBackupOperatorsResponse>, Status> {
+        let (_, extensions, req) = request.into_parts();
+        let result = self.set_backup_operators_inner(&extensions, req).await;
+        Ok(Response::new(SetBackupOperatorsResponse {
+            result: Some(match result {
+                Ok(seq) => set_backup_operators_response::Result::Seq(seq),
+                Err(e) => match auth_failure(e)? {
+                    AuthReply::Raft(e) => set_backup_operators_response::Result::Error(e),
+                    AuthReply::Auth(e) => set_backup_operators_response::Result::AuthError(e),
+                },
+            }),
+        }))
+    }
+
+    async fn get_backup_operators(
+        &self,
+        request: Request<GetBackupOperatorsRequest>,
+    ) -> Result<Response<GetBackupOperatorsResponse>, Status> {
+        let (_, extensions, _) = request.into_parts();
+        let result = self.get_backup_operators_inner(&extensions).await;
+        Ok(Response::new(GetBackupOperatorsResponse {
+            result: Some(match result {
+                Ok(ok) => get_backup_operators_response::Result::Ok(ok),
+                Err(e) => match auth_failure(e)? {
+                    AuthReply::Raft(e) => get_backup_operators_response::Result::Error(e),
+                    AuthReply::Auth(e) => get_backup_operators_response::Result::AuthError(e),
                 },
             }),
         }))

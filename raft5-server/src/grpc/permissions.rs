@@ -43,11 +43,13 @@ use crate::auth::{AuthContext, UserRecord};
 use crate::keyspace;
 use crate::pb::raft5::client::{
     Acl as PbAcl, AclEntry as PbAclEntry, AclList, CreateGroupRequest, DeleteAclRequest,
-    DeleteGroupRequest, GetAclOk, GetAclRequest, GetGroupRequest, Group as PbGroup, GroupList,
-    Principal as PbPrincipal, Right as PbRight, SetAclRequest, UpdateGroupRequest, auth_error,
-    principal,
+    BackupOperators as PbBackupOperators, DeleteGroupRequest, GetAclOk, GetAclRequest,
+    GetGroupRequest, Group as PbGroup, GroupList, Principal as PbPrincipal, Right as PbRight,
+    SetAclRequest, SetBackupOperatorsRequest, UpdateGroupRequest, auth_error, principal,
 };
-use crate::perms::{AclRecord, Decision, GroupRecord, Permissions, Principal, Right};
+use crate::perms::{
+    AclRecord, BackupOperatorsRecord, Decision, GroupRecord, Permissions, Principal, Right,
+};
 use crate::storage::RaftLog;
 use crate::txn::TxnId;
 
@@ -78,6 +80,11 @@ pub(super) const MAX_GROUP_ADMINS: usize = 32;
 /// a longest-prefix lookup, which is one probe per distinct prefix length.
 pub(super) const MAX_ACLS: usize = 1024;
 pub(super) const MAX_ACL_ENTRIES: usize = 64;
+
+/// The most principals the backup operator list may hold. It bounds the
+/// snapshot, like `MAX_ACL_ENTRIES`. A list longer than this is better
+/// served by one group.
+pub(super) const MAX_BACKUP_OPERATORS: usize = 64;
 
 /// How many keys one `GetKeys` examines before it stops trying to fill
 /// its batch and returns a cursor.
@@ -133,7 +140,8 @@ impl ScanFilter {
 
 /// Read all permissions at one point in time.
 ///
-/// The two listings are two iterators, so two moments. The epoch is read
+/// The listings and the backup operator read are separate reads, so
+/// separate moments. The epoch is read
 /// before and after to detect a change in between. This matters only here:
 /// a snapshot built across a change could hold half of it, which is
 /// permission state nobody could reason about.
@@ -146,8 +154,11 @@ fn load_permissions(log: &RaftLog) -> Result<Permissions, Status> {
         let acls = log
             .list_versioned_records_under(keyspace::ACL_PREFIX)
             .map_err(storage_err)?;
+        let backup_operators = log
+            .get_latest(keyspace::BACKUP_OPERATORS_KEY)
+            .map_err(storage_err)?;
         if read_epoch(log)? == before {
-            return Permissions::build(before, groups, acls);
+            return Permissions::build(before, groups, acls, backup_operators);
         }
     }
     Err(Status::unavailable(
@@ -433,7 +444,7 @@ impl KvService {
     /// For the management RPCs. They run on the leader and already pay a raft
     /// round trip, so they can afford the authoritative answer that the data
     /// path cannot.
-    async fn is_cluster_admin(&self, extensions: &tonic::Extensions) -> Result<bool, AuthFailure> {
+    pub(super) async fn is_cluster_admin(&self, extensions: &tonic::Extensions) -> Result<bool, AuthFailure> {
         match self.require_admin(extensions).await {
             Ok(()) => Ok(true),
             Err(AuthFailure::Refused(auth_error::Kind::NotAdmin, _)) => Ok(false),
@@ -915,6 +926,64 @@ impl KvService {
         // effect, least specific to most.
         acls.sort_by(|a, b| a.prefix.cmp(&b.prefix));
         Ok(AclList { acls })
+    }
+
+    // -- Backup operators ----------------------------------------------
+
+    /// Replace the backup operator list. Administrators only, because a
+    /// backup operator can read the whole cluster. An empty list deletes the
+    /// record, so a cluster that never used this and one that stopped look
+    /// the same.
+    pub(super) async fn set_backup_operators_inner(
+        &self,
+        extensions: &tonic::Extensions,
+        req: SetBackupOperatorsRequest,
+    ) -> Result<u64, AuthFailure> {
+        self.require_auth_enabled()?;
+        let principals = principals_from_pb(&req.principals)?;
+        if principals.len() > MAX_BACKUP_OPERATORS {
+            return Err(Status::invalid_argument(format!(
+                "there may be at most {MAX_BACKUP_OPERATORS} backup operators; grant a group instead"
+            ))
+            .into());
+        }
+        self.require_admin(extensions).await?;
+
+        let value = if principals.is_empty() {
+            None
+        } else {
+            Some(BackupOperatorsRecord::new(principals).to_bytes()?)
+        };
+        self.admin_txn(async |id| {
+            self.commit_permission_change(id, keyspace::BACKUP_OPERATORS_KEY, value)
+                .await
+        })
+        .await
+    }
+
+    pub(super) async fn get_backup_operators_inner(
+        &self,
+        extensions: &tonic::Extensions,
+    ) -> Result<PbBackupOperators, AuthFailure> {
+        self.require_auth_enabled()?;
+        caller(extensions)?;
+        let perms = self.permissions().await?;
+        let (principals, seq) = perms.backup_operators();
+        Ok(PbBackupOperators {
+            principals: principals.iter().map(principal_to_pb).collect(),
+            seq,
+        })
+    }
+
+    /// Whether the caller is a backup operator, by this node's permission
+    /// snapshot. Not whether it is an administrator: callers check that
+    /// first, in whatever way their path needs.
+    pub(super) async fn is_backup_operator(
+        &self,
+        extensions: &tonic::Extensions,
+    ) -> Result<bool, AuthFailure> {
+        let who = caller(extensions)?;
+        Ok(self.permissions().await?.may_back_up(&who))
     }
 }
 

@@ -64,6 +64,10 @@ use raft5_shared::raft5::client::{
     get_group_response, list_acls_response, list_groups_response, principal, set_acl_response,
     update_group_response,
 };
+use raft5_shared::raft5::client::{
+    GetBackupOperatorsRequest, GetBackupOperatorsResponse, SetBackupOperatorsRequest,
+    SetBackupOperatorsResponse, get_backup_operators_response, set_backup_operators_response,
+};
 
 use routing::{Kv, Router};
 
@@ -1008,11 +1012,13 @@ impl Client {
     /// normal "already exists", which [`create_snapshot`] resolves with a
     /// suffix.
     ///
-    /// Administrators only: until it is removed, a snapshot keeps every
+    /// Administrators and backup operators only (see
+    /// [`set_backup_operators`]): until it is removed, a snapshot keeps every
     /// version of every key that changed after it.
     ///
     /// [`key_iterator_at`]: Client::key_iterator_at
     /// [`create_snapshot`]: Client::create_snapshot
+    /// [`set_backup_operators`]: Client::set_backup_operators
     pub async fn create_snapshot(&self, id: Option<&[u8]>) -> Result<SnapshotInfo, Error> {
         let now = unix_millis();
         match id {
@@ -1057,7 +1063,8 @@ impl Client {
     }
 
     /// Release a snapshot. The versions it kept can be collected, and reads
-    /// at it start to fail. Administrators only.
+    /// at it start to fail. Administrators and backup operators only. A
+    /// backup operator may remove any snapshot.
     pub async fn remove_snapshot(&self, id: &[u8]) -> Result<u64, Error> {
         let request = RemoveSnapshotRequest {
             snapshot_id: id.to_vec(),
@@ -1320,11 +1327,12 @@ impl Client {
     }
 
     /// Stream a backup of the cluster's key/value state into `out`, as of now
-    /// or as of the snapshot `snapshot_id`. Administrators only. Returns how
-    /// many bytes were written.
+    /// or as of the snapshot `snapshot_id`. Administrators and backup
+    /// operators only. Returns how many bytes were written.
     ///
     /// The backup holds every key a client wrote, with its newest value, plus
-    /// accounts, groups and ACLs. It leaves out invitations, snapshots and
+    /// accounts, groups, ACLs and the backup operators. ACLs do not apply to
+    /// it, so whoever takes one can read every key and password hash. It leaves out invitations, snapshots and
     /// the token signing secret: a cluster restored from it signs tokens with
     /// whatever secret it is started with, so old tokens work only if that is
     /// the same secret.
@@ -1868,6 +1876,40 @@ impl Client {
         .await
     }
 
+    /// Replace the list of backup operators: the users and groups that may
+    /// take backups and create or remove snapshots without being
+    /// administrators. An empty list removes them all. Administrators only.
+    ///
+    /// This grants read access to the whole cluster. A backup ignores ACLs
+    /// and holds every account's password hash, so a backup operator can read
+    /// every key and attack every password offline. It grants nothing else:
+    /// no writes past an ACL, no permission or account changes, no restore.
+    pub async fn set_backup_operators(&self, principals: &[Principal]) -> Result<u64, Error> {
+        let request = SetBackupOperatorsRequest {
+            principals: principals.iter().map(Principal::to_pb).collect(),
+        };
+        self.call(|mut kv: Kv| {
+            let request = request.clone();
+            async move {
+                kv.set_backup_operators(request)
+                    .await
+                    .map(set_backup_operators_reply)
+            }
+        })
+        .await
+    }
+
+    /// The backup operators, and the seq their list was last written at
+    /// (`0` if it never was). Any authenticated caller.
+    pub async fn backup_operators(&self) -> Result<(Vec<Principal>, u64), Error> {
+        self.call(|mut kv: Kv| async move {
+            kv.get_backup_operators(GetBackupOperatorsRequest {})
+                .await
+                .map(get_backup_operators_reply)
+        })
+        .await
+    }
+
     /// Get a token and start to use it, without touching the stored
     /// credentials.
     ///
@@ -2291,6 +2333,29 @@ fn list_acls_reply(resp: tonic::Response<ListAclsResponse>) -> Reply<Vec<Acl>> {
         }
         Some(list_acls_response::Result::Error(e)) => Reply::from_error(e),
         Some(list_acls_response::Result::AuthError(e)) => denied(e),
+        None => empty_response(),
+    }
+}
+
+fn set_backup_operators_reply(resp: tonic::Response<SetBackupOperatorsResponse>) -> Reply<u64> {
+    match resp.into_inner().result {
+        Some(set_backup_operators_response::Result::Seq(seq)) => Reply::Ok(seq),
+        Some(set_backup_operators_response::Result::Error(e)) => Reply::from_error(e),
+        Some(set_backup_operators_response::Result::AuthError(e)) => denied(e),
+        None => empty_response(),
+    }
+}
+
+fn get_backup_operators_reply(
+    resp: tonic::Response<GetBackupOperatorsResponse>,
+) -> Reply<(Vec<Principal>, u64)> {
+    match resp.into_inner().result {
+        Some(get_backup_operators_response::Result::Ok(ok)) => Reply::Ok((
+            ok.principals.iter().filter_map(Principal::from_pb).collect(),
+            ok.seq,
+        )),
+        Some(get_backup_operators_response::Result::Error(e)) => Reply::from_error(e),
+        Some(get_backup_operators_response::Result::AuthError(e)) => denied(e),
         None => empty_response(),
     }
 }

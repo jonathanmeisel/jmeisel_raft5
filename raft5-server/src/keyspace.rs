@@ -65,6 +65,15 @@ pub const ACL_PREFIX: &[u8] = b"\0acl/";
 /// this.
 pub const EPOCH_KEY: &[u8] = b"\0auth/epoch";
 
+/// The one key that holds the list of backup operators: the users and
+/// groups that may take backups and create or remove snapshots without
+/// being administrators. One record, not a range, because the list is
+/// small and is always read and replaced whole.
+///
+/// It is a permission record like a group or an ACL, so every write to it
+/// also bumps `EPOCH_KEY` and the permission cache picks it up.
+pub const BACKUP_OPERATORS_KEY: &[u8] = b"\0auth/backup-operators";
+
 /// Whether `key` belongs to the cluster, not to a client.
 ///
 /// The empty key is not reserved (it has no first byte to be `RESERVED`),
@@ -77,7 +86,7 @@ pub fn is_reserved(key: &[u8]) -> bool {
 /// Whether a backup carries `key`.
 ///
 /// Every key a client wrote, and from the reserved range only accounts,
-/// groups, ACLs and the permission epoch. An allowlist, so a reserved range
+/// groups, ACLs, the backup operators and the permission epoch. An allowlist, so a reserved range
 /// added later stays out of backups until someone decides it belongs.
 ///
 /// - Invitations stay out: they are short-lived credentials for the old
@@ -92,6 +101,7 @@ pub fn is_backed_up(key: &[u8]) -> bool {
         || key.starts_with(USER_PREFIX)
         || key.starts_with(GROUP_PREFIX)
         || key.starts_with(ACL_PREFIX)
+        || key == BACKUP_OPERATORS_KEY
         || key == EPOCH_KEY
 }
 

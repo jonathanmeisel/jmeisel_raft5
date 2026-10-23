@@ -4369,9 +4369,10 @@ async fn a_backup_at_a_snapshot_reads_as_of_it() {
     cleanup(&copy_path);
 }
 
-/// Only an administrator may take a backup: it holds every account's
-/// password hash. What it carries from the reserved range is accounts,
-/// groups, ACLs and the permission epoch, and not invitations.
+/// An account that is neither an administrator nor a backup operator may
+/// not take a backup: it holds every account's password hash. What it
+/// carries from the reserved range is accounts, groups, ACLs and the
+/// permission epoch, and not invitations.
 #[tokio::test]
 async fn a_backup_is_for_administrators_and_carries_permissions() {
     let (log, path) = open_temp();
@@ -4404,4 +4405,161 @@ async fn a_backup_is_for_administrators_and_carries_permissions() {
 
     cleanup(&path);
     cleanup(&copy_path);
+}
+
+// --- backup operators -----------------------------------------------------
+
+async fn set_backup_operators(
+    svc: &KvService,
+    caller: &str,
+    principals: Vec<PbPrincipal>,
+) -> set_backup_operators_response::Result {
+    svc.set_backup_operators(as_user(caller, SetBackupOperatorsRequest { principals }))
+        .await
+        .unwrap()
+        .into_inner()
+        .result
+        .expect("a set_backup_operators response always carries a result")
+}
+
+async fn snapshot_as(svc: &KvService, caller: &str, id: &[u8]) -> create_snapshot_response::Result {
+    svc.create_snapshot(as_user(
+        caller,
+        CreateSnapshotRequest {
+            snapshot_id: id.to_vec(),
+            created_unix_ms: 0,
+        },
+    ))
+    .await
+    .unwrap()
+    .into_inner()
+    .result
+    .expect("a create_snapshot response always carries a result")
+}
+
+async fn drop_snapshot_as(
+    svc: &KvService,
+    caller: &str,
+    id: &[u8],
+) -> remove_snapshot_response::Result {
+    svc.remove_snapshot(as_user(
+        caller,
+        RemoveSnapshotRequest {
+            snapshot_id: id.to_vec(),
+        },
+    ))
+    .await
+    .unwrap()
+    .into_inner()
+    .result
+    .expect("a remove_snapshot response always carries a result")
+}
+
+/// A backup operator, named directly or through a group, may create and
+/// remove snapshots and take backups. Anyone else who is not an
+/// administrator may not. The list travels with the backup.
+#[tokio::test]
+async fn a_backup_operator_may_snapshot_and_back_up() {
+    let (log, path) = open_temp();
+    let svc = service_with_alice(log, "kv-test").await;
+    created_seq(create_user(&svc, "root", "bob", "hunter42", false).await);
+    created_seq(create_user(&svc, "root", "carol", "hunter42", false).await);
+    must_create_group(&svc, "root", "backup", vec![pb_user("carol")]).await;
+    assert!(matches!(
+        set_backup_operators(&svc, "root", vec![pb_user("bob"), pb_group("backup")]).await,
+        set_backup_operators_response::Result::Seq(_)
+    ));
+
+    match snapshot_as(&svc, "alice", b"s1").await {
+        create_snapshot_response::Result::AuthError(e) => {
+            assert_eq!(auth_kind(&e), auth_error::Kind::NotAdmin);
+        }
+        other => panic!("alice is not a backup operator, got {other:?}"),
+    }
+    assert!(matches!(
+        snapshot_as(&svc, "bob", b"s1").await,
+        create_snapshot_response::Result::Ok(_)
+    ));
+
+    let at_s1 = || BackupRequest {
+        snapshot_id: b"s1".to_vec(),
+    };
+    let refused = take_backup(&svc, as_user("alice", at_s1()))
+        .await
+        .unwrap()
+        .expect_err("alice is not a backup operator");
+    assert_eq!(auth_kind(&refused), auth_error::Kind::NotAdmin);
+    let backup = take_backup(&svc, as_user("carol", at_s1()))
+        .await
+        .unwrap()
+        .expect("carol is a backup operator through her group");
+
+    match drop_snapshot_as(&svc, "alice", b"s1").await {
+        remove_snapshot_response::Result::AuthError(e) => {
+            assert_eq!(auth_kind(&e), auth_error::Kind::NotAdmin);
+        }
+        other => panic!("alice is not a backup operator, got {other:?}"),
+    }
+    assert!(matches!(
+        drop_snapshot_as(&svc, "carol", b"s1").await,
+        remove_snapshot_response::Result::Seq(_)
+    ));
+
+    let (copy, copy_path) = restored(&backup);
+    assert!(
+        copy.get_latest(crate::keyspace::BACKUP_OPERATORS_KEY)
+            .unwrap()
+            .is_some()
+    );
+
+    cleanup(&path);
+    cleanup(&copy_path);
+}
+
+/// Only an administrator may change the list, anyone signed in may read
+/// it, and an empty list takes the right away.
+#[tokio::test]
+async fn only_an_administrator_chooses_the_backup_operators() {
+    let (log, path) = open_temp();
+    let svc = service_with_alice(log, "kv-test").await;
+
+    match set_backup_operators(&svc, "alice", vec![pb_user("alice")]).await {
+        set_backup_operators_response::Result::AuthError(e) => {
+            assert_eq!(auth_kind(&e), auth_error::Kind::NotAdmin);
+        }
+        other => panic!("alice is not an administrator, got {other:?}"),
+    }
+    let seq = match set_backup_operators(&svc, "root", vec![pb_user("alice")]).await {
+        set_backup_operators_response::Result::Seq(seq) => seq,
+        other => panic!("root is an administrator, got {other:?}"),
+    };
+
+    let listed = svc
+        .get_backup_operators(as_user("alice", GetBackupOperatorsRequest {}))
+        .await
+        .unwrap()
+        .into_inner()
+        .result;
+    match listed {
+        Some(get_backup_operators_response::Result::Ok(ok)) => {
+            assert_eq!(ok.principals, vec![pb_user("alice")]);
+            assert_eq!(ok.seq, seq);
+        }
+        other => panic!("expected the list, got {other:?}"),
+    }
+    assert!(matches!(
+        snapshot_as(&svc, "alice", b"s1").await,
+        create_snapshot_response::Result::Ok(_)
+    ));
+
+    assert!(matches!(
+        set_backup_operators(&svc, "root", vec![]).await,
+        set_backup_operators_response::Result::Seq(_)
+    ));
+    assert!(matches!(
+        snapshot_as(&svc, "alice", b"s2").await,
+        create_snapshot_response::Result::AuthError(_)
+    ));
+
+    cleanup(&path);
 }

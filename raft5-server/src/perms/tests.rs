@@ -32,7 +32,7 @@ fn snapshot(
             (suffix, 200 + i as u64, record.to_bytes().unwrap())
         })
         .collect();
-    Permissions::build(7, groups, acls).expect("these records should decode")
+    Permissions::build(7, groups, acls, None).expect("these records should decode")
 }
 
 fn acl(entries: &[(Principal, Right)]) -> AclRecord {
@@ -375,9 +375,30 @@ fn an_empty_snapshot_has_never_seen_a_permission_change() {
 #[test]
 fn a_record_that_will_not_decode_fails_the_build() {
     let junk = vec![0xff, 0xff];
-    assert!(Permissions::build(1, vec![(b"ops".to_vec(), 1, junk.clone())], vec![]).is_err());
-    assert!(Permissions::build(1, vec![], vec![(b"6161".to_vec(), 1, junk)]).is_err());
+    assert!(Permissions::build(1, vec![(b"ops".to_vec(), 1, junk.clone())], vec![], None).is_err());
+    assert!(Permissions::build(1, vec![], vec![(b"6161".to_vec(), 1, junk.clone())], None).is_err());
     // A key this module could not have written is corrupt, not empty.
     let acl = acl(&[(user("alice"), Right::Read)]).to_bytes().unwrap();
-    assert!(Permissions::build(1, vec![], vec![(b"zz".to_vec(), 1, acl)]).is_err());
+    assert!(Permissions::build(1, vec![], vec![(b"zz".to_vec(), 1, acl)], None).is_err());
+    assert!(Permissions::build(1, vec![], vec![], Some((1, junk))).is_err());
+}
+
+#[test]
+fn a_backup_operator_is_named_directly_or_through_a_group() {
+    let groups = vec![(
+        b"backup".to_vec(),
+        2,
+        GroupRecord::new("root".into(), vec![], vec![user("carol")])
+            .to_bytes()
+            .unwrap(),
+    )];
+    let record = BackupOperatorsRecord::new(vec![user("bob"), group("backup")])
+        .to_bytes()
+        .unwrap();
+    let perms = Permissions::build(3, groups, vec![], Some((3, record))).unwrap();
+    assert!(perms.may_back_up("bob"));
+    assert!(perms.may_back_up("carol"));
+    assert!(!perms.may_back_up("alice"));
+    assert_eq!(perms.backup_operators().1, 3);
+    assert!(!Permissions::empty().may_back_up("bob"));
 }
