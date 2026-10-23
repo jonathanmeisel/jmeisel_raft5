@@ -35,26 +35,6 @@ use tonic::transport::ClientTlsConfig;
 pub use tonic::transport::{Certificate, Identity};
 
 use raft5_shared::raft5::client::{
-    AddServerRequest, BackupRequest, BootstrapFromBackupChunk, BootstrapRequest,
-    CommitTransactionRequest, CommitTransactionResponse,
-    ConfigChangeResponse, CreateSnapshotRequest, CreateSnapshotResponse, CreateTransactionRequest,
-    CreateInviteRequest, CreateInviteResponse, CreateTransactionResponse, CreateUserRequest,
-    CreateUserResponse, DeleteUserRequest,
-    DeleteUserResponse, DropTransactionRequest, GetConfigRequest, GetKeysRequest, GetKeysResponse,
-    Linearizable, ListInvitesRequest, ListInvitesResponse, ListSnapshotsRequest,
-    ListSnapshotsResponse, LoginRequest, LoginResponse, RedeemInviteRequest, RedeemInviteResponse,
-    RevokeInviteRequest, RevokeInviteResponse,
-    RaftError as PbRaftError, ReadOk, ReadRequest, ReadResponse, RemoveServerRequest,
-    RemoveSnapshotRequest, RemoveSnapshotResponse, SetHeartbeatRequest, WriteRequest,
-    WriteResponse, auth_error,
-    commit_transaction_response, config_change_response, create_snapshot_response,
-    create_invite_response, create_transaction_response, create_user_response,
-    delete_user_response, get_keys_request, get_keys_response, list_invites_response, list_snapshots_response, login_response,
-    backup_chunk, bootstrap_from_backup_chunk, raft_error, read_request, read_response,
-    redeem_invite_response, remove_snapshot_response,
-    revoke_invite_response, transaction_aborted, write_response,
-};
-use raft5_shared::raft5::client::{
     Acl as PbAcl, AclEntry as PbAclEntry, CreateGroupRequest, CreateGroupResponse,
     DeleteAclRequest, DeleteAclResponse, DeleteGroupRequest, DeleteGroupResponse, GetAclRequest,
     GetAclResponse, GetGroupRequest, GetGroupResponse, Group as PbGroup, ListAclsRequest,
@@ -63,6 +43,24 @@ use raft5_shared::raft5::client::{
     create_group_response, delete_acl_response, delete_group_response, get_acl_response,
     get_group_response, list_acls_response, list_groups_response, principal, set_acl_response,
     update_group_response,
+};
+use raft5_shared::raft5::client::{
+    AddServerRequest, BackupRequest, BootstrapFromBackupChunk, BootstrapRequest,
+    CommitTransactionRequest, CommitTransactionResponse, ConfigChangeResponse, CreateInviteRequest,
+    CreateInviteResponse, CreateSnapshotRequest, CreateSnapshotResponse, CreateTransactionRequest,
+    CreateTransactionResponse, CreateUserRequest, CreateUserResponse, DeleteUserRequest,
+    DeleteUserResponse, DropTransactionRequest, GetConfigRequest, GetKeysRequest, GetKeysResponse,
+    Linearizable, ListInvitesRequest, ListInvitesResponse, ListSnapshotsRequest,
+    ListSnapshotsResponse, LoginRequest, LoginResponse, RaftError as PbRaftError, ReadOk,
+    ReadRequest, ReadResponse, RedeemInviteRequest, RedeemInviteResponse, RemoveServerRequest,
+    RemoveSnapshotRequest, RemoveSnapshotResponse, RevokeInviteRequest, RevokeInviteResponse,
+    SetHeartbeatRequest, WriteRequest, WriteResponse, auth_error, backup_chunk,
+    bootstrap_from_backup_chunk, commit_transaction_response, config_change_response,
+    create_invite_response, create_snapshot_response, create_transaction_response,
+    create_user_response, delete_user_response, get_keys_request, get_keys_response,
+    list_invites_response, list_snapshots_response, login_response, raft_error, read_request,
+    read_response, redeem_invite_response, remove_snapshot_response, revoke_invite_response,
+    transaction_aborted, write_response,
 };
 use raft5_shared::raft5::client::{
     GetBackupOperatorsRequest, GetBackupOperatorsResponse, SetBackupOperatorsRequest,
@@ -472,7 +470,10 @@ impl std::fmt::Display for Error {
             Self::InvalidArgument(why) => write!(f, "{why}"),
             Self::Rejected(why) => write!(f, "the cluster refused the request: {why}"),
             Self::Unavailable(why) => write!(f, "the cluster could not serve the request: {why}"),
-            Self::Aborted { reason, key: Some(key) } => write!(
+            Self::Aborted {
+                reason,
+                key: Some(key),
+            } => write!(
                 f,
                 "the transaction was aborted: {reason} ({})",
                 String::from_utf8_lossy(key)
@@ -486,7 +487,10 @@ impl std::fmt::Display for Error {
                  whether it committed is unknown, so it must not be replayed"
             ),
             Self::Unauthenticated(why) => {
-                write!(f, "the cluster did not accept this client's identity: {why}")
+                write!(
+                    f,
+                    "the cluster did not accept this client's identity: {why}"
+                )
             }
             Self::PermissionDenied(why) => write!(f, "not permitted: {why}"),
             Self::NotFound(why) => write!(f, "not found: {why}"),
@@ -717,12 +721,20 @@ enum Reply<T> {
     Unavailable(String),
     /// The transaction is over. Not retried here: the retry is the whole
     /// transaction, which only its caller can replay.
-    Aborted { reason: AbortReason, key: Option<Vec<u8>> },
+    Aborted {
+        reason: AbortReason,
+        key: Option<Vec<u8>>,
+    },
     /// The commit is in doubt. Never retried by anyone.
-    InDoubt { seq: u64 },
+    InDoubt {
+        seq: u64,
+    },
     /// An account request the cluster refused on its merits. Never retried:
     /// the answer will not change.
-    Denied { reason: Denial, detail: String },
+    Denied {
+        reason: Denial,
+        detail: String,
+    },
 }
 
 impl<T> Reply<T> {
@@ -1160,7 +1172,8 @@ impl Client {
                 async move { kv.read(request).await.map(read_reply) }
             })
             .await?;
-        if ok.entries.len() > request.keys.len() || (ok.entries.is_empty() && !request.keys.is_empty())
+        if ok.entries.len() > request.keys.len()
+            || (ok.entries.is_empty() && !request.keys.is_empty())
         {
             return Err(Error::Unavailable(format!(
                 "malformed read response: {} entries for {} keys",
@@ -1344,7 +1357,11 @@ impl Client {
     /// See [`bootstrap_from_backup`] for the restore.
     ///
     /// [`bootstrap_from_backup`]: Client::bootstrap_from_backup
-    pub async fn backup<W>(&self, snapshot_id: Option<&[u8]>, out: &mut W) -> Result<BackupInfo, Error>
+    pub async fn backup<W>(
+        &self,
+        snapshot_id: Option<&[u8]>,
+        out: &mut W,
+    ) -> Result<BackupInfo, Error>
     where
         W: tokio::io::AsyncWrite + Unpin,
     {
@@ -1383,10 +1400,16 @@ impl Client {
                     bytes += data.len() as u64;
                 }
                 Some(backup_chunk::Result::AuthError(e)) => match denied::<()>(e) {
-                    Reply::Denied { reason, detail } => return Err(Error::Denied { reason, detail }),
+                    Reply::Denied { reason, detail } => {
+                        return Err(Error::Denied { reason, detail });
+                    }
                     _ => unreachable!("`denied` only returns `Reply::Denied`"),
                 },
-                None => return Err(Error::Unavailable("the node sent an empty backup chunk".to_string())),
+                None => {
+                    return Err(Error::Unavailable(
+                        "the node sent an empty backup chunk".to_string(),
+                    ));
+                }
             }
         }
         out.flush()
@@ -1439,7 +1462,11 @@ impl Client {
         for node in self.router.nodes() {
             let mut kv = node.connect();
             if let Ok(config) = kv.get_config(GetConfigRequest {}).await
-                && config.get_ref().identity.as_ref().is_some_and(|m| m.server_id == server_id)
+                && config
+                    .get_ref()
+                    .identity
+                    .as_ref()
+                    .is_some_and(|m| m.server_id == server_id)
             {
                 target = Some(kv);
                 break;
@@ -1455,10 +1482,12 @@ impl Client {
         // a few chunks are in memory however large the backup is.
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let header = BootstrapFromBackupChunk {
-            part: Some(bootstrap_from_backup_chunk::Part::Header(BootstrapRequest {
-                server_id: server_id.to_string(),
-                heartbeat_millis: heartbeat_ms.unwrap_or(0),
-            })),
+            part: Some(bootstrap_from_backup_chunk::Part::Header(
+                BootstrapRequest {
+                    server_id: server_id.to_string(),
+                    heartbeat_millis: heartbeat_ms.unwrap_or(0),
+                },
+            )),
         };
         tx.send(header)
             .await
@@ -1497,7 +1526,9 @@ impl Client {
                     Ok(())
                 }
                 Reply::Denied { reason, detail } => Err(Error::Denied { reason, detail }),
-                _ => Err(Error::Unavailable(format!("{server_id} refused to bootstrap"))),
+                _ => Err(Error::Unavailable(format!(
+                    "{server_id} refused to bootstrap"
+                ))),
             },
             // Already in a cluster, or holding data: no retry will change it.
             Err(status) if status.code() == tonic::Code::FailedPrecondition => {
@@ -2351,7 +2382,10 @@ fn get_backup_operators_reply(
 ) -> Reply<(Vec<Principal>, u64)> {
     match resp.into_inner().result {
         Some(get_backup_operators_response::Result::Ok(ok)) => Reply::Ok((
-            ok.principals.iter().filter_map(Principal::from_pb).collect(),
+            ok.principals
+                .iter()
+                .filter_map(Principal::from_pb)
+                .collect(),
             ok.seq,
         )),
         Some(get_backup_operators_response::Result::Error(e)) => Reply::from_error(e),
@@ -2450,8 +2484,7 @@ fn delete_user_reply(resp: tonic::Response<DeleteUserResponse>) -> Reply<u64> {
 /// retried: a cluster that names a reason means it.
 fn denied<T>(error: raft5_shared::raft5::client::AuthError) -> Reply<T> {
     Reply::Denied {
-        reason: auth_error::Kind::try_from(error.kind)
-            .map_or(Denial::Unknown, Denial::from),
+        reason: auth_error::Kind::try_from(error.kind).map_or(Denial::Unknown, Denial::from),
         detail: error.detail,
     }
 }
@@ -2639,9 +2672,7 @@ impl Transaction {
     }
 
     async fn send_drop(client: &Client, id: Vec<u8>) -> Result<(), Error> {
-        let request = DropTransactionRequest {
-            transaction_id: id,
-        };
+        let request = DropTransactionRequest { transaction_id: id };
         client
             .call(|mut kv: Kv| {
                 let request = request.clone();
