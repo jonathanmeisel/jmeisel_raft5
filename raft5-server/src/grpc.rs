@@ -42,7 +42,8 @@ use crate::auth::{AuthConfig, AuthContext, InviteRecord, InviteSecret, UserRecor
 use crate::keyspace::is_reserved;
 use crate::pb::raft5::client::kv_server::Kv;
 use crate::pb::raft5::client::{
-    AddServerRequest, AuthError as PbAuthError, BootstrapRequest, CommitTransactionRequest,
+    AddServerRequest, AuthError as PbAuthError, BackupChunk, BackupRequest,
+    BootstrapFromBackupChunk, BootstrapRequest, CommitTransactionRequest,
     CommitTransactionResponse, ConfigChangeResponse, CreateInviteOk, CreateInviteRequest,
     CreateInviteResponse, CreateSnapshotRequest, CreateSnapshotResponse, CreateTransactionRequest,
     CreateTransactionResponse, CreateUserRequest, CreateUserResponse, DeleteUserRequest,
@@ -58,7 +59,8 @@ use crate::pb::raft5::client::{
     create_snapshot_response, create_transaction_response, create_user_response,
     delete_user_response, drop_transaction_response, get_keys_request, get_keys_response,
     list_invites_response, list_snapshots_response,
-    login_response, raft_error, read_request, read_response, redeem_invite_response,
+    backup_chunk, bootstrap_from_backup_chunk, login_response, raft_error, read_request,
+    read_response, redeem_invite_response,
     remove_snapshot_response, revoke_invite_response, transaction_aborted, write_response,
 };
 use crate::pb::raft5::client::{
@@ -83,11 +85,11 @@ use crate::raft::{
     RaftError, RaftPeerHandle, RoleHandle,
 };
 use crate::storage::{
-    Checkpoint, Fetch, MAX_LIVE_CHECKPOINTS, MultiRead, Mutation, ReadPoint, ReadRow,
-    checkpoint_key,
+    BackupExport, BackupSource, Checkpoint, Fetch, MAX_LIVE_CHECKPOINTS, MultiRead, Mutation,
+    ReadPoint, ReadRow, checkpoint_key,
 };
 use crate::storage::{RaftLog, StorageError};
-use crate::store::ChunkReader;
+use crate::store::{ChunkReader, ChunkWriter};
 use crate::store::Store;
 use crate::txn::{AbortReason, BufferedKeys, Locks, Refused, TxnId};
 
@@ -522,6 +524,8 @@ fn raft_err(e: RaftError) -> Status {
             "this leader has not yet committed an entry from its own term; retry shortly",
         ),
         RaftError::InvalidConfigChange(why) => Status::failed_precondition(why),
+        RaftError::BootstrapRefused(why) => Status::failed_precondition(why),
+        RaftError::BadBackup(why) => Status::invalid_argument(why),
     }
 }
 
@@ -538,6 +542,8 @@ fn client_err(e: RaftError) -> Result<PbRaftError, Status> {
         RaftError::ConfigChangeInProgress
         | RaftError::NotCaughtUp
         | RaftError::AlreadyInitialized
+        | RaftError::BootstrapRefused(_)
+        | RaftError::BadBackup(_)
         | RaftError::InvalidConfigChange(_) => PbRaftError {
             kind: Some(raft_error::Kind::Unavailable(
                 raft_err(e).message().to_string(),
@@ -1350,6 +1356,61 @@ impl KvService {
         }
     }
 
+    /// Check a bootstrap request, and build the single-node configuration it
+    /// asks for. Shared by `Bootstrap` and `BootstrapFromBackup`.
+    ///
+    /// - `server_id`, if set, must name this node.
+    /// - The heartbeat must be in range; 0 means the default.
+    /// - The caller must be the startup administrator.
+    fn bootstrap_config(
+        &self,
+        extensions: &tonic::Extensions,
+        req: &BootstrapRequest,
+    ) -> Result<ClusterConfig, Status> {
+        if !req.server_id.is_empty() && req.server_id != self.identity.server_id {
+            return Err(Status::failed_precondition(format!(
+                "this node is {}, not {}",
+                self.identity.server_id, req.server_id
+            )));
+        }
+        let heartbeat_millis = match req.heartbeat_millis {
+            0 => raft::DEFAULT_HEARTBEAT_MS,
+            ms => {
+                raft::check_heartbeat_ms(ms).map_err(Status::invalid_argument)?;
+                ms
+            }
+        };
+        self.require_startup_admin(extensions)?;
+
+        // A cluster of one: the node is its only voter, so it wins the next
+        // election unopposed and can then serve AddServer to grow.
+        Ok(ClusterConfig {
+            members: vec![self.identity.clone()],
+            heartbeat_millis,
+        })
+    }
+
+    /// Check that the caller may take a backup: an administrator, by this
+    /// node's own account records.
+    ///
+    /// A local check, like the data path's, so a follower can serve backups.
+    /// The cost: an administrator demoted a moment ago can still take a
+    /// backup from a follower that has not applied the change yet. A node
+    /// with no secret keeps no accounts, so it lets anyone back up.
+    async fn require_backup_rights(&self, extensions: &tonic::Extensions) -> Result<(), AuthFailure> {
+        if self.auth.is_none() {
+            return Ok(());
+        }
+        let who = caller(extensions)?;
+        if self.is_admin_locally(&who).await? {
+            return Ok(());
+        }
+        Err(AuthFailure::refused(
+            auth_error::Kind::NotAdmin,
+            "only an administrator may take a backup",
+        ))
+    }
+
     /// Write the startup administrator into the log, once this node is
     /// leader.
     ///
@@ -2020,27 +2081,7 @@ impl Kv for KvService {
         request: Request<BootstrapRequest>,
     ) -> Result<Response<ConfigChangeResponse>, Status> {
         let (_, extensions, req) = request.into_parts();
-        if !req.server_id.is_empty() && req.server_id != self.identity.server_id {
-            return Err(Status::failed_precondition(format!(
-                "this node is {}, not {}",
-                self.identity.server_id, req.server_id
-            )));
-        }
-        let heartbeat_millis = match req.heartbeat_millis {
-            0 => raft::DEFAULT_HEARTBEAT_MS,
-            ms => {
-                raft::check_heartbeat_ms(ms).map_err(Status::invalid_argument)?;
-                ms
-            }
-        };
-        self.require_startup_admin(&extensions)?;
-
-        // A cluster of one: the node is its only voter, so it wins the next
-        // election unopposed and can then serve AddServer to grow.
-        let config = ClusterConfig {
-            members: vec![self.identity.clone()],
-            heartbeat_millis,
-        };
+        let config = self.bootstrap_config(&extensions, &req)?;
         self.client_handle
             .bootstrap(config)
             .await
@@ -2048,6 +2089,136 @@ impl Kv for KvService {
         // Before the answer, not after: the startup password stops working as
         // soon as a configuration exists, so an operator told "ok" needs the
         // administrator to be in the log already.
+        self.write_startup_admin().await?;
+
+        Ok(Response::new(ConfigChangeResponse {
+            result: Some(config_change_response::Result::Ok(true)),
+        }))
+    }
+
+    type BackupStream = tokio_stream::wrappers::ReceiverStream<Result<BackupChunk, Status>>;
+
+    async fn backup(
+        &self,
+        request: Request<BackupRequest>,
+    ) -> Result<Response<Self::BackupStream>, Status> {
+        let (_, extensions, req) = request.into_parts();
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel(crate::store::CHUNK_BACKLOG);
+
+        if let Err(e) = self.require_backup_rights(&extensions).await {
+            let refusal = match auth_failure(e)? {
+                AuthReply::Auth(e) => Ok(BackupChunk {
+                    result: Some(backup_chunk::Result::AuthError(e)),
+                }),
+                AuthReply::Raft(_) => Err(Status::unavailable("this node cannot check accounts now")),
+            };
+            let _ = out_tx.send(refusal).await;
+            return Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(out_rx)));
+        }
+
+        // Check the snapshot exists before any byte is sent, so the caller gets
+        // `not_found` instead of a stream that fails at the end. If it is
+        // removed after this check, the export reports that at the end.
+        let point = if req.snapshot_id.is_empty() {
+            ReadPoint::Latest
+        } else {
+            self.checkpoint_seq(&req.snapshot_id).await?;
+            ReadPoint::Checkpoint(req.snapshot_id.clone())
+        };
+
+        // The export runs on the blocking pool and writes through a bounded
+        // channel, so only a few chunks are in memory at once. If the caller
+        // goes away, the forwarding task stops, the export's next write fails,
+        // and the export stops walking the keyspace.
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel(crate::store::CHUNK_BACKLOG);
+        let node_id = self.identity.server_id.clone();
+        let snapshot_id = req.snapshot_id;
+        let exporting = self.store.spawn(move |log| {
+            let source = BackupSource {
+                node_id: &node_id,
+                snapshot_id: &snapshot_id,
+                created_unix_ms: crate::auth::now_unix_ms(),
+            };
+            log.export_backup(
+                &mut ChunkWriter::new(chunk_tx),
+                &point,
+                &source,
+                crate::keyspace::is_backed_up,
+            )
+        });
+        tokio::spawn(
+            async move {
+                while let Some(data) = chunk_rx.recv().await {
+                    let chunk = BackupChunk {
+                        result: Some(backup_chunk::Result::Data(data)),
+                    };
+                    if out_tx.send(Ok(chunk)).await.is_err() {
+                        return;
+                    }
+                }
+                let failure = match exporting.await {
+                    Ok(Ok(BackupExport::Done { .. })) => return,
+                    Ok(Ok(BackupExport::NoSuchCheckpoint)) => no_such_snapshot(),
+                    Ok(Err(e)) => storage_err(e),
+                    Err(e) => Status::internal(format!("the backup task failed: {e}")),
+                };
+                let _ = out_tx.send(Err(failure)).await;
+            }
+            .instrument(tracing::Span::current()),
+        );
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(out_rx)))
+    }
+
+    async fn bootstrap_from_backup(
+        &self,
+        request: Request<Streaming<BootstrapFromBackupChunk>>,
+    ) -> Result<Response<ConfigChangeResponse>, Status> {
+        let (_, extensions, mut stream) = request.into_parts();
+        let first = stream
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("empty backup stream"))?;
+        let header = match first.part {
+            Some(bootstrap_from_backup_chunk::Part::Header(header)) => header,
+            _ => return Err(Status::invalid_argument("the first message must be the header")),
+        };
+        let config = self.bootstrap_config(&extensions, &header)?;
+
+        // The restore and the pump run together, as for InstallSnapshot: the
+        // restore waits for chunks that only the pump delivers. When the pump
+        // ends, for any reason, it drops `tx`, the restore sees the end of the
+        // stream, and a backup cut short fails its trailer check and is
+        // discarded.
+        let (tx, rx) = tokio::sync::mpsc::channel(crate::store::CHUNK_BACKLOG);
+        let restore = self
+            .client_handle
+            .bootstrap_from_backup(config, ChunkReader::new(rx));
+        let pump = async move {
+            while let Some(chunk) = stream.message().await? {
+                let Some(bootstrap_from_backup_chunk::Part::Data(data)) = chunk.part else {
+                    return Err(Status::invalid_argument("only data may follow the header"));
+                };
+                // A closed channel means the restore stopped early (it refused
+                // the node or the backup). Its answer is the one to report.
+                if tx.send(data.to_vec()).await.is_err() {
+                    break;
+                }
+            }
+            Ok::<(), Status>(())
+        };
+        // A restore that succeeded read a whole, checked backup, so it stands.
+        // A failed one may have failed only because the stream broke, and then
+        // the stream's error says more than "the backup is truncated".
+        let (restored, pumped) = tokio::join!(restore, pump);
+        if let Err(e) = restored {
+            pumped?;
+            return Err(raft_err(e));
+        }
+
+        // As for Bootstrap. The startup administrator is written only if the
+        // backup has no account with that username: `write_startup_admin`
+        // treats "already exists" as done, so a backed-up password stays.
         self.write_startup_admin().await?;
 
         Ok(Response::new(ConfigChangeResponse {

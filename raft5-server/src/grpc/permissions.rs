@@ -414,7 +414,7 @@ impl KvService {
     /// purpose: this is the data path, which a follower serves with no leader
     /// to ask. It is also the state the read itself is answered from, so a
     /// stale read is authorized as of the moment it describes.
-    async fn is_admin_locally(&self, username: &str) -> Result<bool, Status> {
+    pub(super) async fn is_admin_locally(&self, username: &str) -> Result<bool, Status> {
         let key = keyspace::user_key(username);
         let found = self
             .store

@@ -135,6 +135,7 @@ mod checkpoint;
 mod codec;
 mod gc;
 mod meta;
+mod backup;
 mod reserved;
 mod snapshot;
 
@@ -148,6 +149,7 @@ use meta::{
     read_floor,
 };
 
+pub use backup::{BackupExport, BackupSource, BootstrapRefusal, RestoreOutcome};
 pub use checkpoint::{Checkpoint, MAX_LIVE_CHECKPOINTS, checkpoint_key, encode_record};
 pub use gc::GcStats;
 pub use snapshot::SnapshotMeta;
@@ -679,22 +681,8 @@ impl RaftLog {
         value_budget: usize,
     ) -> Result<MultiRead> {
         let snap = self.db.snapshot();
-        let (as_of, seek) = match point {
-            ReadPoint::Latest => {
-                let applied = match snap.get(&self.meta, META_APPLIED_SEQ)? {
-                    Some(bytes) => from_be_bytes(&bytes)?,
-                    None => 0,
-                };
-                (applied, u64::MAX)
-            }
-            ReadPoint::Checkpoint(id) => {
-                match self.head_as_of(&snap, &checkpoint_key(&id), u64::MAX, false)? {
-                    Some((seq, Kind::Value, _)) => (seq, seq),
-                    Some((_, Kind::Tombstone, _)) | None => {
-                        return Ok(MultiRead::NoSuchCheckpoint);
-                    }
-                }
-            }
+        let Some((as_of, seek)) = self.resolve_point(&snap, &point)? else {
+            return Ok(MultiRead::NoSuchCheckpoint);
         };
 
         let mut rows = Vec::with_capacity(keys.len());
@@ -726,6 +714,34 @@ impl RaftLog {
             rows.push(row);
         }
         Ok(MultiRead::Ok { as_of, rows })
+    }
+
+    /// The moment `point` names, inside `snap`: `(as_of, seek)`, where
+    /// `as_of` is the seq to report and `seek` the seq to read heads at.
+    /// `None` if `point` names a checkpoint this node does not have.
+    ///
+    /// - `Latest` reads the applied watermark, which names exactly the
+    ///   entries `snap` can see. Heads are read at `u64::MAX`, which gives the
+    ///   same rows, and the version GC cannot have removed one of them.
+    /// - `Checkpoint` finds the record in `snap` too, so a `RemoveSnapshot`,
+    ///   and the GC it allows, cannot land between finding the checkpoint and
+    ///   reading through it.
+    fn resolve_point(&self, snap: &Snapshot, point: &ReadPoint) -> Result<Option<(u64, u64)>> {
+        match point {
+            ReadPoint::Latest => {
+                let applied = match snap.get(&self.meta, META_APPLIED_SEQ)? {
+                    Some(bytes) => from_be_bytes(&bytes)?,
+                    None => 0,
+                };
+                Ok(Some((applied, u64::MAX)))
+            }
+            ReadPoint::Checkpoint(id) => {
+                match self.head_as_of(snap, &checkpoint_key(id), u64::MAX, false)? {
+                    Some((seq, Kind::Value, _)) => Ok(Some((seq, seq))),
+                    Some((_, Kind::Tombstone, _)) | None => Ok(None),
+                }
+            }
+        }
     }
 
     /// Up to `limit` keys at or after `start` that had a value as of `as_of`,

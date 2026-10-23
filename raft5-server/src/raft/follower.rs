@@ -6,7 +6,17 @@
 use tracing::info;
 
 use super::*;
-use crate::storage::StorageError;
+use crate::storage::{BootstrapRefusal, RestoreOutcome, StorageError};
+
+/// What the storage half of `Follower::bootstrap` did.
+enum Booted {
+    /// A plain bootstrap appended the configuration.
+    Plain,
+    /// A bootstrap from a backup, and what the restore did.
+    Restore(RestoreOutcome),
+    /// A plain bootstrap was refused.
+    Refused(BootstrapRefusal),
+}
 
 /// The result of matching and applying one `AppendEntries` call's
 /// `entries` against storage. Has no `term`: that is `Common`'s concern,
@@ -292,37 +302,68 @@ impl Follower {
     }
 
     /// Form a single-node cluster around this node by appending `config` as
-    /// the first log entry (Raft §4.4).
+    /// the first log entry (Raft §4.4). With `restore`, load that backup
+    /// first, so the cluster holds its contents (see
+    /// `storage::RaftLog::restore_backup`).
     ///
-    /// Refused unless this node has no configuration and no log entry at all.
-    /// A bootstrap of a node that has either is how a cluster silently splits
-    /// in two: both halves would believe they are the whole cluster, and both
-    /// could elect a leader. A server meant to join an existing cluster is
-    /// added from that cluster's leader instead, and gets its configuration by
-    /// replication.
-    async fn bootstrap(&mut self, config: ClusterConfig) -> Result<(), RaftError> {
+    /// Refused unless this node is untouched: no configuration, no log entry,
+    /// and no data (see `storage::RaftLog::bootstrap_refusal`). A bootstrap of
+    /// a node in a cluster is how a cluster silently splits in two: both
+    /// halves would believe they are the whole cluster, and both could elect a
+    /// leader. A server meant to join an existing cluster is added from that
+    /// cluster's leader instead, and gets its configuration by replication.
+    ///
+    /// A restore holds this event loop until the backup is loaded. That is
+    /// fine: the node is in no cluster, so nothing else needs the loop yet.
+    async fn bootstrap(
+        &mut self,
+        config: ClusterConfig,
+        restore: Option<crate::store::ChunkReader>,
+    ) -> Result<(), RaftError> {
         if !self.common.config.members.is_empty() {
             return Err(RaftError::AlreadyInitialized);
         }
         let bytes = config.to_bytes();
-        let appended = self
+        let outcome = self
             .common
             .store
-            .run(move |log| {
-                if log.last_entry()?.is_some() {
-                    return Ok(false);
+            .run(move |log| match restore {
+                Some(mut reader) => log.restore_backup(&mut reader, &bytes).map(Booted::Restore),
+                None => {
+                    if let Some(refusal) = log.bootstrap_refusal()? {
+                        return Ok(Booted::Refused(refusal));
+                    }
+                    // Term 1, not 0: 0 is the "before any term" value an empty
+                    // log reports, and this entry must be reachable by the
+                    // §5.4.1 up-to-date check like any other.
+                    log.append_config(1, &bytes)?;
+                    Ok(Booted::Plain)
                 }
-                // Term 1, not 0: 0 is the "before any term" value an empty log reports,
-                // and this entry must be reachable by the §5.4.1 up-to-date check like any
-                // other.
-                log.append_config(1, &bytes)?;
-                storage::Result::Ok(true)
             })
             .await
             .map_err(RaftError::Storage)?;
 
-        if !appended {
-            return Err(RaftError::AlreadyInitialized);
+        let refusal = match outcome {
+            Booted::Plain => None,
+            Booted::Restore(RestoreOutcome::Restored {
+                as_of,
+                record_count,
+                source_node_id,
+            }) => {
+                info!(as_of, record_count, source_node_id, "restored a backup");
+                None
+            }
+            Booted::Restore(RestoreOutcome::Refused(refusal)) | Booted::Refused(refusal) => {
+                Some(refusal)
+            }
+            Booted::Restore(RestoreOutcome::BadBackup(why)) => {
+                return Err(RaftError::BadBackup(why));
+            }
+        };
+        match refusal {
+            None => {}
+            Some(BootstrapRefusal::AlreadyInitialized) => return Err(RaftError::AlreadyInitialized),
+            Some(BootstrapRefusal::Dirty(why)) => return Err(RaftError::BootstrapRefused(why)),
         }
         self.common.reload_config().await;
         Ok(())
@@ -539,8 +580,12 @@ impl Follower {
                 });
                 Transition::Continue
             }
-            Event::Bootstrap { config, respond_to } => {
-                let outcome = self.bootstrap(config).await;
+            Event::Bootstrap {
+                config,
+                restore,
+                respond_to,
+            } => {
+                let outcome = self.bootstrap(config, restore).await;
                 let accepted = outcome.is_ok();
                 let _ = respond_to.send(outcome);
                 if accepted {

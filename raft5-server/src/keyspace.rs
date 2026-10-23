@@ -74,6 +74,27 @@ pub fn is_reserved(key: &[u8]) -> bool {
     key.first() == Some(&RESERVED)
 }
 
+/// Whether a backup carries `key`.
+///
+/// Every key a client wrote, and from the reserved range only accounts,
+/// groups, ACLs and the permission epoch. An allowlist, so a reserved range
+/// added later stays out of backups until someone decides it belongs.
+///
+/// - Invitations stay out: they are short-lived credentials for the old
+///   cluster.
+/// - Checkpoints stay out: a backup holds one version per key, so no
+///   checkpoint could read through it.
+/// - The epoch must come along. Without it, the restored node's permission
+///   cache sees epoch 0, the value of an empty cache, and never loads the
+///   restored ACLs.
+pub fn is_backed_up(key: &[u8]) -> bool {
+    !is_reserved(key)
+        || key.starts_with(USER_PREFIX)
+        || key.starts_with(GROUP_PREFIX)
+        || key.starts_with(ACL_PREFIX)
+        || key == EPOCH_KEY
+}
+
 /// Where `username`'s account record is stored.
 ///
 /// Safe only for a username that [`validate_username`] accepted: that

@@ -2040,3 +2040,128 @@ async fn a_read_of_too_many_keys_is_refused_by_the_client() {
     let read = client.read(&keys, Consistency::Stale).await;
     assert!(matches!(read, Err(Error::InvalidArgument(_))), "{read:?}");
 }
+
+// --- backup and restore ---------------------------------------------------
+
+/// A backup at a snapshot, restored into a new cluster: the keys as of the
+/// snapshot, the accounts with their old passwords, and the ACLs, enforced.
+/// Invitations and snapshots stay behind. A second node added afterwards
+/// gets the restored data by snapshot transfer.
+#[tokio::test]
+async fn a_backup_restores_into_a_new_cluster() {
+    use raft5_client::{Denial, Principal, Right};
+
+    let source = TestNode::start_with_auth("bk-src", auth_config(Some(("root", "hunter42"))).await);
+    let admin = Client::new([source.url()]).unwrap();
+    admin.login("root", "hunter42").await.unwrap();
+    bootstrap(&admin, "bk-src").await;
+    admin.write(b"k", Some(b"before")).await.unwrap();
+    admin.write(b"secret/x", Some(b"s")).await.unwrap();
+    admin.create_user("alice", "correct horse", false).await.unwrap();
+    admin
+        .set_acl(b"secret/", &[(Principal::user("root"), Right::Write)])
+        .await
+        .unwrap();
+    admin.create_snapshot(Some(b"s1")).await.unwrap();
+    admin.write(b"k", Some(b"after")).await.unwrap();
+    admin.create_invite(false, Duration::ZERO, None).await.unwrap();
+
+    let mut backup = Vec::new();
+    let info = admin.backup(Some(b"s1"), &mut backup).await.unwrap();
+    assert_eq!(info.bytes, backup.len() as u64);
+
+    // A new node, with the same token secret but a different startup
+    // password for the same administrator name.
+    let r1 = TestNode::start_with_auth("bk-r1", auth_config(Some(("root", "other"))).await);
+    let restorer = Client::new([r1.url()]).unwrap();
+    restorer.login("root", "other").await.unwrap();
+    restorer
+        .bootstrap_from_backup("bk-r1", None, std::io::Cursor::new(backup))
+        .await
+        .unwrap();
+
+    // The backed-up password stands; the startup one did not replace it.
+    let root = Client::new([r1.url()]).unwrap();
+    root.login("root", "hunter42").await.unwrap();
+    let wrong = Client::new([r1.url()]).unwrap();
+    assert!(matches!(
+        wrong.login("root", "other").await,
+        Err(Error::Denied { reason: Denial::BadCredentials, .. })
+    ));
+
+    // The keys as of the snapshot.
+    assert_eq!(fresh(&root, b"k").await.value, Some(b"before".to_vec()));
+    assert_eq!(fresh(&root, b"secret/x").await.value, Some(b"s".to_vec()));
+
+    // The ACL came along, and is enforced.
+    let alice = Client::new([r1.url()]).unwrap();
+    alice.login("alice", "correct horse").await.unwrap();
+    assert!(matches!(
+        alice.read_one(b"secret/x").await,
+        Err(Error::Denied { reason: Denial::NotPermitted, .. })
+    ));
+
+    // Invitations and snapshots did not.
+    assert!(root.list_invites().await.unwrap().is_empty());
+    assert!(root.list_snapshots().await.unwrap().is_empty());
+
+    // A second node joins and catches up on the restored data.
+    let r2 = TestNode::start_with_auth("bk-r2", auth_config(None).await);
+    root.add_server(&r2.peer_url()).await.unwrap();
+    let until = Instant::now() + BOOTSTRAP_TIMEOUT;
+    loop {
+        let members = root.members().await.unwrap();
+        if members.members.iter().any(|m| m.server_id == "bk-r2" && m.voting) {
+            break;
+        }
+        assert!(Instant::now() < until, "bk-r2 never caught up: {members:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // A node already in a cluster refuses a second restore, and says why.
+    let mut again = Vec::new();
+    root.backup(None, &mut again).await.unwrap();
+    let refused = restorer
+        .bootstrap_from_backup("bk-r1", None, std::io::Cursor::new(again))
+        .await;
+    assert!(matches!(refused, Err(Error::Rejected(_))), "{refused:?}");
+}
+
+/// A damaged backup is refused with the reason, and leaves the node able to
+/// try again with a good one.
+#[tokio::test]
+async fn a_damaged_backup_is_refused_and_the_node_can_retry() {
+    let source = TestNode::start("bk-d-src");
+    let client = Client::new([source.url()]).unwrap();
+    bootstrap(&client, "bk-d-src").await;
+    client.write(b"k", Some(b"v")).await.unwrap();
+    let mut backup = Vec::new();
+    client.backup(None, &mut backup).await.unwrap();
+
+    let target = TestNode::start("bk-d-r1");
+    let restorer = Client::new([target.url()]).unwrap();
+    let mut damaged = backup.clone();
+    let middle = damaged.len() / 2;
+    damaged[middle] ^= 0xff;
+
+    // The node may still be starting, as for a plain bootstrap.
+    let until = Instant::now() + BOOTSTRAP_TIMEOUT;
+    let refused = loop {
+        match restorer
+            .bootstrap_from_backup("bk-d-r1", None, std::io::Cursor::new(damaged.clone()))
+            .await
+        {
+            Err(Error::Unavailable(_)) if Instant::now() < until => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            other => break other,
+        }
+    };
+    assert!(matches!(refused, Err(Error::Rejected(_))), "{refused:?}");
+
+    restorer
+        .bootstrap_from_backup("bk-d-r1", None, std::io::Cursor::new(backup))
+        .await
+        .unwrap();
+    assert_eq!(fresh(&restorer, b"k").await.value, Some(b"v".to_vec()));
+}

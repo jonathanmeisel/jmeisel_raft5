@@ -481,9 +481,31 @@ impl ClientHandle {
     /// in a cluster refuses with `AlreadyInitialized`; see
     /// `follower::Follower::bootstrap`.
     pub async fn bootstrap(&self, config: ClusterConfig) -> Result<(), RaftError> {
+        self.send_bootstrap(config, None).await
+    }
+
+    /// `bootstrap`, after loading the backup that `backup` streams, so the new
+    /// cluster holds its contents. See `storage::RaftLog::restore_backup`.
+    pub async fn bootstrap_from_backup(
+        &self,
+        config: ClusterConfig,
+        backup: crate::store::ChunkReader,
+    ) -> Result<(), RaftError> {
+        self.send_bootstrap(config, Some(backup)).await
+    }
+
+    async fn send_bootstrap(
+        &self,
+        config: ClusterConfig,
+        restore: Option<crate::store::ChunkReader>,
+    ) -> Result<(), RaftError> {
         let (respond_to, rx) = oneshot::channel();
         self.event_tx
-            .send(Event::Bootstrap { config, respond_to })
+            .send(Event::Bootstrap {
+                config,
+                restore,
+                respond_to,
+            })
             .await
             .map_err(|_| RaftError::Disconnected)?;
         rx.await.map_err(|_| RaftError::Disconnected)?

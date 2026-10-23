@@ -35,7 +35,8 @@ use tonic::transport::ClientTlsConfig;
 pub use tonic::transport::{Certificate, Identity};
 
 use raft5_shared::raft5::client::{
-    AddServerRequest, BootstrapRequest, CommitTransactionRequest, CommitTransactionResponse,
+    AddServerRequest, BackupRequest, BootstrapFromBackupChunk, BootstrapRequest,
+    CommitTransactionRequest, CommitTransactionResponse,
     ConfigChangeResponse, CreateSnapshotRequest, CreateSnapshotResponse, CreateTransactionRequest,
     CreateInviteRequest, CreateInviteResponse, CreateTransactionResponse, CreateUserRequest,
     CreateUserResponse, DeleteUserRequest,
@@ -49,7 +50,8 @@ use raft5_shared::raft5::client::{
     commit_transaction_response, config_change_response, create_snapshot_response,
     create_invite_response, create_transaction_response, create_user_response,
     delete_user_response, get_keys_request, get_keys_response, list_invites_response, list_snapshots_response, login_response,
-    raft_error, read_request, read_response, redeem_invite_response, remove_snapshot_response,
+    backup_chunk, bootstrap_from_backup_chunk, raft_error, read_request, read_response,
+    redeem_invite_response, remove_snapshot_response,
     revoke_invite_response, transaction_aborted, write_response,
 };
 use raft5_shared::raft5::client::{
@@ -612,6 +614,13 @@ fn versions(keys: Vec<Vec<u8>>, ok: ReadOk) -> Read<Version> {
             })
             .collect(),
     }
+}
+
+/// What [`Client::backup`] wrote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BackupInfo {
+    /// The size of the backup, in bytes.
+    pub bytes: u64,
 }
 
 /// A point-in-time view of the store, kept until it is removed.
@@ -1310,6 +1319,186 @@ impl Client {
         })))
     }
 
+    /// Stream a backup of the cluster's key/value state into `out`, as of now
+    /// or as of the snapshot `snapshot_id`. Administrators only. Returns how
+    /// many bytes were written.
+    ///
+    /// The backup holds every key a client wrote, with its newest value, plus
+    /// accounts, groups and ACLs. It leaves out invitations, snapshots and
+    /// the token signing secret: a cluster restored from it signs tokens with
+    /// whatever secret it is started with, so old tokens work only if that is
+    /// the same secret.
+    ///
+    /// Not retried once data has started to arrive: a backup that fails
+    /// partway leaves `out` with a partial file, which a restore refuses.
+    /// Write to a temporary file and rename it on success.
+    ///
+    /// See [`bootstrap_from_backup`] for the restore.
+    ///
+    /// [`bootstrap_from_backup`]: Client::bootstrap_from_backup
+    pub async fn backup<W>(&self, snapshot_id: Option<&[u8]>, out: &mut W) -> Result<BackupInfo, Error>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::AsyncWriteExt;
+
+        let request = BackupRequest {
+            snapshot_id: snapshot_id.unwrap_or_default().to_vec(),
+        };
+        let mut relogged_in = false;
+        let mut stream = loop {
+            let leader = self.router.leader(None).await?;
+            match leader.kv.clone().backup(request.clone()).await {
+                Ok(response) => break response.into_inner(),
+                // An expired token is the common case, as in `call_inner`: log in
+                // again once, if this client has credentials.
+                Err(status) if status.code() == tonic::Code::Unauthenticated && !relogged_in => {
+                    relogged_in = true;
+                    match self.router.credentials() {
+                        Some((username, password)) => {
+                            self.refresh_token(&username, &password).await?;
+                        }
+                        None => return Err(status_error(status)),
+                    }
+                }
+                Err(status) => return Err(status_error(status)),
+            }
+        };
+
+        let mut bytes = 0u64;
+        while let Some(chunk) = stream.message().await.map_err(status_error)? {
+            match chunk.result {
+                Some(backup_chunk::Result::Data(data)) => {
+                    out.write_all(&data)
+                        .await
+                        .map_err(|e| Error::Rejected(format!("could not write the backup: {e}")))?;
+                    bytes += data.len() as u64;
+                }
+                Some(backup_chunk::Result::AuthError(e)) => match denied::<()>(e) {
+                    Reply::Denied { reason, detail } => return Err(Error::Denied { reason, detail }),
+                    _ => unreachable!("`denied` only returns `Reply::Denied`"),
+                },
+                None => return Err(Error::Unavailable("the node sent an empty backup chunk".to_string())),
+            }
+        }
+        out.flush()
+            .await
+            .map_err(|e| Error::Rejected(format!("could not write the backup: {e}")))?;
+        Ok(BackupInfo { bytes })
+    }
+
+    /// Form a single-node cluster around the node named `server_id`, as
+    /// [`bootstrap`] does, holding the contents of the backup that `backup`
+    /// reads. Every other node then joins through [`add_server`], and gets the
+    /// data by snapshot transfer.
+    ///
+    /// - The node must be in no cluster and hold no data.
+    /// - Keys keep the seqs they had in the source cluster.
+    /// - Accounts come from the backup, passwords included. The administrator
+    ///   the node was started with is created only if the backup has no
+    ///   account with that username; when it has one, the backed-up password
+    ///   stays. This client must be logged in as that startup administrator,
+    ///   as for [`bootstrap`].
+    /// - The token signing secret is not in the backup: the new cluster uses
+    ///   whatever secret it was started with.
+    ///
+    /// The node checks the backup before it becomes a cluster. A bad backup
+    /// is [`Error::Rejected`] with the reason, and leaves the node as it was,
+    /// so the call can be repeated. Not retried: the backup is read once.
+    ///
+    /// [`bootstrap`]: Client::bootstrap
+    /// [`add_server`]: Client::add_server
+    pub async fn bootstrap_from_backup<R>(
+        &self,
+        server_id: &str,
+        heartbeat_ms: Option<u64>,
+        mut backup: R,
+    ) -> Result<(), Error>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
+        use tokio::io::AsyncReadExt;
+
+        if server_id.is_empty() {
+            return Err(Error::InvalidArgument(
+                "bootstrap needs the id of the node to bootstrap",
+            ));
+        }
+
+        // Find the node by its own identity first: the backup can be read only
+        // once, so it must go to the right node on the first try.
+        let mut target = None;
+        for node in self.router.nodes() {
+            let mut kv = node.connect();
+            if let Ok(config) = kv.get_config(GetConfigRequest {}).await
+                && config.get_ref().identity.as_ref().is_some_and(|m| m.server_id == server_id)
+            {
+                target = Some(kv);
+                break;
+            }
+        }
+        let Some(mut kv) = target else {
+            return Err(Error::Unavailable(format!(
+                "no endpoint of this client is called {server_id:?}"
+            )));
+        };
+
+        // The reader runs in its own task and feeds a bounded channel, so only
+        // a few chunks are in memory however large the backup is.
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let header = BootstrapFromBackupChunk {
+            part: Some(bootstrap_from_backup_chunk::Part::Header(BootstrapRequest {
+                server_id: server_id.to_string(),
+                heartbeat_millis: heartbeat_ms.unwrap_or(0),
+            })),
+        };
+        tx.send(header)
+            .await
+            .expect("the receiver is still held here");
+        let reading = tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = backup.read(&mut buf).await?;
+                if n == 0 {
+                    return Ok::<(), std::io::Error>(());
+                }
+                let chunk = BootstrapFromBackupChunk {
+                    part: Some(bootstrap_from_backup_chunk::Part::Data(buf[..n].to_vec())),
+                };
+                // The node stopped reading: its answer says why.
+                if tx.send(chunk).await.is_err() {
+                    return Ok(());
+                }
+            }
+        });
+
+        let answered = kv
+            .bootstrap_from_backup(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await;
+        // A local read error ends the stream early, so the node reports a
+        // truncated backup. The local error says more.
+        match reading.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(Error::Rejected(format!("could not read the backup: {e}"))),
+            Err(e) => return Err(Error::Rejected(format!("the backup reader failed: {e}"))),
+        }
+        match answered {
+            Ok(response) => match config_reply(response) {
+                Reply::Ok(()) => {
+                    self.router.refresh_config(&kv).await;
+                    Ok(())
+                }
+                Reply::Denied { reason, detail } => Err(Error::Denied { reason, detail }),
+                _ => Err(Error::Unavailable(format!("{server_id} refused to bootstrap"))),
+            },
+            // Already in a cluster, or holding data: no retry will change it.
+            Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+                Err(Error::Rejected(status.message().to_string()))
+            }
+            Err(status) => Err(status_error(status)),
+        }
+    }
+
     /// `call`, and then a re-read of the membership on success: the client
     /// just changed the cluster's members, so its own view is out of date.
     async fn change_config<F, Fut>(&self, op: F) -> Result<(), Error>
@@ -1862,6 +2051,18 @@ impl Client {
 
             tokio::time::sleep(RETRY_DELAY).await;
         }
+    }
+}
+
+/// A `Status` from a call that is not retried, as the error `call_inner`
+/// would report for it.
+fn status_error(status: Status) -> Error {
+    match status.code() {
+        tonic::Code::Unauthenticated => Error::Unauthenticated(status.message().to_string()),
+        tonic::Code::PermissionDenied => Error::PermissionDenied(status.message().to_string()),
+        tonic::Code::NotFound => Error::NotFound(status.message().to_string()),
+        _ if is_permanent(&status) => Error::Rejected(status.message().to_string()),
+        _ => Error::Unavailable(status.to_string()),
     }
 }
 

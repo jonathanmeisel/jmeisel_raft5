@@ -92,6 +92,8 @@ pub enum Event {
     /// log: see `Follower::bootstrap`.
     Bootstrap {
         config: ClusterConfig,
+        /// A backup to load first, so the new cluster holds its contents.
+        restore: Option<crate::store::ChunkReader>,
         respond_to: oneshot::Sender<Result<(), RaftError>>,
     },
 }
@@ -178,6 +180,12 @@ pub enum RaftError {
     /// that is already a member, removing one that is not, or removing the last
     /// voter.
     InvalidConfigChange(&'static str),
+    /// `Bootstrap` on a node that is in no cluster but holds data a bootstrap
+    /// would build on, for example the remains of an interrupted restore.
+    BootstrapRefused(&'static str),
+    /// A bootstrap from a backup could not read the backup. Nothing was
+    /// kept, so the node can be bootstrapped again.
+    BadBackup(String),
 }
 
 /// A single-server membership change (Raft §4.1: one server at a time, not

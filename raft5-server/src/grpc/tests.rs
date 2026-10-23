@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use super::*;
 use crate::pb::raft5::client::{
-    AclEntry as PbAclEntry, CommitTransactionRequest, CreateGroupRequest, CreateInviteRequest,
+    AclEntry as PbAclEntry, BackupRequest, CommitTransactionRequest, CreateGroupRequest, CreateInviteRequest,
     CreateTransactionRequest, DeleteAclRequest, DropTransactionRequest, GetAclRequest,
     GetGroupRequest, GetKeysRequest, Linearizable, ListAclsRequest, ListGroupsRequest, ListInvitesRequest,
     Principal as PbPrincipal, RedeemInviteRequest, RevokeInviteRequest, Right as PbRight,
     SetAclRequest, UpdateGroupRequest, create_group_response, delete_acl_response,
     get_acl_response, get_group_response, list_acls_response, list_groups_response, principal,
-    set_acl_response, update_group_response, auth_error,
+    set_acl_response, update_group_response, auth_error, backup_chunk,
     commit_transaction_response, config_change_response, create_invite_response,
     create_transaction_response, create_user_response, delete_user_response, get_keys_response,
     list_invites_response, login_response, raft_error, read_response, redeem_invite_response,
@@ -4285,4 +4285,123 @@ async fn one_denied_key_refuses_the_whole_read_and_says_which() {
     assert!(matches!(admin, Some(read_response::Result::Ok(_))), "{admin:?}");
 
     cleanup(&path);
+}
+
+// --- backups ------------------------------------------------------------
+
+/// What a `Backup` call streamed: the bytes, or the refusal it sent as its
+/// only message.
+async fn take_backup(
+    svc: &KvService,
+    request: Request<BackupRequest>,
+) -> Result<Result<Vec<u8>, PbAuthError>, Status> {
+    use tokio_stream::StreamExt;
+    let mut stream = svc.backup(request).await?.into_inner();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        match chunk?.result {
+            Some(backup_chunk::Result::Data(data)) => bytes.extend_from_slice(&data),
+            Some(backup_chunk::Result::AuthError(e)) => return Ok(Err(e)),
+            None => panic!("an empty backup chunk"),
+        }
+    }
+    Ok(Ok(bytes))
+}
+
+/// A new store holding `backup`, as a restored node would.
+fn restored(backup: &[u8]) -> (RaftLog, std::path::PathBuf) {
+    let (_, path) = open_temp();
+    let log = RaftLog::open(path.join("restored")).expect("open");
+    match log.restore_backup(&mut &backup[..], b"cfg").unwrap() {
+        crate::storage::RestoreOutcome::Restored { .. } => {}
+        other => panic!("expected the backup to restore, got {other:?}"),
+    }
+    (log, path)
+}
+
+/// On a node with no accounts, anyone may take a backup. It holds the
+/// client's keys and leaves out snapshots.
+#[tokio::test]
+async fn a_backup_holds_the_keys_and_not_the_snapshots() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+    let a = write(&svc, b"a", Some(b"1")).await;
+    make_snapshot(&svc, b"s1").await;
+    let b = write(&svc, b"b", Some(b"2")).await;
+
+    let backup = take_backup(&svc, Request::new(BackupRequest::default()))
+        .await
+        .unwrap()
+        .expect("no accounts, so no refusal");
+    let (copy, copy_path) = restored(&backup);
+    assert_eq!(copy.get_latest(b"a").unwrap(), Some((a, b"1".to_vec())));
+    assert_eq!(copy.get_latest(b"b").unwrap(), Some((b, b"2".to_vec())));
+    assert_eq!(copy.checkpoint_seq(b"s1").unwrap(), None);
+
+    cleanup(&path);
+    cleanup(&copy_path);
+}
+
+/// A backup at a snapshot shows the store as it was then. A snapshot nobody
+/// created is `not_found`, before any byte is sent.
+#[tokio::test]
+async fn a_backup_at_a_snapshot_reads_as_of_it() {
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+    let old = write(&svc, b"k", Some(b"old")).await;
+    make_snapshot(&svc, b"s1").await;
+    write(&svc, b"k", Some(b"new")).await;
+
+    let at = BackupRequest {
+        snapshot_id: b"s1".to_vec(),
+    };
+    let backup = take_backup(&svc, Request::new(at)).await.unwrap().unwrap();
+    let (copy, copy_path) = restored(&backup);
+    assert_eq!(copy.get_latest(b"k").unwrap(), Some((old, b"old".to_vec())));
+
+    let missing = BackupRequest {
+        snapshot_id: b"nope".to_vec(),
+    };
+    let status = take_backup(&svc, Request::new(missing)).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::NotFound);
+
+    cleanup(&path);
+    cleanup(&copy_path);
+}
+
+/// Only an administrator may take a backup: it holds every account's
+/// password hash. What it carries from the reserved range is accounts,
+/// groups, ACLs and the permission epoch, and not invitations.
+#[tokio::test]
+async fn a_backup_is_for_administrators_and_carries_permissions() {
+    let (log, path) = open_temp();
+    let svc = service_with_alice(log, "kv-test").await;
+    must_create_group(&svc, "root", "ops", vec![pb_user("alice")]).await;
+    must_set_acl(&svc, "root", b"app/", vec![grant(pb_user("root"), PbRight::Write)]).await;
+    let (_, invite_id) = invite(&svc).await;
+
+    let refused = take_backup(&svc, as_user("alice", BackupRequest::default()))
+        .await
+        .unwrap()
+        .expect_err("alice is not an administrator");
+    assert_eq!(auth_kind(&refused), auth_error::Kind::NotAdmin);
+
+    let backup = take_backup(&svc, as_user("root", BackupRequest::default()))
+        .await
+        .unwrap()
+        .expect("root is an administrator");
+    let (copy, copy_path) = restored(&backup);
+    for key in [
+        crate::keyspace::user_key("alice"),
+        crate::keyspace::user_key("root"),
+        crate::keyspace::group_key("ops"),
+        crate::keyspace::acl_key(b"app/"),
+        crate::keyspace::EPOCH_KEY.to_vec(),
+    ] {
+        assert!(copy.get_latest(&key).unwrap().is_some(), "{key:?} is missing");
+    }
+    assert_eq!(copy.get_latest(&crate::keyspace::invite_key(&invite_id)).unwrap(), None);
+
+    cleanup(&path);
+    cleanup(&copy_path);
 }

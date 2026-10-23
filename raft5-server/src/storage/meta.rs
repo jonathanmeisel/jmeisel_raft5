@@ -27,6 +27,11 @@ pub(super) const META_CURRENT_TERM: &[u8] = b"current_term";
 
 pub(super) const META_VOTED_FOR: &[u8] = b"voted_for";
 
+/// Present while `restore_backup` runs. A store that still has it after a
+/// restart had a restore interrupted, and holds partial data that neither
+/// bootstrap path may build on.
+pub(super) const META_RESTORE_IN_PROGRESS: &[u8] = b"restore_in_progress";
+
 /// The newest `Config` entry that was compacted (or snapshotted) out of
 /// `log`. `current_config` falls back to this once the entry with the
 /// active configuration no longer exists. A cluster that has not changed

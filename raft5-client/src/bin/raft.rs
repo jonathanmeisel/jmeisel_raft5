@@ -431,14 +431,46 @@ async fn run(client: &Client, words: &[Vec<u8>]) -> Result<bool, String> {
             }
         }
         "bootstrap" => {
-            const USAGE: &str = "usage: bootstrap <server_id> [heartbeat_ms]";
-            let (server_id, heartbeat_ms) = match args {
+            const USAGE: &str =
+                "usage: bootstrap <server_id> [heartbeat_ms] [--restore-from <backup_file>]";
+            // `--restore-from <file>` may come anywhere after the id.
+            let mut rest: Vec<&Vec<u8>> = args.iter().collect();
+            let mut restore_from = None;
+            if let Some(i) = rest.iter().position(|a| a.as_slice() == b"--restore-from") {
+                if i + 1 >= rest.len() {
+                    return Err(USAGE.to_string());
+                }
+                restore_from = Some(text(rest[i + 1])?.to_string());
+                rest.drain(i..=i + 1);
+            }
+            let (server_id, heartbeat_ms) = match rest.as_slice() {
                 [server_id] => (text(server_id)?, None),
                 [server_id, ms] => (text(server_id)?, Some(parse_millis(ms, USAGE)?)),
                 _ => return Err(USAGE.to_string()),
             };
-            match client.bootstrap(server_id, heartbeat_ms).await {
+            let result = match restore_from {
+                None => client.bootstrap(server_id, heartbeat_ms).await,
+                Some(path) => match tokio::fs::File::open(&path).await {
+                    Ok(file) => client.bootstrap_from_backup(server_id, heartbeat_ms, file).await,
+                    Err(e) => {
+                        println!("error: could not open {path}: {e}");
+                        return Ok(true);
+                    }
+                },
+            };
+            match result {
                 Ok(()) => println!("ok"),
+                Err(e) => println!("error: {e}"),
+            }
+        }
+        "backup" => {
+            let (path, snapshot_id) = match args {
+                [path] => (text(path)?, None),
+                [path, id] => (text(path)?, Some(id.as_slice())),
+                _ => return Err("usage: backup <file> [snapshot_id]".to_string()),
+            };
+            match write_backup(client, path, snapshot_id).await {
+                Ok(bytes) => println!("ok, {bytes} bytes written to {path}"),
                 Err(e) => println!("error: {e}"),
             }
         }
@@ -869,6 +901,30 @@ fn print_seq(result: Result<u64, Error>) {
     }
 }
 
+/// Write a backup to `path`. It goes to a temporary file next to `path`
+/// first and is renamed only when complete, so a failed backup never leaves
+/// a partial file under the name a restore would use.
+async fn write_backup(client: &Client, path: &str, snapshot_id: Option<&[u8]>) -> Result<u64, String> {
+    let partial = format!("{path}.partial");
+    let mut file = tokio::fs::File::create(&partial)
+        .await
+        .map_err(|e| format!("could not create {partial}: {e}"))?;
+    let written = client.backup(snapshot_id, &mut file).await;
+    drop(file);
+    match written {
+        Ok(info) => {
+            tokio::fs::rename(&partial, path)
+                .await
+                .map_err(|e| format!("could not rename {partial} to {path}: {e}"))?;
+            Ok(info.bytes)
+        }
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&partial).await;
+            Err(e.to_string())
+        }
+    }
+}
+
 /// Read `keys` and print them, one line each, under the `as_of` they were
 /// read at.
 ///
@@ -976,6 +1032,11 @@ fn print_help() {
             "remove_server <id>               remove a server",
             "bootstrap <id> [heartbeat_ms]    form a single-node cluster around <id>; the",
             "                                  heartbeat defaults to 50ms",
+            "  [--restore-from <file>]         ...holding the contents of a backup. accounts",
+            "                                  come from the backup, passwords included; the",
+            "                                  token secret does not (the node keeps its own)",
+            "backup <file> [snapshot]         write a backup of every key, account, group and",
+            "                                  ACL, as of now or a snapshot. admins only",
             "members                          list the cluster's members: each one's id, whether",
             "                                  it votes yet or is a learner still catching up,",
             "                                  which leads, and its peer and client addresses",

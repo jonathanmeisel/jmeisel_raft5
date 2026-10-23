@@ -49,6 +49,49 @@ service Kv {
   // any read outside a transaction.
   rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
 
+  // Stream a backup of this node's key/value state, as of now or as of a
+  // snapshot. Administrators only. Any node serves it, because a backup is a
+  // local read, so backups can run on a follower.
+  //
+  // What a backup holds:
+  // - every key a client wrote, with its newest value at the backup's seq;
+  // - accounts (with their password hashes), groups and ACLs.
+  //
+  // What it leaves out: invitations, snapshots, deleted keys, older
+  // versions, the cluster configuration, and the token signing secret.
+  //
+  // The secret is not part of the store, so a cluster restored from a backup
+  // signs tokens with whatever `--jwt-secret-file` it is started with.
+  // Tokens from the old cluster keep working only if that is the same
+  // secret.
+  //
+  // A backup of the current state holds a storage snapshot open while it
+  // streams, so disk use can grow during a long backup. A backup at a named
+  // snapshot reads versions that snapshot already keeps.
+  //
+  // The stream is a versioned file format, independent of the storage
+  // format: write it to a file as it arrives, and give that file to
+  // BootstrapFromBackup.
+  rpc Backup(BackupRequest) returns (stream BackupChunk);
+
+  // Bootstrap this node, as Bootstrap does, from a backup: the new
+  // single-node cluster holds the backup's contents. The first message is
+  // the header (the same fields as BootstrapRequest), and the rest carry the
+  // backup's bytes in order.
+  //
+  // Only a node that is in no cluster and holds no data accepts it. Keys keep
+  // the seqs they had in the source cluster, and the log continues after
+  // them. The backup is checked (record count and checksum) before the node
+  // becomes a cluster; a backup that fails the check leaves the node as it
+  // was, and the call can be repeated. A node that crashes while it loads a
+  // backup refuses every later bootstrap: delete its database directory.
+  //
+  // Accounts come from the backup, passwords included. The administrator the
+  // node was started with is created only if the backup has no account with
+  // that username; when it has one, the backed-up password stays. Like
+  // Bootstrap, the call needs that startup administrator's token.
+  rpc BootstrapFromBackup(stream BootstrapFromBackupChunk) returns (ConfigChangeResponse);
+
   // Cluster membership changes, one server at a time (single-server change,
   // not joint consensus, because it is simpler to reason about). Atomic
   // multi-member changes are not supported.
@@ -572,6 +615,29 @@ message GetKeysOk {
   // client that uses this field when present, and the zero-byte rule
   // otherwise, works with both.
   bytes next_start_key = 3;
+}
+
+message BackupRequest {
+  // The snapshot to back up at. Empty backs up the current state.
+  bytes snapshot_id = 1;
+}
+
+message BackupChunk {
+  oneof result {
+    // The next bytes of the backup file.
+    bytes data = 1;
+    // The caller is not an administrator. Sent as the only message.
+    AuthError auth_error = 2;
+  }
+}
+
+message BootstrapFromBackupChunk {
+  oneof part {
+    // First, and only first.
+    BootstrapRequest header = 1;
+    // The backup file's bytes, in order, after the header.
+    bytes data = 2;
+  }
 }
 
 message AddServerRequest {
