@@ -15,6 +15,7 @@ use crate::pb::raft5::client::{
     revoke_invite_response, transaction_aborted, write_response,
 };
 use crate::auth::{AuthConfig, AuthContext, InitialAdmin};
+use crate::perms::{ADMINS_GROUP, BACKUP_OPERATORS_GROUP};
 use crate::raft::{self, RoleHandle};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -1100,6 +1101,48 @@ async fn a_scan_outside_a_transaction_is_served_without_a_leader() {
         other => panic!("expected NotLeader, got {other:?}"),
     }
 
+    cleanup(&path);
+}
+
+/// A linearizable walk proves leadership first, so a leader serves it and
+/// a bystander refuses it, as for a linearizable `Read`.
+#[tokio::test]
+async fn a_linearizable_scan_needs_a_leader() {
+    let linearizable = || GetKeysRequest {
+        start_key: Vec::new(),
+        max_keys: 10,
+        consistency: Some(get_keys_request::Consistency::Linearizable(Linearizable {})),
+    };
+
+    let (log, path) = open_temp();
+    let svc = leader_kv_service(log, "kv-test").await;
+    write(&svc, b"a", Some(b"1")).await;
+    let result = svc
+        .get_keys(Request::new(linearizable()))
+        .await
+        .unwrap()
+        .into_inner()
+        .result;
+    match result {
+        Some(get_keys_response::Result::Ok(ok)) => assert_eq!(ok.keys, vec![b"a".to_vec()]),
+        other => panic!("expected the leader to serve it, got {other:?}"),
+    }
+    cleanup(&path);
+
+    let (log, path) = open_temp();
+    let (svc, _role_rx) = kv_service(log, "bystander");
+    let result = svc
+        .get_keys(Request::new(linearizable()))
+        .await
+        .unwrap()
+        .into_inner()
+        .result;
+    match result {
+        Some(get_keys_response::Result::Error(e)) => {
+            assert!(matches!(e.kind, Some(raft_error::Kind::NotLeader(_))));
+        }
+        other => panic!("expected NotLeader, got {other:?}"),
+    }
     cleanup(&path);
 }
 
@@ -3916,8 +3959,11 @@ async fn any_account_may_read_the_acls_and_the_groups() {
         Some(list_groups_response::Result::Ok(list)) => list.groups,
         other => panic!("expected a listing, got {other:?}"),
     };
-    assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0].name, "ops");
+    // Sorted by name, with the two built-in groups bootstrap created.
+    assert_eq!(
+        groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
+        vec![ADMINS_GROUP, BACKUP_OPERATORS_GROUP, "ops"]
+    );
 
     cleanup(&path);
 }
@@ -4407,20 +4453,7 @@ async fn a_backup_is_for_administrators_and_carries_permissions() {
     cleanup(&copy_path);
 }
 
-// --- backup operators -----------------------------------------------------
-
-async fn set_backup_operators(
-    svc: &KvService,
-    caller: &str,
-    principals: Vec<PbPrincipal>,
-) -> set_backup_operators_response::Result {
-    svc.set_backup_operators(as_user(caller, SetBackupOperatorsRequest { principals }))
-        .await
-        .unwrap()
-        .into_inner()
-        .result
-        .expect("a set_backup_operators response always carries a result")
-}
+// --- built-in groups -------------------------------------------------------
 
 async fn snapshot_as(svc: &KvService, caller: &str, id: &[u8]) -> create_snapshot_response::Result {
     svc.create_snapshot(as_user(
@@ -4455,20 +4488,31 @@ async fn drop_snapshot_as(
     .expect("a remove_snapshot response always carries a result")
 }
 
-/// A backup operator, named directly or through a group, may create and
-/// remove snapshots and take backups. Anyone else who is not an
-/// administrator may not. The list travels with the backup.
+async fn add_member(
+    svc: &KvService,
+    caller: &str,
+    group: &str,
+    who: PbPrincipal,
+) -> update_group_response::Result {
+    update_group(svc, caller, group, vec![who], vec![]).await
+}
+
+/// A member of `backup-operators`, directly or through a nested group, may
+/// create and remove snapshots and take backups. Anyone else who is not an
+/// administrator may not.
 #[tokio::test]
 async fn a_backup_operator_may_snapshot_and_back_up() {
     let (log, path) = open_temp();
     let svc = service_with_alice(log, "kv-test").await;
     created_seq(create_user(&svc, "root", "bob", "hunter42", false).await);
     created_seq(create_user(&svc, "root", "carol", "hunter42", false).await);
-    must_create_group(&svc, "root", "backup", vec![pb_user("carol")]).await;
-    assert!(matches!(
-        set_backup_operators(&svc, "root", vec![pb_user("bob"), pb_group("backup")]).await,
-        set_backup_operators_response::Result::Seq(_)
-    ));
+    must_create_group(&svc, "root", "nightly", vec![pb_user("carol")]).await;
+    for who in [pb_user("bob"), pb_group("nightly")] {
+        assert!(matches!(
+            add_member(&svc, "root", BACKUP_OPERATORS_GROUP, who).await,
+            update_group_response::Result::Seq(_)
+        ));
+    }
 
     match snapshot_as(&svc, "alice", b"s1").await {
         create_snapshot_response::Result::AuthError(e) => {
@@ -4489,7 +4533,7 @@ async fn a_backup_operator_may_snapshot_and_back_up() {
         .unwrap()
         .expect_err("alice is not a backup operator");
     assert_eq!(auth_kind(&refused), auth_error::Kind::NotAdmin);
-    let backup = take_backup(&svc, as_user("carol", at_s1()))
+    take_backup(&svc, as_user("carol", at_s1()))
         .await
         .unwrap()
         .expect("carol is a backup operator through her group");
@@ -4505,61 +4549,134 @@ async fn a_backup_operator_may_snapshot_and_back_up() {
         remove_snapshot_response::Result::Seq(_)
     ));
 
-    let (copy, copy_path) = restored(&backup);
-    assert!(
-        copy.get_latest(crate::keyspace::BACKUP_OPERATORS_KEY)
-            .unwrap()
-            .is_some()
-    );
-
     cleanup(&path);
-    cleanup(&copy_path);
 }
 
-/// Only an administrator may change the list, anyone signed in may read
-/// it, and an empty list takes the right away.
+/// An administrator is a member of `admins`. Joining it gives the rights,
+/// leaving it takes them away, and only administrators may change it.
 #[tokio::test]
-async fn only_an_administrator_chooses_the_backup_operators() {
+async fn the_admins_group_decides_who_is_an_administrator() {
     let (log, path) = open_temp();
     let svc = service_with_alice(log, "kv-test").await;
 
-    match set_backup_operators(&svc, "alice", vec![pb_user("alice")]).await {
-        set_backup_operators_response::Result::AuthError(e) => {
-            assert_eq!(auth_kind(&e), auth_error::Kind::NotAdmin);
-        }
-        other => panic!("alice is not an administrator, got {other:?}"),
-    }
-    let seq = match set_backup_operators(&svc, "root", vec![pb_user("alice")]).await {
-        set_backup_operators_response::Result::Seq(seq) => seq,
-        other => panic!("root is an administrator, got {other:?}"),
-    };
+    // alice cannot add herself: she does not administer the group.
+    assert!(matches!(
+        add_member(&svc, "alice", ADMINS_GROUP, pb_user("alice")).await,
+        update_group_response::Result::AuthError(_)
+    ));
+    assert!(matches!(
+        create_user(&svc, "alice", "bob", "hunter42", false).await,
+        create_user_response::Result::AuthError(_)
+    ));
 
-    let listed = svc
-        .get_backup_operators(as_user("alice", GetBackupOperatorsRequest {}))
+    assert!(matches!(
+        add_member(&svc, "root", ADMINS_GROUP, pb_user("alice")).await,
+        update_group_response::Result::Seq(_)
+    ));
+    created_seq(create_user(&svc, "alice", "bob", "hunter42", false).await);
+
+    assert!(matches!(
+        update_group(&svc, "root", ADMINS_GROUP, vec![], vec![pb_user("alice")]).await,
+        update_group_response::Result::Seq(_)
+    ));
+    assert!(matches!(
+        create_user(&svc, "alice", "carol", "hunter42", false).await,
+        create_user_response::Result::AuthError(_)
+    ));
+
+    cleanup(&path);
+}
+
+/// The built-in groups cannot be created or deleted, and `admins` cannot
+/// be emptied.
+#[tokio::test]
+async fn the_built_in_groups_stay() {
+    let (log, path) = open_temp();
+    let svc = service_with_alice(log, "kv-test").await;
+
+    for name in [ADMINS_GROUP, BACKUP_OPERATORS_GROUP] {
+        let status = svc
+            .delete_group(as_user(
+                "root",
+                DeleteGroupRequest {
+                    name: name.to_string(),
+                },
+            ))
+            .await
+            .expect_err("a built-in group cannot be deleted");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        let status = svc
+            .create_group(as_user(
+                "root",
+                CreateGroupRequest {
+                    name: name.to_string(),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect_err("a built-in group cannot be created");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    let status = svc
+        .update_group(as_user(
+            "root",
+            UpdateGroupRequest {
+                name: ADMINS_GROUP.to_string(),
+                remove_members: vec![pb_user("root")],
+                ..Default::default()
+            },
+        ))
         .await
-        .unwrap()
-        .into_inner()
-        .result;
-    match listed {
-        Some(get_backup_operators_response::Result::Ok(ok)) => {
-            assert_eq!(ok.principals, vec![pb_user("alice")]);
-            assert_eq!(ok.seq, seq);
-        }
-        other => panic!("expected the list, got {other:?}"),
-    }
+        .expect_err("admins cannot be emptied");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    let status = svc
+        .delete_user(as_user(
+            "root",
+            DeleteUserRequest {
+                username: "root".to_string(),
+            },
+        ))
+        .await
+        .expect_err("the last administrator cannot be deleted");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+
+    cleanup(&path);
+}
+
+/// A deleted account leaves every group, so an account made later with the
+/// same name inherits nothing. And a group cannot name an account that
+/// does not exist yet.
+#[tokio::test]
+async fn a_name_does_not_carry_rights_to_its_next_owner() {
+    let (log, path) = open_temp();
+    let svc = service_with_alice(log, "kv-test").await;
     assert!(matches!(
-        snapshot_as(&svc, "alice", b"s1").await,
-        create_snapshot_response::Result::Ok(_)
+        add_member(&svc, "root", ADMINS_GROUP, pb_user("alice")).await,
+        update_group_response::Result::Seq(_)
     ));
 
+    svc.delete_user(as_user(
+        "root",
+        DeleteUserRequest {
+            username: "alice".to_string(),
+        },
+    ))
+    .await
+    .unwrap();
+    created_seq(create_user(&svc, "root", "alice", "hunter42", false).await);
     assert!(matches!(
-        set_backup_operators(&svc, "root", vec![]).await,
-        set_backup_operators_response::Result::Seq(_)
+        create_user(&svc, "alice", "bob", "hunter42", false).await,
+        create_user_response::Result::AuthError(_)
     ));
-    assert!(matches!(
-        snapshot_as(&svc, "alice", b"s2").await,
-        create_snapshot_response::Result::AuthError(_)
-    ));
+
+    match add_member(&svc, "root", ADMINS_GROUP, pb_user("ghost")).await {
+        update_group_response::Result::AuthError(e) => {
+            assert_eq!(auth_kind(&e), auth_error::Kind::NoSuchUser);
+        }
+        other => panic!("expected NO_SUCH_USER, got {other:?}"),
+    }
 
     cleanup(&path);
 }

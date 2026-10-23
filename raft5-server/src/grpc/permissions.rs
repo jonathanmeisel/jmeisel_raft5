@@ -24,14 +24,22 @@
 //!
 //! # Administrators
 //!
-//! `is_admin` means write everywhere, and no ACL can remove it. An
-//! administrator can rewrite any ACL anyway, so an ACL that excluded one
-//! would add no safety, and would let one call lock the cluster out of its
-//! own keyspace.
+//! A member of the `admins` group may write everywhere, and no ACL can
+//! remove that. An administrator can rewrite any ACL anyway, so an ACL that
+//! excluded one would add no safety, and would let one call lock the
+//! cluster out of its own keyspace.
 //!
 //! The bypass is checked after the ACLs, not before, so only a request an
-//! ACL would refuse pays for the account read. On the common path (a key
-//! nothing governs), nothing is read.
+//! ACL would refuse pays for the group walk. On the common path (a key
+//! nothing governs), it never runs.
+//!
+//! # Groups name only accounts that exist
+//!
+//! Roles are groups, so a group that named an account nobody holds yet
+//! would hand that name's rights to whoever created it next, for example
+//! by redeeming an ordinary invitation. So a group may name only existing
+//! accounts, and deleting an account takes it out of every group in the
+//! same transaction.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -39,16 +47,17 @@ use std::sync::{Arc, Mutex};
 use tonic::Status;
 
 use super::{AuthFailure, KvService, caller, storage_err};
-use crate::auth::{AuthContext, UserRecord};
+use crate::auth::AuthContext;
 use crate::keyspace;
 use crate::pb::raft5::client::{
     Acl as PbAcl, AclEntry as PbAclEntry, AclList, CreateGroupRequest, DeleteAclRequest,
-    BackupOperators as PbBackupOperators, DeleteGroupRequest, GetAclOk, GetAclRequest,
-    GetGroupRequest, Group as PbGroup, GroupList, Principal as PbPrincipal, Right as PbRight,
-    SetAclRequest, SetBackupOperatorsRequest, UpdateGroupRequest, auth_error, principal,
+    DeleteGroupRequest, GetAclOk, GetAclRequest, GetGroupRequest, Group as PbGroup, GroupList,
+    Principal as PbPrincipal, Right as PbRight, SetAclRequest, UpdateGroupRequest, auth_error,
+    principal,
 };
 use crate::perms::{
-    AclRecord, BackupOperatorsRecord, Decision, GroupRecord, Permissions, Principal, Right,
+    ADMINS_GROUP, AclRecord, BACKUP_OPERATORS_GROUP, Decision, GroupRecord, Permissions,
+    Principal, Right,
 };
 use crate::storage::RaftLog;
 use crate::txn::TxnId;
@@ -80,11 +89,6 @@ pub(super) const MAX_GROUP_ADMINS: usize = 32;
 /// a longest-prefix lookup, which is one probe per distinct prefix length.
 pub(super) const MAX_ACLS: usize = 1024;
 pub(super) const MAX_ACL_ENTRIES: usize = 64;
-
-/// The most principals the backup operator list may hold. It bounds the
-/// snapshot, like `MAX_ACL_ENTRIES`. A list longer than this is better
-/// served by one group.
-pub(super) const MAX_BACKUP_OPERATORS: usize = 64;
 
 /// How many keys one `GetKeys` examines before it stops trying to fill
 /// its batch and returns a cursor.
@@ -140,8 +144,7 @@ impl ScanFilter {
 
 /// Read all permissions at one point in time.
 ///
-/// The listings and the backup operator read are separate reads, so
-/// separate moments. The epoch is read
+/// The two listings are two iterators, so two moments. The epoch is read
 /// before and after to detect a change in between. This matters only here:
 /// a snapshot built across a change could hold half of it, which is
 /// permission state nobody could reason about.
@@ -154,11 +157,8 @@ fn load_permissions(log: &RaftLog) -> Result<Permissions, Status> {
         let acls = log
             .list_versioned_records_under(keyspace::ACL_PREFIX)
             .map_err(storage_err)?;
-        let backup_operators = log
-            .get_latest(keyspace::BACKUP_OPERATORS_KEY)
-            .map_err(storage_err)?;
         if read_epoch(log)? == before {
-            return Permissions::build(before, groups, acls, backup_operators);
+            return Permissions::build(before, groups, acls);
         }
     }
     Err(Status::unavailable(
@@ -280,6 +280,26 @@ fn not_permitted(detail: impl Into<String>) -> AuthFailure {
     AuthFailure::refused(auth_error::Kind::NotPermitted, detail)
 }
 
+/// A new built-in group: no members, administered by the administrators.
+fn builtin_group(created_by: &str) -> GroupRecord {
+    GroupRecord::new(
+        created_by.to_string(),
+        vec![Principal::Group(ADMINS_GROUP.to_string())],
+        Vec::new(),
+    )
+}
+
+/// Refuse to create or delete a built-in group. The cluster creates them
+/// at bootstrap, and its permission checks look for them by name.
+fn refuse_builtin(name: &str) -> Result<(), Status> {
+    if name == ADMINS_GROUP || name == BACKUP_OPERATORS_GROUP {
+        return Err(Status::invalid_argument(format!(
+            "{name} is a built-in group; it cannot be created or deleted"
+        )));
+    }
+    Ok(())
+}
+
 fn no_such_group(name: &str) -> AuthFailure {
     AuthFailure::refused(
         auth_error::Kind::NoSuchGroup,
@@ -352,7 +372,7 @@ impl KvService {
     /// names the first such key by position.
     ///
     /// The permissions are loaded once and the caller resolved once, however
-    /// many keys there are. The admin check (a store read) runs at most once,
+    /// many keys there are. The admin check (a group walk) runs at most once,
     /// and only if some key needs it.
     pub(super) async fn require_access_all(
         &self,
@@ -376,7 +396,7 @@ impl KvService {
         else {
             return Ok(());
         };
-        if self.is_admin_locally(&who).await? {
+        if perms.is_admin(&who) {
             return Ok(());
         }
         Err(not_permitted(if keys.len() == 1 {
@@ -412,30 +432,22 @@ impl KvService {
             ));
         };
         let who = context.username.clone();
-        if self.is_admin_locally(&who).await? {
+        if perms.is_admin(&who) {
             return Ok(None);
         }
         Ok(Some(ScanFilter { caller: who, perms }))
     }
 
-    /// Whether this account is an administrator, by what this node has
-    /// applied.
+    /// Every group and ACL, including everything committed anywhere in the
+    /// cluster.
     ///
-    /// A local read, unlike the linearizable read in `require_admin`, on
-    /// purpose: this is the data path, which a follower serves with no leader
-    /// to ask. It is also the state the read itself is answered from, so a
-    /// stale read is authorized as of the moment it describes.
-    pub(super) async fn is_admin_locally(&self, username: &str) -> Result<bool, Status> {
-        let key = keyspace::user_key(username);
-        let found = self
-            .store
-            .run(move |log| log.get_latest(&key))
-            .await
-            .map_err(storage_err)?;
-        match found {
-            Some((_, bytes)) => Ok(UserRecord::from_bytes(&bytes)?.is_admin),
-            None => Ok(false),
-        }
+    /// For the management RPCs. They run on the leader and already pay a raft
+    /// round trip, so they can afford the authoritative answer that the data
+    /// path cannot: the read quorum proves this node still leads and has
+    /// applied everything committed, so its local state is current.
+    pub(super) async fn current_permissions(&self) -> Result<Arc<Permissions>, AuthFailure> {
+        self.read_quorum().await?;
+        Ok(self.permissions().await?)
     }
 
     /// Whether this request comes from an administrator, read as
@@ -489,6 +501,135 @@ impl KvService {
             .into());
         }
         Ok(perms)
+    }
+
+    /// Bump the permission epoch in transaction `id`. For a transaction that
+    /// changes several permission records, or mixes them with an account
+    /// write, and so cannot use `commit_permission_change`.
+    pub(super) fn buffer_epoch_bump(&self, id: TxnId) -> Result<(), AuthFailure> {
+        self.locks
+            .buffer_write(id, keyspace::EPOCH_KEY, Some(EPOCH_MARK.to_vec()))?;
+        Ok(())
+    }
+
+    /// Refuse if a user in `principals` has no account. See the module doc
+    /// for why.
+    ///
+    /// Read inside the transaction, so an account deleted at the same time
+    /// conflicts with this write instead of slipping past it.
+    async fn require_accounts_exist(
+        &self,
+        id: TxnId,
+        principals: &[Principal],
+    ) -> Result<(), AuthFailure> {
+        for principal in principals {
+            if let Principal::User(name) = principal
+                && self
+                    .transactional_read(id, &keyspace::user_key(name))
+                    .await?
+                    .value
+                    .is_none()
+            {
+                return Err(AuthFailure::refused(
+                    auth_error::Kind::NoSuchUser,
+                    format!("there is no account called {name}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Create whichever built-in groups do not exist yet, and put
+    /// `first_admin` in `admins`. Buffers the writes; the caller bumps the
+    /// epoch and commits. Returns whether it buffered anything.
+    ///
+    /// A restored backup already holds both groups, so on that path this adds
+    /// at most the startup administrator.
+    pub(super) async fn buffer_builtin_groups(
+        &self,
+        id: TxnId,
+        created_by: &str,
+        first_admin: Option<&str>,
+    ) -> Result<bool, AuthFailure> {
+        let mut changed = false;
+        for name in [ADMINS_GROUP, BACKUP_OPERATORS_GROUP] {
+            let key = keyspace::group_key(name);
+            let existing = self.transactional_read(id, &key).await?.value;
+            let mut group = match &existing {
+                Some(bytes) => GroupRecord::from_bytes(bytes)?,
+                None => builtin_group(created_by),
+            };
+            if name == ADMINS_GROUP
+                && let Some(user) = first_admin.map(|name| Principal::User(name.to_string()))
+                && !group.members.contains(&user)
+            {
+                group.members.push(user);
+                check_group_size(&group.admins, &group.members)?;
+            } else if existing.is_some() {
+                continue;
+            }
+            self.locks.buffer_write(id, &key, Some(group.to_bytes()?))?;
+            changed = true;
+        }
+        Ok(changed)
+    }
+
+    /// Put `username` in the built-in group `name`. Buffers the write; the
+    /// caller bumps the epoch and commits.
+    pub(super) async fn buffer_role_grant(
+        &self,
+        id: TxnId,
+        name: &str,
+        username: &str,
+    ) -> Result<(), AuthFailure> {
+        let mut group = self.locked_group(id, name).await?;
+        let user = Principal::User(username.to_string());
+        if !group.members.contains(&user) {
+            group.members.push(user);
+            check_group_size(&group.admins, &group.members)?;
+        }
+        self.locks
+            .buffer_write(id, &keyspace::group_key(name), Some(group.to_bytes()?))?;
+        Ok(())
+    }
+
+    /// Take `username` out of every group, as a member and as an
+    /// administrator. Buffers the writes; the caller bumps the epoch and
+    /// commits.
+    ///
+    /// - Refuses if `admins` would be left with no members, because then
+    ///   nobody could manage the cluster.
+    /// - A group whose only administrator this was is left with none. A
+    ///   cluster administrator can still change it.
+    /// - ACL grants that name the account stay. They match nobody until an
+    ///   account with that name exists again.
+    pub(super) async fn buffer_removal_from_groups(
+        &self,
+        id: TxnId,
+        username: &str,
+    ) -> Result<(), AuthFailure> {
+        let perms = self.locked_permissions(id).await?;
+        let user = Principal::User(username.to_string());
+        let named: Vec<String> = perms
+            .groups()
+            .filter(|(_, group)| group.members.contains(&user) || group.admins.contains(&user))
+            .map(|(name, _)| name.to_string())
+            .collect();
+        for name in named {
+            let mut group = self.locked_group(id, &name).await?;
+            group.members.retain(|principal| *principal != user);
+            group.admins.retain(|principal| *principal != user);
+            if name == ADMINS_GROUP && group.members.is_empty() {
+                return Err(Status::failed_precondition(
+                    "that account is the last member of the admins group; add another \
+                     administrator first",
+                )
+                .into());
+            }
+            self.locks
+                .buffer_write(id, &keyspace::group_key(&name), Some(group.to_bytes()?))?;
+        }
+        Ok(())
     }
 
     /// Commit a permission change: the record and the epoch bump, in one
@@ -605,6 +746,7 @@ impl KvService {
     ) -> Result<u64, AuthFailure> {
         self.require_auth_enabled()?;
         keyspace::validate_group_name(&req.name)?;
+        refuse_builtin(&req.name)?;
         let members = principals_from_pb(&req.members)?;
         let mut admins = principals_from_pb(&req.admins)?;
         let who = caller(extensions)?;
@@ -643,6 +785,8 @@ impl KvService {
                     "that group already exists",
                 ));
             }
+            self.require_accounts_exist(id, &record.members).await?;
+            self.require_accounts_exist(id, &record.admins).await?;
             if self.would_create_a_cycle(id, &req.name, &members).await? {
                 return Err(
                     Status::invalid_argument("that would put the group inside itself").into(),
@@ -661,6 +805,7 @@ impl KvService {
     ) -> Result<u64, AuthFailure> {
         self.require_auth_enabled()?;
         keyspace::validate_group_name(&req.name)?;
+        refuse_builtin(&req.name)?;
         let who = caller(extensions)?;
         let key = keyspace::group_key(&req.name);
 
@@ -709,6 +854,17 @@ impl KvService {
                 )
                 .into());
             }
+            // The same reasoning one level up: with no administrators, nobody could
+            // manage the cluster again. A nested group that is itself empty passes
+            // this check; it catches the common mistake, not every one.
+            if req.name == ADMINS_GROUP && group.members.is_empty() {
+                return Err(Status::invalid_argument(
+                    "the admins group must always have at least one member",
+                )
+                .into());
+            }
+            self.require_accounts_exist(id, &add_members).await?;
+            self.require_accounts_exist(id, &add_admins).await?;
             if !add_members.is_empty()
                 && self
                     .would_create_a_cycle(id, &req.name, &group.members)
@@ -926,64 +1082,6 @@ impl KvService {
         // effect, least specific to most.
         acls.sort_by(|a, b| a.prefix.cmp(&b.prefix));
         Ok(AclList { acls })
-    }
-
-    // -- Backup operators ----------------------------------------------
-
-    /// Replace the backup operator list. Administrators only, because a
-    /// backup operator can read the whole cluster. An empty list deletes the
-    /// record, so a cluster that never used this and one that stopped look
-    /// the same.
-    pub(super) async fn set_backup_operators_inner(
-        &self,
-        extensions: &tonic::Extensions,
-        req: SetBackupOperatorsRequest,
-    ) -> Result<u64, AuthFailure> {
-        self.require_auth_enabled()?;
-        let principals = principals_from_pb(&req.principals)?;
-        if principals.len() > MAX_BACKUP_OPERATORS {
-            return Err(Status::invalid_argument(format!(
-                "there may be at most {MAX_BACKUP_OPERATORS} backup operators; grant a group instead"
-            ))
-            .into());
-        }
-        self.require_admin(extensions).await?;
-
-        let value = if principals.is_empty() {
-            None
-        } else {
-            Some(BackupOperatorsRecord::new(principals).to_bytes()?)
-        };
-        self.admin_txn(async |id| {
-            self.commit_permission_change(id, keyspace::BACKUP_OPERATORS_KEY, value)
-                .await
-        })
-        .await
-    }
-
-    pub(super) async fn get_backup_operators_inner(
-        &self,
-        extensions: &tonic::Extensions,
-    ) -> Result<PbBackupOperators, AuthFailure> {
-        self.require_auth_enabled()?;
-        caller(extensions)?;
-        let perms = self.permissions().await?;
-        let (principals, seq) = perms.backup_operators();
-        Ok(PbBackupOperators {
-            principals: principals.iter().map(principal_to_pb).collect(),
-            seq,
-        })
-    }
-
-    /// Whether the caller is a backup operator, by this node's permission
-    /// snapshot. Not whether it is an administrator: callers check that
-    /// first, in whatever way their path needs.
-    pub(super) async fn is_backup_operator(
-        &self,
-        extensions: &tonic::Extensions,
-    ) -> Result<bool, AuthFailure> {
-        let who = caller(extensions)?;
-        Ok(self.permissions().await?.may_back_up(&who))
     }
 }
 

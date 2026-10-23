@@ -71,10 +71,6 @@ use crate::pb::raft5::client::{
     delete_acl_response, delete_group_response, get_acl_response, get_group_response,
     list_acls_response, list_groups_response, set_acl_response, update_group_response,
 };
-use crate::pb::raft5::client::{
-    GetBackupOperatorsRequest, GetBackupOperatorsResponse, SetBackupOperatorsRequest,
-    SetBackupOperatorsResponse, get_backup_operators_response, set_backup_operators_response,
-};
 use crate::pb::raft5::cluster::{ClusterConfig, ClusterMember};
 use crate::pb::raft5::raft::raft_peer_server::RaftPeer;
 use crate::pb::raft5::raft::{
@@ -1042,7 +1038,7 @@ impl KvService {
     /// Create a checkpoint: write its record once, and return the seq of
     /// that write, which is the snapshot's seq.
     ///
-    /// Same shape as `put_user`, for the same reason: the read and the write
+    /// Same shape as `write_user`, for the same reason: the read and the write
     /// must be one transaction. Otherwise two callers could both find the id
     /// absent and both create it, and the second record would silently move
     /// the snapshot forward in time.
@@ -1134,21 +1130,6 @@ impl KvService {
         }
     }
 
-    /// Write an account record, or remove it when `record` is `None`, in its
-    /// own transaction. See [`admin_txn`] for why it uses a transaction and
-    /// not a plain append.
-    ///
-    /// [`admin_txn`]: KvService::admin_txn
-    async fn put_user(
-        &self,
-        username: &str,
-        record: Option<UserRecord>,
-    ) -> Result<u64, AuthFailure> {
-        let key = crate::keyspace::user_key(username);
-        self.admin_txn(async |id| self.write_user(id, &key, record).await)
-            .await
-    }
-
     /// Run `f` in a server-owned transaction on the leader, and release what
     /// it held however it ends.
     ///
@@ -1185,7 +1166,12 @@ impl KvService {
         result
     }
 
-    /// The body of `put_user`, inside its transaction.
+    /// Write an account record, or remove it when `record` is `None`, and
+    /// commit transaction `id`. Refuses to create an account that exists or
+    /// remove one that does not. See [`admin_txn`] for why account writes use
+    /// a transaction and not a plain append.
+    ///
+    /// [`admin_txn`]: KvService::admin_txn
     async fn write_user(
         &self,
         id: TxnId,
@@ -1229,8 +1215,7 @@ impl KvService {
     ) -> Result<(), AuthFailure> {
         let id = txn_id(&req.transaction_id)?;
         // The guard against privilege escalation. A client that could buffer a
-        // write to a reserved key could write its own account record with any
-        // `is_admin` value.
+        // write to a reserved key could put itself in the admins group.
         reject_reserved(&req.key)?;
         // A delete is a write with no value, so this covers both.
         self.require_access(extensions, &req.key, Right::Write)
@@ -1244,13 +1229,14 @@ impl KvService {
         Ok(())
     }
 
-    /// Check that the sender of this request is an administrator.
+    /// Check that the sender of this request is an administrator: a member
+    /// of the `admins` group.
     ///
-    /// The token says who they are; the store says what they may do. The
-    /// store is read on every call, not trusted from a token claim, because
-    /// a right inside a token cannot be withdrawn until the token expires.
-    /// These calls are rare and already pay a raft round trip, so the read
-    /// is cheap by comparison.
+    /// The token says who they are; the groups say what they may do. They are
+    /// checked on every call, not trusted from a token claim, because a right
+    /// inside a token cannot be withdrawn until the token expires. The check
+    /// is current as of a read quorum. These calls are rare and already pay a
+    /// raft round trip, so that is cheap by comparison.
     async fn require_admin(&self, extensions: &tonic::Extensions) -> Result<(), AuthFailure> {
         // A node with no secret keeps no accounts, so there is no admin and
         // nothing to check. This is the only place that decides the open case,
@@ -1259,25 +1245,17 @@ impl KvService {
         if self.auth.is_none() {
             return Ok(());
         }
-        // Missing only if the auth layer did not run. That is a configuration
-        // error, not a forged request, but the safe response is the same.
-        let Some(context) = extensions.get::<AuthContext>() else {
-            return Err(
-                Status::unauthenticated("this request carried no verified identity").into(),
-            );
-        };
-        match self.load_user(&context.username).await? {
-            Some(user) if user.is_admin => Ok(()),
-            // Either not an admin, or an account deleted after its token was
-            // issued. Neither may proceed, and the caller is not told which.
-            // The message does not name the operation: this guards account
-            // management and membership changes, and a name would be wrong for one
-            // of them.
-            _ => Err(AuthFailure::refused(
-                auth_error::Kind::NotAdmin,
-                "this account is not an administrator",
-            )),
+        let who = caller(extensions)?;
+        // A deleted account is in no group, so its token fails here too. The
+        // message does not name the operation: this guards account management
+        // and membership changes, and a name would be wrong for one of them.
+        if self.current_permissions().await?.is_admin(&who) {
+            return Ok(());
         }
+        Err(AuthFailure::refused(
+            auth_error::Kind::NotAdmin,
+            "this account is not an administrator",
+        ))
     }
 
     async fn login_inner(&self, req: LoginRequest) -> Result<LoginOk, AuthFailure> {
@@ -1394,8 +1372,8 @@ impl KvService {
         })
     }
 
-    /// Check that the caller may take a backup: an administrator or a backup
-    /// operator, by this node's own records.
+    /// Check that the caller may take a backup: a member of `admins` or
+    /// `backup-operators`, by this node's own records.
     ///
     /// A local check, like the data path's, so a follower can serve backups.
     /// The cost: a caller whose right was withdrawn a moment ago can still take
@@ -1406,7 +1384,7 @@ impl KvService {
             return Ok(());
         }
         let who = caller(extensions)?;
-        if self.is_admin_locally(&who).await? || self.is_backup_operator(extensions).await? {
+        if self.permissions().await?.may_back_up(&who) {
             return Ok(());
         }
         Err(AuthFailure::refused(
@@ -1419,13 +1397,17 @@ impl KvService {
     /// administrator or a backup operator.
     ///
     /// The same people who may take a backup, because a snapshot exists to
-    /// back up from. The admin check is the authoritative one `require_admin`
-    /// makes; these calls write through the leader anyway.
+    /// back up from. Checked against current groups, like `require_admin`:
+    /// these calls write through the leader anyway.
     async fn require_snapshot_rights(
         &self,
         extensions: &tonic::Extensions,
     ) -> Result<(), AuthFailure> {
-        if self.is_cluster_admin(extensions).await? || self.is_backup_operator(extensions).await? {
+        if self.auth.is_none() {
+            return Ok(());
+        }
+        let who = caller(extensions)?;
+        if self.current_permissions().await?.may_back_up(&who) {
             return Ok(());
         }
         Err(AuthFailure::refused(
@@ -1442,7 +1424,12 @@ impl KvService {
     /// it can append. So this waits, and `Bootstrap` answers only after it:
     /// "ok" means an administrator exists, not that one will exist soon.
     ///
-    /// Safe to repeat: a record that already exists is the goal.
+    /// In the same transaction it creates the built-in groups (`admins` and
+    /// `backup-operators`) and puts the new account in `admins`.
+    ///
+    /// Safe to repeat. An account that already exists is left alone, password
+    /// and groups included: that is how a restored backup keeps its own
+    /// administrator.
     async fn write_startup_admin(&self) -> Result<(), Status> {
         let Some(admin) = self
             .auth
@@ -1451,13 +1438,31 @@ impl KvService {
         else {
             return Ok(());
         };
-        let record = UserRecord::new(admin.username.clone(), admin.password_hash.clone(), true);
+        let record = UserRecord::new(admin.username.clone(), admin.password_hash.clone());
+        let key = crate::keyspace::user_key(&admin.username);
 
         let deadline = std::time::Instant::now() + BOOTSTRAP_ADMIN_TIMEOUT;
         loop {
-            match self.put_user(&admin.username, Some(record.clone())).await {
-                Ok(_) => return Ok(()),
-                Err(AuthFailure::Refused(auth_error::Kind::AlreadyExists, _)) => return Ok(()),
+            let attempt = self
+                .admin_txn(async |id| {
+                    let fresh = self.transactional_read(id, &key).await?.value.is_none();
+                    let first_admin = fresh.then_some(admin.username.as_str());
+                    let groups_changed = self
+                        .buffer_builtin_groups(id, &admin.username, first_admin)
+                        .await?;
+                    if !fresh && !groups_changed {
+                        return Ok(());
+                    }
+                    if fresh {
+                        self.locks.buffer_write(id, &key, Some(record.to_bytes()?))?;
+                    }
+                    self.buffer_epoch_bump(id)?;
+                    self.commit(id).await?;
+                    Ok(())
+                })
+                .await;
+            match attempt {
+                Ok(()) => return Ok(()),
                 Err(_) if std::time::Instant::now() < deadline => {
                     tokio::time::sleep(BOOTSTRAP_ADMIN_RETRY).await;
                 }
@@ -1488,8 +1493,17 @@ impl KvService {
         self.require_admin(extensions).await?;
 
         let password_hash = crate::auth::hash_password(req.password).await?;
-        let record = UserRecord::new(req.username.clone(), password_hash, req.is_admin);
-        self.put_user(&req.username, Some(record)).await
+        let record = UserRecord::new(req.username.clone(), password_hash);
+        let key = crate::keyspace::user_key(&req.username);
+        self.admin_txn(async |id| {
+            if req.is_admin {
+                self.buffer_role_grant(id, crate::perms::ADMINS_GROUP, &req.username)
+                    .await?;
+                self.buffer_epoch_bump(id)?;
+            }
+            self.write_user(id, &key, Some(record)).await
+        })
+        .await
     }
 
     async fn delete_user_inner(
@@ -1502,7 +1516,15 @@ impl KvService {
         }
         crate::keyspace::validate_username(&req.username)?;
         self.require_admin(extensions).await?;
-        self.put_user(&req.username, None).await
+        let key = crate::keyspace::user_key(&req.username);
+        // One transaction, so no moment exists where the name is free but still
+        // in a group. See `grpc::permissions` for why that moment would matter.
+        self.admin_txn(async |id| {
+            self.buffer_removal_from_groups(id, &req.username).await?;
+            self.buffer_epoch_bump(id)?;
+            self.write_user(id, &key, None).await
+        })
+        .await
     }
 
     /// Every open invitation, split into the ones that can still be used and
@@ -1636,7 +1658,8 @@ impl KvService {
     ///   else, or lapse, and the account name could be taken. So the record
     ///   is read again, and `is_admin` comes from the locked read: the
     ///   account's rights must come from the invite as it was when it was
-    ///   used.
+    ///   used. An admin invite puts the account in `admins` in the same
+    ///   transaction.
     ///
     /// The account and the invite's removal are buffered into one
     /// transaction, so they land at one seq or not at all. That is what
@@ -1698,9 +1721,14 @@ impl KvService {
                 ));
             }
 
-            let user = UserRecord::new(req.username.clone(), password_hash, record.is_admin);
+            let user = UserRecord::new(req.username.clone(), password_hash);
             self.locks
                 .buffer_write(id, &user_key, Some(user.to_bytes()?))?;
+            if record.is_admin {
+                self.buffer_role_grant(id, crate::perms::ADMINS_GROUP, &req.username)
+                    .await?;
+                self.buffer_epoch_bump(id)?;
+            }
             self.locks.buffer_write(id, &invite_key, None)?;
             Ok(self.commit(id).await?)
         })
@@ -1915,17 +1943,27 @@ impl Kv for KvService {
             }));
         }
 
-        // A snapshot walk: the keys that had a value at that seq, including keys
-        // deleted since and excluding keys created since. Stale by design, so
-        // any node serves it.
         let as_of = match &req.consistency {
+            // A snapshot walk: the keys that had a value at that seq, including keys
+            // deleted since and excluding keys created since. Stale by design, so
+            // any node serves it.
             Some(get_keys_request::Consistency::SnapshotId(id)) => self.checkpoint_seq(id).await?,
+            // Linearizable: the read quorum proves this node leads and has applied
+            // everything committed, then the walk is the same local one.
+            Some(get_keys_request::Consistency::Linearizable(_)) => {
+                if let Err(e) = self.read_quorum().await {
+                    return Ok(Response::new(GetKeysResponse {
+                        result: Some(get_keys_response::Result::Error(client_err(e)?)),
+                    }));
+                }
+                u64::MAX
+            }
             _ => u64::MAX,
         };
 
         // Outside a transaction, the same terms as `read`: local state, no
-        // locks, any node. There is nothing to merge (no buffered writes) and
-        // no second pass (no locks to take).
+        // locks. There is nothing to merge (no buffered writes) and no second
+        // pass (no locks to take).
         let batch = self
             .scan(req.start_key, as_of, limit, &BufferedKeys::new(), &filter)
             .await
@@ -2599,40 +2637,6 @@ impl Kv for KvService {
                 Err(e) => match auth_failure(e)? {
                     AuthReply::Raft(e) => list_acls_response::Result::Error(e),
                     AuthReply::Auth(e) => list_acls_response::Result::AuthError(e),
-                },
-            }),
-        }))
-    }
-
-    async fn set_backup_operators(
-        &self,
-        request: Request<SetBackupOperatorsRequest>,
-    ) -> Result<Response<SetBackupOperatorsResponse>, Status> {
-        let (_, extensions, req) = request.into_parts();
-        let result = self.set_backup_operators_inner(&extensions, req).await;
-        Ok(Response::new(SetBackupOperatorsResponse {
-            result: Some(match result {
-                Ok(seq) => set_backup_operators_response::Result::Seq(seq),
-                Err(e) => match auth_failure(e)? {
-                    AuthReply::Raft(e) => set_backup_operators_response::Result::Error(e),
-                    AuthReply::Auth(e) => set_backup_operators_response::Result::AuthError(e),
-                },
-            }),
-        }))
-    }
-
-    async fn get_backup_operators(
-        &self,
-        request: Request<GetBackupOperatorsRequest>,
-    ) -> Result<Response<GetBackupOperatorsResponse>, Status> {
-        let (_, extensions, _) = request.into_parts();
-        let result = self.get_backup_operators_inner(&extensions).await;
-        Ok(Response::new(GetBackupOperatorsResponse {
-            result: Some(match result {
-                Ok(ok) => get_backup_operators_response::Result::Ok(ok),
-                Err(e) => match auth_failure(e)? {
-                    AuthReply::Raft(e) => get_backup_operators_response::Result::Error(e),
-                    AuthReply::Auth(e) => get_backup_operators_response::Result::AuthError(e),
                 },
             }),
         }))

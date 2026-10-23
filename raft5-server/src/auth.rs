@@ -17,10 +17,9 @@
 //! # What a token does not say
 //!
 //! [`Claims`] holds the username and nothing about what that user may do.
-//! Admin rights are read from the store on each request that needs them,
-//! because a claim inside a token cannot be withdrawn: a demoted admin's
-//! token would keep full power until it expired. The admin RPCs are rare
-//! and already pay a raft round trip, so the extra read is cheap.
+//! Admin rights come from the `admins` group, checked on each request that
+//! needs them, because a claim inside a token cannot be withdrawn: a
+//! demoted admin's token would keep full power until it expired.
 //!
 //! The opposite gap is real and not solved here: a deleted user's token
 //! still verifies, for non-admin requests, until it expires. The token
@@ -103,16 +102,14 @@ pub struct UserRecord {
     pub version: u8,
     pub username: String,
     pub password_hash: String,
-    pub is_admin: bool,
 }
 
 impl UserRecord {
-    pub fn new(username: String, password_hash: String, is_admin: bool) -> Self {
+    pub fn new(username: String, password_hash: String) -> Self {
         Self {
             version: RECORD_VERSION,
             username,
             password_hash,
-            is_admin,
         }
     }
 
@@ -147,8 +144,8 @@ pub struct InviteRecord {
     /// invitation came from. When accounts create accounts, "who let this
     /// person in?" has no other answer.
     pub issued_by: String,
-    /// What the resulting account will be. An administrator sets it at issue
-    /// time; the redeemer has no say.
+    /// Whether the resulting account joins the `admins` group. An
+    /// administrator sets it at issue time; the redeemer has no say.
     pub is_admin: bool,
     /// The only username this invite may create, if it was pinned to one.
     pub username: Option<String>,

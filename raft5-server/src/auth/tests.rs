@@ -109,17 +109,17 @@ async fn an_unreadable_stored_hash_is_an_error_rather_than_a_refusal() {
 
 #[tokio::test]
 async fn an_account_record_round_trips() {
-    let record = UserRecord::new("alice".to_string(), "$argon2id$fake".to_string(), true);
+    let record = UserRecord::new("alice".to_string(), "$argon2id$fake".to_string());
     let decoded = UserRecord::from_bytes(&record.to_bytes().unwrap()).unwrap();
     assert_eq!(decoded, record);
     assert_eq!(decoded.version, RECORD_VERSION);
 }
 
 /// A record written by a node that knows a newer format is refused, not
-/// read as this format: misreading `is_admin` is the failure to avoid here.
+/// read as this format: misreading a field is the failure to avoid here.
 #[tokio::test]
 async fn an_account_record_from_a_future_version_is_refused() {
-    let mut record = UserRecord::new("alice".to_string(), "$argon2id$fake".to_string(), true);
+    let mut record = UserRecord::new("alice".to_string(), "$argon2id$fake".to_string());
     record.version = RECORD_VERSION + 1;
 
     let status = UserRecord::from_bytes(&record.to_bytes().unwrap())

@@ -384,29 +384,24 @@ async fn run(client: &Client, words: &[Vec<u8>]) -> Result<bool, String> {
             let versions_only = cmd.starts_with("version");
             print_reads(client, keys, Consistency::Snapshot(id), versions_only).await;
         }
-        "keys_at" => {
-            let (id, start) = match args {
-                [id] => (id.as_slice(), &[][..]),
-                [id, start] => (id.as_slice(), start.as_slice()),
-                _ => return Err("usage: keys_at <snapshot> [start_key]".to_string()),
-            };
-            match client.key_iterator_at(id, start).collect().await {
-                Ok(keys) if keys.is_empty() => println!("(no keys)"),
-                Ok(keys) => {
-                    for key in keys {
-                        println!("{}", quote_bytes(&key));
-                    }
+        "keys" | "keys_current" | "keys_at" => {
+            let (consistency, rest) = match (cmd, args) {
+                ("keys_at", [id, rest @ ..]) => (Consistency::Snapshot(id.as_slice()), rest),
+                ("keys_at", []) => {
+                    return Err("usage: keys_at <snapshot> [start_key]".to_string());
                 }
-                Err(e) => println!("error: {e}"),
-            }
-        }
-        "keys" => {
-            let start = match args {
+                ("keys_current", rest) => (Consistency::Linearizable, rest),
+                (_, rest) => (Consistency::Stale, rest),
+            };
+            let start = match rest {
                 [] => &[][..],
                 [start] => start.as_slice(),
-                _ => return Err("usage: keys [start_key]".to_string()),
+                _ if cmd == "keys_at" => {
+                    return Err("usage: keys_at <snapshot> [start_key]".to_string());
+                }
+                _ => return Err(format!("usage: {cmd} [start_key]")),
             };
-            match client.key_iterator(start).collect().await {
+            match client.key_iterator(start, consistency).collect().await {
                 Ok(keys) if keys.is_empty() => println!("(no keys)"),
                 Ok(keys) => {
                     for key in keys {
@@ -686,25 +681,6 @@ async fn run(client: &Client, words: &[Vec<u8>]) -> Result<bool, String> {
         "acl_delete" => {
             let [prefix] = fixed_args(args, "acl_delete <prefix>")?;
             print_seq(client.delete_acl(prefix).await);
-        }
-        "backup_operators" => match client.backup_operators().await {
-            Ok((principals, _)) if principals.is_empty() => {
-                println!("(no backup operators -- only administrators may back up)");
-            }
-            Ok((principals, seq)) => {
-                for principal in &principals {
-                    println!("{principal}");
-                }
-                println!("seq={seq}");
-            }
-            Err(e) => println!("error: {e}"),
-        },
-        "backup_operators_set" => {
-            let principals = args
-                .iter()
-                .map(|arg| parse_principal(text(arg)?))
-                .collect::<Result<Vec<_>, _>>()?;
-            print_seq(client.set_backup_operators(&principals).await);
         }
         other => println!("unknown command {other:?}; type `help` for a list"),
     }
@@ -1039,12 +1015,13 @@ fn print_help() {
             "                                  values -- same cost whatever the values weigh;",
             "                                  stale like `read`",
             "version_current <key>...         the same, confirmed by the leader",
-            "keys [start_key]                list every key from <start_key> on, stale like `read`",
+            "keys [start_key]                 list every key from <start_key> on, stale like `read`",
+            "keys_current [start_key]         the same, each batch current like `read_current`",
             "snapshot [id]                    pin the current sequence as a snapshot; the id",
             "                                  defaults to this machine's clock. admins and",
-            "                                  backup operators only",
+            "                                  backup-operators only",
             "snapshots                        list every snapshot that exists",
-            "drop_snapshot <id>               release a snapshot. admins and backup operators",
+            "drop_snapshot <id>               release a snapshot. admins and backup-operators",
             "read_at <snapshot> <key>...      read keys as they were when the snapshot was taken",
             "version_at <snapshot> <key>...   the seqs keys were at when the snapshot was taken",
             "keys_at <snapshot> [start_key]   list the keys that existed at the snapshot",
@@ -1056,8 +1033,8 @@ fn print_help() {
             "                                  come from the backup, passwords included; the",
             "                                  token secret does not (the node keeps its own)",
             "backup <file> [snapshot]         write a backup of every key, account, group and",
-            "                                  ACL, as of now or a snapshot. admins and backup",
-            "                                  operators only",
+            "                                  ACL, as of now or a snapshot. admins and",
+            "                                  backup-operators only",
             "members                          list the cluster's members: each one's id, whether",
             "                                  it votes yet or is a learner still catching up,",
             "                                  which leads, and its peer and client addresses",
@@ -1086,6 +1063,10 @@ fn print_help() {
             "                                  written user:<name> or group:<name>",
             "group_remove <group> [--admin]   the same, taking them out again",
             "             <principal> ...",
+            "                                  two groups are built in: admins (the cluster's",
+            "                                  administrators) and backup-operators (may back",
+            "                                  up and manage snapshots, so may read every key",
+            "                                  and password hash). grant either with group_add",
             "acls                             list every ACL, least specific prefix first",
             "acl <key>                        which ACL governs a key, and what it grants you",
             "acl_set <prefix>                 replace the ACL on a key prefix. a grant is",
@@ -1094,10 +1075,6 @@ fn print_help() {
             "                                  that prefix, or -- where no ACL governs it yet",
             "                                  -- an administrator",
             "acl_delete <prefix>              remove one, so a shorter prefix governs instead",
-            "backup_operators                 list who may take backups and manage snapshots",
-            "backup_operators_set             replace that list; no principals empties it.",
-            "        [<principal> ...]        admins only. a backup operator can read every",
-            "                                  key and password hash, whatever the ACLs say",
             "help                             show this message",
             "quit                             end the session",
             "",

@@ -44,3 +44,16 @@ pub const MAX_KEYS_PER_READ: usize = 1024;
 /// progress. What `MAX_KV_MESSAGE_BYTES` allows beyond this covers the
 /// framing of `MAX_KEYS_PER_READ` entries many times over.
 pub const MAX_READ_VALUE_BYTES: usize = MAX_TRANSACTION_BYTES;
+
+/// The built-in group whose members are the cluster's administrators.
+///
+/// Created at bootstrap and administered by its own members. Membership is
+/// transitive like any group's, so whoever administers a group nested in
+/// this one decides who is an administrator.
+pub const ADMINS_GROUP: &str = "admins";
+
+/// The built-in group whose members may take backups and create or remove
+/// snapshots without being administrators. A backup ignores ACLs and holds
+/// every password hash, so membership gives read access to the whole
+/// cluster.
+pub const BACKUP_OPERATORS_GROUP: &str = "backup-operators";

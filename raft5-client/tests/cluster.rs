@@ -9,7 +9,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio_util::sync::CancellationToken;
 
-use raft5_client::{Client, Consistency, Entry, Error, Transaction};
+use raft5_client::{
+    ADMINS_GROUP, BACKUP_OPERATORS_GROUP, Client, Consistency, Entry, Error, Transaction,
+};
 
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -813,7 +815,7 @@ async fn a_key_iterator_walks_every_key_in_order() {
     // A batch size that divides the keyspace several times, so the walk really
     // spans batches instead of fitting in one.
     let keys = client
-        .key_iterator(b"")
+        .key_iterator(b"", Consistency::Stale)
         .batch_size(4)
         .collect()
         .await
@@ -835,10 +837,10 @@ async fn a_key_iterator_starts_where_it_is_told_and_stops_at_the_end() {
         client.write(key, Some(b"v")).await.unwrap();
     }
 
-    let keys = client.key_iterator(b"banana").collect().await.unwrap();
+    let keys = client.key_iterator(b"banana", Consistency::Stale).collect().await.unwrap();
     assert_eq!(keys, vec![b"banana".to_vec(), b"cherry".to_vec()]);
 
-    let past_the_end = client.key_iterator(b"z").collect().await.unwrap();
+    let past_the_end = client.key_iterator(b"z", Consistency::Stale).collect().await.unwrap();
     assert!(past_the_end.is_empty());
 }
 
@@ -855,7 +857,7 @@ async fn a_key_iterator_skips_deleted_keys() {
     }
     client.write(b"b", None).await.unwrap();
 
-    let keys = client.key_iterator(b"").collect().await.unwrap();
+    let keys = client.key_iterator(b"", Consistency::Stale).collect().await.unwrap();
     assert_eq!(keys, vec![b"a".to_vec(), b"c".to_vec()]);
 }
 
@@ -951,7 +953,7 @@ async fn a_key_iterator_pages_correctly_across_keys_that_prefix_each_other() {
     // One key per batch, so the zero-byte continuation crosses every one of
     // those boundaries, instead of skipping over it inside a batch.
     let keys = client
-        .key_iterator(b"")
+        .key_iterator(b"", Consistency::Stale)
         .batch_size(1)
         .collect()
         .await
@@ -1339,7 +1341,7 @@ async fn a_snapshot_holds_the_store_as_it_was_taken() {
     assert_eq!(client.read_one_at(b"fresh", Consistency::Snapshot(b"s1")).await.unwrap().value, None);
 
     // The key set as of the snapshot, too.
-    let keys = client.key_iterator_at(b"s1", b"").collect().await.unwrap();
+    let keys = client.key_iterator(b"", Consistency::Snapshot(b"s1")).collect().await.unwrap();
     assert_eq!(keys, vec![b"doomed".to_vec(), b"kept".to_vec()]);
 
     // And it is listed, at the seq it was taken at.
@@ -1510,7 +1512,7 @@ async fn a_snapshot_walk_pages_across_batches() {
     }
 
     let keys = client
-        .key_iterator_at(b"s1", b"")
+        .key_iterator(b"", Consistency::Snapshot(b"s1"))
         .batch_size(4)
         .collect()
         .await
@@ -1520,7 +1522,7 @@ async fn a_snapshot_walk_pages_across_batches() {
     assert_eq!(keys, expected);
 
     // While the current walk sees only what survives.
-    let now = client.key_iterator(b"").collect().await.unwrap();
+    let now = client.key_iterator(b"", Consistency::Stale).collect().await.unwrap();
     assert_eq!(now.len(), 25 - 9);
 }
 
@@ -1668,9 +1670,56 @@ async fn a_nested_group_carries_a_grant_to_its_members() {
     let groups = bob.list_groups().await.unwrap();
     assert_eq!(
         groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
-        vec!["interns", "staff"]
+        vec![ADMINS_GROUP, BACKUP_OPERATORS_GROUP, "interns", "staff"]
     );
     assert_eq!(bob.list_acls().await.unwrap().len(), 1);
+}
+
+/// Roles are the built-in groups: joining one grants it, and leaving takes
+/// it away, with nothing else to change.
+#[tokio::test]
+async fn a_role_is_granted_by_joining_its_group() {
+    use raft5_client::{Denial, Principal};
+
+    let n1 = TestNode::start_with_auth("role-c1", auth_config(Some(("root", "hunter42"))).await);
+    let admin = Client::new([n1.url()]).unwrap();
+    admin.login("root", "hunter42").await.unwrap();
+    bootstrap(&admin, "role-c1").await;
+    admin.create_user("alice", "correct horse", false).await.unwrap();
+    let alice = Client::new([n1.url()]).unwrap();
+    alice.login("alice", "correct horse").await.unwrap();
+
+    let mut sink = Vec::new();
+    assert!(matches!(
+        alice.backup(None, &mut sink).await,
+        Err(Error::Denied { reason: Denial::NotAdmin, .. })
+    ));
+    let alice_only = [Principal::user("alice")];
+    admin
+        .update_group(BACKUP_OPERATORS_GROUP, &alice_only, &[], &[], &[])
+        .await
+        .unwrap();
+    alice.create_snapshot(Some(b"s1")).await.unwrap();
+    alice.backup(Some(b"s1"), &mut sink).await.unwrap();
+    // A backup operator is not an administrator.
+    assert!(matches!(
+        alice.create_user("bob", "correct horse", false).await,
+        Err(Error::Denied { reason: Denial::NotAdmin, .. })
+    ));
+
+    admin
+        .update_group(ADMINS_GROUP, &alice_only, &[], &[], &[])
+        .await
+        .unwrap();
+    alice.create_user("bob", "correct horse", false).await.unwrap();
+    admin
+        .update_group(ADMINS_GROUP, &[], &alice_only, &[], &[])
+        .await
+        .unwrap();
+    assert!(matches!(
+        alice.create_user("carol", "correct horse", false).await,
+        Err(Error::Denied { reason: Denial::NotAdmin, .. })
+    ));
 }
 
 /// The paging case the server-side cursor exists for: a walk over a store
@@ -1708,11 +1757,21 @@ async fn a_key_walk_pages_past_everything_the_caller_may_not_see() {
     let alice = Client::new([n1.url()]).unwrap();
     alice.login("alice", "correct horse").await.unwrap();
 
-    let keys = alice.key_iterator(b"").batch_size(5).collect().await.unwrap();
+    let keys = alice
+        .key_iterator(b"", Consistency::Stale)
+        .batch_size(5)
+        .collect()
+        .await
+        .unwrap();
     assert_eq!(keys, vec![b"zzz".to_vec()]);
 
     // The administrator's walk is unaffected.
-    let keys = admin.key_iterator(b"").batch_size(5).collect().await.unwrap();
+    let keys = admin
+        .key_iterator(b"", Consistency::Stale)
+        .batch_size(5)
+        .collect()
+        .await
+        .unwrap();
     assert_eq!(keys.len(), 41);
 }
 

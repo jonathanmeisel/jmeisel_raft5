@@ -35,16 +35,16 @@ service Kv {
   // Save the current seq under `snapshot_id`, so Read and GetKeys can later
   // see the store exactly as it is now, however much it changes after.
   //
-  // Administrators and backup operators only (see SetBackupOperators). A
+  // Members of the `admins` or `backup-operators` group only. A
   // snapshot is a storage commitment, not a read: until it is removed,
   // every key overwritten or deleted after it keeps the version this
   // snapshot sees.
   rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
 
   // Release a snapshot. The versions it kept can be collected, and reads at
-  // it start to fail. Administrators and backup operators only. A backup
-  // operator may remove any snapshot, not only one it created: snapshots
-  // record no owner.
+  // it start to fail. Members of `admins` or `backup-operators` only. A
+  // backup operator may remove any snapshot, not only one it created:
+  // snapshots record no owner.
   rpc RemoveSnapshot(RemoveSnapshotRequest) returns (RemoveSnapshotResponse);
 
   // Every snapshot that exists. The only way to find ids: snapshot records
@@ -53,17 +53,18 @@ service Kv {
   rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
 
   // Stream a backup of this node's key/value state, as of now or as of a
-  // snapshot. Administrators and backup operators only (see
-  // SetBackupOperators). Any node serves it, because a backup is a local
-  // read, so backups can run on a follower.
+  // snapshot. Members of `admins` or `backup-operators` only. Any node
+  // serves it, because a backup is a local read, so backups can run on a
+  // follower.
   //
   // What a backup holds:
   // - every key a client wrote, with its newest value at the backup's seq;
-  // - accounts (with their password hashes), groups, ACLs and the backup
-  //   operators.
+  // - accounts (with their password hashes), groups (the built-in ones
+  //   included) and ACLs.
   //
   // ACLs do not apply to a backup. Whoever may take one can read every key
-  // in the cluster and every password hash.
+  // in the cluster and every password hash, so membership of
+  // `backup-operators` is read access to everything.
   //
   // What it leaves out: invitations, snapshots, deleted keys, older
   // versions, the cluster configuration, and the token signing secret.
@@ -173,9 +174,14 @@ service Kv {
   // anyone who can see the traffic can see it.
   rpc Login(LoginRequest) returns (LoginResponse);
 
-  // Add and remove accounts. Admin only. The caller's admin rights are read
-  // from the store on each call, not taken from the token: a right inside a
-  // token could not be withdrawn before the token expired.
+  // Add and remove accounts. Admin only. The caller's admin rights (its
+  // membership of `admins`) are checked on each call, not taken from the
+  // token: a right inside a token could not be withdrawn before the token
+  // expired.
+  //
+  // Deleting an account also takes it out of every group, so a later
+  // account with the same name inherits nothing. It is refused for the last
+  // member of `admins`.
   rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
   rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse);
 
@@ -198,7 +204,7 @@ service Kv {
   // Create an invitation. Administrators only.
   //
   // The administrator sets the new account's rights here; the recipient
-  // cannot choose them. An invite whose holder could ask for `is_admin`
+  // cannot choose them. An invite whose holder could ask to join `admins`
   // would let anyone promote themselves.
   rpc CreateInvite(CreateInviteRequest) returns (CreateInviteResponse);
 
@@ -240,9 +246,23 @@ service Kv {
   // `write` includes `read`, and adds creating and deleting keys, and
   // authority over the ACL of that prefix and every longer one.
   //
-  // Administrators are outside all of this: `is_admin` means write
+  // Administrators are outside all of this: a member of `admins` may write
   // everywhere, and no ACL can revoke it. An administrator could rewrite
   // that ACL anyway, and locking one out would only lock out the cluster.
+  //
+  // Roles are groups. Two are built in and created at bootstrap:
+  // - `admins`: the cluster's administrators. Administered by its own
+  //   members, and never left with no members.
+  // - `backup-operators`: may call Backup, CreateSnapshot and
+  //   RemoveSnapshot. A backup ignores ACLs and holds every account's
+  //   password hash, so this is read access to the whole cluster. It
+  //   gives nothing else. Administered by `admins`.
+  // Neither can be created or deleted through CreateGroup or DeleteGroup.
+  // Membership is transitive, so whoever administers a group nested in one
+  // of them decides who holds that role.
+  //
+  // A group may name only accounts that exist. Otherwise a role granted to
+  // a name nobody holds would pass to whoever created that account next.
 
   // Create a group. Any authenticated caller may, up to a per-creator quota;
   // the creator becomes its only administrator.
@@ -271,6 +291,7 @@ service Kv {
   //
   // A group must always have at least one administrator, and cannot
   // contain itself: a cycle would make "who is in this group" unanswerable.
+  // Every account added must exist.
   rpc UpdateGroup(UpdateGroupRequest) returns (UpdateGroupResponse);
 
   // What a group contains and who administers it. Any authenticated caller:
@@ -306,27 +327,6 @@ service Kv {
   // it, because that is the question a caller with a refusal has.
   rpc GetAcl(GetAclRequest) returns (GetAclResponse);
   rpc ListAcls(ListAclsRequest) returns (ListAclsResponse);
-
-  // Backup operators: the users and groups that may call Backup,
-  // CreateSnapshot and RemoveSnapshot without being administrators.
-  //
-  // This gives read access to the whole cluster. A backup ignores ACLs and
-  // holds every account's password hash, so a backup operator can read
-  // every key and attack every password offline. Grant it only to a
-  // principal you would trust with that, such as the account a backup job
-  // runs as.
-  //
-  // It gives nothing else: a backup operator cannot write keys an ACL denies
-  // it, change permissions, manage accounts, or restore a backup (restore
-  // happens only at bootstrap, with the startup administrator's token).
-  //
-  // SetBackupOperators replaces the whole list. Administrators only. An
-  // empty list removes every backup operator.
-  rpc SetBackupOperators(SetBackupOperatorsRequest) returns (SetBackupOperatorsResponse);
-
-  // Read the backup operators. Any authenticated caller, for the reason the
-  // ACLs are readable.
-  rpc GetBackupOperators(GetBackupOperatorsRequest) returns (GetBackupOperatorsResponse);
 }
 
 // Sent in every response, so a client can find the real leader with no
@@ -549,6 +549,12 @@ message GetKeysRequest {
     // Walk the keys that had a value as of this snapshot, including keys
     // deleted since and excluding keys created since.
     bytes snapshot_id = 4;
+
+    // Include everything committed anywhere in the cluster, as for Read.
+    // Each call is its own moment: a walk of several calls is linearizable
+    // per batch, not as a whole. A walk that must see one moment uses a
+    // snapshot or a transaction.
+    Linearizable linearizable = 5;
   }
 }
 
@@ -847,7 +853,7 @@ message LoginResponse {
 message CreateUserRequest {
   string username = 1;
   string password = 2;
-  // Whether this account may add and remove accounts too.
+  // Whether the account joins the `admins` group, in the same transaction.
   bool is_admin = 3;
 }
 
@@ -873,7 +879,7 @@ message DeleteUserResponse {
 }
 
 message CreateInviteRequest {
-  // Whether the account this invite creates may manage accounts. The
+  // Whether the account this invite creates joins the `admins` group. The
   // issuer's choice, never the recipient's.
   bool is_admin = 1;
   // How long the invite can be used, from when the leader writes it. 0
@@ -1185,36 +1191,6 @@ message AclList {
 message ListAclsResponse {
   oneof result {
     AclList ok = 1;
-    RaftError error = 2;
-    AuthError auth_error = 3;
-  }
-}
-
-message SetBackupOperatorsRequest {
-  // Replaces the list; does not merge, for the reason SetAclRequest gives.
-  // A principal may appear at most once.
-  repeated Principal principals = 1;
-}
-
-message SetBackupOperatorsResponse {
-  oneof result {
-    uint64 seq = 1;
-    RaftError error = 2;
-    AuthError auth_error = 3;
-  }
-}
-
-message GetBackupOperatorsRequest {}
-
-message BackupOperators {
-  repeated Principal principals = 1;
-  // The seq the list was last written at, 0 if it never was.
-  uint64 seq = 2;
-}
-
-message GetBackupOperatorsResponse {
-  oneof result {
-    BackupOperators ok = 1;
     RaftError error = 2;
     AuthError auth_error = 3;
   }

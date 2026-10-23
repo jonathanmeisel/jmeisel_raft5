@@ -1,9 +1,14 @@
 //! Who may read and write which keys.
 //!
-//! `auth` answers who is calling, and `require_admin` answers whether they
-//! are an administrator. This module adds the rest: named sets of
-//! principals (groups), and grants of `read` or `write` on a key prefix to
-//! those principals (ACLs).
+//! `auth` answers who is calling. This module answers the rest: named sets
+//! of principals (groups), and grants of `read` or `write` on a key prefix
+//! to those principals (ACLs).
+//!
+//! Roles are groups too. An administrator is a member of [`ADMINS_GROUP`],
+//! and a backup operator a member of [`BACKUP_OPERATORS_GROUP`]. Both are
+//! created at bootstrap. One mechanism means a role can be granted to a
+//! group, nests like any group, and is listed and changed with the same
+//! calls.
 //!
 //! # The rules
 //!
@@ -28,11 +33,8 @@
 //! # Why this is a snapshot
 //!
 //! These checks are on the data path: every `Read`, every `Write`, every
-//! key a scan considers. The account check next to them (`require_admin`)
-//! reads the store on every call, which is fine for a few rare RPCs that
-//! already pay a raft round trip. This cannot: a linearizable read per
-//! scanned key would be absurd, and a follower serving a stale read has no
-//! leader to ask.
+//! key a scan considers. A linearizable read per scanned key would be
+//! absurd, and a follower serving a stale read has no leader to ask.
 //!
 //! So all of it, every group and every ACL, is loaded into one immutable
 //! [`Permissions`] and kept until it changes. It is small by design (the
@@ -50,6 +52,8 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tonic::Status;
+
+pub use raft5_shared::{ADMINS_GROUP, BACKUP_OPERATORS_GROUP};
 
 /// The version stamped into every record this build writes. Separate from
 /// the constant of the same name in `auth`: these records are versioned
@@ -221,46 +225,6 @@ impl AclRecord {
     }
 }
 
-/// The users and groups that may take backups and create or remove
-/// snapshots without being administrators.
-///
-/// One capability, not two: a snapshot is only useful to back up from, and
-/// a backup reads everything. So a backup operator can read the whole
-/// cluster, ACLs and account password hashes included. Grant it only to a
-/// principal you would trust with that.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BackupOperatorsRecord {
-    /// First, for the reason `auth::UserRecord::version` is first.
-    pub version: u8,
-    pub principals: Vec<Principal>,
-}
-
-impl BackupOperatorsRecord {
-    pub fn new(principals: Vec<Principal>) -> Self {
-        Self {
-            version: RECORD_VERSION,
-            principals,
-        }
-    }
-
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Status> {
-        postcard::to_allocvec(self)
-            .map_err(|e| Status::internal(format!("could not encode the backup operators: {e}")))
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Status> {
-        let record: Self = postcard::from_bytes(bytes)
-            .map_err(|_| Status::internal("the stored backup operators could not be decoded"))?;
-        if record.version != RECORD_VERSION {
-            return Err(Status::internal(format!(
-                "the stored backup operators are version {}, and this node understands {RECORD_VERSION}",
-                record.version
-            )));
-        }
-        Ok(record)
-    }
-}
-
 /// What the ACLs say about one caller and one key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
@@ -319,10 +283,6 @@ pub struct Permissions {
     groups: HashMap<String, GroupRecord>,
     /// The seq each group was last written at. See [`Permissions::acl_seqs`].
     group_seqs: HashMap<String, u64>,
-    /// Who may take backups and manage snapshots. Empty when no record exists.
-    backup_operators: Vec<Principal>,
-    /// The seq that record was last written at, or `0` if there is none.
-    backup_operators_seq: u64,
     /// The membership edges, reversed: each principal maps to the groups that
     /// directly contain it.
     ///
@@ -357,7 +317,6 @@ impl Permissions {
         epoch: u64,
         groups: Vec<(Vec<u8>, u64, Vec<u8>)>,
         acls: Vec<(Vec<u8>, u64, Vec<u8>)>,
-        backup_operators: Option<(u64, Vec<u8>)>,
     ) -> Result<Self, Status> {
         let mut decoded_groups = HashMap::with_capacity(groups.len());
         let mut group_seqs = HashMap::with_capacity(groups.len());
@@ -391,11 +350,6 @@ impl Permissions {
             }
         }
 
-        let (backup_operators_seq, backup_operators) = match backup_operators {
-            Some((seq, bytes)) => (seq, BackupOperatorsRecord::from_bytes(&bytes)?.principals),
-            None => (0, Vec::new()),
-        };
-
         Ok(Self {
             epoch,
             acls: decoded_acls,
@@ -403,8 +357,6 @@ impl Permissions {
             acl_lengths,
             groups: decoded_groups,
             group_seqs,
-            backup_operators,
-            backup_operators_seq,
             parents,
             closures: Mutex::new(HashMap::new()),
         })
@@ -420,8 +372,6 @@ impl Permissions {
             acl_lengths: Vec::new(),
             groups: HashMap::new(),
             group_seqs: HashMap::new(),
-            backup_operators: Vec::new(),
-            backup_operators_seq: 0,
             parents: HashMap::new(),
             closures: Mutex::new(HashMap::new()),
         }
@@ -562,16 +512,17 @@ impl Permissions {
         }
     }
 
-    /// Whether `caller` may take backups and create or remove snapshots
-    /// without being an administrator.
-    pub fn may_back_up(&self, caller: &str) -> bool {
-        self.is_any(caller, &self.backup_operators)
+    /// Whether `caller` is a cluster administrator: a member of
+    /// [`ADMINS_GROUP`], directly or through a nested group.
+    pub fn is_admin(&self, caller: &str) -> bool {
+        self.is(caller, &Principal::Group(ADMINS_GROUP.to_string()))
     }
 
-    /// The backup operators, and the seq their record was last written at
-    /// (`0` if it never was).
-    pub fn backup_operators(&self) -> (&[Principal], u64) {
-        (&self.backup_operators, self.backup_operators_seq)
+    /// Whether `caller` may take backups and create or remove snapshots: an
+    /// administrator or a member of [`BACKUP_OPERATORS_GROUP`].
+    pub fn may_back_up(&self, caller: &str) -> bool {
+        let closure = self.groups_of(caller);
+        closure.contains(ADMINS_GROUP) || closure.contains(BACKUP_OPERATORS_GROUP)
     }
 
     /// Whether `caller` matches any of `principals`. Used to ask "may this
