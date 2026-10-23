@@ -3,17 +3,17 @@ use std::time::Duration;
 use super::*;
 use crate::raft::test_support::{cleanup, open_temp_log};
 
-/// Everything needed to drive one `LeaderHandle` by hand: the states
-/// worth testing here -- a leader that has not caught up, a leader
-/// deposed while something waits on it -- are otherwise only reachable
-/// in the split second after an election.
+/// Everything needed to drive one `LeaderHandle` by hand. The states worth
+/// testing here (a leader that has not caught up, a leader deposed while
+/// something waits on it) are otherwise reachable only in the moment right
+/// after an election.
 struct TestLeader {
     handle: LeaderHandle,
     applied_tx: watch::Sender<u64>,
     role_tx: watch::Sender<RoleHandle>,
     path: std::path::PathBuf,
-    /// Nothing reads these; holding them open is what stops the handle
-    /// seeing a closed channel and concluding the node has shut down.
+    /// Nothing reads these. Keeping them open stops the handle from seeing a
+    /// closed channel and deciding the node has shut down.
     _event_rx: mpsc::Receiver<Event>,
     _quorum_tx: watch::Sender<bool>,
 }
@@ -35,9 +35,9 @@ fn test_leader(noop_seq: u64) -> TestLeader {
         noop_seq,
         log_tx: Arc::new(watch::channel(0).0),
     };
-    // Published over the very channel it holds a receiver for -- the
-    // same self-reference a real leader has (see `RoleHandle::Stopped`
-    // for what that costs), and what makes `still_leader` say yes.
+    // Published over the same channel it holds a receiver for: the same
+    // self-reference a real leader has (see `RoleHandle::Stopped` for the
+    // cost), and what makes `still_leader` say yes.
     role_tx.send(RoleHandle::Leader(handle.clone())).unwrap();
 
     TestLeader {
@@ -50,10 +50,10 @@ fn test_leader(noop_seq: u64) -> TestLeader {
     }
 }
 
-/// The gate a conditional write and a linearizable read both wait on:
-/// until this leader's own no-op has been *applied*, `latest` may still
-/// be missing writes a previous leader committed, and anything that
-/// answers from it would answer from a gap.
+/// The gate that linearizable and transactional reads wait on: until this
+/// leader's own no-op is applied, `latest` may still miss writes an earlier
+/// leader committed, and anything answering from it would answer from a
+/// gap.
 #[tokio::test]
 async fn catching_up_waits_for_this_leader_to_apply_its_own_noop() {
     let leader = test_leader(5);
@@ -65,8 +65,8 @@ async fn catching_up_waits_for_this_leader_to_apply_its_own_noop() {
         "a leader that has applied nothing cannot answer from `latest` yet"
     );
 
-    // Replicated and committed, but the tail it inherited is not in
-    // `latest` yet -- which is the whole distinction being drawn here.
+    // Replicated and committed, but the inherited tail is not in `latest` yet,
+    // which is the distinction being tested.
     leader.applied_tx.send_replace(4);
     assert!(
         tokio::time::timeout(Duration::from_millis(50), leader.handle.await_caught_up())
@@ -85,8 +85,8 @@ async fn catching_up_waits_for_this_leader_to_apply_its_own_noop() {
 }
 
 /// Waiting to catch up is not waiting forever. A leader deposed while
-/// someone waits on it will never apply that no-op, so the waiter is
-/// sent to whoever replaced it instead of hanging.
+/// someone waits on it will never apply that no-op, so the waiter is sent
+/// to its replacement instead of hanging.
 #[tokio::test]
 async fn a_deposed_leader_stops_waiting_to_catch_up() {
     let leader = test_leader(5);

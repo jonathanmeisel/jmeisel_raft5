@@ -1,11 +1,10 @@
-//! End-to-end authentication, through a real socket and therefore
-//! through the layer that enforces it.
+//! End-to-end authentication, through a real socket and so through the
+//! layer that enforces it.
 //!
-//! The unit tests in `grpc::tests` drive the handlers directly and hand
-//! them an already-verified identity, which is exactly the part this
-//! file does not take on trust: here the only thing a caller has is a
-//! token in a header, and everything else follows from whether the layer
-//! accepts it.
+//! The unit tests in `grpc::tests` drive the handlers directly and give
+//! them an already verified identity. This file does not take that part on
+//! trust: here a caller has only a token in a header, and everything else
+//! depends on whether the layer accepts it.
 
 mod common;
 
@@ -40,7 +39,7 @@ async fn auth_config(admin: Option<(&str, &str)>) -> AuthConfig {
     AuthConfig::new(SECRET, Duration::from_secs(3600), initial_admin)
 }
 
-/// A request carrying a bearer token, the way a client sends one.
+/// A request with a bearer token, as a client sends one.
 fn with_token<T>(token: &str, message: T) -> Request<T> {
     let mut request = Request::new(message);
     request.metadata_mut().insert(
@@ -76,14 +75,14 @@ async fn log_in(node: &TestNode, username: &str, password: &str) -> String {
 }
 
 /// The whole startup sequence for an authenticated cluster, which is
-/// circular until the startup administrator breaks it: `Bootstrap` needs
-/// a token, and until it has run there are no accounts to get one from.
+/// circular until the startup administrator breaks the circle: `Bootstrap`
+/// needs a token, and until it runs there are no accounts to get one from.
 #[tokio::test]
 async fn an_authenticated_cluster_can_be_bootstrapped_and_then_used() {
     let node = TestNode::with_auth("auth1", auth_config(Some(("root", "hunter42"))).await).await;
 
-    // Nothing is stored yet, so this token can only have come from the
-    // password the node was started with.
+    // Nothing is stored yet, so this token can only come from the password the
+    // node was started with.
     let token = log_in(&node, "root", "hunter42").await;
 
     node.client()
@@ -100,8 +99,8 @@ async fn an_authenticated_cluster_can_be_bootstrapped_and_then_used() {
         .expect("the startup administrator may bootstrap")
         .into_inner();
 
-    // Bootstrap wrote `root` into the log on its way out, so the same
-    // credentials now work against a stored account rather than a flag.
+    // Bootstrap wrote `root` into the log, so the same credentials now work
+    // against a stored account instead of a flag.
     let token = log_in(&node, "root", "hunter42").await;
     let created = node
         .client()
@@ -125,13 +124,13 @@ async fn an_authenticated_cluster_can_be_bootstrapped_and_then_used() {
         "expected the account to be created, got {created:?}"
     );
 
-    // And the new account can get a token of its own.
+    // And the new account can get its own token.
     assert!(!log_in(&node, "alice", "correct horse").await.is_empty());
 }
 
-/// The exempt list, from the outside. These two have to work without a
-/// token or nothing else can: `Login` is what issues one, and
-/// `GetConfig` is how a client finds the node to send a login to.
+/// The exempt list, from outside. These two must work without a token, or
+/// nothing else can: `Login` issues tokens, and `GetConfig` is how a client
+/// finds the node to send a login to.
 #[tokio::test]
 async fn get_config_and_login_are_answered_without_a_token() {
     let node = TestNode::with_auth("auth2", auth_config(Some(("root", "hunter42"))).await).await;
@@ -143,8 +142,8 @@ async fn get_config_and_login_are_answered_without_a_token() {
         .await
         .expect("GetConfig is how a client finds the leader, before it can log in");
 
-    // Answered, and refused on its merits rather than for want of a
-    // token -- the distinction the exemption exists to make.
+    // Answered, and refused on its merits, not for lack of a token: the
+    // difference the exemption exists to make.
     let refused = node
         .client()
         .as_ref()
@@ -164,8 +163,8 @@ async fn get_config_and_login_are_answered_without_a_token() {
     );
 }
 
-/// Everything not on that list. An allowlist rather than a denylist is
-/// what makes this the default.
+/// Everything not on that list. An allowlist, not a denylist, makes this
+/// the default.
 #[tokio::test]
 async fn every_other_rpc_is_refused_without_a_token() {
     let node = TestNode::with_auth("auth3", auth_config(Some(("root", "hunter42"))).await).await;
@@ -211,9 +210,9 @@ async fn every_other_rpc_is_refused_without_a_token() {
         .expect_err("creating an account needs a token");
     assert_eq!(status.code(), tonic::Code::Unauthenticated);
 
-    // The permission RPCs are on the list by construction -- `EXEMPT`
-    // is an allowlist and nothing was added to it -- but a new RPC that
-    // forgot to be is exactly what this test exists to catch.
+    // The permission RPCs are on the list by construction (`EXEMPT` is an
+    // allowlist and nothing was added to it), but a new RPC that was forgotten
+    // is exactly what this test exists to catch.
     let status = client
         .as_ref()
         .clone()
@@ -246,8 +245,8 @@ async fn every_other_rpc_is_refused_without_a_token() {
     assert_eq!(status.code(), tonic::Code::Unauthenticated);
 }
 
-/// A token is only as good as the secret behind it. This is what stops a
-/// node from trusting a token minted anywhere outside its own cluster.
+/// A token is only as good as the secret behind it. This stops a node from
+/// trusting a token created anywhere outside its own cluster.
 #[tokio::test]
 async fn a_token_signed_with_another_secret_is_refused() {
     let node = TestNode::with_auth("auth4", auth_config(Some(("root", "hunter42"))).await).await;
@@ -306,9 +305,9 @@ async fn a_malformed_authorization_header_is_refused() {
     }
 }
 
-/// The opt-in half, tested rather than assumed: a node started without a
-/// secret behaves exactly as this server did before any of this existed,
-/// and is not confused by a header it never asked for.
+/// The optional part, tested, not assumed: a node started without a secret
+/// asks nobody for a token, and is not confused by a header it never asked
+/// for.
 #[tokio::test]
 async fn a_node_without_a_secret_requires_and_ignores_tokens_alike() {
     let node = TestNode::new("auth6").await;
@@ -341,12 +340,11 @@ async fn a_node_without_a_secret_requires_and_ignores_tokens_alike() {
 
 /// The third exemption, and the only one that writes.
 ///
-/// `RedeemInvite` is answered without a bearer token because its callers
-/// are people who have no account yet. What it is not is unprotected:
-/// the layer lets the request through, and the handler then refuses
-/// everything that does not carry an invitation this cluster issued.
-/// This test is about that distinction -- the request is *answered*, on
-/// its merits, rather than turned away for want of a token.
+/// `RedeemInvite` is answered without a bearer token, because its callers
+/// have no account yet. It is not unprotected: the layer lets the request
+/// through, and the handler refuses everything that does not carry an
+/// invitation this cluster issued. This test is about that difference: the
+/// request is answered, on its merits, not turned away for lack of a token.
 #[tokio::test]
 async fn an_invitation_creates_an_account_with_no_token_anywhere() {
     let node = TestNode::with_auth("auth6", auth_config(Some(("root", "hunter42"))).await).await;
@@ -367,8 +365,8 @@ async fn an_invitation_creates_an_account_with_no_token_anywhere() {
         .expect("the startup administrator may bootstrap");
     let token = log_in(&node, "root", "hunter42").await;
 
-    // Issuing one needs the administrator's token, like any other
-    // account management.
+    // Issuing one needs the administrator's token, like any account
+    // management.
     let status = client
         .as_ref()
         .clone()
@@ -406,8 +404,8 @@ async fn an_invitation_creates_an_account_with_no_token_anywhere() {
         other => panic!("expected an invitation, got {other:?}"),
     };
 
-    // No `with_token` anywhere here: this is someone who has nothing but
-    // the secret they were handed.
+    // No `with_token` here: this is someone who has only the secret they were
+    // given.
     let redeemed = client
         .as_ref()
         .clone()
@@ -426,15 +424,14 @@ async fn an_invitation_creates_an_account_with_no_token_anywhere() {
         "expected the account to be created, got {redeemed:?}"
     );
 
-    // And the account it made is an ordinary one, which can now get a
-    // token the ordinary way.
+    // And the account it made is a normal one, which can now get a token the
+    // normal way.
     assert!(!log_in(&node, "alice", "correct horse").await.is_empty());
 }
 
 /// The exemption is for the RPC, not for whoever calls it. A redemption
-/// with no usable invitation is answered and refused -- which is the
-/// whole of what keeps an open write on this service from being an open
-/// cluster.
+/// with no usable invitation is answered and refused, which is all that
+/// keeps an open write on this service from being an open cluster.
 #[tokio::test]
 async fn a_redemption_without_a_real_invitation_creates_nothing() {
     let node = TestNode::with_auth("auth7", auth_config(Some(("root", "hunter42"))).await).await;
@@ -497,7 +494,7 @@ fn user(name: &str) -> Principal {
     }
 }
 
-/// A whole single-key write as whoever holds `token`.
+/// A whole single-key write as the holder of `token`.
 async fn write_with(
     node: &TestNode,
     token: &str,
@@ -547,20 +544,20 @@ async fn write_with(
     }
 }
 
-/// Permissions end to end: two real accounts, two real tokens, and an
-/// ACL that has to be enforced against whoever the layer says is calling
-/// rather than against an identity a test put there.
+/// Permissions end to end: two real accounts, two real tokens, and an ACL
+/// that must be enforced against whoever the layer says is calling, not
+/// against an identity a test put there.
 ///
-/// The refusal arriving *in band* is half the point. A token that is
-/// missing or forged is an `UNAUTHENTICATED` status raised before any
-/// handler runs; an ACL saying no is an answer, and a client that
-/// retried it would spend its whole deadline arriving back here.
+/// The refusal arriving in band is half the point. A missing or forged
+/// token is an `UNAUTHENTICATED` status raised before any handler runs; an
+/// ACL saying no is an answer, and a client that retried it would spend its
+/// whole deadline getting the same answer.
 #[tokio::test]
 async fn an_acl_is_enforced_against_the_identity_the_token_carries() {
     let node = TestNode::with_auth("auth9", auth_config(Some(("root", "hunter42"))).await).await;
     let mut client = node.client().as_ref().clone();
 
-    // The startup administrator breaks the circle, exactly as in
+    // The startup administrator breaks the circle, as in
     // `an_authenticated_cluster_can_be_bootstrapped_and_then_used`.
     let startup = log_in(&node, "root", "hunter42").await;
     client
@@ -587,7 +584,7 @@ async fn an_acl_is_enforced_against_the_identity_the_token_carries() {
     assert!(matches!(created, create_user_response::Result::Seq(_)));
     let alice = log_in(&node, "alice", "correct horse").await;
 
-    // Before any ACL: alice reaches everything, as she always could.
+    // Before any ACL: alice reaches everything.
     write_with(&node, &alice, b"app/config", b"v")
         .await
         .expect("with no ACL, every account reaches every key");
@@ -607,7 +604,7 @@ async fn an_acl_is_enforced_against_the_identity_the_token_carries() {
         .expect("set_acl always answers");
     assert!(matches!(set, set_acl_response::Result::Seq(_)), "got {set:?}");
 
-    // Now the same call is refused, and refused in band.
+    // Now the same call is refused, in band.
     let refused = client
         .read(with_token(&alice, ReadRequest {
             keys: vec![b"app/config".to_vec()],
@@ -642,33 +639,31 @@ async fn an_acl_is_enforced_against_the_identity_the_token_carries() {
         .expect("a read always answers");
     assert!(matches!(allowed, read_response::Result::Ok(_)), "got {allowed:?}");
 
-    // A key the ACL does not govern is untouched for either of them.
+    // A key the ACL does not govern is untouched for both.
     write_with(&node, &alice, b"other/config", b"v")
         .await
         .expect("nothing governs `other/`");
 }
 
-/// A follower enforces the ACLs, which is what proves the permission
-/// snapshot is fed by locally applied state rather than by a read of
-/// the leader.
+/// A follower enforces the ACLs, which proves the permission snapshot comes
+/// from locally applied state, not from a read on the leader.
 ///
 /// This is the case the obvious implementation gets wrong. The account
-/// check beside it, `require_admin`, reads the store *linearizably*: it
-/// needs a leader and a read quorum, and it can have both because it
-/// guards a handful of rare RPCs that all run on the leader anyway. A
-/// stale read does not run on the leader, so a permission check built
-/// the same way would not merely be slow here -- there would be nothing
-/// for it to ask.
+/// check next to it, `require_admin`, reads the store linearizably: it needs
+/// a leader and a read quorum, and can have both because it guards a few
+/// rare RPCs that all run on the leader anyway. A stale read does not run
+/// on the leader, so a permission check built the same way would not only
+/// be slow here: there would be nobody to ask.
 ///
-/// So the check reads what this node has applied, which is the same
-/// state the read it is authorizing is answered from. The cost is the
-/// honest one: a change reaches a follower when replication does, which
-/// is why this polls rather than asserting straight away.
+/// So the check reads what this node has applied, which is the same state
+/// the authorized read is answered from. The honest cost: a change reaches
+/// a follower when replication does, which is why this polls instead of
+/// asserting at once.
 #[tokio::test]
 async fn a_follower_enforces_an_acl_written_on_the_leader() {
     let leader = TestNode::with_auth("auth10", auth_config(Some(("root", "hunter42"))).await).await;
-    // The same secret, so a token minted by one is good at the other --
-    // which is the whole of what makes them one cluster to a client.
+    // The same secret, so a token created by one is good at the other, which
+    // is what makes them one cluster to a client.
     let follower = TestNode::with_auth("auth11", auth_config(None).await).await;
 
     let startup = log_in(&leader, "root", "hunter42").await;
@@ -711,10 +706,9 @@ async fn a_follower_enforces_an_acl_written_on_the_leader() {
         .await
         .expect("nothing governs this key yet");
 
-    // Until replication catches up the follower knows nothing about
-    // either. Waiting for the *value* is what makes the next assertion
-    // meaningful: it says the follower could have answered, and then
-    // stopped.
+    // Until replication catches up, the follower knows nothing about either.
+    // Waiting for the value makes the next assertion meaningful: it shows the
+    // follower could have answered, and then stopped.
     let mut follow = follower.client().as_ref().clone();
     retry("the write reaching the follower", || {
         let mut follow = follow.clone();
@@ -746,8 +740,8 @@ async fn a_follower_enforces_an_acl_written_on_the_leader() {
     .expect("setting an ACL should be answered")
     .into_inner();
 
-    // And now the follower -- which is not the leader, holds no quorum,
-    // and answers this read entirely from its own state -- refuses it.
+    // And now the follower, which is not the leader, holds no quorum, and
+    // answers this read from its own state alone, refuses it.
     retry("the ACL reaching the follower", || {
         let mut follow = follow.clone();
         let alice = alice.clone();
@@ -767,8 +761,8 @@ async fn a_follower_enforces_an_acl_written_on_the_leader() {
     })
     .await;
 
-    // The administrator's bypass is resolved from the follower's own
-    // account records, so it works there too.
+    // The administrator's bypass is resolved from the follower's own account
+    // records, so it works there too.
     let answered = follow
         .read(with_token(&root, ReadRequest {
             keys: vec![b"app/config".to_vec()],
@@ -785,11 +779,11 @@ async fn a_follower_enforces_an_acl_written_on_the_leader() {
     );
 }
 
-/// Polls `check` until it holds, or fails the test after ten seconds.
+/// Poll `check` until it holds, or fail the test after ten seconds.
 ///
-/// Replication and apply are both asynchronous, so everything a
-/// follower is asked about here is "eventually" rather than "now".
-/// Sleeping a fixed amount instead would be either flaky or slow.
+/// Replication and apply are both asynchronous, so everything a follower is
+/// asked here is "eventually", not "now". A fixed sleep would be flaky or
+/// slow.
 async fn retry<F, Fut>(what: &str, mut check: F)
 where
     F: FnMut() -> Fut,

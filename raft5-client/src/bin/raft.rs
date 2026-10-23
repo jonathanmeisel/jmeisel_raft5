@@ -1,9 +1,8 @@
 //! An interactive shell for a raft5 cluster.
 //!
-//! Connects once, using `--nodes` as seeds, and keeps that [`Client`]
-//! alive for the whole session -- so, unlike a one-shot CLI, the second
-//! command onward reuses whatever leader and membership the first one
-//! already found.
+//! Connects once, with `--nodes` as seeds, and keeps that [`Client`] for
+//! the whole session. Unlike a one-shot CLI, the second command onward
+//! reuses the leader and membership the first one found.
 
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
@@ -12,43 +11,42 @@ use clap::Parser;
 
 use raft5_client::{Client, ClientTls, Consistency, Error, Invite, Membership, Principal, Right};
 
-/// Opens an interactive session against a raft5 cluster.
+/// Open an interactive session against a raft5 cluster.
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
-    /// Comma-separated client API addresses of one or more cluster
-    /// members to start from, e.g.
-    /// `127.0.0.1:52005,127.0.0.1:52006`. A starting point rather than a
-    /// fixed list -- see [`Client::new`]. An address with no scheme is
-    /// taken to be `http://`, or `https://` with `--ca-cert`.
+    /// Comma-separated client API addresses of one or more cluster members to
+    /// start from, for example `127.0.0.1:52005,127.0.0.1:52006`. A starting
+    /// point, not a fixed list: see [`Client::new`]. An address with no scheme
+    /// is taken as `http://`, or `https://` with `--ca-cert`.
     #[arg(long, value_delimiter = ',')]
     nodes: Vec<String>,
 
     /// Log in as this user before the session starts. The password is
-    /// prompted for; it is never taken as an argument, where it would
-    /// end up in shell history and in the process list.
+    /// prompted for, never taken as an argument, where it would end up in
+    /// shell history and the process list.
     ///
-    /// Against a cluster started without a signing secret there is
-    /// nothing to log in to, and this is not needed.
+    /// A cluster started without a signing secret has nothing to log in to,
+    /// so this is not needed there.
     #[arg(long)]
     user: Option<String>,
 
-    /// PEM certificate(s) to trust the cluster's client API with. Turns
-    /// on TLS. Only these are trusted -- not the system's roots -- so for
-    /// a self-signed cluster this is that certificate (or its CA).
+    /// The PEM certificate(s) to trust for the cluster's client API. Turns on
+    /// TLS. Only these are trusted, not the system roots, so for a self-signed
+    /// cluster this is that certificate (or its CA).
     #[arg(long)]
     ca_cert: Option<PathBuf>,
 
-    /// PEM certificate to present, for a cluster that requires mTLS.
+    /// The PEM certificate to present, for a cluster that requires mTLS.
     #[arg(long, requires_all = ["key", "ca_cert"])]
     cert: Option<PathBuf>,
 
-    /// PEM private key for `--cert`.
+    /// The PEM private key for `--cert`.
     #[arg(long, requires = "cert")]
     key: Option<PathBuf>,
 
-    /// Check the servers' certificate against this name instead of the
-    /// host in each address.
+    /// Check the servers' certificate against this name instead of the host
+    /// in each address.
     #[arg(long, requires = "ca_cert")]
     tls_server_name: Option<String>,
 }
@@ -70,14 +68,12 @@ fn tls(args: &Args) -> Result<Option<ClientTls>, String> {
     Ok(Some(tls))
 }
 
-/// Asks for a password, without echoing it when there is an echo to
-/// suppress.
+/// Ask for a password, without echo when there is an echo to suppress.
 ///
-/// `rpassword` reads from the terminal directly and fails outright if
-/// there isn't one, so a shell being driven by a script -- which is how
-/// these commands get tested -- needs the plain path instead. There is
-/// nothing to hide in that case anyway: the password is arriving down a
-/// pipe, not being typed where someone could read it.
+/// `rpassword` reads from the terminal directly and fails if there is
+/// none, so a shell driven by a script (which is how these commands are
+/// tested) needs the plain path. There is nothing to hide then anyway: the
+/// password arrives through a pipe, not typed where someone could see it.
 fn prompt_password(username: &str) -> Result<String, String> {
     let prompt = format!("password for {username}: ");
     if io::stdin().is_terminal() {
@@ -153,11 +149,11 @@ async fn main() {
     repl(&client).await;
 }
 
-/// Reads commands from stdin until EOF or `quit`, running each against
-/// `client` in turn. One line is one command; nothing is pipelined, so a
-/// command that blocks (a write waiting on an election, say) is seen to
-/// do so before the next prompt appears -- which is the point of a shell
-/// meant for a human to drive.
+/// Read commands from stdin until EOF or `quit`, and run each against
+/// `client` in turn. One line is one command, with no pipelining, so a
+/// command that blocks (a write waiting for an election, for example) is
+/// seen to block before the next prompt appears. That is the point of a
+/// shell meant for a human.
 async fn repl(client: &Client) {
     let stdin = io::stdin();
     loop {
@@ -197,22 +193,23 @@ async fn repl(client: &Client) {
     }
 }
 
-/// Splits a command line into words, each of them bytes.
+/// Split a command line into words, each one bytes.
 ///
-/// Not `shell_words`: POSIX quoting eats a backslash outside quotes and
-/// turns `\\` into `\` inside double ones, so `"k\xff"` as [`quote_bytes`]
-/// prints it would not come back as the key it named. Here a backslash
-/// escape means the same thing wherever it appears, and covers everything
-/// `quote_bytes` emits -- so any key or value this shell prints can be
-/// pasted back in as an argument.
+/// Not `shell_words`: POSIX quoting drops a backslash outside quotes and
+/// turns `\\` into `\` inside double quotes, so `"k\xff"` as
+/// [`quote_bytes`] prints it would not come back as the same key. Here a
+/// backslash escape means the same thing everywhere, and covers everything
+/// `quote_bytes` emits, so any key or value this shell prints can be pasted
+/// back as an argument.
 ///
-/// Whitespace separates words; `"..."` and `'...'` keep it from doing so,
-/// and `""` is a word of its own -- the empty one, which `acl_set` needs.
+/// Whitespace separates words; `"..."` and `'...'` keep whitespace inside a
+/// word, and `""` is a word of its own (the empty word, which `acl_set`
+/// needs).
 fn split_line(line: &str) -> Result<Vec<Vec<u8>>, String> {
     let mut words = Vec::new();
     let mut word = Vec::new();
-    // Whether there is a word in progress, which `word.is_empty()` cannot
-    // say once `""` is allowed to be one.
+    // Whether a word is in progress. `word.is_empty()` cannot say this once
+    // `""` counts as a word.
     let mut in_word = false;
     let mut quote = None;
     let mut chars = line.chars();
@@ -249,7 +246,7 @@ fn split_line(line: &str) -> Result<Vec<Vec<u8>>, String> {
     Ok(words)
 }
 
-/// Decodes the escape following a backslash onto the end of `word`.
+/// Decode the escape after a backslash, and add it to the end of `word`.
 fn unescape(chars: &mut std::str::Chars, word: &mut Vec<u8>) -> Result<(), String> {
     let c = match chars.next().ok_or("trailing \\ escapes nothing")? {
         '\\' => '\\',
@@ -288,9 +285,9 @@ fn unescape(chars: &mut std::str::Chars, word: &mut Vec<u8>) -> Result<(), Strin
     Ok(())
 }
 
-/// Bytes as this shell prints them: quoted, with valid UTF-8 shown as
-/// text and every byte that is not part of any escaped as `\xNN`.
-/// [`split_line`] reads the result back as the same bytes.
+/// Bytes as this shell prints them: quoted, with valid UTF-8 shown as text
+/// and every other byte escaped as `\xNN`. [`split_line`] reads the result
+/// back as the same bytes.
 fn quote_bytes(bytes: &[u8]) -> String {
     let mut out = String::from("\"");
     for chunk in bytes.utf8_chunks() {
@@ -303,21 +300,21 @@ fn quote_bytes(bytes: &[u8]) -> String {
     out
 }
 
-/// An argument that has to be text -- a username, a server id -- rather
-/// than the bytes a key or value can be.
+/// An argument that must be text (a username, a server id), not the
+/// arbitrary bytes a key or value can be.
 fn text(arg: &[u8]) -> Result<&str, String> {
     std::str::from_utf8(arg).map_err(|_| format!("{} is not UTF-8", quote_bytes(arg)))
 }
 
-/// Runs one already-tokenized command. Returns `Ok(false)` for `quit` /
-/// `exit`, which is the only thing that ends the session.
+/// Run one tokenized command. Returns `Ok(false)` for `quit` or `exit`,
+/// the only things that end the session.
 ///
-/// Nothing is carried between commands. Transactions deliberately aren't
-/// exposed here: one is held on the leader with a deadline measured in
-/// seconds, and a human typing the next command would lose it more often
-/// than not -- along with the locks it was holding on everyone else's
-/// behalf. `write` and `delete` still commit through a transaction; the
-/// client opens and closes it inside the one call.
+/// Nothing carries over between commands. Transactions are not exposed
+/// here, on purpose: one lives on the leader with a deadline of seconds,
+/// and a human typing the next command would usually lose it, along with
+/// the locks it held against everyone else. `write` and `delete` still
+/// commit through a transaction, which the client opens and closes inside
+/// the one call.
 async fn run(client: &Client, words: &[Vec<u8>]) -> Result<bool, String> {
     let Some((cmd, args)) = words.split_first() else {
         return Ok(true);
@@ -352,8 +349,8 @@ async fn run(client: &Client, words: &[Vec<u8>]) -> Result<bool, String> {
             print_reads(client, args, consistency, cmd.starts_with("version")).await;
         }
         "snapshot" => {
-            // An id is optional: with none, the client stamps its own
-            // clock, which is where a clock belongs.
+            // An id is optional: with none, the client uses its own clock, which is
+            // where a clock belongs.
             let id = match args {
                 [] => None,
                 [id] => Some(id.as_slice()),
@@ -475,14 +472,12 @@ async fn run(client: &Client, words: &[Vec<u8>]) -> Result<bool, String> {
         "login" => {
             let username = match args {
                 [username] => text(username)?.to_string(),
-                // Prompted rather than defaulted: whose session this is
-                // is not something to guess at.
+                // Prompted, not defaulted: whose session this is must not be guessed.
                 [] => read_line("username: ")?,
                 _ => return Err("usage: login [username]".to_string()),
             };
-            // The password is never a positional argument: it would end
-            // up in this shell's history, where it would outlive the
-            // session.
+            // The password is never a positional argument: it would end up in this
+            // shell's history, which outlives the session.
             if let Err(e) = log_in(client, &username).await {
                 println!("{e}");
             }
@@ -523,11 +518,10 @@ async fn run(client: &Client, words: &[Vec<u8>]) -> Result<bool, String> {
             }
         }
         "redeem" => {
-            // The token is a positional argument and the password is
-            // not, which looks inconsistent and is not. A password is
-            // reusable and its owner's forever; an invitation is
-            // single-use and stops being a secret the moment it is
-            // spent, which is the same moment this command spends it.
+            // The token is a positional argument and the password is not. That looks
+            // inconsistent but is not: a password is reusable and belongs to its owner
+            // forever, while an invitation is single-use and stops being a secret the
+            // moment it is used, which is the moment this command uses it.
             let (token, username) = match args {
                 [token] => (text(token)?.to_string(), read_line("username: ")?),
                 [token, username] => (text(token)?.to_string(), text(username)?.to_string()),
@@ -586,10 +580,9 @@ async fn run(client: &Client, words: &[Vec<u8>]) -> Result<bool, String> {
             if rest.is_empty() {
                 return Err(format!("usage: {usage}"));
             }
-            // `--admin` says these principals are being added to (or
-            // taken from) the group's administrators rather than its
-            // members. The two lists are separate everywhere else, and
-            // collapsing them here would be the one place they were not.
+            // `--admin` says these principals are added to (or removed from) the
+            // group's administrators, not its members. The two lists are separate
+            // everywhere else, and must not be merged in this one place.
             let (as_admin, names) = match rest.split_first() {
                 Some((flag, names)) if flag == b"--admin" && !names.is_empty() => (true, names),
                 _ => (false, rest),
@@ -641,9 +634,8 @@ async fn run(client: &Client, words: &[Vec<u8>]) -> Result<bool, String> {
             }
         }
         "acl_set" => {
-            // The prefix is first and may be empty, which is the one
-            // that governs every key -- so it is a positional argument
-            // that can legitimately be "".
+            // The prefix comes first and may be empty (the empty prefix governs every
+            // key), so it is a positional argument that can validly be "".
             let Some((prefix, grants)) = args.split_first() else {
                 return Err("usage: acl_set <prefix> <principal>=<right> ...".to_string());
             };
@@ -673,15 +665,14 @@ async fn run(client: &Client, words: &[Vec<u8>]) -> Result<bool, String> {
 struct InviteOptions {
     is_admin: bool,
     username: Option<String>,
-    /// `Duration::ZERO` asks the cluster for its own default rather than
-    /// guessing at one here -- how long an invitation may last is the
-    /// cluster's policy, and this shell should not have a second opinion
-    /// about it.
+    /// `Duration::ZERO` asks for the cluster's own default instead of guessing
+    /// one here: how long an invitation may last is cluster policy, and this
+    /// shell should not have its own opinion.
     ttl: std::time::Duration,
 }
 
-/// `invite`'s flags, which are enough of them to want parsing rather
-/// than matching on shapes the way the fixed-arity commands do.
+/// Parse `invite`'s flags. There are enough of them to need parsing,
+/// unlike the fixed-arity commands, which match on shapes.
 fn invite_options(args: &[Vec<u8>]) -> Result<InviteOptions, String> {
     const USAGE: &str = "usage: invite [--admin] [--user <name>] [--hours <n>]";
     let mut options = InviteOptions {
@@ -709,11 +700,11 @@ fn invite_options(args: &[Vec<u8>]) -> Result<InviteOptions, String> {
     Ok(options)
 }
 
-/// Prints a freshly minted invitation, token first.
+/// Print a new invitation, token first.
 ///
-/// The warning is not decoration. This is the only time the cluster will
-/// ever produce the token -- it keeps a hash -- so an issuer who scrolls
-/// past it has to revoke the invitation and mint another.
+/// The warning matters: this is the only time the cluster ever produces
+/// the token (it keeps a hash), so an issuer who scrolls past it must
+/// revoke the invitation and create another.
 fn print_new_invite(new: &raft5_client::NewInvite) {
     println!("token: {}", new.token);
     println!("  ^ copy this now; the cluster keeps only a hash and cannot show it again");
@@ -726,8 +717,8 @@ fn describe_invite(invite: &Invite, now_unix_ms: u64) -> String {
         None => "for anyone holding it".to_string(),
     };
     let rights = if invite.is_admin { "admin" } else { "ordinary" };
-    // The id leads the line: it is what `revoke_invite` takes, and the
-    // thing most likely to be copied out of a listing.
+    // The id comes first on the line: `revoke_invite` takes it, and it is the
+    // part most likely to be copied from a listing.
     format!(
         "{}  {who}, {rights}, from {}, {}",
         invite.id,
@@ -736,11 +727,11 @@ fn describe_invite(invite: &Invite, now_unix_ms: u64) -> String {
     )
 }
 
-/// How much longer an invitation has, by this machine's clock.
+/// How much time an invitation has left, by this machine's clock.
 ///
-/// Relative rather than absolute because the cluster's clock is the one
-/// that decides and this one is only approximating it -- "in about 3h"
-/// is honest about that in a way a printed timestamp would not be.
+/// Relative, not absolute, because the cluster's clock decides and this one
+/// only approximates it. "in about 3h" is honest about that in a way a
+/// printed timestamp would not be.
 fn remaining(expires_unix_ms: u64, now_unix_ms: u64) -> String {
     let left_ms = expires_unix_ms.saturating_sub(now_unix_ms);
     if left_ms == 0 {
@@ -760,12 +751,12 @@ fn unix_millis() -> u64 {
         .unwrap_or(0)
 }
 
-/// A principal as this shell spells one: `user:alice` or `group:ops`.
+/// A principal as this shell writes one: `user:alice` or `group:ops`.
 ///
-/// The kind is never inferred from the name. Users and groups are
-/// separate namespaces, so `ops` alone is genuinely ambiguous, and
-/// guessing would make the one command where it mattered -- granting
-/// something to the wrong `ops` -- the one that failed silently.
+/// The kind is never inferred from the name. Users and groups are separate
+/// namespaces, so `ops` alone is ambiguous, and a guess would make the one
+/// command where it matters (granting something to the wrong `ops`) fail
+/// silently.
 fn parse_principal(text: &str) -> Result<Principal, String> {
     match text.split_once(':') {
         Some(("user", name)) if !name.is_empty() => Ok(Principal::user(name)),
@@ -776,7 +767,7 @@ fn parse_principal(text: &str) -> Result<Principal, String> {
     }
 }
 
-/// One ACL grant, as `acl_set` takes them: `user:alice=write`.
+/// One ACL grant, as `acl_set` takes it: `user:alice=write`.
 fn parse_grant(text: &str) -> Result<(Principal, Right), String> {
     let Some((who, right)) = text.rsplit_once('=') else {
         return Err(format!(
@@ -828,8 +819,8 @@ fn describe_acl(acl: &raft5_client::Acl) -> String {
     format!("{prefix}  {grants}  (seq={})", acl.seq)
 }
 
-/// Reads one line from stdin, for the arguments a command would rather
-/// ask for than have typed where they can be seen.
+/// Read one line from stdin, for arguments a command prefers to prompt
+/// for instead of having them typed where others can see them.
 fn read_line(prompt: &str) -> Result<String, String> {
     print!("{prompt}");
     io::stdout().flush().map_err(|e| e.to_string())?;
@@ -844,9 +835,8 @@ fn read_line(prompt: &str) -> Result<String, String> {
     Ok(line)
 }
 
-/// Matches `args` against exactly `N` positional arguments, so each
-/// command above can destructure straight into named bindings instead of
-/// indexing.
+/// Match `args` against exactly `N` positional arguments, so each command
+/// above can destructure into named bindings instead of indexing.
 fn fixed_args<'a, const N: usize>(
     args: &'a [Vec<u8>],
     usage: &str,
@@ -879,12 +869,12 @@ fn print_seq(result: Result<u64, Error>) {
     }
 }
 
-/// Reads `keys` and prints them, one line each under the `as_of` they
-/// were read at.
+/// Read `keys` and print them, one line each, under the `as_of` they were
+/// read at.
 ///
-/// A response the cluster cut short is reissued for the rest, and each
-/// batch prints its own `as_of`: two batches of a stale or current read
-/// are two moments, and printing them under one heading would hide that.
+/// If the cluster cuts a response short, the rest is reissued, and each
+/// batch prints its own `as_of`: two batches of a stale or current read are
+/// two moments, and one heading for both would hide that.
 async fn print_reads(
     client: &Client,
     keys: &[Vec<u8>],
@@ -901,9 +891,8 @@ async fn print_reads(
                 println!("as_of={}", read.as_of);
                 for v in &read.entries {
                     match v.seq {
-                        // Seq 0 is the "no current value" sentinel, so it
-                        // is spelled out rather than printed as a number
-                        // that looks like a real version.
+                        // Seq 0 means "no current value", so it is spelled out instead of printed
+                        // as a number that looks like a real version.
                         0 => println!("{} (no value)", quote_bytes(&v.key)),
                         seq => println!("{} seq={seq}", quote_bytes(&v.key)),
                     }
@@ -937,7 +926,7 @@ async fn print_reads(
     }
 }
 
-/// One line a member, ids padded to line up:
+/// One line per member, with ids padded to line up:
 /// `n1  voter    leader  peer=... client=...`.
 fn print_members(membership: &Membership) {
     let width = membership

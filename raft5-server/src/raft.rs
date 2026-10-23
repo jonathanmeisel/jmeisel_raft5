@@ -1,170 +1,170 @@
-//! Raft consensus state machine.
+//! The Raft consensus state machine.
 //!
-//! Only one role's event loop is ever running at a time. `run` drives a
-//! `Common` through a sequence of roles: each role's `new` consumes
-//! `Common`, starts whatever background tasks that role needs (replication
-//! for the leader, vote-requesting for the candidate, an election timer for
-//! the follower), publishes a `RoleHandle` so the outside world (the gRPC
-//! layer) can see what's currently possible, then runs its own event loop
-//! until it decides to change role. `shutdown` tears down that role's
-//! background tasks and hands `Common` back, and the driver constructs the
-//! next role from it. Because a role is fully torn down before the next one
-//! starts, there's never more than one event loop reading `Common`'s state
-//! at a time -- no locking needed around it.
+//! # Roles
 //!
-//! This file holds what's shared across every role -- `Common`, `Event`,
-//! the handle types, `PeerConnections`, the driver -- and each role's own
-//! implementation lives in its own submodule (`leader`, `candidate`,
-//! `follower`), private to this module. A submodule sees everything here
-//! (including private fields/methods) since it's a descendant of this
-//! module, same as if the code hadn't moved; the split is purely about file
-//! size, not encapsulation.
+//! Only one role's event loop runs at a time. `run` passes a `Common`
+//! through a sequence of roles. Each role:
+//! - takes `Common` in its `new`,
+//! - starts its background tasks (replication for the leader, vote
+//!   requests for the candidate, an election timer for the follower),
+//! - publishes a `RoleHandle`, so the gRPC layer can see what is possible,
+//! - runs its event loop until it decides to change role,
+//! - in `shutdown`, stops its tasks and gives `Common` back.
 //!
-//! `LeaderHandle::append_writes` is the one piece of the public API that does
-//! *not* go through the event loop: `storage::RaftLog::append` is already
-//! safe to call concurrently, and waiting for a commit is just watching a
-//! channel, so many concurrent client requests can sit in `append_writes`
-//! without serializing on (or blocking) the state machine's own loop.
+//! A role is fully stopped before the next one starts, so only one loop
+//! reads `Common` at a time, and `Common` needs no lock.
 //!
-//! `RaftPeerHandle` is the mirror image for *inbound* RPCs: unlike
-//! `LeaderHandle`, it isn't role-specific (every role has to be able to
-//! answer AppendEntries/RequestVote), so it's handed out once, up front,
-//! and stays valid across every role transition for the life of the node.
-//! It does go through the event loop -- `RaftPeerService`'s gRPC handlers
-//! call `append_entries`/`request_vote`, which push an `Event` carrying a
-//! `oneshot` reply channel and await it, so whichever role is currently
-//! running decides how to answer.
+//! This file holds what all roles share: `Common`, `Event`, the handle
+//! types, `PeerConnections` and the driver. Each role lives in its own
+//! private submodule (`leader`, `candidate`, `follower`). A submodule sees
+//! private items here, so the split is about file size, not
+//! encapsulation.
 //!
-//! `current_term`/`voted_for` are persisted to `storage`'s `meta` keyspace
-//! (`RaftLog::term_state`/`persist_term_state`) through `Common::advance_term`
-//! /`vote_for`, the only two places allowed to change them -- Raft's safety
-//! property depends on a node never granting two votes in the same term,
-//! even across a restart, so every change is durable before it's acted on.
-//! A persist failure panics rather than continuing on an unpersisted vote
-//! (see those methods).
+//! # Handles
 //!
-//! Raft §5.1's term rule -- "if an RPC request *or response* contains term
-//! T > currentTerm, set currentTerm = T and convert to follower" -- is
-//! split by which half of it is uniform. For a **response** it is applied
-//! once, for every role, in `Common::next_event` (see
-//! `Event::response_term`): there is no reply to compose, so adopting the
-//! term is the entire job, and centralising it means a new `Event` variant
-//! cannot quietly skip it. For a **request** each role answers differently
-//! before stepping down -- a leader rejects the append, a follower accepts
-//! it, a candidate still evaluates the vote -- so that half stays in the
-//! role event loops, next to the reply it has to build.
+//! `LeaderHandle::append_writes` does not go through the event loop:
+//! `storage::RaftLog::append` is safe to call concurrently, and waiting for
+//! a commit is only watching a channel. So many client requests can wait
+//! in `append_writes` without blocking the state machine's loop.
 //!
-//! Every `storage::RaftLog` call made from async code goes through
-//! `store::Store`, which puts it on the blocking pool -- fjall's calls
-//! are synchronous, and blocking an executor thread on disk I/O (even
-//! briefly) can stall whatever else that thread was scheduled to run.
-//! Nothing here calls `spawn_blocking` itself; `Store` is the one place
-//! that does, so the rule cannot be forgotten at a new call site. Because
-//! of this, `handle_event` is `async fn` on every role even though most
-//! events don't touch storage, so the one that does (`AppendEntries`, via
-//! `apply_append_entries`) can `.await` its storage call like anything
-//! else in the loop.
+//! `RaftPeerHandle` serves inbound RPCs. Every role must answer
+//! AppendEntries and RequestVote, so this handle is not role-specific: it
+//! is created once and stays valid for the life of the node. It does go
+//! through the event loop: the gRPC handlers push an `Event` with a
+//! `oneshot` reply channel and wait, so the current role decides the
+//! answer.
+//!
+//! # Term and vote
+//!
+//! `current_term` and `voted_for` are persisted (`RaftLog::term_state`,
+//! `persist_term_state`) through `Common::advance_term` and `vote_for`,
+//! the only two places that change them. Raft is safe only if a node never
+//! votes twice in one term, even across a restart, so every change is
+//! durable before the node acts on it. A failed persist panics.
+//!
+//! Raft §5.1 says: "if an RPC request or response contains term T >
+//! currentTerm, set currentTerm = T and convert to follower". This is
+//! split in two:
+//! - For a response, `Common::next_event` applies it once for all roles
+//!   (see `Event::response_term`). Adopting the term is the whole job, and
+//!   one central place means a new `Event` variant cannot skip it.
+//! - For a request, each role answers differently before it steps down (a
+//!   leader rejects the append, a follower accepts it, a candidate still
+//!   evaluates the vote). So that half stays in each role's loop, next to
+//!   the reply it builds.
+//!
+//! # Storage calls
+//!
+//! Every `storage::RaftLog` call from async code goes through
+//! `store::Store`, which runs it on the blocking pool: fjall is
+//! synchronous, and disk I/O on an executor thread can stall other tasks
+//! on that thread. Nothing here calls `spawn_blocking` directly. For the
+//! same reason, `handle_event` is `async fn` on every role, so that the one
+//! event that touches storage (`AppendEntries`, via `apply_append_entries`)
+//! can `.await` it.
+//!
+//! # Peer connections
 //!
 //! `Common::peer_conns` holds one gRPC client per peer (keyed by
-//! `PeerInfo::id`), shared across every role and every election so
-//! `RequestVote`/`AppendEntries` calls don't pay a fresh connection setup
-//! each time. The clients are built with `Endpoint::connect_lazy`, which
-//! dials on first use and re-dials by itself afterwards, so a failed call
-//! needs no eviction and no bookkeeping -- the next call simply
-//! reconnects. That is also what makes handing one out a pure in-memory
-//! lookup rather than something that can block: see `PeerConnections`.
+//! `PeerInfo::id`), shared by all roles and elections, so RPCs do not pay
+//! for a new connection each time. The clients use
+//! `Endpoint::connect_lazy`: they dial on first use and re-dial by
+//! themselves, so a failed call needs no cleanup, and getting a client is
+//! an in-memory lookup that never blocks. See `PeerConnections`.
 //!
-//! Before a `Follower` (or a `Candidate` whose real election timed out)
-//! commits to a real, term-incrementing candidacy, it first runs a
-//! `PreCandidate` round: a non-binding pre-vote (Raft dissertation §9.6,
-//! `RequestVoteRequest.dry_run`) that asks every peer "would you grant a
-//! real vote at `current_term + 1`" without either side changing any
-//! state. Only once a majority say yes does it become a real `Candidate`.
-//! This keeps a node that's been partitioned (and so can't possibly win)
-//! from inflating its term every election timeout and disrupting a healthy
-//! cluster the moment it reconnects. `Common::election_attempt` counts
-//! consecutive failed cycles (pre-vote or real) since this node last had
-//! reason to believe a leader existed, and backs off the retry timeout
-//! exponentially (`Timing::election_timeout_for_attempt`) so a persistently
-//! undecided cluster doesn't hammer itself forever; it resets to 0 the
-//! moment a fresh `Follower` starts (see `follower::Follower::new`).
-//! `PreCandidate` and `Candidate` share nearly all of this machinery --
-//! see `candidate::Campaign`.
+//! # Elections
 //!
-//! Every other timing value derives from one heartbeat, a per-cluster
-//! setting carried in the replicated configuration (see `Timing`): the
-//! lease is `4 * heartbeat`, and a follower's own election timeout (the
-//! "am I sure there's no leader" wait) is one lease plus an additional
-//! `fuzz(0, lease)` on top -- see `follower::spawn_lease_expiration_watcher`
-//! for why that's two sequential phases (one deterministic, one
-//! randomized) rather than one combined random draw.
-//! `PreCandidate`/`Candidate`'s own campaign-retry timeout starts at that
-//! same `[lease, 2*lease)` range for their first attempt and backs off
-//! exponentially from there (`Timing::election_timeout_for_attempt`).
+//! Before a `Follower` (or a `Candidate` whose election timed out) starts
+//! a real candidacy, which increments the term, it runs a `PreCandidate`
+//! round: a non-binding pre-vote (Raft dissertation §9.6,
+//! `RequestVoteRequest.dry_run`). It asks every peer "would you vote for me
+//! at `current_term + 1`?", and neither side changes state. Only after a
+//! majority says yes does it become a real `Candidate`. This stops a
+//! partitioned node, which cannot win, from raising its term on every
+//! timeout and disrupting a healthy cluster when it reconnects.
 //!
-//! Leader leasing (`GetLease`, deliberately a separate RPC from
-//! `AppendEntries` since that one can be slow -- it does real log-append
-//! work, a lease probe needs to stay fast) serves two purposes: a leader
-//! that can't retain a quorum of leases can no longer prove it's safe to
-//! serve a linearizable read locally (see `LeaderHandle::has_read_quorum`
-//! -- not consumed by any read path yet, but the plumbing is there), and
-//! a follower holding a live lease refuses *any* vote request (real or
-//! pre-vote) for someone else, so a leader that a majority can still
-//! reach can never be disrupted by a competing election. Losing lease
-//! quorum does not, by itself, force a leader to step down -- only actual
-//! contact revealing a higher term (a real `AppendEntries`/`RequestVote`)
-//! does that; lease loss is a read-safety signal, not a health verdict on
-//! its own, since replication (and therefore write-side commit safety)
-//! has its own independent, majority-based quorum check.
+//! `Common::election_attempt` counts failed cycles (pre-vote or real)
+//! since this node last believed a leader existed. The retry timeout backs
+//! off exponentially with it (`Timing::election_timeout_for_attempt`), so an
+//! undecided cluster does not overload itself. It resets to 0 when a new
+//! `Follower` starts (see `follower::Follower::new`). `PreCandidate` and
+//! `Candidate` share most of this logic: see `candidate::Campaign`.
+//!
+//! # Timing
+//!
+//! All timing values come from one heartbeat, a per-cluster setting in the
+//! replicated configuration (see `Timing`):
+//! - The lease is `4 * heartbeat`.
+//! - A follower's election timeout (the "is there really no leader?" wait)
+//!   is one lease plus `fuzz(0, lease)`. See
+//!   `follower::spawn_lease_expiration_watcher` for why these are two
+//!   phases (one fixed, one random) and not one random draw.
+//! - A campaign's retry timeout starts in the same `[lease, 2*lease)`
+//!   range and backs off from there.
+//!
+//! # Leases
+//!
+//! Leader leases use `GetLease`, a separate RPC from `AppendEntries`,
+//! because `AppendEntries` does real log work and can be slow, while a
+//! lease probe must stay fast. Leases have two purposes:
+//! - A leader that cannot keep a quorum of leases cannot prove it is safe
+//!   to serve a linearizable read locally (see
+//!   `LeaderHandle::has_read_quorum`, which linearizable and
+//!   transactional reads check).
+//! - A follower with a live lease refuses every vote request (real or
+//!   pre-vote) for another node, so a leader that a majority can reach is
+//!   never disrupted by an election.
+//!
+//! Losing the lease quorum does not make a leader step down. Only contact
+//! that shows a higher term does that. Lease loss is a read-safety signal:
+//! commit safety for writes has its own majority check in replication.
 //!
 //! # Cluster membership
 //!
-//! Membership is not configuration a node is started with -- it lives in
-//! the log, as `Config` entries replicated and log-matched like any other
-//! (Raft §4). Three consequences run through this module:
+//! Membership is not start-up configuration. It lives in the log, as
+//! `Config` entries that are replicated and log-matched like any other
+//! (Raft §4). This has three effects:
 //!
 //! * A configuration takes effect on **append**, not on commit (§4.1).
-//!   `Common::reload_config` is called wherever one may have appeared,
-//!   and `storage::RaftLog::current_config` explains why waiting for
-//!   commitment would deadlock.
-//! * Members are **voters or learners** (§4.2.1). Everyone is replicated
-//!   to; only voters count toward a quorum, campaign, or hold a lease.
-//!   A server is added as a learner and promoted automatically once it
-//!   can keep up -- see `leader::Leader::review_learner_progress`.
-//! * A node whose log holds no configuration belongs to **no cluster**
+//!   `Common::reload_config` runs wherever one may have appeared, and
+//!   `storage::RaftLog::current_config` explains why waiting for commit
+//!   would deadlock.
+//! * Members are **voters or learners** (§4.2.1). All members get
+//!   replication; only voters count toward a quorum, campaign, or hold a
+//!   lease. A server joins as a learner and is promoted automatically when
+//!   it keeps up: see `leader::Leader::review_learner_progress`.
+//! * A node whose log has no configuration is in **no cluster**
 //!   (`RoleHandle::Uninitialized`, §4.4). It answers RPCs and waits to be
-//!   bootstrapped (`ClientHandle::bootstrap`) or replicated to; it never
-//!   assumes it is its own cluster, since two nodes doing that would be
+//!   bootstrapped (`ClientHandle::bootstrap`) or replicated to. It never
+//!   assumes it is its own cluster, because two nodes doing that would make
 //!   two clusters.
 //!
 //! # Cancellation
 //!
-//! Every background task here -- a role's timers, a leader's per-peer
-//! replication and lease probes, a candidate's vote requests, the storage
-//! maintenance task -- is owned by a `Task`, and every one of those runs
-//! under a child of the node's single root `CancellationToken` (supplied
-//! by `crate::serve`). There are three rules, and `Task` exists to make
-//! them hard to break:
+//! Every background task (role timers, leader replication and lease
+//! probes, candidate vote requests, storage maintenance) is owned by a
+//! `Task`, and each runs under a child of the node's root
+//! `CancellationToken` (from `crate::serve`). `Task` enforces three rules:
 //!
-//! * **Nothing is detached.** A task is stopped by `Task::stop`, which
-//!   cancels and *then joins*. `JoinHandle::abort` leaves the task
-//!   wherever its last poll got to, which is how an `Arc<RaftLog>` -- and
-//!   with it the database lock -- ends up outliving the node that owned
-//!   it, invisibly, until the next node to open the same directory fails.
-//! * **Long waits are cancellable, storage calls are not.** Peer RPCs,
-//!   heartbeat sleeps and sends into the event loop go through
-//!   `until_cancelled`; `Store` calls are always awaited to completion,
-//!   since dropping a `spawn_blocking` doesn't stop it -- it keeps
-//!   running on its own worker thread, still holding what it captured.
-//! * **`run` returning means the node is gone.** Not "is stopping": every
-//!   role has torn down and joined its own tasks, the maintenance task
-//!   has been joined, and `Common` has been dropped, which is what
-//!   releases the gRPC handlers still parked on its channels.
+//! * **Nothing is detached.** `Task::stop` cancels and then joins.
+//!   `JoinHandle::abort` leaves a task wherever its last poll stopped, so
+//!   an `Arc<RaftLog>`, and with it the database lock, can outlive the
+//!   node. The next node to open the same directory then fails.
+//! * **Long waits are cancellable; storage calls are not.** Peer RPCs,
+//!   heartbeat sleeps and sends into the event loop use
+//!   `until_cancelled`. `Store` calls always run to completion: dropping a
+//!   `spawn_blocking` does not stop it, and it keeps holding what it
+//!   captured.
+//! * **When `run` returns, the node is gone.** Every role has stopped and
+//!   joined its tasks, the maintenance task is joined, and `Common` is
+//!   dropped, which releases gRPC handlers waiting on its channels.
 //!
-//! Still simplified: the leader-side §5.3 backoff optimization (see
-//! `leader::Leader::spawn_replication`), and nothing triggers snapshots
-//! on its own yet -- a snapshot is sent only when a peer has fallen
-//! behind the compaction floor.
+//! # Limits
+//!
+//! - The leader-side §5.3 backoff is simplified (see
+//!   `leader::Leader::spawn_replication`).
+//! - Nothing triggers a snapshot by itself: a snapshot is sent only when a
+//!   peer is behind the compaction floor.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -195,11 +195,10 @@ use candidate::{Candidate, PreCandidate};
 use follower::Follower;
 use leader::Leader;
 
-// Re-exported at the module root rather than left behind a path, for two
-// reasons: these names are `raft`'s public API (`grpc` and `lib` know
-// them as `raft::LeaderHandle`, not `raft::handles::LeaderHandle`), and
-// each role module's `use super::*` picks the whole vocabulary up from
-// here, so splitting this file didn't touch a single role.
+// Re-exported at the module root, for two reasons: these names are the
+// public API of `raft` (`grpc` and `lib` use `raft::LeaderHandle`, not
+// `raft::handles::LeaderHandle`), and each role module gets the whole set
+// through `use super::*`.
 pub use event::{ConfigChange, Event, RaftError};
 pub use handles::{
     AppendError, ClientHandle, FollowerHandle, LeaderHandle, RaftPeerHandle, RoleHandle,
@@ -209,8 +208,8 @@ pub use peer::PeerInfo;
 
 pub(crate) use event::Role;
 use event::Transition;
-/// The wire form of an `AppendEntries`, for the one test that has to
-/// speak it over a real socket -- see `grpc::tests`.
+/// The wire form of an `AppendEntries`, for the one test that sends it
+/// over a real socket: see `grpc::tests`.
 #[cfg(test)]
 pub(crate) use leader::replication::append_entries_stream;
 use peer::PeerConnections;
@@ -218,21 +217,20 @@ pub(crate) use peer::peer_endpoint;
 pub(crate) use task::Task;
 use task::{send_event, until_cancelled};
 
-/// The heartbeat a cluster runs at unless it was bootstrapped with (or
-/// later set to) something else -- and what a node with no configuration
-/// yet runs at. Comfortable on a LAN; see `Timing` for what to raise it
-/// for.
+/// The heartbeat of a cluster that was not bootstrapped with (or later set
+/// to) another value, and of a node with no configuration yet. Good on a
+/// LAN; see `Timing` for when to raise it.
 pub(crate) const DEFAULT_HEARTBEAT_MS: u64 = 50;
 
-/// The range a cluster's heartbeat may be set to. The floor keeps a typo
-/// from turning every peer into a busy-loop of probes; the ceiling keeps
-/// one from making a dead leader take the better part of a minute to
-/// notice (a follower waits up to `2 * lease`, i.e. 8 heartbeats).
+/// The allowed heartbeat range. The floor stops a typo from making every
+/// peer a busy loop of probes. The ceiling stops one from making a dead
+/// leader take most of a minute to detect (a follower waits up to
+/// `2 * lease`, which is 8 heartbeats).
 pub(crate) const HEARTBEAT_MS_RANGE: std::ops::RangeInclusive<u64> = 10..=10_000;
 
-/// Whether `ms` is a heartbeat a cluster may be set to -- checked where
-/// one is asked for (bootstrap, `ConfigChange::SetHeartbeat`), so an
-/// operator hears about a bad value instead of having it quietly clamped.
+/// Whether a cluster may use `ms` as its heartbeat. Checked where a value
+/// is requested (bootstrap, `ConfigChange::SetHeartbeat`), so an operator
+/// learns about a bad value instead of having it silently clamped.
 pub(crate) fn check_heartbeat_ms(ms: u64) -> Result<(), &'static str> {
     if HEARTBEAT_MS_RANGE.contains(&ms) {
         Ok(())
@@ -241,21 +239,21 @@ pub(crate) fn check_heartbeat_ms(ms: u64) -> Result<(), &'static str> {
     }
 }
 
-/// Every timeout and interval the consensus core runs on, all derived
-/// from one heartbeat (see the module doc).
+/// Every timeout and interval of the consensus core, all derived from one
+/// heartbeat (see the module doc).
 ///
-/// The heartbeat is a per-cluster setting carried in the replicated
+/// The heartbeat is a per-cluster setting in the replicated
 /// `ClusterConfig` (`heartbeat_millis`), so it takes effect on every node
-/// the moment the entry setting it is appended, like any membership
-/// change. Raise it when nodes are far apart: the lightweight-RPC timeout
-/// is only `2 * heartbeat`, so a heartbeat much below the peer round trip
-/// (plus a TLS handshake, on a cold connection) means lease probes and
-/// votes time out, leases lapse, and elections churn.
+/// when the entry that sets it is appended, like a membership change.
+/// Raise it when nodes are far apart: the light RPC timeout is only
+/// `2 * heartbeat`, so a heartbeat well below the peer round trip (plus a
+/// TLS handshake on a cold connection) makes lease probes and votes time
+/// out, leases lapse, and elections repeat.
 ///
-/// `Copy` and cheap: the event loop publishes the current one through a
-/// `watch` (see `Common::timing_tx`), and a long-lived task re-reads it
-/// on each iteration so a change applies on its next tick without
-/// anything being respawned.
+/// `Copy` and cheap: the event loop publishes the current value through a
+/// `watch` (see `Common::timing_tx`). Long-lived tasks read it again on
+/// each iteration, so a change applies on the next tick without
+/// restarting anything.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Timing {
     heartbeat_ms: u64,
@@ -268,8 +266,8 @@ impl Default for Timing {
 }
 
 impl Timing {
-    /// `ms`, clamped into `HEARTBEAT_MS_RANGE` -- except 0, which is what
-    /// an unset proto field reads as, and means the default.
+    /// `ms`, clamped into `HEARTBEAT_MS_RANGE`. 0 is an unset proto field and
+    /// means the default.
     pub(crate) fn from_millis(ms: u64) -> Self {
         let heartbeat_ms = if ms == 0 {
             DEFAULT_HEARTBEAT_MS
@@ -279,7 +277,7 @@ impl Timing {
         Self { heartbeat_ms }
     }
 
-    /// The timing `config` asks for.
+    /// The timing that `config` asks for.
     pub(crate) fn of(config: &ClusterConfig) -> Self {
         Self::from_millis(config.heartbeat_millis)
     }
@@ -288,28 +286,27 @@ impl Timing {
         self.heartbeat_ms
     }
 
-    /// How often the leader ticks, probes leases, and retries an
-    /// unreachable peer.
+    /// How often the leader ticks, probes leases, and retries an unreachable
+    /// peer.
     fn heartbeat(self) -> Duration {
         Duration::from_millis(self.heartbeat_ms)
     }
 
-    /// How long a caught-up replication task waits with nothing to do
-    /// before sending its peer an empty `AppendEntries` anyway. Not a
-    /// liveness heartbeat -- leases do that -- but a safety net:
-    /// replication otherwise only runs when the log or a watermark
-    /// changes, so a follower that silently restarted would go unnoticed
-    /// until the next write.
+    /// How long an idle, caught-up replication task waits before it sends its
+    /// peer an empty `AppendEntries`. This is not a liveness heartbeat (leases
+    /// do that) but a safety net: replication otherwise runs only when the log
+    /// or a watermark changes, so a follower that silently restarted would go
+    /// unnoticed until the next write.
     fn idle_replication_interval(self) -> Duration {
         self.heartbeat() * 10
     }
 
-    /// How long a lease (see `RaftPeerHandle::get_lease`) is asked for:
-    /// how long a follower keeps refusing other vote requests after its
-    /// last confirmed contact with the leader, and how long a leader
-    /// keeps counting a peer's grant toward its own lease quorum. The two
-    /// sides agree because the leader names the duration in each request
-    /// rather than each assuming its own -- see `GetLeaseRequest`.
+    /// The lease duration a request asks for (see
+    /// `RaftPeerHandle::get_lease`). A follower refuses other vote requests
+    /// for this long after its last confirmed contact with the leader, and a
+    /// leader counts a peer's grant toward its lease quorum for this long. The
+    /// two agree because the leader names the duration in each request: see
+    /// `GetLeaseRequest`.
     fn lease_ms(self) -> u64 {
         self.heartbeat_ms * 4
     }
@@ -318,87 +315,79 @@ impl Timing {
         Duration::from_millis(self.lease_ms())
     }
 
-    /// Timeout for a cheap, no-disk-I/O peer RPC (`RequestVote`,
-    /// `GetLease`) -- including connecting, if there's no cached client
-    /// yet. Tight, since these should always be fast; a slow reply is as
-    /// good as no reply.
+    /// The timeout for a cheap peer RPC with no disk I/O (`RequestVote`,
+    /// `GetLease`), including the connect if no client is cached. Tight,
+    /// because these should be fast: a slow reply is as good as none.
     fn lightweight_rpc_timeout(self) -> Duration {
         self.heartbeat() * 2
     }
 
-    /// The longest a lease request can ask for: the lease a cluster at
-    /// the top of `HEARTBEAT_MS_RANGE` uses. A follower clamps to this
-    /// so no leader, however misconfigured, can silence its elections
-    /// for longer.
+    /// The longest lease a request may ask for: the lease of a cluster at the
+    /// top of `HEARTBEAT_MS_RANGE`. A follower clamps to this, so no leader,
+    /// however misconfigured, can block its elections for longer.
     fn max_lease() -> Duration {
         Timing::from_millis(*HEARTBEAT_MS_RANGE.end()).lease()
     }
 
-    /// The shortest, likewise.
+    /// The shortest lease a request may ask for.
     fn min_lease() -> Duration {
         Timing::from_millis(*HEARTBEAT_MS_RANGE.start()).lease()
     }
 }
 
-/// Timeout for `AppendEntries` specifically, which -- unlike the above --
-/// does real log-append work on the follower and so can legitimately take
-/// a while under load. Deliberately generous: retrying an already-slow
-/// follower sooner doesn't help if the bottleneck is disk I/O, it just
-/// adds more redundant work on top.
+/// The timeout for `AppendEntries`. Unlike the RPCs above, it does real
+/// log work on the follower and can take a while under load. Generous on
+/// purpose: an earlier retry does not help a follower whose disk is the
+/// bottleneck; it only adds more work.
 ///
-/// Sized against `MAX_REPLICATION_BATCH_BYTES`: a full batch has to fit
-/// inside this on a link worth replicating over at all. At 16 MiB that is
-/// a floor of roughly 550 KiB/s, which is a very low bar -- but the
-/// relationship is the thing to preserve if either number moves, because
-/// a batch that cannot finish inside the timeout never commits, and
-/// nothing after it commits either.
+/// Sized against `MAX_REPLICATION_BATCH_BYTES`: a full batch must fit in
+/// this time on any link worth using. At 16 MiB that needs about
+/// 550 KiB/s. Keep this relation if either number changes: a batch that
+/// cannot finish in time never commits, and nothing after it commits
+/// either.
 const APPEND_ENTRIES_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long replication to one peer may keep failing before it is
-/// reported as a stall rather than a retry. Past this, the likely causes
-/// stop being "the peer is restarting" and start being "this will never
-/// succeed" -- a batch too large for the link, most of all, which pins
-/// the commit index indefinitely with nothing else to show for it.
+/// How long replication to one peer may keep failing before it is logged
+/// as a stall, not a retry. After this long the likely cause is no longer
+/// "the peer is restarting" but "this will never succeed", most often a
+/// batch too large for the link, which blocks the commit index with no
+/// other symptom.
 const REPLICATION_STALL_WARNING: Duration = Duration::from_secs(60);
 
 // --- the replication size cap chain -----------------------------------
 //
-// These are not independent knobs. If the leader can ever emit an entry
-// the follower will refuse, that entry is already in the log, the leader
-// re-proposes it forever, and the cluster never commits anything again --
-// the failure `txn::MAX_TRANSACTION_BYTES` exists to prevent. So they are
-// derived from one another and the ordering is asserted below.
+// These limits depend on each other. If the leader ever sends an entry the
+// follower refuses, the entry is already in the log, the leader sends it
+// forever, and the cluster never commits again. `txn::MAX_TRANSACTION_BYTES`
+// exists to prevent this. So the limits are derived from each other, and
+// their order is asserted below.
 //
-// Budgets are in *encoded* bytes, and the three layers do not encode
-// identically: `txn` counts raw key and value bytes, a `log` row is
-// postcard, the wire is protobuf. The headroom between
-// `txn::MAX_TRANSACTION_BYTES` and `MAX_ENTRY_BYTES` is what absorbs the
-// difference between them.
+// Budgets are in encoded bytes, and the layers encode differently: `txn`
+// counts raw key and value bytes, a `log` row is postcard, the wire is
+// protobuf. The gap between `txn::MAX_TRANSACTION_BYTES` and
+// `MAX_ENTRY_BYTES` absorbs the difference.
 
-/// The largest single log entry that may exist, anywhere. Enforced at the
-/// only place that can enforce it -- `txn`, before anything reaches the
-/// log -- and everything below is sized so that an entry this large can
-/// always be replicated.
+/// The largest log entry that may exist. `txn` enforces it, before
+/// anything reaches the log, which is the only place that can. Everything
+/// below is sized so an entry this large always replicates.
 pub const MAX_ENTRY_BYTES: usize = 16 * 1024 * 1024;
 
 /// How many bytes of log entries one replication round may carry.
 ///
-/// A soft budget: `RaftLog::entries_in_range_capped` always yields at
-/// least one entry even when that entry alone exceeds this, so a single
-/// large entry makes progress rather than wedging behind a budget it can
-/// never fit. That is exactly why this must be at least
-/// `MAX_ENTRY_BYTES` -- the "at least one" escape hatch is only safe if
-/// no single entry can outgrow the cap it escapes.
+/// A soft budget: `RaftLog::entries_in_range_capped` always returns at
+/// least one entry, even if that entry alone is over the budget, so a
+/// large entry makes progress. That is why this must be at least
+/// `MAX_ENTRY_BYTES`: the "at least one" rule is safe only if no entry is
+/// larger than the budget.
 pub const MAX_REPLICATION_BATCH_BYTES: usize = MAX_ENTRY_BYTES;
 
-/// The receiver's hard ceiling on one `AppendEntries` body. Strictly
-/// above `MAX_REPLICATION_BATCH_BYTES` so that protobuf framing around a
-/// maximal batch can never tip an honest leader over the line.
+/// The receiver's hard limit on one `AppendEntries` body. Above
+/// `MAX_REPLICATION_BATCH_BYTES`, so protobuf framing around a full batch
+/// never puts an honest leader over the limit.
 pub const MAX_APPEND_ENTRIES_BYTES: usize = MAX_REPLICATION_BATCH_BYTES + 4 * 1024 * 1024;
 
-// Compile-time, not a test: breaking this ordering should fail the
-// build rather than a run. Today the chain is 10 MiB < 16 MiB <= 16 MiB
-// < 20 MiB.
+// A compile-time check, not a test: breaking this order should fail the
+// build. The chain is 10 MiB < 16 MiB <= 16 MiB < 20 MiB.
 const _: () = assert!(
     crate::txn::MAX_TRANSACTION_BYTES < MAX_ENTRY_BYTES,
     "a transaction must leave room for the framing its log entry adds, or \
@@ -415,84 +404,76 @@ const _: () = assert!(
      an entry is refused forever and the cluster stops committing"
 );
 
-/// Timeout for a full `InstallSnapshot` transfer -- more generous still
-/// than `AppendEntries`: this moves the *entire* current state, not just a
-/// batch of new entries, so it can take much longer on a large log or a
-/// slow link.
+/// The timeout for a full `InstallSnapshot` transfer. Longer than for
+/// `AppendEntries`, because it moves the whole current state, not a batch
+/// of new entries.
 const SNAPSHOT_RPC_TIMEOUT: Duration = Duration::from_secs(7200);
 
-/// How much of an encoded entry batch goes into each `AppendEntriesChunk`
-/// on the wire.
+/// How much of an encoded entry batch goes into each
+/// `AppendEntriesChunk`.
 ///
-/// Only bounds the size of one gRPC message; the batch as a whole is
-/// bounded by `MAX_REPLICATION_BATCH_BYTES`. Keeping each message well
-/// under any plausible decode limit is the point -- it is what moves the
-/// ceiling on a batch off the transport's defaults and into the cap
-/// chain below, where it is chosen rather than inherited.
+/// This bounds one gRPC message only; `MAX_REPLICATION_BATCH_BYTES` bounds
+/// the batch. Small messages stay well under any decode limit, so the
+/// batch limit is set by the cap chain on purpose, not inherited from
+/// transport defaults.
 const APPEND_ENTRIES_CHUNK_SIZE: usize = 1024 * 1024;
 
-/// A random value in `[0, max)`. Good enough for election-timeout jitter
-/// without pulling in a `rand` dependency: `RandomState`'s whole purpose is
-/// a fresh random seed per instance (it's what `HashMap` uses to resist
-/// hash-flooding), so a fresh hasher's initial state is already
-/// unpredictable without needing to write anything through it.
+/// A random value in `[0, max)`, for election-timeout jitter, without a
+/// `rand` dependency. Each `RandomState` gets a random seed (that is how
+/// `HashMap` resists hash flooding), so a new hasher's output is already
+/// unpredictable.
 fn random_jitter_millis(max: u64) -> u64 {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
     RandomState::new().build_hasher().finish() % max
 }
 
-/// How long the storage maintenance task waits before retrying an apply
-/// that failed. Long enough that a persistently failing disk doesn't spin
-/// the blocking pool, short enough that a transient one costs a commit a
-/// noticeable pause rather than the rest of the term.
+/// How long the storage maintenance task waits before it retries a failed
+/// apply. Long enough that a failing disk does not spin the blocking pool,
+/// short enough that a brief failure costs a commit a short pause, not the
+/// rest of the term.
 const APPLY_RETRY_DELAY: Duration = Duration::from_millis(100);
 
-/// How often the version GC wakes when it has nothing left to do.
+/// How often the version GC wakes when it has no work.
 ///
-/// Short, because what it is reclaiming is every superseded version of
-/// every key that has been overwritten -- on a write-heavy workload the
-/// store grows until this runs. A pass that stops on its budget does not
-/// wait this out; it goes straight round again.
+/// Short, because it reclaims every superseded version of every
+/// overwritten key: under heavy writes, the store grows until it runs. A
+/// pass that stops on its budget does not wait: it starts again at once.
 const VERSION_GC_INTERVAL: Duration = Duration::from_secs(60);
 
-/// How many version rows one GC pass visits before yielding.
+/// How many version rows one GC pass visits before it yields.
 ///
-/// Bounds how long the blocking-pool worker is held and how large the
-/// write batch can get, in the same spirit as `WRITE_CHUNK`. A pass
-/// always finishes the key it is in the middle of, so this is
-/// approximate.
+/// Bounds how long a blocking-pool worker is held and how large the write
+/// batch gets, like `WRITE_CHUNK`. A pass always finishes the key it is in,
+/// so the limit is approximate.
 const VERSION_GC_BUDGET: usize = 50_000;
 
-/// How long a persistently failing campaign backs off to, at most -- or
-/// `4 * lease`, if that is longer, so a cluster with a long heartbeat
-/// still gets a jitter window on its first couple of attempts rather than
-/// every node retrying at exactly the cap.
+/// The longest backoff for a campaign that keeps failing, or `4 * lease`
+/// if that is longer, so a cluster with a long heartbeat still gets a
+/// jitter window on its first attempts instead of all nodes retrying at
+/// exactly the cap.
 const MAX_ELECTION_BACKOFF_MS: u64 = 30_000;
 
 impl Timing {
-    /// The jitter window for the `attempt`-th consecutive *campaign*
-    /// cycle (`PreCandidate`/`Candidate` waiting on vote responses) since
-    /// this node last had reason to believe a leader existed -- see
-    /// `Common::election_attempt`. Attempt 0 is `[lease, 2*lease)`,
-    /// doubling per attempt from there, capped at
-    /// `MAX_ELECTION_BACKOFF_MS`, so a persistently undecided cluster (or
-    /// a node that genuinely can't reach anyone) backs off instead of
-    /// retrying forever at the same tight interval.
+    /// The jitter window for the `attempt`-th failed campaign cycle in a row
+    /// (`PreCandidate` or `Candidate` waiting for votes) since this node last
+    /// believed a leader existed (see `Common::election_attempt`).
+    /// - Attempt 0 is `[lease, 2*lease)`.
+    /// - Each attempt doubles it, up to `MAX_ELECTION_BACKOFF_MS`.
     ///
-    /// This is *not* what a `Follower` uses to decide it's time to stop
-    /// trusting its leader in the first place -- that's
-    /// `follower::spawn_lease_expiration_watcher`'s two-phase wait, which
-    /// happens to total the same `[lease, 2*lease)` range for different
-    /// reasons (a deterministic detection phase plus a randomized settle
-    /// phase, rather than a single random draw).
+    /// So an undecided cluster, or a node that cannot reach anyone, backs off
+    /// instead of retrying at the same short interval forever.
+    ///
+    /// A `Follower` does not use this to decide its leader is gone. It uses
+    /// the two-phase wait in `follower::spawn_lease_expiration_watcher`, which
+    /// also totals `[lease, 2*lease)` but for different reasons (a fixed
+    /// detection phase plus a random settle phase).
     fn election_timeout_for_attempt(self, attempt: u32) -> Duration {
         let lease_ms = self.lease_ms();
         let cap = MAX_ELECTION_BACKOFF_MS.max(lease_ms.saturating_mul(4));
-        // Cap the shift itself (not just its result) so this can't panic
-        // on a pathologically large attempt count -- 2^20 already blows
-        // past the millisecond cap by many orders of magnitude, so
-        // nothing above that ever changes the (already-capped) outcome.
+        // Cap the shift itself, not only the result, so a huge attempt count
+        // cannot panic. 2^20 is already far past the millisecond cap, so higher
+        // values change nothing.
         let scale = 1u64 << attempt.min(20);
         let min = lease_ms.saturating_mul(scale).min(cap);
         let max = lease_ms.saturating_mul(2).saturating_mul(scale).min(cap);
@@ -506,17 +487,16 @@ impl Timing {
     }
 }
 
-/// Both `Follower` (waiting for a leader) and `PreCandidate`/`Candidate`
-/// (waiting for votes) need this: if nothing interesting happens in time,
-/// push `ElectionTimeout` so the event loop can start/restart an election.
+/// Push `ElectionTimeout` if nothing happens in time, so the event loop
+/// can start or restart an election. `Follower` (waiting for a leader)
+/// and `PreCandidate`/`Candidate` (waiting for votes) both use this.
 ///
-/// Randomized per the Raft paper: two nodes with the exact same fixed
-/// timeout tend to become candidates at the same instant, and then
-/// perpetually split-vote against each other every single attempt
-/// (neither's `RequestVote` looks newer than the other's own, so both
-/// just deny each other and restart in lockstep) -- jitter is what breaks
-/// the tie within a few rounds. `attempt` widens that jitter window for
-/// repeated failures; a fresh `Follower` always passes 0.
+/// Randomized, as in the Raft paper. Two nodes with the same fixed timeout
+/// tend to become candidates at the same moment and then split the vote on
+/// every attempt: neither's `RequestVote` looks newer than its own, so both
+/// refuse and restart together. Jitter breaks the tie within a few rounds.
+/// `attempt` widens the window after repeated failures; a new `Follower`
+/// passes 0.
 fn spawn_election_timer(
     cancel: &CancellationToken,
     timing: Timing,
@@ -535,7 +515,7 @@ fn spawn_election_timer(
 }
 
 /// See `Common::notify_appended`. A free function so `LeaderHandle` can
-/// call it with just the sender.
+/// call it with only the sender.
 fn notify_appended(log_tx: &watch::Sender<u64>, seq: u64) {
     log_tx.send_if_modified(|latest| {
         let advanced = seq > *latest;
@@ -546,10 +526,10 @@ fn notify_appended(log_tx: &watch::Sender<u64>, seq: u64) {
     });
 }
 
-/// This node's own `(last_log_index, last_log_term)`, needed both to fill
-/// in a `RequestVoteRequest` we're sending and to evaluate the §5.4.1
-/// up-to-date check on one we've received. `(0, 0)` for an empty log,
-/// matching Raft's virtual "before the first entry" convention.
+/// This node's `(last_log_index, last_log_term)`. Used to fill in an
+/// outgoing `RequestVoteRequest` and to run the §5.4.1 up-to-date check on
+/// an incoming one. `(0, 0)` for an empty log, as in Raft's "before the
+/// first entry" convention.
 async fn last_log_index_and_term(store: &Store) -> (u64, u64) {
     store
         .expect("read the last log entry", RaftLog::last_entry)
@@ -557,32 +537,27 @@ async fn last_log_index_and_term(store: &Store) -> (u64, u64) {
         .unwrap_or((0, 0))
 }
 
-/// The term of the entry at `seq`, or `None` if we no longer have (or
-/// never had) one there. Async wrapper over `RaftLog::term_at`, same
-/// shape as `last_log_index_and_term`.
+/// The term of the entry at `seq`, or `None` if there is no entry there
+/// (any more). An async wrapper over `RaftLog::term_at`.
 async fn term_at(store: &Store, seq: u64) -> Option<u64> {
     store
         .expect("read the term at a log index", move |log| log.term_at(seq))
         .await
 }
 
-/// Evaluates a pre-vote (`RequestVoteRequest.dry_run == true`) without
-/// touching any state -- no term bump, no `voted_for`, no election timer
-/// reset. Reports whether a *real* `RequestVote` at `req.term` would be
-/// granted.
+/// Evaluate a pre-vote (`RequestVoteRequest.dry_run == true`) without
+/// changing any state: no term change, no `voted_for`, no timer reset.
+/// Returns whether a real `RequestVote` at `req.term` would be granted.
 ///
-/// Deliberately doesn't check `voted_for`: it's always scoped to exactly
-/// `current_term` (`Common::advance_term` resets it in the same step it
-/// bumps the term, and `vote_for` is only ever called once `current_term`
-/// already equals the term being voted for), so a real vote can only ever
-/// exist at a term `<= common.current_term`. A dry run that passes the
-/// `req.term > common.current_term` check below is by construction asking
-/// about a term strictly beyond any term a real vote could have been cast
-/// at, so there's no possible conflict to check for. (Two concurrent
-/// candidates can still both pass pre-vote against the same peer this way
-/// -- that's fine, since it's non-binding; the real vote phase's
-/// `voted_for` check is what actually enforces "at most one winner per
-/// term".)
+/// It does not check `voted_for`, because a vote is always scoped to
+/// `current_term`: `Common::advance_term` resets it when it raises the
+/// term, and `vote_for` runs only when `current_term` equals the voted
+/// term. So a real vote exists only at a term `<= common.current_term`. A
+/// dry run that passes the `req.term > common.current_term` check asks
+/// about a later term, so no vote can conflict. Two candidates can both
+/// pass pre-vote against the same peer, which is fine because pre-vote is
+/// not binding: the `voted_for` check in the real vote enforces "at most
+/// one winner per term".
 async fn evaluate_dry_run_vote(common: &Common, req: &RequestVoteRequest) -> bool {
     if req.term <= common.current_term {
         return false;
@@ -591,21 +566,22 @@ async fn evaluate_dry_run_vote(common: &Common, req: &RequestVoteRequest) -> boo
     (req.last_log_term, req.last_log_index) >= (our_term, our_index)
 }
 
-/// Evaluates *and applies* a real `RequestVote` (§5.4.1: term at least as
-/// current, not already voted for someone else this term, candidate's log
-/// at least as up to date as ours), advancing `common`'s term first if
-/// `req.term` is higher and persisting the vote if granted. Returns
-/// whether it granted.
+/// Evaluate and apply a real `RequestVote` (§5.4.1). The vote is granted
+/// if:
+/// - the term is at least the current term,
+/// - this node has not voted for someone else in this term,
+/// - the candidate's log is at least as up to date as ours.
 ///
-/// Shared by every role: `Follower` and `PreCandidate` need the full
-/// check since either can have an existing `voted_for` from earlier this
-/// term (a `PreCandidate` never sets one, so it just inherits whatever
-/// `Follower` had); `Candidate` and `Leader` always have `voted_for ==
-/// Some(self)` at their own `current_term`, so for them this simplifies
-/// to exactly their old behavior at `req.term == current_term` (deny) --
-/// but unlike their old behavior, it also correctly withholds the vote at
-/// `req.term > current_term` if the candidate's log isn't actually as up
-/// to date, which the term check alone doesn't guarantee.
+/// If `req.term` is higher, `common`'s term advances first, and a granted
+/// vote is persisted. Returns whether the vote was granted.
+///
+/// All roles share this. `Follower` and `PreCandidate` need the full check,
+/// because either can already have a `voted_for` in this term (a
+/// `PreCandidate` never sets one; it keeps the `Follower`'s). `Candidate`
+/// and `Leader` always have `voted_for == Some(self)` in their own term,
+/// so they deny at `req.term == current_term`. At `req.term >
+/// current_term`, the log check still withholds the vote from a candidate
+/// whose log is behind, which the term check alone does not guarantee.
 async fn evaluate_real_vote(common: &mut Common, req: &RequestVoteRequest) -> bool {
     if req.term > common.current_term {
         common.advance_term(req.term).await;
@@ -627,8 +603,8 @@ async fn evaluate_real_vote(common: &mut Common, req: &RequestVoteRequest) -> bo
     grant
 }
 
-/// The cluster configuration recorded in `log`, decoded. `None` for a
-/// store that has never seen one.
+/// The cluster configuration in `log`, decoded. `None` for a store that
+/// has never seen one.
 fn load_config(log: &RaftLog) -> storage::Result<Option<ClusterConfig>> {
     match log.current_config()? {
         Some(bytes) => ClusterConfig::from_bytes(&bytes)
@@ -638,13 +614,13 @@ fn load_config(log: &RaftLog) -> storage::Result<Option<ClusterConfig>> {
     }
 }
 
-/// A configuration made of `node_id` plus `peers`, all voting -- an
-/// implicit bootstrap.
+/// A configuration of `node_id` plus `peers`, all voting: an implicit
+/// bootstrap.
 ///
-/// Test-only, and deliberately so: implicit bootstrap is exactly what
-/// Raft §4.4 warns against, since two nodes started with different peer
-/// lists would each form a cluster believing itself to be the whole
-/// thing. Real nodes start uninitialized and are bootstrapped explicitly.
+/// Test-only, on purpose: Raft §4.4 warns against implicit bootstrap,
+/// because two nodes started with different peer lists would each form a
+/// cluster and believe it is the whole one. Real nodes start uninitialized
+/// and are bootstrapped explicitly.
 #[cfg(test)]
 fn seed_config(node_id: &str, peers: &[PeerInfo]) -> ClusterConfig {
     use crate::pb::raft5::cluster::ClusterMember;
@@ -662,119 +638,111 @@ fn seed_config(node_id: &str, peers: &[PeerInfo]) -> ClusterConfig {
     }
 }
 
-/// State shared across every role, threaded from one role's `shutdown`
-/// straight into the next role's `new`.
+/// State shared by all roles, passed from one role's `shutdown` into the
+/// next role's `new`.
 ///
-/// Every field is private. That isn't only tidiness: `raft` is a `pub`
-/// module, so a `pub` field here would put this node's event channel,
-/// watermark senders and role publisher on the crate's public API, where
-/// anything could drive them out from under the state machine. The role
-/// modules are descendants of `raft` and so see them all regardless --
-/// which is the intended audience, and the only one.
+/// Every field is private. `raft` is a `pub` module, so a `pub` field
+/// would put this node's event channel, watermark senders and role
+/// publisher on the crate's public API, where anything could drive them
+/// behind the state machine's back. The role modules are inside `raft`, so
+/// they see every field; they are the intended users.
 pub struct Common {
     node_id: String,
-    /// The cluster configuration this node is currently operating under:
-    /// who its peers are, and which of them vote. Read from the log (see
-    /// `storage::RaftLog::current_config`) rather than from a flag, and
-    /// re-read whenever a `Config` entry is appended or rolled back --
-    /// on *append*, not on commit, per Raft §4.1.
+    /// The cluster configuration this node runs under: its peers and which of
+    /// them vote. Read from the log (see `storage::RaftLog::current_config`),
+    /// not from a flag, and read again when a `Config` entry is appended or
+    /// rolled back. On append, not on commit, per Raft §4.1.
     config: ClusterConfig,
-    /// `Timing::of(&config)`, published whenever `config` changes it.
-    /// Long-lived tasks hold a receiver and re-read it on every
-    /// iteration, so a heartbeat change reaches a running leader's probes
-    /// and replication without anything being respawned; `RaftPeerHandle`
-    /// reads it for an old leader's lease request that names no duration.
+    /// `Timing::of(&config)`, published when `config` changes it. Long-lived
+    /// tasks read it on every iteration, so a heartbeat change reaches a
+    /// running leader's probes and replication without a restart.
+    /// `RaftPeerHandle` reads it for a lease request from an old leader that
+    /// names no duration.
     timing_tx: watch::Sender<Timing>,
     store: Store,
     peer_conns: Arc<PeerConnections>,
 
-    /// Only ever changed via `advance_term`/`vote_for` below, which also
-    /// persist the change -- see the module doc on why nothing should be
-    /// able to touch these without going through storage first.
+    /// Changed only through `advance_term` and `vote_for`, which also persist
+    /// the change. See the module doc for why storage must come first.
     current_term: u64,
     voted_for: Option<String>,
-    /// Mirrors `current_term`, published on every `advance_term` call, so
-    /// `RaftPeerHandle::get_lease`'s fast path can read it without going
-    /// through the event loop.
+    /// A copy of `current_term`, published on every `advance_term`, so the
+    /// fast path of `RaftPeerHandle::get_lease` can read it without the event
+    /// loop.
     term_tx: watch::Sender<u64>,
 
-    /// Consecutive failed election cycles (pre-vote or real) since this
-    /// node last had reason to believe a leader existed -- see the module
-    /// doc. Not persisted: it's just a backoff hint, not safety-critical
-    /// state, so losing it across a restart is harmless.
+    /// Failed election cycles in a row (pre-vote or real) since this node
+    /// last believed a leader existed. See the module doc. Not persisted: it is
+    /// only a backoff hint, so losing it on restart is harmless.
     election_attempt: u32,
 
-    /// When this node stops refusing vote requests from anyone but the
-    /// leader it currently recognizes -- see the module doc on leader
-    /// leasing. `None` means no lease has ever been established (distinct
-    /// from "expired": see `follower::spawn_lease_expiration_watcher` and
-    /// `follower::Follower::has_active_lease`, which each need to treat a
-    /// never-established lease differently -- an already-passed `Instant`
-    /// can't represent both "never granted" and "granted, then lapsed").
-    /// `Arc`-wrapped because `RaftPeerHandle::get_lease` writes to it
-    /// directly (bypassing the event loop entirely, on purpose -- see
-    /// that method), not just whichever role's event loop is currently
-    /// running.
+    /// When this node stops refusing vote requests from nodes other than its
+    /// current leader. See the module doc on leases.
+    ///
+    /// `None` means no lease was ever granted, which differs from "expired":
+    /// `follower::spawn_lease_expiration_watcher` and
+    /// `follower::Follower::has_active_lease` treat a never-granted lease
+    /// differently, and a past `Instant` cannot mean both.
+    ///
+    /// `Arc`-wrapped because `RaftPeerHandle::get_lease` writes to it directly,
+    /// outside the event loop on purpose (see that method).
     lease_expires_at_tx: Arc<watch::Sender<Option<Instant>>>,
     lease_expires_at_rx: watch::Receiver<Option<Instant>>,
 
-    /// Highest seq known committed. Outlives any single role (a follower
-    /// applies a leader's `leader_commit` here too), so it lives in
-    /// `Common` rather than inside `Leader`.
+    /// The highest seq known to be committed. It outlives a single role (a
+    /// follower also applies the leader's `leader_commit` here), so it lives
+    /// in `Common`, not in `Leader`.
     commit_tx: watch::Sender<u64>,
 
-    /// Highest seq this leader has appended to its own log. Replication
-    /// tasks wait on it so a new entry goes out immediately instead of on
-    /// the next timer tick. Only the leader-side append sites publish
-    /// here; `Arc`-wrapped so `LeaderHandle` (which appends client writes
-    /// without going through the event loop) can publish too.
+    /// The highest seq this leader has appended to its own log. Replication
+    /// tasks wait on it, so a new entry goes out at once instead of on the
+    /// next tick. Only leader-side append sites publish here. `Arc`-wrapped so
+    /// `LeaderHandle`, which appends client writes outside the event loop, can
+    /// publish too.
     log_tx: Arc<watch::Sender<u64>>,
 
-    /// Highest seq known replicated to *every* peer, not just a majority --
-    /// safe to compact below regardless of role: a leader computes it from
-    /// `Leader::peer_match_index`, a follower just adopts whatever value
-    /// rides along on `AppendEntries.compact_seq`. Consumed by
+    /// The highest seq known to be replicated to every peer (not only a
+    /// majority), so it is safe to compact below it in any role. A leader
+    /// computes it from `Leader::peer_match_index`; a follower takes the value
+    /// from `AppendEntries.compact_seq`. Used by
     /// `spawn_storage_maintenance_task`.
     compact_tx: watch::Sender<u64>,
 
-    /// How far `RaftLog::apply_committed` has actually brought `latest`
-    /// up to date -- published by `spawn_storage_maintenance_task` only
-    /// *after* that call returns, deliberately never touched anywhere
-    /// else. This is what `LeaderHandle::append_writes` waits on (see its
-    /// doc): `commit_tx` alone only says an entry is safely replicated,
-    /// not that `latest` reflects it yet, since the maintenance task is
-    /// an independent `watch` subscriber with no ordering relationship to
-    /// any other subscriber of `commit_tx`. `Arc`-wrapped so `Common` can
-    /// keep handing out fresh `subscribe()`s (one per `Leader::new`, since
-    /// a new `LeaderHandle` is built on every election) after the one
-    /// sender has already been moved into the maintenance task.
+    /// How far `RaftLog::apply_committed` has brought `latest`. Only
+    /// `spawn_storage_maintenance_task` publishes it, after that call returns.
+    ///
+    /// `LeaderHandle::append_writes` waits on this (see its doc).
+    /// `commit_tx` only says an entry is safely replicated, not that `latest`
+    /// shows it: the maintenance task is a separate `watch` subscriber with no
+    /// ordering against other subscribers of `commit_tx`.
+    ///
+    /// `Arc`-wrapped so `Common` can hand out new `subscribe()`s (one per
+    /// `Leader::new`, because every election builds a new `LeaderHandle`)
+    /// after the sender has moved into the maintenance task.
     applied_tx: Arc<watch::Sender<u64>>,
 
-    /// Where peer RPCs (relayed by `RaftPeerService`) and internal timers
-    /// land. Shared across roles so anything already queued survives a
-    /// transition.
+    /// Where peer RPCs (from `RaftPeerService`) and internal timers arrive.
+    /// Shared by all roles, so queued events survive a role change.
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
 
     role_tx: watch::Sender<RoleHandle>,
 
-    /// This node's root cancellation token, supplied by whoever started
-    /// it (`crate::serve`). Every background task this node spawns runs
-    /// under a child of it, so cancelling it here brings the whole node
-    /// down -- see `Task` and the module doc.
+    /// This node's root cancellation token, from whoever started it
+    /// (`crate::serve`). Every background task runs under a child of it, so
+    /// cancelling it stops the whole node. See `Task` and the module doc.
     cancel: CancellationToken,
 }
 
-/// What `Common::new` hands back: the state machine itself, plus the
-/// handles a caller needs to observe and drive it.
+/// What `Common::new` returns: the state machine, and the handles a
+/// caller needs to observe and drive it.
 ///
-/// A struct rather than the tuple this used to be, and deliberately.
-/// `commit_rx` and `compact_rx` are both `watch::Receiver<u64>` and mean
-/// very different things, so as adjacent tuple elements they could be
-/// transposed at any call site and still compile -- yielding a node that
-/// compacted at its commit watermark, which is exactly the bug
+/// A struct, not a tuple, on purpose. `commit_rx` and `compact_rx` are
+/// both `watch::Receiver<u64>` with very different meanings. As tuple
+/// elements they could be swapped at a call site and still compile, giving
+/// a node that compacts at its commit watermark: the exact bug that
 /// `RaftLog::compact`'s clamp exists to survive. Named fields make the
-/// mistake unrepresentable instead of merely survivable.
+/// mistake impossible.
 pub struct NodeHandles {
     pub common: Common,
     pub role_rx: watch::Receiver<RoleHandle>,
@@ -784,14 +752,12 @@ pub struct NodeHandles {
 }
 
 impl Common {
-    /// Membership comes from `log` alone. A store that has never seen a
-    /// configuration yields an empty one, which is how a node starts out
-    /// uninitialized: it has no vote, so it never campaigns, and it waits
-    /// to be either bootstrapped or replicated to. See
+    /// Membership comes only from `log`. A store with no configuration gives
+    /// an empty one, so the node starts uninitialized: it has no vote, never
+    /// campaigns, and waits to be bootstrapped or replicated to. See
     /// `RoleHandle::Uninitialized`.
-    // Same reason the role constructors carry this: what a caller needs
-    // back is not just the `Common` but the handles for reaching it, and
-    // splitting the two into `new` plus a second call would let a caller
+    // For the same reason as the role constructors: the caller needs the
+    // handles as well as `Common`. A separate second call would let a caller
     // hold a `Common` that nothing can observe.
     #[allow(clippy::new_ret_no_self)]
     pub fn new(
@@ -802,10 +768,9 @@ impl Common {
         Self::build(node_id, log, ClusterConfig::default(), cancel)
     }
 
-    /// `new`, but with a configuration supplied directly rather than read
-    /// from the log -- for tests that want a given cluster shape without
-    /// bootstrapping one. Still loses to a configuration in the log, if
-    /// there is one.
+    /// `new`, with a configuration given directly instead of read from the
+    /// log, for tests that want a cluster shape without a bootstrap. A
+    /// configuration in the log still wins.
     #[cfg(test)]
     pub fn new_seeded(
         node_id: String,
@@ -830,20 +795,17 @@ impl Common {
         let (compact_tx, compact_rx) = watch::channel(0);
         let (log_tx, _log_rx) = watch::channel(0);
         let log_tx = Arc::new(log_tx);
-        // The initial receiver is discarded -- `Common` hands out fresh
-        // ones later via `applied_tx.subscribe()` (once per `Leader::new`),
-        // which works regardless of whether any earlier receiver is still
-        // alive, as long as the sender itself is.
+        // Drop the first receiver. `Common` hands out new ones later through
+        // `applied_tx.subscribe()` (once per `Leader::new`), which works as long as
+        // the sender is alive.
         let (applied_tx, _applied_rx) = watch::channel(0);
         let applied_tx = Arc::new(applied_tx);
         let (term_tx, term_rx) = watch::channel(current_term);
-        // `None` -- no lease established yet. `has_active_lease` treats
-        // this as "not blocked" (a brand new node that's never contacted
-        // anyone shouldn't refuse votes), while
-        // `spawn_lease_expiration_watcher` treats it as "give this node
-        // the same full grace period a fresh grant would get" -- neither
-        // of those is what an already-elapsed `Instant` would mean, which
-        // is why this is `Option<Instant>` rather than just `Instant`.
+        // `None`: no lease yet. `has_active_lease` treats this as "not blocked"
+        // (a new node that has contacted nobody must not refuse votes), and
+        // `spawn_lease_expiration_watcher` treats it as "give the same full grace
+        // period as a new grant". A past `Instant` would mean neither, which is
+        // why this is `Option<Instant>`.
         let (lease_expires_at_tx, lease_expires_at_rx) = watch::channel(None);
         let lease_expires_at_tx = Arc::new(lease_expires_at_tx);
         let (event_tx, event_rx) = mpsc::channel(256);
@@ -888,40 +850,38 @@ impl Common {
         })
     }
 
-    /// Publishes that entries up to `seq` now exist in this leader's log,
-    /// waking replication. Keeps the max: concurrent client appends can
-    /// finish in either order.
+    /// Publish that entries up to `seq` exist in this leader's log, to wake
+    /// replication. Keeps the maximum, because concurrent client appends can
+    /// finish in any order.
     fn notify_appended(&self, seq: u64) {
         notify_appended(&self.log_tx, seq);
     }
 
-    /// Advances `commit_tx` to `new_value` if that's higher than what's
-    /// already published -- never regresses, in case responses/requests
-    /// are ever processed out of order.
+    /// Raise `commit_tx` to `new_value` if that is higher. Never lowers it, in
+    /// case messages are processed out of order.
     ///
-    /// `send_replace`, not `send`, and that matters: every `watch` in
-    /// `Common` is *state* that is read back through `borrow()` (this
-    /// method's own comparison, `Leader::propose_config`'s catch-up gate,
-    /// `step_down_if_removed`), not merely a notification. `send` fails
-    /// and leaves the value untouched once the last receiver is dropped,
-    /// so a watermark could silently stop advancing while the code that
-    /// reads it went on believing it. `send_replace` always stores.
+    /// `send_replace`, not `send`, on purpose. Every `watch` in `Common` is
+    /// state that code reads back with `borrow()` (this comparison, the
+    /// catch-up gate in `Leader::propose_config`, `step_down_if_removed`), not
+    /// only a notification. `send` fails and keeps the old value when the last
+    /// receiver is gone, so a watermark could silently stop moving while code
+    /// still trusts it. `send_replace` always stores.
     fn advance_commit(&self, new_value: u64) {
         if new_value > *self.commit_tx.borrow() {
             self.commit_tx.send_replace(new_value);
         }
     }
 
-    /// Same as `advance_commit`, for the "replicated to every peer, safe
-    /// to compact" watermark.
+    /// Like `advance_commit`, for the "replicated to every peer, safe to
+    /// compact" watermark.
     fn advance_compact(&self, new_value: u64) {
         if new_value > *self.compact_tx.borrow() {
             self.compact_tx.send_replace(new_value);
         }
     }
 
-    /// A handle for the client-facing service. Taken before `run`
-    /// consumes `Common`.
+    /// A handle for the client-facing service. Take it before `run` consumes
+    /// `Common`.
     pub fn client_handle(&self) -> ClientHandle {
         ClientHandle {
             event_tx: self.event_tx.clone(),
@@ -929,9 +889,8 @@ impl Common {
         }
     }
 
-    /// Dials every peer over mTLS from now on, rather than in plaintext.
-    /// Set before `run` consumes `Common`, so there are no plaintext
-    /// clients cached yet to replace.
+    /// Dial every peer over mTLS instead of plaintext. Set it before `run`
+    /// consumes `Common`, so no plaintext clients are cached yet.
     pub fn set_peer_tls(&mut self, tls: tonic::transport::ClientTlsConfig) {
         self.peer_conns = Arc::new(PeerConnections::new(Some(tls)));
     }
@@ -945,11 +904,10 @@ impl Common {
 
     /// The next thing this node's event loop should do.
     ///
-    /// Every role funnels through here, which buys two things. Cancelling
-    /// the node stops it at once rather than whenever its next timer
-    /// happens to fire; and Raft §5.1's term rule is applied once, for all
-    /// roles, rather than being rewritten in each of them (see
-    /// `Event::response_term`).
+    /// Every role comes through here, which gives two benefits:
+    /// - Cancelling the node stops it at once, not at its next timer.
+    /// - Raft §5.1's term rule is applied once for all roles, not in each one
+    ///   (see `Event::response_term`).
     async fn next_event(&mut self) -> Next {
         let Self {
             cancel, event_rx, ..
@@ -966,14 +924,14 @@ impl Common {
         Next::Handle(event)
     }
 
-    /// A parent for the background tasks a role owns, so that cancelling
-    /// this node cancels them too -- see `Task::spawn`.
+    /// A parent for a role's background tasks, so cancelling this node
+    /// cancels them too. See `Task::spawn`.
     fn cancel_token(&self) -> &CancellationToken {
         &self.cancel
     }
 
-    /// Every other member of the current configuration -- everyone this
-    /// node replicates to and probes, learners included.
+    /// Every other member of the current configuration: everyone this node
+    /// replicates to and probes, learners included.
     fn peers(&self) -> Vec<PeerInfo> {
         self.config
             .others(&self.node_id)
@@ -981,9 +939,9 @@ impl Common {
             .collect()
     }
 
-    /// The other *voting* members: who a candidate solicits votes from,
-    /// and whose leases a leader counts toward read quorum. A learner is
-    /// replicated to but is invisible to every quorum (§4.2.1).
+    /// The other voting members: who a candidate asks for votes, and whose
+    /// leases a leader counts toward read quorum. A learner gets replication
+    /// but counts in no quorum (§4.2.1).
     fn voting_peers(&self) -> Vec<PeerInfo> {
         self.config
             .others(&self.node_id)
@@ -997,30 +955,30 @@ impl Common {
         self.config.majority()
     }
 
-    /// Whether this node is itself a voter -- false while it is a learner
-    /// catching up, and false once it has been removed from the cluster.
-    /// Such a node replicates and serves reads but must never campaign.
+    /// Whether this node is a voter. False while it is a learner that is
+    /// catching up, and false once it is removed from the cluster. Such a node
+    /// replicates and serves reads but must never campaign.
     fn is_voter(&self) -> bool {
         self.config.is_voter(&self.node_id)
     }
 
-    /// Re-read the active configuration from the log, and report whether
-    /// this node's own right to vote changed as a result. Called whenever
-    /// a `Config` entry may have been appended, truncated away, or
-    /// brought in by a snapshot -- note *appended*, not committed, per
-    /// Raft §4.1 (see `storage::RaftLog::current_config`).
+    /// Read the active configuration from the log again, and report whether
+    /// this node's own right to vote changed. Called wherever a `Config` entry
+    /// may have been appended, truncated, or brought in by a snapshot.
+    /// Appended, not committed, per Raft §4.1 (see
+    /// `storage::RaftLog::current_config`).
     ///
-    /// Panics on a storage failure, same as every other storage read on
-    /// the event loop -- see the module doc.
+    /// Panics on a storage failure, like every storage read on the event loop:
+    /// see the module doc.
     async fn reload_config(&mut self) -> bool {
         let was_voter = self.is_voter();
         let loaded = self
             .store
             .expect("read the cluster config", load_config)
             .await;
-        // Nothing in the log (or in the compacted fallback) means no
-        // configuration has ever been established here, so there's
-        // nothing to switch to -- keep operating under what we have.
+        // No configuration in the log (or in the compacted fallback) means none
+        // was ever set here, so there is nothing to switch to. Keep the current
+        // one.
         if let Some(config) = loaded {
             let timing = Timing::of(&config);
             self.config = config;
@@ -1032,19 +990,16 @@ impl Common {
         was_voter != self.is_voter()
     }
 
-    /// The timing this node is currently running at -- see `Timing`.
+    /// The timing this node runs at. See `Timing`.
     fn timing(&self) -> Timing {
         *self.timing_tx.borrow()
     }
 
-    /// Advance to a higher term, discarding any vote already cast (Raft
-    /// scopes `voted_for` per-term -- a candidate campaigning in a brand
-    /// new term must not be refused because of who we voted for last
-    /// term). No-op if `term` isn't actually higher than what's already
-    /// recorded -- callers should still check `term > current_term`
-    /// themselves before calling where practical, to skip the
-    /// persist-dispatching `.await` entirely rather than pay for it and
-    /// have it no-op.
+    /// Advance to a higher term and discard any vote already cast. Raft scopes
+    /// `voted_for` per term: a candidate in a new term must not be refused
+    /// because of last term's vote. Does nothing if `term` is not higher.
+    /// Where practical, callers check `term > current_term` first, to skip the
+    /// persist `.await` entirely.
     async fn advance_term(&mut self, term: u64) {
         if term > self.current_term {
             self.current_term = term;
@@ -1060,10 +1015,9 @@ impl Common {
         self.persist_term_state().await;
     }
 
-    /// Panics on a storage failure rather than continuing on an
-    /// unpersisted term/vote: silently proceeding risks a double vote in
-    /// the same term after a crash, which is a Raft safety violation, not
-    /// just a lost write.
+    /// Panics on a storage failure instead of continuing with an unpersisted
+    /// term or vote: after a crash, that could mean two votes in one term,
+    /// which breaks Raft safety, not only a lost write.
     async fn persist_term_state(&self) {
         let term = self.current_term;
         let voted_for = self.voted_for.clone();
@@ -1075,12 +1029,11 @@ impl Common {
     }
 }
 
-/// What `Common::next_event` decided, before any role-specific handling.
+/// What `Common::next_event` decided, before any role handles it.
 enum Next {
     Handle(Event),
-    /// A response carried a term higher than ours. `next_event` has
-    /// already adopted it (Raft §5.1); whatever role asked has only to
-    /// stop being that role.
+    /// A response carried a higher term. `next_event` has already adopted it
+    /// (Raft §5.1); the role only has to stop being that role.
     StepDown,
     /// The node is shutting down.
     Stop,
@@ -1088,60 +1041,22 @@ enum Next {
 
 // --- Driver ----------------------------------------------------------------
 
-/// Storage maintenance: applies newly committed entries to `latest` (see
-/// `RaftLog::apply_committed` -- `latest` must never reflect an
-/// uncommitted write, since a leader change could still roll it back),
-/// publishes `applied_tx` to say so, and then compacts `log` up to
-/// `compact_seq`, every time either watermark advances.
+/// Collect, on a timer, versions that no read can select.
 ///
-/// The apply-then-compact ordering matters: `compact` physically removes
-/// `log` entries, and doing that before they've been applied to `latest`
-/// would lose that data permanently (`RaftLog::compact` also
-/// independently clamps itself to `apply_committed`'s watermark as a
-/// second line of defense, but doing both here, always in this order,
-/// keeps the common case simple rather than relying on that clamp to
-/// silently paper over bad ordering). `applied_tx` is published as its
-/// own step, right after `apply_committed` returns and *before* `compact`
-/// even runs -- `LeaderHandle::append_writes` needs to know `latest` itself
-/// is caught up, not merely that `compact` was also attempted, and
-/// separating the two means a slow/failing `compact` call can never delay
-/// that signal. Reacting to both `commit_tx` and `compact_tx` (rather
-/// than just one) matters too: a follower's `compact_seq` can advance
-/// independently of its own `commit_tx` (see `Follower::apply_append_entries`),
-/// so watching only one channel could leave the other's progress stalled.
+/// A separate task, not another branch of
+/// `spawn_storage_maintenance_task`, for three reasons:
+/// - That loop is driven by changes to the commit and compaction
+///   watermarks. A tick there would make an idle cluster run
+///   `apply_committed` and `compact` for no reason.
+/// - Its failure policy (retry the same seq, skip that cycle's
+///   compaction) has nothing to do with GC, and neither should be able to
+///   delay the other.
+/// - GC has its own budget, cursor and log line, which are easier to read
+///   apart.
 ///
-/// Spawned once per node, independent of role: this is storage
-/// maintenance, not state-machine behavior, so unlike replication/lease/tick
-/// tasks it doesn't need starting or stopping across role transitions.
-///
-/// A failure here is logged rather than panicking (unlike, say, a failed
-/// term persist): falling behind on applying/compacting doesn't corrupt
-/// anything or violate a safety property, it just means `latest` is
-/// briefly stale and the log is larger on disk than it needs to be --
-/// this is maintenance, not a correctness requirement.
-///
-/// It does have to keep *trying*, though, which is why a failed apply
-/// sleeps and retries the same seq rather than going back to waiting on
-/// the watermarks. Waiting would mean a cluster that has gone quiet never
-/// retries at all, since nothing is left to change a watermark -- and
-/// while that used to cost only a stale read, `applied_tx` is now what
-/// every write and every transaction commit is parked on. A commit that
-/// never hears back holds its locks for the rest of the term.
-/// Collect versions no read can select, on a timer.
-///
-/// A task of its own rather than another arm of
-/// `spawn_storage_maintenance_task`, for three reasons. That loop is
-/// edge-driven on the commit and compaction watermarks, so adding a tick
-/// to it would make an idle cluster run `apply_committed` and `compact`
-/// for no reason. Its failure policy -- retry the same seq, skip that
-/// cycle's compaction -- has nothing to do with GC, and neither should
-/// be able to delay the other. And GC has its own budget, its own cursor
-/// and its own log line, which are easier to read apart than together.
-///
-/// Runs on every node regardless of role, and needs no coordination with
-/// any other: it only removes rows no read could have selected, so two
-/// nodes may hold different amounts of uncollected garbage with nothing
-/// observable differing between them. See `storage::gc`.
+/// Runs on every node in every role, with no coordination: it removes only
+/// rows no read could select, so two nodes may hold different amounts of
+/// garbage with no visible difference. See `storage::gc`.
 fn spawn_version_gc_task(cancel: &CancellationToken, store: Store) -> Task {
     Task::spawn(cancel, move |cancel| async move {
         loop {
@@ -1149,9 +1064,8 @@ fn spawn_version_gc_task(cancel: &CancellationToken, store: Store) -> Task {
             let stats = match store.run(|log| log.gc_versions(VERSION_GC_BUDGET)).await {
                 Ok(stats) => stats,
                 Err(e) => {
-                    // Logged, never fatal, same policy as the
-                    // maintenance task: uncollected garbage costs space,
-                    // and nothing else depends on this having run.
+                    // Logged, never fatal, as in the maintenance task: uncollected garbage
+                    // costs space, and nothing depends on this having run.
                     warn!("version gc failed, retrying on the next tick: {e}");
                     tokio::select! {
                         biased;
@@ -1171,9 +1085,8 @@ fn spawn_version_gc_task(cancel: &CancellationToken, store: Store) -> Task {
                 );
             }
 
-            // A pass that stopped on its budget has work waiting, so it
-            // goes straight round rather than sleeping on a store it
-            // has already been told is behind.
+            // A pass that stopped on its budget has more work, so it starts again at
+            // once instead of sleeping.
             if !stats.done {
                 if cancel.is_cancelled() {
                     return;
@@ -1190,6 +1103,37 @@ fn spawn_version_gc_task(cancel: &CancellationToken, store: Store) -> Task {
     })
 }
 
+/// Storage maintenance. Each time a watermark advances:
+/// - apply newly committed entries to `latest` (see
+///   `RaftLog::apply_committed`; `latest` must never show an uncommitted
+///   write, because a leader change could still roll it back),
+/// - publish `applied_tx`,
+/// - compact `log` up to `compact_seq`.
+///
+/// The order matters. `compact` removes `log` entries, and removing them
+/// before they are applied would lose the data. (`RaftLog::compact` also
+/// clamps itself to the applied watermark as a second line of defense.)
+/// `applied_tx` is published before `compact` runs, because
+/// `LeaderHandle::append_writes` needs to know that `latest` is current,
+/// and a slow or failing `compact` must not delay that signal.
+///
+/// It reacts to both `commit_tx` and `compact_tx`: a follower's
+/// `compact_seq` can advance without its `commit_tx` (see
+/// `Follower::apply_append_entries`), so watching one channel could stall
+/// the other's progress.
+///
+/// Started once per node, for every role: this is storage upkeep, not
+/// state-machine behavior, so it does not start and stop with roles.
+///
+/// A failure is logged, not a panic (unlike a failed term persist). Falling
+/// behind does not corrupt anything or break safety: `latest` is briefly
+/// stale and the log is larger than needed.
+///
+/// It must keep trying, though, so a failed apply sleeps and retries the
+/// same seq instead of waiting for the watermarks again. A quiet cluster
+/// changes no watermark, so waiting would mean no retry at all, and every
+/// write and transaction commit waits on `applied_tx`. A commit that never
+/// hears back keeps its locks for the rest of the term.
 fn spawn_storage_maintenance_task(
     cancel: &CancellationToken,
     store: Store,
@@ -1211,9 +1155,8 @@ fn spawn_storage_maintenance_task(
             let apply_started = Instant::now();
             match store.run(move |log| log.apply_committed(commit_seq)).await {
                 Ok(()) => {
-                    // Only ever moves forward -- `commit_seq` is itself
-                    // monotonic (`Common::advance_commit`), so an
-                    // out-of-order wakeup can't regress this.
+                    // Only moves forward: `commit_seq` itself never goes back
+                    // (`Common::advance_commit`), so a wakeup out of order cannot lower this.
                     applied_tx.send_replace(commit_seq);
                 }
                 Err(e) => {
@@ -1221,10 +1164,9 @@ fn spawn_storage_maintenance_task(
                         "apply_committed to seq {commit_seq} failed, retrying in \
                          {APPLY_RETRY_DELAY:?}: {e}"
                     );
-                    // Don't compact past what didn't apply, and don't go
-                    // back to waiting on a watermark that may never move
-                    // again. `select!` rather than a bare sleep so a
-                    // shutdown isn't held up by the backoff.
+                    // Do not compact past what did not apply, and do not go back to waiting on
+                    // a watermark that may never move again. `select!`, not a plain sleep, so
+                    // the backoff does not delay a shutdown.
                     tokio::select! {
                         biased;
                         () = cancel.cancelled() => return,
@@ -1241,12 +1183,10 @@ fn spawn_storage_maintenance_task(
                 warn!("compact to seq {compact_seq} failed: {e}");
             }
 
-            // Both halves of the cycle, because a commit waiting to be
-            // applied is queued behind whatever the previous cycle was
-            // still doing -- including its compaction, which nothing
-            // else waits for. A large `compact_ms` next to a small
-            // `apply_ms` is what "compaction is delaying commits" would
-            // actually look like.
+            // Log both halves of the cycle: a commit that waits to be applied is
+            // queued behind the previous cycle's work, including its compaction,
+            // which nothing else waits for. A large `compact_ms` next to a small
+            // `apply_ms` is what "compaction delays commits" looks like.
             info!(
                 applied_to = commit_seq,
                 apply_ms,
@@ -1257,9 +1197,9 @@ fn spawn_storage_maintenance_task(
     })
 }
 
-/// Runs forever, handing `Common` from one role to the next. Only one
-/// role's event loop is ever active: the previous one has fully returned
-/// (and torn down its background tasks) before the next one starts.
+/// Run forever, passing `Common` from one role to the next. Only one
+/// role's event loop is active: the previous one has fully returned, and
+/// stopped its background tasks, before the next one starts.
 pub async fn run(mut common: Common) {
     let maintenance_task = spawn_storage_maintenance_task(
         common.cancel_token(),
@@ -1276,10 +1216,8 @@ pub async fn run(mut common: Common) {
             Role::PreCandidate => PreCandidate::new(common).await,
             Role::Candidate => Candidate::new(common).await,
             Role::Leader => Leader::new(common).await,
-            // Each role's own `shutdown` has already stopped and joined
-            // that role's tasks by the time it hands `common` back, so
-            // there is nothing left here but the node-wide maintenance
-            // task.
+            // Each role's `shutdown` has already stopped and joined its tasks before
+            // it gives `common` back, so only the node-wide maintenance task is left.
             Role::Stopped => break,
         };
         role = next_role;
@@ -1287,24 +1225,22 @@ pub async fn run(mut common: Common) {
     }
     maintenance_task.stop().await;
     version_gc_task.stop().await;
-    // Both a courtesy to anyone still holding a `RoleHandle` and a
-    // necessity: it is what breaks the `LeaderHandle` reference cycle
-    // that would otherwise pin this node's `Arc<RaftLog>` (and its
-    // database lock) for the life of the process. See
-    // `RoleHandle::Stopped`.
+    // A courtesy to anyone who still holds a `RoleHandle`, and a necessity:
+    // it breaks the `LeaderHandle` reference cycle that would otherwise keep
+    // this node's `Arc<RaftLog>` (and its database lock) alive for the life of
+    // the process. See `RoleHandle::Stopped`.
     common.publish_role(RoleHandle::Stopped);
-    // Explicit rather than incidental: dropping `Common` is what closes
-    // `event_tx`/`role_tx`/`commit_tx` and so releases any gRPC handler
-    // still parked on one of them (`LeaderHandle::await_applied`, say),
-    // letting the servers finish their own graceful shutdown. It is also
-    // the last `Arc<RaftLog>` this module holds, so the database lock is
-    // free the moment this function returns.
+    // Explicit on purpose: dropping `Common` closes `event_tx`, `role_tx` and
+    // `commit_tx`, which releases any gRPC handler waiting on one of them (for
+    // example `LeaderHandle::await_applied`), so the servers can finish their
+    // graceful shutdown. It is also the last `Arc<RaftLog>` this module holds,
+    // so the database lock is free when this function returns.
     drop(common);
 }
 
-/// Shared test infrastructure for this module and its `leader`/`candidate`/
-/// `follower` submodules -- each submodule's own `#[cfg(test)] mod tests`
-/// pulls these in with `use crate::raft::test_support::*;`.
+/// Shared test helpers for this module and its `leader`, `candidate` and
+/// `follower` submodules. Each submodule's tests use
+/// `use crate::raft::test_support::*;`.
 #[cfg(test)]
 pub(crate) mod test_support;
 

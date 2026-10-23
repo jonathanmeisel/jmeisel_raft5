@@ -1,11 +1,11 @@
 //! The leader role: replicates its log to every peer and advances the
-//! commit/compaction watermarks as they catch up. See the parent module's
-//! doc for how roles fit together generally.
+//! commit and compaction watermarks as peers catch up. See the parent
+//! module's doc for how roles fit together.
 
 use super::*;
-// `GetLeaseRequest` is only ever *sent*, and only by a leader, so unlike
-// the rest of the peer protocol it isn't part of `Event` and doesn't come
-// in through `super::*`.
+// Only a leader sends `GetLeaseRequest`, and nobody receives it through
+// `Event`, so unlike the rest of the peer protocol it does not come in
+// through `super::*`.
 use crate::pb::raft5::raft::{
     AppendEntriesChunk, AppendEntriesHeader, EntryBatch, GetLeaseRequest, SnapshotChunk,
     append_entries_chunk, snapshot_chunk,
@@ -18,8 +18,8 @@ use lease::spawn_lease_prober;
 use tracing::info;
 use replication::spawn_replication;
 
-/// Periodically pushes `Event::LeaderTick` -- see the variant's doc for why
-/// the leader needs this in addition to reacting to peer responses.
+/// Push `Event::LeaderTick` at intervals. See that variant's doc for why
+/// the leader needs this as well as reacting to peer responses.
 fn spawn_leader_tick(
     cancel: &CancellationToken,
     timing_rx: watch::Receiver<Timing>,
@@ -41,71 +41,65 @@ fn spawn_leader_tick(
 
 pub struct Leader {
     common: Common,
-    /// One replication task per peer, keyed by node id so a membership
-    /// change can spawn or abort exactly the ones that changed rather
-    /// than tearing every peer's replication down and starting over --
-    /// each task holds per-peer `next_index` state that would be lost.
-    /// Every member except us, learners included.
+    /// One replication task per peer, keyed by node id, so a membership change
+    /// starts or stops only the tasks that changed. Restarting every task would
+    /// lose each task's per-peer `next_index`. Every member except us, learners
+    /// included.
     replication_tasks: HashMap<String, Task>,
-    /// Same, for lease probes -- but voting members only.
+    /// Same, for lease probes, but voting members only.
     lease_tasks: HashMap<String, Task>,
     tick_timer: Task,
-    /// Highest seq each peer is known to have replicated. Missing entry
-    /// (rather than 0) for a peer we haven't heard back from yet -- same
-    /// thing numerically, `recompute_watermarks` just treats an absent
-    /// peer as 0 rather than requiring this to be pre-seeded.
+    /// The highest seq each peer is known to have replicated. A peer we have
+    /// not heard from yet has no entry; `recompute_watermarks` treats a missing
+    /// peer as 0, so the map needs no pre-seeding.
     peer_match_index: HashMap<String, u64>,
-    /// When each peer's last granted lease stops counting toward quorum
-    /// (the probe's send time plus the lease it asked for -- see
-    /// `Event::GetLeaseResponse`).
-    /// Missing entry means "never granted (or already known-stale)" --
-    /// treated as expired, same as an entry whose deadline has passed.
+    /// When each peer's last granted lease stops counting toward quorum (the
+    /// probe's send time plus the lease it asked for; see
+    /// `Event::GetLeaseResponse`). No entry means never granted, or known
+    /// stale, and is treated as expired.
     peer_lease_expiry: HashMap<String, Instant>,
     read_quorum_tx: watch::Sender<bool>,
-    /// The seq of this leader's term-opening no-op. Raft §5.4.2 means
-    /// commitment can't pass this point until it is itself replicated to
-    /// a majority, so `commit_seq >= noop_seq` is exactly "this leader
-    /// has committed an entry from its own term" -- the precondition for
-    /// proposing a membership change (see `propose_config`).
+    /// The seq of this leader's term-opening no-op. By Raft §5.4.2, commit
+    /// cannot pass this point until the no-op itself reaches a majority, so
+    /// `commit_seq >= noop_seq` means "this leader has committed an entry from
+    /// its own term", which a membership change needs first (see
+    /// `propose_config`).
     noop_seq: u64,
-    /// The seq of a `Config` entry this leader has appended but not yet
-    /// seen commit, if any. Raft allows only one membership change in
-    /// flight at a time (§4.1).
+    /// The seq of a `Config` entry this leader appended that has not
+    /// committed yet, if any. Raft allows only one membership change in flight
+    /// at a time (§4.1).
     pending_config_seq: Option<u64>,
-    /// Per-learner catch-up progress, for automatic promotion. Keyed by
-    /// node id; entries exist only while a member is a non-voting
-    /// learner.
+    /// Catch-up progress per learner, for automatic promotion. Keyed by node
+    /// id; an entry exists only while a member is a non-voting learner.
     catch_up: HashMap<String, CatchUpState>,
 }
 
-/// One round of a learner catching up (Raft §4.2.1). A round starts at
-/// whatever the leader's log tail is right then; the learner has caught
-/// up when its `match_index` reaches that point. What matters is not
-/// that it finished, but *how fast*: a round that completes inside an
-/// election timeout means this server can keep up with the cluster in
-/// real time, which is the actual precondition for giving it a vote.
+/// One round of a learner catching up (Raft §4.2.1). A round starts at the
+/// leader's log tail at that moment, and the learner has caught up when its
+/// `match_index` reaches that point. What matters is how fast, not only
+/// that it finished: a round that ends within an election timeout means
+/// this server can keep up in real time, which is the real condition for
+/// giving it a vote.
 struct CatchUpState {
     round_start_index: u64,
     round_started_at: Instant,
 }
 
 impl Leader {
-    /// Starts one replication task per peer plus a self-tick, publishes a
-    /// `LeaderHandle`, then runs the event loop until a role change is
-    /// needed.
-    // Named `new` (paired with `shutdown`) rather than returning `Self`,
-    // since this runs the whole role lifecycle and hands back `Common` for
-    // the driver to build the *next* role from, not just constructs one.
+    /// Start one replication task per peer plus a self-tick, publish a
+    /// `LeaderHandle`, then run the event loop until a role change is needed.
+    // Named `new` (paired with `shutdown`) but does not return `Self`: it runs
+    // the whole role lifecycle and returns `Common`, from which the driver
+    // builds the next role.
     #[allow(clippy::new_ret_no_self)]
     pub async fn new(common: Common) -> (Role, Common) {
-        // Raft §5.4.2 (Figure 8): a leader may only advance `commit_seq`
-        // over an entry from its *own* term. Appending a no-op first
-        // means there is always such an entry to reach -- without it, a
-        // leader that never receives a client write could never commit
-        // the inherited tail of its log at all, and `recompute_watermarks`
-        // would stall indefinitely. Done before the `RoleHandle` is
-        // published and before any replication task starts, so the no-op
-        // is part of the log from the very first `AppendEntries` we send.
+        // Raft §5.4.2 (Figure 8): a leader may only advance `commit_seq` over an
+        // entry from its own term. A no-op first means such an entry always
+        // exists. Without it, a leader that never gets a client write could never
+        // commit its inherited tail, and `recompute_watermarks` would stall
+        // forever. Done before the `RoleHandle` is published and before any
+        // replication task starts, so the no-op is in the log from the first
+        // `AppendEntries` we send.
         let noop_seq = {
             let term = common.current_term;
             common
@@ -147,12 +141,12 @@ impl Leader {
             pending_config_seq: None,
             catch_up: HashMap::new(),
         };
-        // Starting from empty maps, this spawns the full initial set --
-        // the same code path a later membership change goes through.
+        // Starting from empty maps, this starts the full initial set, through the
+        // same code path a later membership change uses.
         leader.reconcile_peers().await;
-        // A zero-peer cluster starts out already at majority (just itself)
-        // -- get commit/compact and read-quorum caught up without waiting
-        // for the first tick.
+        // A cluster with no peers is already at majority (just itself), so bring
+        // commit, compaction and read quorum up to date without waiting for the
+        // first tick.
         leader.recompute_watermarks().await;
         leader.recompute_lease_quorum();
         let next_role = leader.run().await;
@@ -176,27 +170,25 @@ impl Leader {
     async fn handle_event(&mut self, event: Event) -> Transition {
         match event {
             Event::AppendEntries { req, respond_to } => {
-                // A higher term means someone else won an election; step
-                // down regardless of who they are.
+                // A higher term means someone else won an election; step down, whoever
+                // they are.
                 if req.term > self.common.current_term {
                     self.common.advance_term(req.term).await;
                     let _ = respond_to.send(self.reject_append(req.term));
                     return Transition::Become(Role::Follower);
                 }
-                // Otherwise it's a stale/duplicate leader -- reject, stay
-                // leader (should be unreachable if term is the sole
-                // leadership marker, but harmless to guard).
+                // Otherwise it is a stale or duplicate leader: reject and stay leader.
+                // This should not happen if the term is the only leadership marker, but
+                // the guard is harmless.
                 let _ = respond_to.send(self.reject_append(self.common.current_term));
                 Transition::Continue
             }
             Event::AppendEntriesResponse { from, resp } => {
-                // No term check: a response from a newer term never
-                // reaches a role's event loop at all (see
-                // `Common::next_event`).
+                // No term check: a response from a newer term never reaches a role's
+                // event loop (see `Common::next_event`).
                 //
-                // A failure's `match_index` is meaningless (0) -- only a
-                // successful response tells us anything about the peer's
-                // actual progress.
+                // A failure's `match_index` means nothing (0); only a success tells us
+                // the peer's real progress.
                 if resp.success {
                     let entry = self.peer_match_index.entry(from).or_insert(0);
                     *entry = (*entry).max(resp.match_index);
@@ -208,10 +200,9 @@ impl Leader {
             Event::InstallSnapshot {
                 header, respond_to, ..
             } => {
-                // Same shape as the AppendEntries arm above: a higher term
-                // means someone else is leading now, step down; otherwise
-                // it's stale, reject and stay leader. `data` is unused --
-                // a leader never applies an inbound snapshot itself.
+                // Same shape as the AppendEntries arm above: a higher term means someone
+                // else leads now, so step down; otherwise it is stale, so reject and stay
+                // leader. `data` is unused: a leader never applies an inbound snapshot.
                 if header.term > self.common.current_term {
                     self.common.advance_term(header.term).await;
                     let _ = respond_to.send(InstallSnapshotResponse {
@@ -227,17 +218,16 @@ impl Leader {
             Event::InstallSnapshotResponse {
                 from,
                 last_included_seq,
-                // The only thing the response itself carried was a term,
-                // and a newer one never reaches here (see
-                // `Common::next_event`).
+                // The response carried only a term, and a newer term never reaches here
+                // (see `Common::next_event`).
                 resp: _,
             } => {
                 let entry = self.peer_match_index.entry(from).or_insert(0);
                 *entry = (*entry).max(last_included_seq);
                 self.recompute_watermarks().await;
-                // A learner far enough behind to need a snapshot makes
-                // its progress here rather than through AppendEntries, so
-                // its catch-up round has to be judged here too.
+                // A learner far enough behind to need a snapshot makes progress here,
+                // not through AppendEntries, so its catch-up round must be judged here
+                // too.
                 self.review_learner_progress().await;
                 self.step_down_if_removed()
             }
@@ -250,11 +240,9 @@ impl Leader {
                     });
                     return Transition::Continue;
                 }
-                // `voted_for == Some(self)` at our own `current_term`
-                // always denies a same-term request, same as before this
-                // used the shared check -- what's new is that a
-                // higher-term request is no longer granted unconditionally:
-                // it's now also subject to the §5.4.1 log check.
+                // `voted_for == Some(self)` in our own `current_term` always denies a
+                // same-term request. A higher-term request is also subject to the
+                // §5.4.1 log check, so it is not granted just for its term.
                 let is_new_term = req.term > self.common.current_term;
                 let grant = evaluate_real_vote(&mut self.common, &req).await;
                 let _ = respond_to.send(RequestVoteResponse {
@@ -273,14 +261,12 @@ impl Leader {
                 expires_at,
             } => {
                 if resp.lease_granted {
-                    // Kept, not maxed against the old deadline: probes
-                    // go out one at a time per peer, so a later response
-                    // is always for a later send.
+                    // Replace, do not take the max with the old deadline: probes go out one
+                    // at a time per peer, so a later response is always for a later send.
                     self.peer_lease_expiry.insert(from, expires_at);
                 } else {
-                    // An explicit denial is stronger evidence than mere
-                    // silence -- this peer no longer trusts us right now,
-                    // so don't keep counting a stale prior grant.
+                    // An explicit denial is stronger evidence than silence: this peer does
+                    // not trust us now, so stop counting an older grant.
                     self.peer_lease_expiry.remove(&from);
                 }
                 self.recompute_lease_quorum();
@@ -297,7 +283,7 @@ impl Leader {
                 let _ = respond_to.send(outcome);
                 self.step_down_if_removed()
             }
-            // A leader is by definition already part of a cluster.
+            // A leader is in a cluster by definition.
             Event::Bootstrap { respond_to, .. } => {
                 let _ = respond_to.send(Err(RaftError::AlreadyInitialized));
                 Transition::Continue
@@ -305,24 +291,22 @@ impl Leader {
         }
     }
 
-    /// Appends a membership change to the log, where it takes effect
-    /// immediately (§4.1 -- on append, not on commit). Returns the seq
-    /// the `Config` entry landed at, so the caller can wait for it to
-    /// commit.
+    /// Append a membership change to the log, where it takes effect at once
+    /// (§4.1: on append, not on commit). Returns the seq of the `Config`
+    /// entry, so the caller can wait for its commit.
     ///
-    /// Two guards, both about not building on ground that can still move:
+    /// Two guards, both against building on ground that can still move:
     ///
     /// * **One change at a time** (§4.1). Two overlapping single-server
-    ///   changes can produce configurations with no majority in common,
-    ///   which is precisely the disjoint-quorum split that makes
-    ///   single-server changes safe in the first place. Enforced by
-    ///   refusing while a `Config` entry we appended is still uncommitted.
-    /// * **A committed entry from our own term** (Ongaro 2015). A new
-    ///   leader's inherited tail isn't committed yet, so the
-    ///   configuration it is reading could still be rolled back by a
-    ///   future leader -- and a membership change built on a
-    ///   configuration that never existed can produce two disjoint
-    ///   quorums just as surely. `noop_seq` is the entry that clears this.
+    ///   changes can produce configurations with no majority in common: the
+    ///   exact disjoint-quorum split that single-server changes exist to
+    ///   avoid. Enforced by refusing while a `Config` entry we appended is
+    ///   uncommitted.
+    /// * **A committed entry from our own term** (Ongaro 2015). A new leader's
+    ///   inherited tail is not committed yet, so the configuration it reads
+    ///   could still be rolled back by a later leader, and a change built on a
+    ///   configuration that never existed can also produce two disjoint
+    ///   quorums. `noop_seq` is the entry that clears this.
     async fn propose_config(&mut self, change: ConfigChange) -> Result<u64, RaftError> {
         if self.pending_config_seq.is_some() {
             return Err(RaftError::ConfigChangeInProgress);
@@ -343,18 +327,17 @@ impl Leader {
         self.common.notify_appended(seq);
 
         self.pending_config_seq = Some(seq);
-        // In force as of now -- so start replicating to (or stop
-        // replicating to) the affected server straight away.
+        // In force now, so start (or stop) replicating to the affected server at
+        // once.
         self.common.reload_config().await;
         self.reconcile_peers().await;
         Ok(seq)
     }
 
-    /// Raft §4.2.2: a leader that removes itself keeps serving until the
-    /// entry removing it *commits* -- it is the only node that can get
-    /// that entry committed -- and steps down the moment it does.
-    /// Stepping down any earlier would leave the cluster with no one able
-    /// to finish the change.
+    /// Raft §4.2.2: a leader that removes itself keeps serving until the entry
+    /// that removes it commits (it is the only node that can commit that
+    /// entry), and steps down as soon as it does. An earlier step-down would
+    /// leave nobody able to finish the change.
     fn step_down_if_removed(&self) -> Transition {
         let committed = match self.pending_config_seq {
             Some(seq) => *self.common.commit_tx.borrow() >= seq,
@@ -367,18 +350,17 @@ impl Leader {
         }
     }
 
-    /// Raft §4.2.1: promotes a learner that has demonstrated it can keep
-    /// up with the cluster in real time.
+    /// Raft §4.2.1: promote a learner that has shown it can keep up with the
+    /// cluster in real time.
     ///
-    /// A learner is measured in rounds. Each round fixes a target -- the
-    /// leader's log tail at the moment the round starts -- and ends when
-    /// the learner's `match_index` reaches it. The round's *duration* is
-    /// the actual test: finishing within an election timeout means this
-    /// server can replicate as fast as the cluster produces entries, so
-    /// giving it a vote won't stall commitment. A round that takes longer
-    /// simply starts another one; there is no failure path, and a learner
-    /// that never converges just stays a learner, replicated to but
-    /// invisible to every quorum.
+    /// A learner is measured in rounds. Each round fixes a target (the
+    /// leader's log tail when the round starts) and ends when the learner's
+    /// `match_index` reaches it. The round's duration is the test: finishing
+    /// within an election timeout means this server replicates as fast as the
+    /// cluster produces entries, so a vote for it will not stall commit. A
+    /// slower round just starts another one. There is no failure path: a
+    /// learner that never converges stays a learner, replicated to but counted
+    /// in no quorum.
     async fn review_learner_progress(&mut self) {
         let learners: Vec<String> = self
             .common
@@ -412,8 +394,8 @@ impl Leader {
                         promote = Some(id);
                         break;
                     }
-                    // Caught up, but too slowly to be trusted with a vote
-                    // yet. Try again against a fresh target.
+                    // Caught up, but too slowly to get a vote yet. Try again with a new
+                    // target.
                     state.round_start_index = own_last_index;
                     state.round_started_at = now;
                 }
@@ -422,32 +404,30 @@ impl Leader {
         }
 
         if let Some(server_id) = promote {
-            // Best-effort: the guards in `propose_config` can legitimately
-            // refuse right now (another change in flight, say). The
-            // learner stays a learner and is reconsidered on the next
-            // response, so there is nothing to recover from here.
+            // Best effort: the guards in `propose_config` can refuse now for valid
+            // reasons (another change in flight, for example). The learner stays a
+            // learner and is checked again on the next response, so there is nothing
+            // to recover from.
             let _ = self
                 .propose_config(ConfigChange::Promote { server_id })
                 .await;
         }
     }
 
-    /// Brings the running replication and lease-probe tasks in line with
-    /// the current configuration: spawns one for each member that doesn't
-    /// have one, and aborts (plus forgets) the ones for members that are
-    /// no longer there.
+    /// Bring the replication and lease-probe tasks in line with the current
+    /// configuration: start one for each member that has none, and stop (and
+    /// forget) the ones for members that left.
     ///
     /// Incremental on purpose. A replication task owns this leader's
-    /// `next_index` for its peer, discovered over potentially many
-    /// round trips of §5.3 backup; restarting every task on every
-    /// membership change would throw all of that away and re-probe the
-    /// whole cluster just because one server was added.
+    /// `next_index` for its peer, found over possibly many round trips of
+    /// §5.3 backup. Restarting every task on every membership change would
+    /// throw that away and probe the whole cluster again because one server
+    /// was added.
     ///
-    /// Dropping a departed peer's `peer_match_index`/`peer_lease_expiry`
-    /// isn't only tidiness: a stale entry for a server that is no longer
-    /// a member would otherwise keep being counted -- holding
-    /// `compact_seq` down forever at whatever index a removed node
-    /// happened to stop at.
+    /// Removing a departed peer's `peer_match_index` and `peer_lease_expiry`
+    /// entries is required: a stale entry for a former member would keep being
+    /// counted, and hold `compact_seq` down forever at the index where the
+    /// removed node stopped.
     async fn reconcile_peers(&mut self) {
         let wanted_replication = self.common.peers();
         let wanted_leases = self.common.voting_peers();
@@ -507,11 +487,10 @@ impl Leader {
             .cloned()
             .collect();
 
-        // Signalled in one pass and joined in a second, so several peers
-        // leaving at once wind down concurrently -- and signalled *before*
-        // any is awaited, since a task already parked on `event_tx.send`
-        // can only finish once it hears it is no longer wanted (this same
-        // event loop is what would otherwise be draining it).
+        // Signal in one pass and join in a second, so several leaving peers wind
+        // down concurrently. Signal before awaiting any, because a task already
+        // blocked on `event_tx.send` can only finish once it learns it is not
+        // wanted (this same event loop would otherwise drain it).
         for id in &demoted {
             if let Some(task) = self.lease_tasks.get(id) {
                 task.signal();
@@ -528,7 +507,7 @@ impl Leader {
             }
             self.peer_lease_expiry.remove(id);
         }
-        // A promoted learner is done being measured.
+        // A promoted learner no longer needs measuring.
         self.catch_up
             .retain(|id, _| self.common.config.member(id).is_some_and(|m| !m.voting));
         for id in &dropped {
@@ -537,33 +516,31 @@ impl Leader {
             }
             self.peer_match_index.remove(id);
             self.catch_up.remove(id);
-            // Nothing will dial this peer again, so don't hold its
-            // connection open.
+            // Nothing will dial this peer again, so close its connection.
             self.common.peer_conns.forget(id);
         }
 
         if !dropped.is_empty() || !demoted.is_empty() {
-            // Both quorums just got smaller, which can mean an entry is
-            // already committed, or read quorum already held, on the
-            // strength of responses we have in hand.
+            // Both quorums just got smaller, so an entry may already be committed,
+            // or read quorum already held, from responses we already have.
             self.recompute_watermarks().await;
             self.recompute_lease_quorum();
         }
     }
 
-    /// Recomputes `commit_seq` (highest seq replicated to a majority of
-    /// *voters*) and `compact_seq` (lowest seq replicated to *every*
-    /// member, learners included) from `peer_match_index`, and publishes
-    /// both via `Common` -- monotonically, so a stale/out-of-order
-    /// response can never make either regress.
+    /// Recompute `commit_seq` (highest seq replicated to a majority of voters)
+    /// and `compact_seq` (lowest seq replicated to every member, learners
+    /// included) from `peer_match_index`, and publish both through `Common`.
+    /// Both only move forward, so a stale or out-of-order response can never
+    /// lower either.
     ///
-    /// The two watermarks deliberately draw from different populations.
-    /// Commitment is a safety property and belongs to the voters alone:
-    /// counting a learner would let an entry commit on the strength of a
-    /// node that can't vote in the election that must preserve it.
-    /// Compaction is only about what is safe to physically discard, so it
-    /// has to wait for everyone who might still need to be sent it --
-    /// which very much includes a learner that is still catching up.
+    /// The two watermarks use different groups on purpose:
+    /// - Commit is a safety property and belongs to voters alone: counting a
+    ///   learner would let an entry commit because of a node that cannot vote
+    ///   in the election that must preserve it.
+    /// - Compaction is only about what is safe to delete, so it must wait for
+    ///   everyone who might still need an entry, including a learner that is
+    ///   still catching up.
     async fn recompute_watermarks(&mut self) {
         let (own_last_index, _) = last_log_index_and_term(&self.common.store).await;
         let matched_for = |peer: &PeerInfo| *self.peer_match_index.get(&peer.id).unwrap_or(&0);
@@ -574,10 +551,9 @@ impl Leader {
             .iter()
             .map(&matched_for)
             .collect();
-        // Our own log counts only if we are ourselves a voter -- a leader
-        // that has been removed from the configuration goes on serving
-        // until the entry removing it commits (§4.2.2), but it is not
-        // part of the quorum deciding that.
+        // Our own log counts only if we are a voter. A leader removed from the
+        // configuration keeps serving until the entry that removes it commits
+        // (§4.2.2), but it is not part of the quorum that decides that.
         if self.common.is_voter() {
             voter_matched.push(own_last_index);
         }
@@ -586,49 +562,45 @@ impl Leader {
         let mut all_matched: Vec<u64> = self.common.peers().iter().map(&matched_for).collect();
         all_matched.push(own_last_index);
 
-        // The value at position `majority - 1` is the majority-th largest
-        // -- i.e. the highest value at least `majority` voters are `>=`
-        // to. A configuration with no voters at all can't decide
-        // anything; nothing commits until one exists.
+        // The value at position `majority - 1` is the majority-th largest: the
+        // highest value that at least `majority` voters have reached. A
+        // configuration with no voters decides nothing; nothing commits until one
+        // exists.
         let majority = self.common.majority();
         if voter_matched.len() >= majority {
             let commit_seq = voter_matched[majority - 1];
 
-            // Raft §5.4.2 (Figure 8): replication to a majority is *not*
-            // on its own enough to commit an entry from an earlier term
-            // -- such an entry can still be overwritten by a future
-            // leader. Only an entry from our own term is safe to count
-            // directly, and committing it commits everything before it by
-            // the Log Matching Property. One check on `commit_seq` covers
-            // the whole prefix: terms are non-decreasing along the log, so
-            // if the entry there isn't from our term, nothing below it is
-            // either.
+            // Raft §5.4.2 (Figure 8): a majority alone is not enough to commit an
+            // entry from an earlier term, because a later leader can still overwrite
+            // it. Only an entry from our own term can be counted directly, and
+            // committing it commits everything before it (Log Matching Property).
+            // One check at `commit_seq` covers the whole prefix: terms never decrease
+            // along the log, so if that entry is not from our term, nothing below it
+            // is.
             //
-            // `Leader::new` appends a no-op at the start of every term, so
-            // this gate always has something reachable to open on -- it
-            // delays commitment until that no-op replicates, never blocks
-            // it forever.
+            // `Leader::new` appends a no-op at the start of every term, so this gate
+            // always has something it can open on: it delays commit until that no-op
+            // replicates, and never blocks it forever.
             if term_at(&self.common.store, commit_seq).await == Some(self.common.current_term) {
                 self.common.advance_commit(commit_seq);
-                // The one-change-at-a-time guard lifts the moment the
-                // change we are holding it for commits.
+                // The one-change-at-a-time guard lifts as soon as the change it waits for
+                // commits.
                 if self.pending_config_seq.is_some_and(|seq| commit_seq >= seq) {
                     self.pending_config_seq = None;
                 }
             }
         }
 
-        // The smallest entry -- the one value every single member,
-        // without exception, has reached.
+        // The smallest value: the one that every member, without exception, has
+        // reached.
         let compact_seq = all_matched.into_iter().min().expect("always has our own");
         self.common.advance_compact(compact_seq);
     }
 
-    /// Recomputes whether this leader currently holds a quorum of live
-    /// leases (itself, which trivially always trusts itself, plus every
-    /// peer whose last granted lease hasn't yet expired) and publishes
-    /// the result. Purely in-memory (no storage read needed, unlike
-    /// `recompute_watermarks`), so this can be a plain sync fn.
+    /// Recompute whether this leader holds a quorum of live leases (itself,
+    /// plus every peer whose last grant has not expired), and publish the
+    /// result. In memory only (no storage read, unlike
+    /// `recompute_watermarks`), so this is a plain sync fn.
     fn recompute_lease_quorum(&mut self) {
         let now = Instant::now();
         let live = self
@@ -641,8 +613,7 @@ impl Leader {
                     .is_some_and(|exp| *exp > now)
             })
             .count()
-            // We always trust ourselves -- but, as with commitment, only
-            // if we are a voter at all.
+            // We always trust ourselves, but, as with commit, only if we are a voter.
             + usize::from(self.common.is_voter());
         let has_quorum = live >= self.common.majority();
         self.read_quorum_tx.send_replace(has_quorum);
@@ -658,11 +629,10 @@ impl Leader {
         }
     }
 
-    /// Stops every task this leader owns -- replication, lease probes and
-    /// the self-tick -- and hands `Common` back only once they have all
-    /// actually returned. Whatever they were holding (peer connections,
-    /// an `Arc<RaftLog>`) is therefore gone by the time the next role, or
-    /// the shutting-down node, gets `Common` back.
+    /// Stop every task this leader owns (replication, lease probes, the
+    /// self-tick), and return `Common` only after all have returned. So
+    /// whatever they held (peer connections, an `Arc<RaftLog>`) is gone before
+    /// the next role, or the shutting-down node, gets `Common` back.
     async fn shutdown(self) -> Common {
         Task::stop_all(
             self.replication_tasks

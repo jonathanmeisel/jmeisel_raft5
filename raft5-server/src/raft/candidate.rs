@@ -1,20 +1,20 @@
-//! `PreCandidate` (pre-vote) and `Candidate` (real, term-incrementing
-//! election): both campaign for votes from every peer, count responses,
-//! and become something else on majority or on timeout -- close enough in
-//! shape that they share one implementation (`Campaign`) parameterized by
-//! `CampaignKind`, rather than maintaining two near-identical copies. See
-//! the parent module's doc for how pre-vote fits into the bigger picture.
+//! `PreCandidate` (pre-vote) and `Candidate` (a real election that raises
+//! the term). Both ask every peer for votes, count responses, and change
+//! role on a majority or a timeout. They are close enough in shape to share
+//! one implementation (`Campaign`), parameterized by `CampaignKind`, instead
+//! of two near-identical copies. See the parent module's doc for how
+//! pre-vote fits in.
 
 use tracing::info;
 
 use super::*;
 
-/// Requests a vote (real or pre-vote, per `req.dry_run`) from `peer`,
-/// over `conns`' shared client for it, bounded by `timeout`
-/// (`Timing::lightweight_rpc_timeout`). `None` on any failure -- connect error, RPC
-/// error, or timeout -- which is always safe to just ignore: the
-/// campaign's own election timer is Raft's built-in retry mechanism, so
-/// there's nothing else to do with a peer that didn't answer in time.
+/// Request a vote (real or pre-vote, as `req.dry_run` says) from `peer`,
+/// through `conns`' shared client, within `timeout`
+/// (`Timing::lightweight_rpc_timeout`). `None` on any failure (connect
+/// error, RPC error, timeout). Always safe to ignore: the campaign's own
+/// election timer is Raft's retry mechanism, so there is nothing else to do
+/// with a peer that did not answer in time.
 async fn request_vote_from_peer(
     peer: &PeerInfo,
     req: RequestVoteRequest,
@@ -29,13 +29,13 @@ async fn request_vote_from_peer(
     }
 }
 
-/// Which kind of campaign a `Campaign` is running.
+/// Which kind of campaign a `Campaign` runs.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CampaignKind {
-    /// Non-binding pre-vote: doesn't touch `current_term`/`voted_for`.
-    /// Winning promotes to a real `Candidate`.
+    /// Non-binding pre-vote: does not touch `current_term` or `voted_for`.
+    /// Winning leads to a real `Candidate`.
     PreVote,
-    /// A real, term-incrementing candidacy. Winning promotes to `Leader`.
+    /// A real candidacy that raises the term. Winning leads to `Leader`.
     RealVote,
 }
 
@@ -48,12 +48,13 @@ impl CampaignKind {
     }
 }
 
-/// The event loop and state shared by `PreCandidate` and `Candidate` --
-/// see the module doc. `kind` is the only thing that changes what this
-/// actually does at the handful of points where the two genuinely differ:
-/// whether `start` bumps the term, what a granted majority promotes to,
-/// and how a `RequestVoteResponse` is matched to *this* campaign (see the
-/// comment in `handle_event`).
+/// The event loop and state shared by `PreCandidate` and `Candidate` (see
+/// the module doc). `kind` changes behavior only where the two really
+/// differ:
+/// - whether `start` raises the term,
+/// - what a majority leads to,
+/// - how a `RequestVoteResponse` is matched to this campaign (see the
+///   comment in `handle_event`).
 struct Campaign {
     common: Common,
     kind: CampaignKind,
@@ -64,10 +65,10 @@ struct Campaign {
 
 impl Campaign {
     async fn start(mut common: Common, kind: CampaignKind) -> (Role, Common) {
-        // A real candidacy commits to the new term up front (and persists
-        // it, so a crash mid-election can't lead to a double vote later);
-        // a pre-vote only asks a hypothetical "what if" without changing
-        // anything, so it just computes what that term *would* be.
+        // A real candidacy commits to the new term up front, and persists it, so
+        // a crash mid-election cannot lead to a double vote later. A pre-vote
+        // only asks "what if" without changing anything, so it only computes what
+        // the term would be.
         let term = match kind {
             CampaignKind::RealVote => {
                 common.current_term += 1;
@@ -77,15 +78,15 @@ impl Campaign {
             }
             CampaignKind::PreVote => common.current_term + 1,
         };
-        // Pre-vote is externally indistinguishable from a real candidacy
-        // -- a client can't act on the difference either way, so there's
-        // no separate `RoleHandle` variant for it.
+        // From outside, pre-vote looks the same as a real candidacy (a client
+        // cannot act on the difference), so it has no separate `RoleHandle`
+        // variant.
         common.publish_role(RoleHandle::Candidate);
 
         let (last_log_index, last_log_term) = last_log_index_and_term(&common.store).await;
         let dry_run = kind == CampaignKind::PreVote;
-        // Voting peers only: a learner has no vote to give, so asking it
-        // would just be a wasted RPC that can never move `votes_received`.
+        // Voting peers only: a learner has no vote, so asking it would be a
+        // wasted RPC that can never change `votes_received`.
         let vote_tasks = common
             .voting_peers()
             .into_iter()
@@ -104,9 +105,9 @@ impl Campaign {
                 )
             })
             .collect();
-        // Without this, a split vote (or a cluster too small to reach
-        // majority with the peers that actually answer) would leave the
-        // campaign stuck forever with nothing left to wait on.
+        // Without this, a split vote (or a cluster too small to reach a majority
+        // with the peers that answer) would leave the campaign stuck forever with
+        // nothing to wait for.
         let election_timer = spawn_election_timer(
             common.cancel_token(),
             common.timing(),
@@ -120,19 +121,17 @@ impl Campaign {
             kind,
             vote_tasks,
             election_timer,
-            // A vote/pre-vote for ourselves -- but only if we actually
-            // have one. A learner, or a server that has been removed
-            // from the configuration, counts for nothing. (It shouldn't
-            // be campaigning at all; see `Follower::handle_event`. This
-            // is the same rule enforced where it is actually counted.)
+            // A vote (or pre-vote) for ourselves, but only if we have one. A learner,
+            // or a server removed from the configuration, counts for nothing. (It
+            // should not campaign at all; see `Follower::handle_event`. This applies
+            // the same rule where votes are counted.)
             votes_received: usize::from(campaign_common_is_voter),
         };
-        // A zero-peer cluster reaches majority on the self-vote alone --
-        // nothing will ever arrive on the event loop to notice that, so
-        // check up front rather than sitting in `run` forever restarting
-        // every timeout (see `candidate_restarts_the_election_after_its_own_timeout`,
-        // which covers the *intended* version of that behavior: peers
-        // exist but aren't answering).
+        // A cluster with no peers reaches a majority on the self-vote alone, and
+        // nothing will arrive on the event loop to notice. So check now, instead of
+        // waiting in `run` forever and restarting on every timeout (see
+        // `candidate_restarts_the_election_after_its_own_timeout`, which covers the
+        // intended version of that: peers exist but do not answer).
         let next_role = if campaign.votes_received >= campaign.common.majority() {
             kind.promotion()
         } else {
@@ -141,9 +140,9 @@ impl Campaign {
         (next_role, campaign.shutdown().await)
     }
 
-    /// Calls `peer`'s RequestVote RPC and, if it answers in time, pushes
-    /// the result back as `Event::RequestVoteResponse` so vote counting
-    /// happens on the event loop rather than racing with it.
+    /// Call `peer`'s RequestVote RPC and, if it answers in time, push the
+    /// result back as `Event::RequestVoteResponse`, so votes are counted on the
+    /// event loop, not in a race with it.
     #[allow(clippy::too_many_arguments)]
     fn spawn_request_vote(
         cancel: &CancellationToken,
@@ -165,10 +164,9 @@ impl Campaign {
                 last_log_term,
                 dry_run,
             };
-            // Wrapped rather than simply awaited: `request_vote_from_peer`
-            // is bounded by `timeout`, but an abandoned campaign
-            // shouldn't have to wait out even that much before this task
-            // is gone.
+            // Wrapped, not just awaited: `request_vote_from_peer` is bounded by
+            // `timeout`, but an abandoned campaign should not have to wait even that
+            // long for this task to end.
             let resp =
                 until_cancelled(&cancel, request_vote_from_peer(&peer, req, &conns, timeout)).await;
             let Some(Some(resp)) = resp else {
@@ -203,21 +201,18 @@ impl Campaign {
     async fn handle_event(&mut self, event: Event) -> Transition {
         match event {
             Event::RequestVoteResponse { resp, .. } => {
-                // A response from a newer term never gets here -- see
-                // `Common::next_event`.
+                // A response from a newer term never gets here (see
+                // `Common::next_event`).
                 //
-                // A real vote is only meaningful if it's for the exact
-                // term we're running at (an equal-or-lower term response
-                // could be a stale reply from an abandoned attempt). A
-                // pre-vote response has no such term to match: it always
-                // carries the *responder's own* current term, which for a
-                // granted pre-vote is guaranteed `<= self.common.current_term`
-                // (never `==` it in general -- our dry-run term is
-                // `current_term + 1`, strictly ahead of anything a
-                // responder would report) but isn't stale in the same
-                // sense (`current_term` doesn't change across pre-vote
-                // retries the way it does between real candidacies), so
-                // `vote_granted` alone is the right thing to check.
+                // A real vote counts only for the exact term we run at: a response for an
+                // equal or lower term could be a stale reply from an abandoned attempt.
+                // A pre-vote response has no such term to match. It always carries the
+                // responder's own current term, which for a granted pre-vote is at most
+                // `self.common.current_term` (our dry-run term is `current_term + 1`, ahead
+                // of anything a responder reports). That is not stale in the same sense,
+                // because `current_term` does not change between pre-vote retries as it
+                // does between real candidacies. So `vote_granted` alone is the right
+                // check.
                 let counts = match self.kind {
                     CampaignKind::RealVote => {
                         resp.term == self.common.current_term && resp.vote_granted
@@ -233,14 +228,12 @@ impl Campaign {
                 Transition::Continue
             }
             Event::AppendEntries { req, respond_to } => {
-                // A valid leader for this (or a later) term means the
-                // election is over; concede. Only actually advance the
-                // term (and persist) if it's strictly higher -- conceding
-                // to a leader already at our own term needs no term change.
-                // For a `PreVote` campaign, `current_term` is still the
-                // *old*, un-bumped term, so this concedes to any leader at
-                // least that current -- correctly, since a `PreCandidate`
-                // hasn't actually committed to anything yet.
+                // A valid leader for this (or a later) term means the election is over:
+                // give in. Advance (and persist) the term only if it is strictly higher;
+                // giving in to a leader at our own term needs no change. In a `PreVote`
+                // campaign, `current_term` is still the old term, so this gives in to any
+                // leader at least that current, which is correct: a `PreCandidate` has not
+                // committed to anything yet.
                 if req.term >= self.common.current_term {
                     if req.term > self.common.current_term {
                         self.common.advance_term(req.term).await;
@@ -266,13 +259,11 @@ impl Campaign {
             Event::InstallSnapshot {
                 header, respond_to, ..
             } => {
-                // Same concede-or-reject shape as the AppendEntries arm
-                // above, and for the same reason: a campaigning node
-                // never applies the snapshot itself (`data` is unused
-                // here) -- it just concedes if the sender's term is
-                // legitimate, and the leader's own retry will resend once
-                // this node is back to being a Follower able to actually
-                // install it.
+                // Same give-in-or-reject shape as the AppendEntries arm above, for the
+                // same reason: a campaigning node never applies the snapshot itself
+                // (`data` is unused here). It gives in if the sender's term is valid, and
+                // the leader's retry resends the snapshot once this node is a Follower
+                // that can install it.
                 if header.term >= self.common.current_term {
                     if header.term > self.common.current_term {
                         self.common.advance_term(header.term).await;
@@ -296,12 +287,10 @@ impl Campaign {
                     });
                     return Transition::Continue;
                 }
-                // A `PreVote` campaign hasn't cast any real vote of its
-                // own (unlike `RealVote`, which always has `voted_for ==
-                // Some(self)` already) -- it just inherits whatever
-                // `voted_for` its preceding `Follower` had, so this needs
-                // the full check, not "deny, we already voted for
-                // ourselves this term".
+                // A `PreVote` campaign has cast no real vote of its own (unlike `RealVote`,
+                // which always has `voted_for == Some(self)`). It keeps whatever
+                // `voted_for` its `Follower` had, so it needs the full check, not "deny,
+                // we already voted for ourselves this term".
                 let is_new_term = req.term > self.common.current_term;
                 let grant = evaluate_real_vote(&mut self.common, &req).await;
                 let _ = respond_to.send(RequestVoteResponse {
@@ -314,12 +303,10 @@ impl Campaign {
                 Transition::Continue
             }
             Event::ElectionTimeout => {
-                // Every retry -- pre-vote or real -- goes back through a
-                // fresh pre-vote round rather than straight into another
-                // real candidacy, so a genuinely hopeless attempt (e.g. a
-                // still-partitioned node) never bumps its term just to
-                // fail again; `election_attempt` backs off how long the
-                // *next* attempt waits before giving up in turn.
+                // Every retry, pre-vote or real, goes back through a new pre-vote round,
+                // not straight into another real candidacy. So a hopeless attempt (for
+                // example, a node still partitioned) never raises its term only to fail
+                // again. `election_attempt` makes the next attempt wait longer.
                 self.common.election_attempt = self.common.election_attempt.saturating_add(1);
                 Transition::Become(Role::PreCandidate)
             }
@@ -327,13 +314,13 @@ impl Campaign {
             | Event::GetLeaseResponse { .. }
             | Event::InstallSnapshotResponse { .. }
             | Event::LeaderTick => Transition::Continue,
-            // No leader to forward to yet -- an election is in progress.
+            // No leader to forward to yet: an election is in progress.
             Event::ProposeConfig { respond_to, .. } => {
                 let _ = respond_to.send(Err(RaftError::NotLeader { leader_hint: None }));
                 Transition::Continue
             }
-            // Only an uninitialized node can be bootstrapped, and an
-            // uninitialized node never campaigns.
+            // Only an uninitialized node can be bootstrapped, and an uninitialized
+            // node never campaigns.
             Event::Bootstrap { respond_to, .. } => {
                 let _ = respond_to.send(Err(RaftError::AlreadyInitialized));
                 Transition::Continue
@@ -341,10 +328,9 @@ impl Campaign {
         }
     }
 
-    /// Stops this campaign's tasks and hands `Common` back. Every one is
-    /// signalled first and only then joined, so the outstanding vote
-    /// requests wind down in parallel rather than one RPC timeout at a
-    /// time.
+    /// Stop this campaign's tasks and return `Common`. All are signalled first
+    /// and only then joined, so the open vote requests wind down in parallel,
+    /// not one RPC timeout at a time.
     async fn shutdown(self) -> Common {
         Task::stop_all(self.vote_tasks).await;
         self.election_timer.stop().await;
@@ -352,24 +338,24 @@ impl Campaign {
     }
 }
 
-/// Non-binding pre-vote round. See the parent module's doc.
+/// A non-binding pre-vote round. See the parent module's doc.
 pub struct PreCandidate;
 
 impl PreCandidate {
-    // See the comment on `Leader::new` re: this not returning `Self`.
+    // See the comment on `Leader::new` about this not returning `Self`.
     #[allow(clippy::new_ret_no_self)]
     pub async fn new(common: Common) -> (Role, Common) {
         Campaign::start(common, CampaignKind::PreVote).await
     }
 }
 
-/// A real, term-incrementing candidacy -- only ever entered after
-/// `PreCandidate` has already confirmed a majority would plausibly grant
-/// it a real vote.
+/// A real candidacy that raises the term. Entered only after
+/// `PreCandidate` has confirmed that a majority would likely grant a real
+/// vote.
 pub struct Candidate;
 
 impl Candidate {
-    // See the comment on `Leader::new` re: this not returning `Self`.
+    // See the comment on `Leader::new` about this not returning `Self`.
     #[allow(clippy::new_ret_no_self)]
     pub async fn new(common: Common) -> (Role, Common) {
         Campaign::start(common, CampaignKind::RealVote).await

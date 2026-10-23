@@ -1,13 +1,14 @@
 //! Where a request goes, and what the client remembers between calls.
 //!
-//! Only the leader can serve anything transactional -- which is to say
-//! every write and every read that has to be current -- or a membership
-//! change, and a node that isn't the leader answers `NotLeader` rather
-//! than forwarding (Raft §6.2). So finding the leader, and not having to
-//! find it again for every call, is the client's job. `Router` is that
-//! job: it holds every client API address it knows of, the `server_id`
-//! -> address map that turns a `NotLeader.leader_hint` into somewhere to
-//! dial, and the connection to whoever it last saw leading.
+//! Only the leader serves transactional work (every write, and every read
+//! that must be current) and membership changes, and a node that is not
+//! the leader answers `NotLeader` instead of forwarding (Raft §6.2). So the
+//! client must find the leader, and should not have to find it again for
+//! every call. `Router` does that. It holds:
+//! - every client API address it knows,
+//! - the `server_id` to address map that turns a `NotLeader.leader_hint`
+//!   into somewhere to dial,
+//! - the connection to the node it last saw leading.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -30,11 +31,11 @@ pub(crate) type Kv = KvClient<InterceptedService<Channel, BearerToken>>;
 
 /// The session token, shared by every connection this client holds.
 ///
-/// One handle behind an `Arc`, cloned into each `Node`, so that logging
-/// in reaches connections built *before* the login as well as after --
-/// the cached leader connection above all, which deliberately outlives
-/// individual calls. Storing the token on the `Client` instead would
-/// leave that cached connection sending the old one, or none.
+/// One handle behind an `Arc`, cloned into each `Node`, so a login reaches
+/// connections built before it as well as after, above all the cached
+/// leader connection, which outlives single calls on purpose. A token
+/// stored on the `Client` would leave that cached connection sending the
+/// old token, or none.
 #[derive(Clone, Default)]
 pub(crate) struct BearerToken(Arc<Mutex<Option<String>>>);
 
@@ -50,10 +51,9 @@ impl BearerToken {
 
 impl Interceptor for BearerToken {
     fn call(&mut self, mut request: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
-        // No token is not an error here. A client that has not logged in
-        // is perfectly able to call `GetConfig` and `Login`, and against
-        // a cluster with no secret it can call everything -- so what to
-        // do about a missing token is the server's to decide, not this.
+        // No token is not an error here. A client that has not logged in can call
+        // `GetConfig` and `Login`, and on a cluster with no secret it can call
+        // everything. What to do about a missing token is the server's decision.
         let Some(token) = self.0.lock().unwrap().clone() else {
             return Ok(request);
         };
@@ -65,30 +65,29 @@ impl Interceptor for BearerToken {
     }
 }
 
-/// How long a single discovery `GetConfig` may take before the scan
-/// gives up on that node and moves on. A node that is merely down
-/// refuses immediately; one that is black-holing packets would otherwise
-/// stall the scan for as long as the call has left.
+/// How long one discovery `GetConfig` may take before the scan gives up on
+/// that node and moves on. A node that is down refuses at once; one that
+/// drops packets silently would otherwise stall the scan for the rest of
+/// the call's time.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// One node's client API: how to reach it, and what to call it.
 #[derive(Clone)]
 pub(crate) struct Node {
-    /// The address as a normalized URI, so the same node named two
-    /// slightly different ways -- a seed's spelling versus the
-    /// configuration's -- is recognized as one node rather than two.
+    /// The address as a normalized URI, so one node named two slightly
+    /// different ways (a seed's spelling and the configuration's) is
+    /// recognized as one node, not two.
     pub(crate) key: String,
     endpoint: Endpoint,
     token: BearerToken,
 }
 
 impl Node {
-    /// With `tls`, the node is dialed over TLS whatever scheme `address`
-    /// names -- the cluster advertises whatever its members were
-    /// configured with, which for a cluster that predates TLS is
-    /// `http://`, and tonic would dial that in plaintext (see
-    /// `raft5_shared::tls`). Normalizing before `key` is taken also keeps
-    /// a seed and the configuration's spelling of it one node, not two.
+    /// With `tls`, the node is dialed over TLS whatever scheme `address` names.
+    /// The cluster advertises what its members were configured with, which for
+    /// a cluster configured without TLS is `http://`, and tonic would dial that
+    /// in plaintext (see `raft5_shared::tls`). Normalizing before `key` is taken
+    /// also keeps a seed and the configuration's spelling of it as one node.
     fn new(address: &str, token: BearerToken, tls: Option<&ClientTlsConfig>) -> Result<Self, Error> {
         let mut endpoint =
             Endpoint::from_shared(raft5_shared::tls::with_scheme(address, tls.is_some()))
@@ -105,13 +104,13 @@ impl Node {
         })
     }
 
-    /// Never blocks: `connect_lazy` performs no I/O, it only describes
-    /// how to reach the node. The channel dials on first use and re-dials
-    /// by itself after a failure.
+    /// Never blocks: `connect_lazy` does no I/O, it only describes how to
+    /// reach the node. The channel dials on first use and re-dials by itself
+    /// after a failure.
     ///
-    /// The decoding limit is raised because a read can return a value as
-    /// large as a whole transaction; tonic's 4 MiB default would refuse
-    /// it. Encoding is unlimited by default, so sending needs nothing.
+    /// The decode limit is raised because a read can return a value as large as
+    /// a whole transaction, which tonic's 4 MiB default would refuse. Encoding
+    /// has no limit by default, so sending needs nothing.
     pub(crate) fn connect(&self) -> Kv {
         KvClient::new(InterceptedService::new(
             self.endpoint.clone().connect_lazy(),
@@ -130,30 +129,27 @@ pub(crate) struct Leader {
 
 pub(crate) struct Router {
     state: Mutex<State>,
-    /// Held outside `state` because the interceptor reads it on every
-    /// request, from inside the connection, with no way to reach this
-    /// lock.
+    /// Kept outside `state` because the interceptor reads it on every request,
+    /// from inside the connection, with no way to reach this lock.
     token: BearerToken,
-    /// How every node is dialed over TLS, or `None` for plaintext --
-    /// the seeds and every member learned afterwards alike.
+    /// How every node (the seeds and every member learned later) is dialed
+    /// over TLS, or `None` for plaintext.
     tls: Option<ClientTlsConfig>,
 }
 
 struct State {
-    /// Every client API address we know of: the seeds we were handed,
-    /// replaced by the cluster's own membership as soon as we have seen
-    /// it.
+    /// Every client API address we know: the seeds we were given, replaced by
+    /// the cluster's own membership as soon as we see it.
     endpoints: Vec<Node>,
-    /// `server_id` -> that member's client API, which is what makes a
-    /// `leader_hint` actionable: the hint names a server, not an address.
+    /// `server_id` to that member's client API. This makes a `leader_hint`
+    /// usable: the hint names a server, not an address.
     by_id: HashMap<String, Node>,
-    /// Held between calls, so the common case -- the leader hasn't
-    /// changed since last time -- dials nothing.
+    /// Kept between calls, so the common case (the leader has not changed)
+    /// dials nothing.
     leader: Option<Leader>,
-    /// What to log in again with when a token expires mid-session.
-    /// `None` for a client that was handed a token directly, or has
-    /// never logged in: there is then nothing to retry with, and an
-    /// expiry is simply reported.
+    /// What to log in with again when a token expires mid-session. `None` for
+    /// a client that was given a token directly, or never logged in: then
+    /// there is nothing to retry with, and the expiry is reported.
     credentials: Option<(String, String)>,
 }
 
@@ -182,7 +178,7 @@ impl Router {
         })
     }
 
-    /// Starts using `token` on every connection, existing ones included.
+    /// Start using `token` on every connection, existing ones included.
     pub(crate) fn set_token(&self, token: Option<String>) {
         self.token.set(token);
     }
@@ -208,19 +204,18 @@ impl Router {
             .map(|(username, _)| username.clone())
     }
 
-    /// A connection to whoever should serve the next request: the node
-    /// `hint` names, else the one we last saw leading, else whoever a
-    /// fresh scan turns up.
+    /// A connection to the node that should serve the next request: the node
+    /// `hint` names, else the one we last saw leading, else whichever node a
+    /// new scan finds.
     pub(crate) async fn leader(&self, hint: Option<String>) -> Result<Leader, Error> {
         if let Some(id) = hint
             && let Some(node) = self.lookup(&id)
         {
             return Ok(self.remember(&node));
         }
-        // Falling through means either no hint, or a hint naming a server
-        // we have no address for -- a configuration we have never
-        // fetched, or one from before that server joined. The scan below
-        // refreshes it from whoever answers.
+        // Getting here means no hint, or a hint naming a server we have no
+        // address for (a configuration we never fetched, or one from before that
+        // server joined). The scan below refreshes it from whoever answers.
         if let Some(leader) = self.cached() {
             return Ok(leader);
         }
@@ -231,9 +226,9 @@ impl Router {
         self.state.lock().unwrap().by_id.get(server_id).cloned()
     }
 
-    /// Drops the cached connection to `key`, if that is still who we
-    /// think is leading. Called when it answers `NotLeader` or stops
-    /// answering at all: either way the next call has to look again.
+    /// Drop the cached connection to `key`, if that node is still who we think
+    /// leads. Called when it answers `NotLeader` or stops answering: either way
+    /// the next call must look again.
     pub(crate) fn forget(&self, key: &str) {
         let mut state = self.state.lock().unwrap();
         if state.leader.as_ref().is_some_and(|l| l.key == key) {
@@ -259,22 +254,20 @@ impl Router {
         self.state.lock().unwrap().endpoints.clone()
     }
 
-    /// Asks `kv`'s node what the cluster looks like and adopts the
-    /// answer. Any node can answer, leader or not: membership is local,
-    /// read-only state. A node that can't answer teaches us nothing,
-    /// which is not worth failing a call over. Returns whether a
-    /// configuration was adopted.
+    /// Ask `kv`'s node what the cluster looks like, and adopt the answer. Any
+    /// node can answer, leader or not: membership is local, read-only state. A
+    /// node that cannot answer teaches us nothing, which is not worth failing a
+    /// call over. Returns whether a configuration was adopted.
     pub(crate) async fn refresh_config(&self, kv: &Kv) -> bool {
         self.ask(kv).await.is_some_and(|(adopted, _)| adopted)
     }
 
-    /// One `GetConfig`: adopt whatever membership it carries, and report
-    /// `(adopted, is_leader)`. `None` is a node that didn't answer.
+    /// One `GetConfig`: adopt the membership it carries, and report
+    /// `(adopted, is_leader)`. `None` is a node that did not answer.
     ///
-    /// Both halves come from the one call because a scan wants both --
-    /// a node that says it isn't the leader has still just told us where
-    /// the rest of the cluster is, which is often how the leader is
-    /// found at all.
+    /// Both come from one call because a scan wants both: a node that says it
+    /// is not the leader has still told us where the rest of the cluster is,
+    /// which is often how the leader is found.
     async fn ask(&self, kv: &Kv) -> Option<(bool, bool)> {
         let mut kv = kv.clone();
         let resp =
@@ -293,17 +286,16 @@ impl Router {
         Some((self.adopt(resp.members), is_leader))
     }
 
-    /// Replaces what we know about the cluster with what the cluster
-    /// itself says. Addresses we were seeded with that no longer appear
-    /// in the configuration belong to servers that have left it (or were
-    /// never in it): every request sent to one of those costs a round
-    /// trip to be told `NotLeader`, and a stale read sent to one is
-    /// answered from a log that has stopped moving.
+    /// Replace what we know about the cluster with what the cluster says.
+    /// Seed addresses that are no longer in the configuration belong to
+    /// servers that left (or were never in it): every request to one costs a
+    /// round trip to hear `NotLeader`, and a stale read there is answered from
+    /// a log that no longer moves.
     ///
-    /// Returns whether it did: an empty configuration is ignored.
+    /// Returns whether it adopted anything: an empty configuration is ignored.
     fn adopt(&self, members: Vec<ClusterMember>) -> bool {
-        // An empty configuration is a node that hasn't been bootstrapped
-        // or added to a cluster yet. It knows less than we do.
+        // An empty configuration means a node not yet bootstrapped or added to a
+        // cluster. It knows less than we do.
         if members.is_empty() {
             return false;
         }
@@ -326,8 +318,8 @@ impl Router {
         let mut state = self.state.lock().unwrap();
         state.endpoints = endpoints;
         state.by_id = by_id;
-        // The node we were talking to has left the cluster. Continuing to
-        // send it requests would earn nothing but refusals.
+        // The node we were talking to has left the cluster. More requests to it
+        // would get nothing but refusals.
         let left = state
             .leader
             .as_ref()
@@ -338,18 +330,16 @@ impl Router {
         true
     }
 
-    /// Finds the leader by asking every node we know of, in turn, for the
-    /// cluster configuration, and taking the one whose answer says
-    /// `is_leader`. Only a caught-up leader still holding a read quorum
-    /// sets it, so it is proof of leadership rather than a guess -- a
-    /// deposed leader that hasn't noticed yet says false, same as a
+    /// Find the leader by asking every known node in turn for the cluster
+    /// configuration, and taking the one whose answer says `is_leader`. Only a
+    /// caught-up leader that still holds a read quorum sets it, so it proves
+    /// leadership; a deposed leader that has not noticed yet says false, like a
     /// follower.
     ///
-    /// The same answer carries the membership, which is why every node
-    /// reached is worth asking even once it is clear it isn't the leader:
-    /// a client seeded with a single follower has no other way to learn
-    /// where the rest of the cluster -- the leader included -- can be
-    /// reached.
+    /// The same answer carries the membership, so every node reached is worth
+    /// asking even once it is clearly not the leader: a client seeded with one
+    /// follower has no other way to learn where the rest of the cluster,
+    /// leader included, is.
     async fn discover(&self) -> Result<Leader, Error> {
         let mut tried: Vec<String> = Vec::new();
         let mut last: Option<String> = None;
@@ -370,10 +360,9 @@ impl Router {
         })))
     }
 
-    /// The first address we know of that this scan hasn't reached yet.
-    /// Re-read from the state each time rather than snapshotted up front,
-    /// because a `GetConfig` mid-scan can add members we were never
-    /// seeded with -- including, often, the leader itself.
+    /// The first known address this scan has not reached yet. Read from the
+    /// state each time, not copied at the start, because a `GetConfig` mid-scan
+    /// can add members we were never seeded with, often including the leader.
     fn next_untried(&self, tried: &[String]) -> Option<Node> {
         self.state
             .lock()

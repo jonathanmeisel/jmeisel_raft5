@@ -1,33 +1,26 @@
 //! A client for a raft5 cluster.
 //!
-//! [`Client`] wraps the `Kv` service (`client.proto`) so that a caller
-//! writes `client.write(key, value)` and gets an answer, rather than
-//! having to know which of the cluster's nodes is currently able to give
-//! one -- or that the write is a transaction underneath, since the
-//! cluster has no other way to write. Three things stand between those
-//! two:
+//! [`Client`] wraps the `Kv` service (`client.proto`). A caller writes
+//! `client.write(key, value)` and gets an answer, without knowing which
+//! node can serve it, or that the write is a transaction (the cluster's
+//! only way to write). The client handles three things for the caller:
 //!
-//! * **Only the leader can serve most requests**, and a node that isn't
-//!   the leader says so rather than forwarding (Raft §6.2). Every such
-//!   refusal carries a `leader_hint` naming whoever it last heard from,
-//!   and the client follows it -- immediately, without backing off,
-//!   since a redirect is not a failure.
-//! * **The leader changes.** With no hint to follow (a cluster mid
-//!   election, a configuration older than the current leader), the
-//!   client finds it by asking each node it knows of for the cluster
-//!   configuration and seeing which one says `is_leader` -- which only a
-//!   caught-up leader still holding a read quorum does, so it is proof
-//!   rather than a guess.
-//! * **The membership changes.** A client is constructed from seed
-//!   addresses, but the cluster is the authority on who its members are,
-//!   so the client periodically re-reads the configuration from whoever
-//!   it believes is leading and keeps its endpoint list in step --
-//!   picking up servers it was never seeded with, and dropping seeds
-//!   that have left.
+//! * **Only the leader serves most requests.** A follower says so and does
+//!   not forward (Raft §6.2). Each refusal carries a `leader_hint`, and the
+//!   client follows it at once, without backoff: a redirect is not a
+//!   failure.
+//! * **The leader changes.** With no hint (an election is in progress, or
+//!   the configuration is older than the leader), the client asks each
+//!   known node for the cluster configuration and picks the one that says
+//!   `is_leader`. Only a caught-up leader with a read quorum says that, so
+//!   it is proof, not a guess.
+//! * **Membership changes.** The client starts from seed addresses, but
+//!   the cluster decides who its members are. So the client re-reads the
+//!   configuration from the leader from time to time, adds servers it was
+//!   never seeded with, and drops seeds that have left.
 //!
-//! The connection to the leader is kept open between calls, so the
-//! common case -- same leader as last time -- dials nothing and costs one
-//! round trip.
+//! The connection to the leader stays open between calls, so the common
+//! case (same leader as last time) dials nothing and costs one round trip.
 
 mod routing;
 
@@ -37,8 +30,8 @@ use std::time::{Duration, Instant};
 
 use tonic::Status;
 use tonic::transport::ClientTlsConfig;
-/// Re-exported so a caller can build a [`ClientTls`] without depending
-/// on tonic itself.
+/// Re-exported so a caller can build a [`ClientTls`] without a direct
+/// tonic dependency.
 pub use tonic::transport::{Certificate, Identity};
 
 use raft5_shared::raft5::client::{
@@ -72,137 +65,125 @@ use raft5_shared::raft5::client::{
 
 use routing::{Kv, Router};
 
-/// How long a call keeps retrying before giving up. Everything a call is
-/// retried for -- a redirect, an election in progress, a membership
-/// change still committing -- resolves well inside this on a healthy
-/// cluster; past it, something is actually wrong and a caller waiting on
-/// a key/value store deserves to hear about it.
+/// How long a call keeps retrying before it gives up. On a healthy
+/// cluster, everything a call retries for (a redirect, an election, a
+/// membership change still committing) resolves well within this. After
+/// it, something is wrong and the caller should hear about it.
 ///
-/// Note what this costs a large transaction's commit, which has to
-/// replicate to a majority and be applied inside it: a commit that runs
-/// out of deadline comes back as [`Error::InDoubt`], the one outcome a
-/// caller must never replay. "Too slow" therefore becomes
-/// "unrecoverable", not "try again" -- so if the cluster's transaction
-/// size limit ever grows much past its current few megabytes, this
-/// wants growing with it.
+/// This also limits a large transaction's commit, which must replicate to
+/// a majority and apply within it. A commit that runs out of time returns
+/// [`Error::InDoubt`], which a caller must never replay: "too slow"
+/// becomes "unrecoverable", not "try again". If the cluster's transaction
+/// size limit grows far past a few megabytes, raise this too.
 const DEADLINE: Duration = Duration::from_secs(10);
 
-/// How long to wait before re-sending a request that was refused for a
-/// reason only time fixes (no leader elected yet, say). A redirect
-/// carrying a leader hint doesn't wait at all -- there is somewhere
-/// better to ask right now.
+/// How long to wait before resending a request refused for a reason only
+/// time fixes (for example, no leader elected yet). A redirect with a
+/// leader hint does not wait: there is a better node to ask now.
 const RETRY_DELAY: Duration = Duration::from_millis(20);
 
-/// How often to re-read the cluster's membership from the node believed
-/// to be leading.
+/// How often to re-read the cluster's membership from the leader.
 const CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
-/// The lifetime [`Client::write`] asks for on the transaction it opens
-/// behind the caller's back. Short, because that transaction is never
-/// waiting on anything a caller does: it is three round trips end to
-/// end, and holding the key any longer than that would only block
-/// whoever wants it next if this client stalls mid-write.
+/// The lifetime of the transaction that [`Client::write`] opens for the
+/// caller. Short, because that transaction never waits on the caller: it
+/// is three round trips end to end. A longer hold would only block the
+/// next writer if this client stalls mid-write.
 const IMPLICIT_TXN_TTL: Duration = Duration::from_secs(2);
 
-/// How many keys a [`KeyIterator`] fetches per round trip unless told
-/// otherwise. Small enough that walking a handful of keys doesn't drag
-/// back a page of them, large enough that walking a lot doesn't cost a
-/// round trip each.
+/// How many keys a [`KeyIterator`] fetches per round trip by default.
+/// Small enough that a short walk does not fetch a full page, large
+/// enough that a long walk does not cost a round trip per key.
 pub const DEFAULT_KEY_BATCH: u32 = 64;
 
 #[derive(Debug)]
 pub enum Error {
-    /// A seed address (or one the cluster advertised) that isn't a
-    /// usable URI. Addresses look like `http://host:port`.
+    /// A seed address (or an address the cluster advertised) that is not a
+    /// valid URI. Addresses look like `http://host:port`.
     InvalidAddress(String),
-    /// The TLS configuration was refused -- a certificate or key that
-    /// isn't usable PEM, say. Not a handshake failure: those happen per
-    /// connection, and are reported as [`Unavailable`].
+    /// The TLS configuration was refused, for example a certificate or key
+    /// that is not valid PEM. Not a handshake failure: those happen per
+    /// connection and are reported as [`Unavailable`].
     ///
     /// [`Unavailable`]: Error::Unavailable
     Tls(String),
-    /// A client was constructed with no seeds, so it has nowhere to send
+    /// The client was built with no seeds, so it has nowhere to send
     /// anything.
     NoSeeds,
     /// Rejected before it was sent.
     InvalidArgument(&'static str),
     /// The cluster refused outright. Unlike [`Unavailable`], this is not
-    /// about timing: the request is one no node will serve at any point,
-    /// so it was not retried. Asking for more than a limit allows, or
-    /// sending something malformed, lands here.
+    /// about timing: no node will ever serve this request, so it was not
+    /// retried. Examples: asking for more than a limit allows, or a
+    /// malformed request.
     ///
     /// [`Unavailable`]: Error::Unavailable
     Rejected(String),
-    /// Nobody served the request: either no member managed to before the
-    /// deadline, or (for `Bootstrap`, which doesn't retry) the node
-    /// refused outright. The text is the last refusal or transport
-    /// failure seen.
+    /// Nobody served the request: no member did before the deadline, or (for
+    /// `Bootstrap`, which does not retry) the node refused outright. The text
+    /// is the last refusal or transport failure seen.
     Unavailable(String),
-    /// The transaction is over and nothing it buffered was written.
+    /// The transaction is over, and nothing it buffered was written.
     ///
-    /// Not retried by this library, because the retry isn't the request
-    /// -- it is the whole transaction, reads and all, and only the
-    /// caller knows what those were. Replaying is always safe: an
-    /// aborted transaction wrote nothing.
+    /// This library does not retry it, because the retry is the whole
+    /// transaction, reads included, and only the caller knows what those
+    /// were. A replay is always safe: an aborted transaction wrote nothing.
     Aborted {
         reason: AbortReason,
-        /// Which key was contended, for [`AbortReason::LockConflict`].
+        /// The contended key, for [`AbortReason::LockConflict`].
         key: Option<Vec<u8>>,
     },
-    /// The commit reached the log and then the leader changed, so
-    /// nothing anywhere can say whether it committed or was rolled back.
-    /// `seq` is where the entry went.
+    /// The commit reached the log, and then the leader changed, so nobody can
+    /// say if it committed or was rolled back. `seq` is where the entry went.
     ///
     /// **Do not replay the transaction.** Every other failure here means
-    /// nothing was written; this one means nobody knows. Re-running a
-    /// read-modify-write that already applied applies it twice. Read the
-    /// keys back and decide from what is actually there.
+    /// nothing was written; this one means nobody knows. Running a
+    /// read-modify-write again after it already applied applies it twice.
+    /// Read the keys back and decide from what is there.
     InDoubt { seq: u64 },
-    /// The cluster would not accept who this client is: no token, or one
-    /// it did not sign, or one that has expired.
+    /// The cluster did not accept this client's identity: no token, a token
+    /// it did not sign, or an expired one.
     ///
     /// Never retried. If the client has credentials from an earlier
-    /// [`login`](Client::login) it logs in again once and retries by
-    /// itself before reporting this, so seeing it means that failed too
-    /// -- or that there were no credentials to try.
+    /// [`login`](Client::login), it logs in again once and retries before it
+    /// reports this. So this error means that failed too, or that there were
+    /// no credentials.
     Unauthenticated(String),
-    /// The cluster knows who this client is and will not let them do
-    /// this. Never retried: time does not grant permissions.
+    /// The cluster knows who this client is and does not allow this. Never
+    /// retried: time does not grant permissions.
     PermissionDenied(String),
     /// The thing the request names does not exist: a snapshot id nobody
-    /// created (or that has since been removed), an invitation already
-    /// redeemed. Never retried -- the leader answered, and asking it
-    /// again would only spend the deadline collecting the same answer.
+    /// created (or that was removed), an invitation already redeemed. Never
+    /// retried: the leader answered, and asking again gets the same answer.
     NotFound(String),
-    /// An account request the cluster understood and refused. Never
-    /// retried, for the same reason -- a wrong password does not come
-    /// right on the second attempt.
+    /// An account request that the cluster understood and refused. Never
+    /// retried, for the same reason: a wrong password does not become right
+    /// on the second try.
     Denied {
         reason: Denial,
-        /// What the cluster said, for a human to read.
+        /// What the cluster said, for a human.
         detail: String,
     },
 }
 
-/// One batch of a key walk, as the cluster answered it.
+/// One batch of a key walk, as the cluster sent it.
 ///
-/// Internal: [`KeyIterator`] is the public way to walk keys, and the
-/// only reason this is a type of its own is that `has_more` and
-/// `next_start_key` are two different facts -- a batch can be short, or
-/// empty, and still have keys after it.
+/// Internal: [`KeyIterator`] is the public way to walk keys. This is a
+/// separate type because `has_more` and `next_start_key` are separate
+/// facts: a batch can be short or empty and still have keys after it.
 struct KeyBatch {
     keys: Vec<Vec<u8>>,
     has_more: bool,
-    /// Where the server says the next batch starts. Absent from an
-    /// older server, and from a batch that is the last one.
+    /// Where the server says the next batch starts. Unset by a server that
+    /// does not send it, and on the last batch.
     next_start_key: Option<Vec<u8>>,
 }
 
 /// Someone an ACL or a group can name.
 ///
-/// Users and groups are separate namespaces: `Principal::user("ops")`
-/// and `Principal::group("ops")` are two different principals, and
-/// nothing resolves one to the other.
+/// Users and groups are separate namespaces: `Principal::user("ops")` and
+/// `Principal::group("ops")` are two different principals, and neither
+/// resolves to the other.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Principal {
     User(String),
@@ -227,9 +208,9 @@ impl Principal {
         }
     }
 
-    /// A principal off the wire. A kind this client does not know about
-    /// is left out of the list it was in rather than failing the call:
-    /// an ACL from a newer cluster is still worth most of what it says.
+    /// A principal from the wire. A kind this client does not know is left
+    /// out of its list instead of failing the call: an ACL from a newer
+    /// cluster is still mostly useful.
     fn from_pb(pb: &PbPrincipal) -> Option<Self> {
         match &pb.kind {
             Some(principal::Kind::User(name)) => Some(Self::User(name.clone())),
@@ -284,7 +265,7 @@ impl std::fmt::Display for Right {
 /// One access control list: the key prefix it governs and what it grants.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Acl {
-    /// The prefix. Empty governs every key there is.
+    /// The prefix. An empty prefix governs every key.
     pub prefix: Vec<u8>,
     pub entries: Vec<(Principal, Right)>,
     /// The seq the record was last written at.
@@ -311,14 +292,14 @@ impl Acl {
 /// What governs one key, and what it grants the account that asked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AclFor {
-    /// The ACL that governs the key, or `None` when nothing does --
-    /// which means the key is open to every authenticated account.
+    /// The ACL that governs the key, or `None` if none does. Then the key is
+    /// open to every authenticated account.
     pub acl: Option<Acl>,
-    /// What that ACL grants this account, or `None` when it grants it
-    /// nothing, and when nothing governs the key.
+    /// What that ACL grants this account. `None` if it grants nothing, and
+    /// when nothing governs the key.
     ///
-    /// Note that an administrator sees what the ACL says about them,
-    /// not their bypass: the question is about the ACL.
+    /// An administrator sees what the ACL says about them, not their bypass:
+    /// the question is about the ACL.
     pub effective: Option<Right>,
 }
 
@@ -326,12 +307,12 @@ pub struct AclFor {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Group {
     pub name: String,
-    /// The account that created it, which need not still administer it.
+    /// The account that created it. It need not still administer the group.
     pub created_by: String,
     /// Who may change it.
     pub admins: Vec<Principal>,
-    /// Who is in it. A group here is a nested group: everything in it
-    /// is in this one too, transitively.
+    /// Who is in it. A group in this list is nested: all its members are
+    /// members of this group too, transitively.
     pub members: Vec<Principal>,
     /// The seq the record was last written at.
     pub seq: u64,
@@ -362,34 +343,32 @@ fn entries_to_pb(entries: &[(Principal, Right)]) -> Vec<PbAclEntry> {
 /// Why the cluster refused an account request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Denial {
-    /// The username or the password was wrong. Which of the two is not
-    /// disclosed, so this is the answer for an account that does not
-    /// exist as well.
+    /// The username or the password was wrong. The cluster does not say
+    /// which, so this is also the answer for an account that does not exist.
     BadCredentials,
-    /// An account by that name already exists.
+    /// An account with that name already exists.
     AlreadyExists,
-    /// There is no account by that name to remove.
+    /// No account has that name.
     NoSuchUser,
     /// The caller is not an administrator.
     NotAdmin,
     /// The cluster was started without a signing secret, so it keeps no
     /// accounts and issues no tokens.
     AuthDisabled,
-    /// The invitation offered cannot be spent: unknown, already
-    /// redeemed, withdrawn, lapsed, or issued for a different username.
-    /// Which of those is not distinguished -- there is one thing to do
-    /// about any of them, which is to ask for another.
+    /// The invitation cannot be used: unknown, already redeemed, withdrawn,
+    /// lapsed, or issued for another username. The cluster does not say
+    /// which, because the fix is the same for all: ask for another.
     BadInvite,
-    /// An ACL governs the key or prefix asked about, and does not grant
-    /// this account what the call needed. `Client::get_acl` says which
-    /// ACL decided and what it grants.
+    /// An ACL governs the key or prefix and does not grant this account what
+    /// the call needs. `Client::get_acl` shows which ACL decided and what it
+    /// grants.
     NotPermitted,
-    /// There is no group by that name.
+    /// No group has that name.
     NoSuchGroup,
-    /// There is no ACL on that exact prefix. A longer or a shorter one
-    /// may still govern the keys under it.
+    /// No ACL is set on that exact prefix. A longer or shorter prefix may
+    /// still govern the keys under it.
     NoSuchAcl,
-    /// A reason this version of the client does not know about.
+    /// A reason this client version does not know.
     Unknown,
 }
 
@@ -428,28 +407,25 @@ impl From<auth_error::Kind> for Denial {
     }
 }
 
-/// Why a transaction ended without committing. Each of these means
-/// nothing was written.
+/// Why a transaction ended without a commit. Each of these means nothing
+/// was written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AbortReason {
-    /// A key was held by someone this transaction couldn't displace: an
-    /// older transaction, or one already committing. Worth retrying --
-    /// the holder will finish.
+    /// A key was held by a transaction this one could not displace: an older
+    /// one, or one already committing. Worth a retry: the holder will finish.
     LockConflict,
-    /// Its deadline passed before it committed. A longer one, or less
-    /// work between opening it and committing, would help.
+    /// The deadline passed before the commit. A longer deadline, or less
+    /// work between opening and committing, would help.
     Expired,
-    /// An older transaction took one of its keys, so that the older one
-    /// could make progress rather than the two aborting each other
-    /// forever. Retrying is expected: this transaction is now the older
-    /// one relative to whatever starts next.
+    /// An older transaction took one of its keys, so that the older one makes
+    /// progress instead of the two aborting each other forever. A retry is
+    /// expected: this transaction is older than whatever starts next.
     Wounded,
-    /// The leader changed. A transaction lives on the leader that
-    /// created it and cannot be finished anywhere else.
+    /// The leader changed. A transaction lives on the leader that created it
+    /// and cannot finish anywhere else.
     LeaderChanged,
-    /// The cluster has no transaction by this id -- it was dropped,
-    /// committed already, or died long enough ago that even the record
-    /// of why is gone.
+    /// The cluster has no transaction with this id: it was dropped, already
+    /// committed, or died so long ago that its record is gone.
     Unknown,
 }
 
@@ -460,9 +436,8 @@ impl AbortReason {
             transaction_aborted::Reason::Expired => Self::Expired,
             transaction_aborted::Reason::Wounded => Self::Wounded,
             transaction_aborted::Reason::LeaderChanged => Self::LeaderChanged,
-            // `InDoubt` never reaches here -- it becomes `Error::InDoubt`
-            // before this, precisely so it cannot be mistaken for one of
-            // the reasons that are safe to replay.
+            // `InDoubt` never gets here: it becomes `Error::InDoubt` first, so it
+            // cannot be mistaken for a reason that is safe to replay.
             transaction_aborted::Reason::Unknown | transaction_aborted::Reason::InDoubt => {
                 Self::Unknown
             }
@@ -518,34 +493,31 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// Which moment a read outside a transaction describes, and what was
-/// proved about it. A read inside one is [`Transaction::read`].
+/// proved about it. For a read inside one, see [`Transaction::read`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Consistency<'a> {
-    /// From whichever node the client is currently talking to, without
-    /// checking that it still leads. Cheap -- one round trip and no
-    /// read-quorum round -- at the price of possibly missing recent
-    /// writes, including ones this client itself just made. [`Read::as_of`]
-    /// says how far behind: anything below the seq a commit of yours
-    /// returned means this node has not applied it yet.
+    /// From whichever node the client talks to, without checking that it
+    /// still leads. Cheap (one round trip, no read-quorum round), but it may
+    /// miss recent writes, including this client's own. [`Read::as_of`] says
+    /// how far behind it is: a value below the seq one of your commits
+    /// returned means this node has not applied that commit yet.
     Stale,
-    /// As of the moment the call is answered, reflecting everything
-    /// committed anywhere in the cluster. The node answering proves it
-    /// still leads and still holds a quorum of leases first, which costs
-    /// a round of lease checks that [`Consistency::Stale`] does not.
+    /// As of the moment the call is answered, including everything committed
+    /// anywhere in the cluster. The node first proves it still leads and holds
+    /// a quorum of leases, which costs a round of lease checks that
+    /// [`Consistency::Stale`] does not.
     ///
-    /// Nothing is locked, so the answer describes an instant that has
-    /// already passed: the keys may change immediately after. That is
-    /// the difference from reading inside a [`Transaction`], which holds
-    /// them against conflicting writes until it ends.
+    /// Nothing is locked, so the answer describes a moment already past: the
+    /// keys may change right after. A read in a [`Transaction`] differs: it
+    /// holds the keys against conflicting writes until the transaction ends.
     Linearizable,
-    /// As the keys were when the snapshot with this id was created --
-    /// whatever has happened to them since, including being deleted.
+    /// As the keys were when the snapshot with this id was created, whatever
+    /// happened to them since, including deletes.
     ///
-    /// Stale in the same sense [`Consistency::Stale`] is, and
-    /// deliberately so: it describes a moment that has already passed, so
-    /// any node can serve it without proving it still leads. What it
-    /// *does* guarantee is stability: the same read against the same
-    /// snapshot gives the same answer for as long as that snapshot exists.
+    /// Stale like [`Consistency::Stale`], on purpose: it describes a past
+    /// moment, so any node can serve it without proving it leads. It does
+    /// guarantee stability: the same read of the same snapshot gives the same
+    /// answer for as long as the snapshot exists.
     Snapshot(&'a [u8]),
 }
 
@@ -561,35 +533,35 @@ impl Consistency<'_> {
     }
 }
 
-/// What a read found: one entry per key, in the order they were asked
-/// for, every one of them as of the same moment.
+/// What a read found: one entry per key, in the order asked, all as of
+/// the same moment.
 ///
-/// **Possibly fewer entries than keys.** Once the values in one response
-/// would pass [`raft5_shared::MAX_READ_VALUE_BYTES`] the cluster stops,
-/// and `entries` answers a prefix of the keys -- never an empty one, so
-/// reissuing for `&keys[entries.len()..]` always makes progress. A
-/// versions-only read is never cut short.
+/// **There may be fewer entries than keys.** When the values in one
+/// response would pass [`raft5_shared::MAX_READ_VALUE_BYTES`], the cluster
+/// stops, and `entries` answers a prefix of the keys. The prefix is never
+/// empty, so a reissue for `&keys[entries.len()..]` always makes progress.
+/// A versions-only read is never cut short.
 ///
-/// The reissue is a read of its own, with an `as_of` of its own. In a
-/// [`Transaction`] or at a [`Consistency::Snapshot`] that changes nothing
-/// -- the keys are locked, or the moment is fixed -- but a stale or
-/// linearizable reissue describes a later moment than the first half
-/// did, and comparing the two `as_of`s says whether anything was applied
-/// in between. That is why this library never reissues on your behalf:
-/// stitching the halves together would claim one moment for two.
+/// The reissue is a separate read with its own `as_of`. In a
+/// [`Transaction`] or at a [`Consistency::Snapshot`] that changes nothing:
+/// the keys are locked, or the moment is fixed. A stale or linearizable
+/// reissue describes a later moment, and comparing the two `as_of` values
+/// shows whether anything was applied in between. That is why this
+/// library never reissues for you: joining the halves would claim one
+/// moment for two.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Read<T> {
-    /// The sequence number every entry describes the store as of.
+    /// The seq that every entry describes the store as of.
     ///
     /// In a transaction: committed state as of this point, with the
-    /// transaction's own buffered writes laid over it.
+    /// transaction's own buffered writes on top.
     pub as_of: u64,
     pub entries: Vec<T>,
 }
 
-/// One key's value. `seq` is the sequence number the value was written
-/// at; a key that has never been written (or has been deleted) reads as
-/// `None` at seq 0, since sequencing starts at 1.
+/// One key's value. `seq` is the seq the value was written at. A key that
+/// was never written, or was deleted, reads as `None` at seq 0 (seqs start
+/// at 1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub key: Vec<u8>,
@@ -597,7 +569,7 @@ pub struct Entry {
     pub value: Option<Vec<u8>>,
 }
 
-/// One key's version alone: the seq its value was written at, or 0 if it
+/// One key's version only: the seq its value was written at, or 0 if it
 /// has no value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Version {
@@ -606,9 +578,8 @@ pub struct Version {
 }
 
 impl<T> Read<T> {
-    /// Whether every key asked for was answered -- false when the value
-    /// budget cut the response short. `asked` is how many keys the read
-    /// named.
+    /// Whether every key asked for was answered. False when the value budget
+    /// cut the response short. `asked` is how many keys the read named.
     pub fn is_complete(&self, asked: usize) -> bool {
         self.entries.len() == asked
     }
@@ -643,27 +614,26 @@ fn versions(keys: Vec<Vec<u8>>, ok: ReadOk) -> Read<Version> {
     }
 }
 
-/// A point-in-time view of the store, pinned until it is removed.
+/// A point-in-time view of the store, kept until it is removed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SnapshotInfo {
     pub id: Vec<u8>,
-    /// The sequence number this snapshot reads at. Every write with a
-    /// seq at or below this one is visible through it; nothing above it
-    /// is, however long the snapshot lives.
+    /// The seq this snapshot reads at. Every write at or below this seq is
+    /// visible through it; nothing above it is, however long it lives.
     pub seq: u64,
-    /// What the creating client's clock said at the time. Informational
-    /// only -- it is one machine's wall clock, recorded verbatim, and
-    /// nothing in the cluster depends on it.
+    /// What the creating client's clock said. For information only: it is
+    /// one machine's wall clock, stored as given, and nothing in the cluster
+    /// depends on it.
     pub created_unix_ms: u64,
 }
 
 /// The cluster's membership, as [`Client::members`] reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Membership {
-    /// The id of the member that answered, if it was leading when it did
-    /// -- which, asked through a [`Client`], it nearly always is: the
-    /// client sends the question to the leader. `None` from a leader not
-    /// yet ready to say so (see `GetConfigResponse.is_leader`).
+    /// The id of the member that answered, if it was leading when it
+    /// answered. Through a [`Client`] it nearly always is, because the client
+    /// asks the leader. `None` from a leader not yet ready to say so (see
+    /// `GetConfigResponse.is_leader`).
     pub leader: Option<String>,
     pub members: Vec<Member>,
 }
@@ -672,78 +642,73 @@ pub struct Membership {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Member {
     pub server_id: String,
-    /// Where the other servers replicate to it: its peer API, the
-    /// address [`Client::add_server`] was given.
+    /// Where the other servers replicate to it: its peer API, the address
+    /// given to [`Client::add_server`].
     pub peer_address: String,
     /// Where clients reach it.
     pub client_address: String,
-    /// Whether it votes and counts toward the commit quorum. A server
-    /// added with [`Client::add_server`] starts as a non-voting learner,
-    /// and the leader promotes it once it has caught up quickly enough
-    /// to keep up in real time -- so `true` here for a new server is
-    /// what "it has caught up" looks like from outside.
+    /// Whether it votes and counts toward the commit quorum. A server added
+    /// with [`Client::add_server`] starts as a non-voting learner, and the
+    /// leader promotes it once it keeps up in real time. So `true` for a new
+    /// server means "it has caught up".
     pub voting: bool,
 }
 
-/// One outstanding invitation, as an administrator sees it.
+/// One open invitation, as an administrator sees it.
 ///
-/// Everything about an invitation except the secret, which exists only
-/// in the reply to the [`create_invite`] that minted it.
+/// All facts about an invitation except the secret, which exists only in
+/// the reply to the [`create_invite`] that created it.
 ///
 /// [`create_invite`]: Client::create_invite
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Invite {
-    /// What to name this invitation in a [`revoke_invite`] -- the hash
-    /// of the token rather than the token, so it can be written down and
-    /// passed around without being worth anything.
+    /// The name to give [`revoke_invite`]: the hash of the token, not the
+    /// token, so it can be written down and shared without being worth
+    /// anything.
     ///
     /// [`revoke_invite`]: Client::revoke_invite
     pub id: String,
     /// The administrator who issued it.
     pub issued_by: String,
-    /// Whether the account it creates will be an administrator. Settled
-    /// when the invitation was issued; the recipient has no say.
+    /// Whether the account it creates will be an administrator. Set when it
+    /// was issued; the recipient has no say.
     pub is_admin: bool,
-    /// The one username it may create, if it was issued for a particular
-    /// person.
+    /// The only username it may create, if it was issued for one person.
     pub username: Option<String>,
-    /// When it stops being redeemable, by the cluster's clock.
+    /// When it can no longer be redeemed, by the cluster's clock.
     pub expires_unix_ms: u64,
 }
 
-/// A newly minted invitation: the secret to pass on, and the public
-/// record of it.
+/// A new invitation: the secret to pass on, and its public record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewInvite {
-    /// **The only time this is ever available.** The cluster keeps a
-    /// hash of it and cannot produce it again; an issuer who loses it
-    /// has to withdraw the invitation and mint another.
+    /// **The only time this is available.** The cluster keeps a hash and
+    /// cannot produce it again. An issuer who loses it must withdraw the
+    /// invitation and create another.
     pub token: String,
     pub invite: Invite,
-    /// The sequence number the invitation was written at.
+    /// The seq the invitation was written at.
     pub seq: u64,
 }
 
-/// How one attempt came back, with the transport and protocol-level
-/// differences flattened into the only distinction the retry loop cares
-/// about: done, redirected, or try again.
+/// The result of one attempt, reduced to what the retry loop cares about:
+/// done, redirected, or try again.
 enum Reply<T> {
     Ok(T),
-    /// Not the leader; `Option<String>` is the hinted leader's
-    /// `server_id`, absent if it doesn't know one either.
+    /// Not the leader. The `Option<String>` is the hinted leader's
+    /// `server_id`, or `None` if it knows no leader either.
     NotLeader(Option<String>),
-    /// Refused for a reason that may pass on its own: no leader elected
-    /// yet, a membership change still in flight, a leader that hasn't
-    /// yet committed an entry from its own term.
+    /// Refused for a reason that may pass by itself: no leader yet, a
+    /// membership change in flight, a leader that has not yet committed an
+    /// entry from its own term.
     Unavailable(String),
-    /// The transaction is over. Not retried here: what would have to be
-    /// retried is the whole transaction, which only its caller can
-    /// replay.
+    /// The transaction is over. Not retried here: the retry is the whole
+    /// transaction, which only its caller can replay.
     Aborted { reason: AbortReason, key: Option<Vec<u8>> },
-    /// The commit is in doubt. Retried by nobody, ever.
+    /// The commit is in doubt. Never retried by anyone.
     InDoubt { seq: u64 },
-    /// An account request the cluster refused on its merits. Never
-    /// retried: the answer will not change.
+    /// An account request the cluster refused on its merits. Never retried:
+    /// the answer will not change.
     Denied { reason: Denial, detail: String },
 }
 
@@ -756,10 +721,8 @@ impl<T> Reply<T> {
             Some(raft_error::Kind::Unavailable(why)) => Self::Unavailable(why),
             Some(raft_error::Kind::Aborted(aborted)) => {
                 match transaction_aborted::Reason::try_from(aborted.reason) {
-                    // Split out before anything else can touch it: this
-                    // is the one outcome that must never be retried, so
-                    // it must never be reachable through a variant that
-                    // is.
+                    // Handle this first: it is the one outcome that must never be retried,
+                    // so it must never reach a variant that is.
                     Ok(transaction_aborted::Reason::InDoubt) => Self::InDoubt {
                         seq: aborted.seq.unwrap_or_default(),
                     },
@@ -767,9 +730,8 @@ impl<T> Reply<T> {
                         reason: AbortReason::from_wire(reason),
                         key: aborted.key,
                     },
-                    // A reason this build doesn't know. Reporting it as
-                    // in-doubt is the conservative reading: it refuses to
-                    // replay something it cannot show was not written.
+                    // A reason this build does not know. In-doubt is the safe reading: it
+                    // refuses to replay something that may have been written.
                     Err(_) => Self::InDoubt {
                         seq: aborted.seq.unwrap_or_default(),
                     },
@@ -782,11 +744,11 @@ impl<T> Reply<T> {
 
 /// How a [`Client`] dials the cluster over TLS.
 ///
-/// There is no default trust: the certificates to trust are whatever
-/// `ca` holds, and nothing else -- not the system's roots. So a cluster
-/// with a self-signed certificate is trusted by handing that certificate
-/// here, and a client built for one cluster can't be pointed at some
-/// other server that merely has a publicly-valid certificate.
+/// There is no default trust: only the certificates in `ca` are trusted,
+/// not the system roots. So you trust a cluster with a self-signed
+/// certificate by passing that certificate here, and a client built for
+/// one cluster cannot be pointed at another server that merely has a
+/// publicly valid certificate.
 #[derive(Clone)]
 pub struct ClientTls {
     ca: Certificate,
@@ -795,9 +757,9 @@ pub struct ClientTls {
 }
 
 impl ClientTls {
-    /// Trusts servers whose certificate chains to `ca` -- which may be a
-    /// self-signed leaf trusted as its own anchor, as long as it is not
-    /// marked `CA:TRUE`.
+    /// Trust servers whose certificate chains to `ca`. `ca` may be a
+    /// self-signed leaf used as its own anchor, if it is not marked
+    /// `CA:TRUE`.
     pub fn new(ca: Certificate) -> Self {
         Self {
             ca,
@@ -806,17 +768,16 @@ impl ClientTls {
         }
     }
 
-    /// Presents `identity` to the server, for a cluster whose client API
-    /// requires mTLS. It needs the `clientAuth` extended key usage if it
-    /// lists any.
+    /// Present `identity` to the server, for a cluster whose client API
+    /// requires mTLS. If it lists extended key usages, it needs
+    /// `clientAuth`.
     pub fn identity(mut self, identity: Identity) -> Self {
         self.identity = Some(identity);
         self
     }
 
-    /// Checks every server's certificate against `name` instead of the
-    /// host in its address -- for one certificate, with one name, shared
-    /// by every node.
+    /// Check every server's certificate against `name` instead of the host in
+    /// its address. For one certificate, with one name, shared by all nodes.
     pub fn server_name(mut self, name: impl Into<String>) -> Self {
         self.server_name = Some(name.into());
         self
@@ -834,32 +795,31 @@ impl ClientTls {
     }
 }
 
-/// A handle on a raft5 cluster.
+/// A handle to a raft5 cluster.
 ///
-/// Cheap to clone -- clones share one connection to the leader and one
-/// view of the membership -- and safe to use from many tasks at once.
+/// Cheap to clone (clones share one connection to the leader and one view
+/// of the membership) and safe to use from many tasks at once.
 #[derive(Clone)]
 pub struct Client {
     router: Arc<Router>,
 }
 
 impl Client {
-    /// A client that starts out knowing `seeds`: client API addresses
-    /// (`http://host:port`) of nodes that are, or are about to become,
-    /// members. They are a starting point rather than a fixed list --
-    /// the cluster's own configuration takes over as soon as any one of
-    /// them answers.
+    /// A client that starts from `seeds`: client API addresses
+    /// (`http://host:port`) of nodes that are, or will become, members. They
+    /// are a starting point, not a fixed list: the cluster's own
+    /// configuration takes over when any one of them answers.
     ///
-    /// Must be called from within a Tokio runtime: it spawns the task
-    /// that keeps that configuration up to date.
+    /// Call it inside a Tokio runtime: it starts the task that keeps the
+    /// configuration current.
     pub fn new(seeds: impl IntoIterator<Item = impl AsRef<str>>) -> Result<Self, Error> {
         Self::build(seeds, None)
     }
 
-    /// [`Client::new`], for a cluster whose client API is served over
-    /// TLS. Every node is dialed over TLS, whatever scheme its address
-    /// names -- `http://` included, which is what a cluster that
-    /// predates TLS still advertises.
+    /// [`Client::new`], for a cluster whose client API uses TLS. Every node
+    /// is dialed over TLS, whatever scheme its address names, including
+    /// `http://`, which a cluster advertises when its configuration was made
+    /// without TLS.
     pub fn with_tls(
         seeds: impl IntoIterator<Item = impl AsRef<str>>,
         tls: ClientTls,
@@ -876,44 +836,39 @@ impl Client {
         Ok(Self { router })
     }
 
-    /// The client API addresses this client currently knows of: the
-    /// seeds until the cluster's configuration has been read, its
-    /// membership afterwards.
+    /// The client API addresses this client knows: the seeds until it reads
+    /// the cluster's configuration, the membership after that.
     pub fn endpoints(&self) -> Vec<String> {
         self.router.endpoints()
     }
 
-    /// Writes `value` to `key`, or deletes `key` if `value` is `None`,
-    /// whatever it currently holds, returning the sequence number it
-    /// committed at. Returns only once the write has been committed
-    /// *and* applied, so a transactional read that follows it reflects
+    /// Write `value` to `key`, or delete `key` if `value` is `None`, whatever
+    /// it holds now. Returns the seq of the commit. Returns only after the
+    /// write is committed and applied, so a transactional read after it sees
     /// it.
     ///
-    /// A transaction is the cluster's only way to write, so this opens
-    /// one of its own, buffers the key, and commits -- three round trips
-    /// rather than one. [`transaction`] is the same machinery with the
-    /// steps left to the caller, and is what to reach for when more than
-    /// one key is involved or the value depends on what was read.
+    /// A transaction is the cluster's only way to write, so this opens one,
+    /// buffers the key, and commits: three round trips, not one.
+    /// [`transaction`] is the same mechanism with the steps left to you; use
+    /// it when more than one key is involved or the value depends on a read.
     ///
-    /// Losing a key to a contending transaction is not a failure here:
-    /// an aborted transaction wrote nothing, so this simply opens
-    /// another and tries again until [`DEADLINE`]. [`Error::InDoubt`] is
-    /// the exception and is never retried.
+    /// Losing a key to another transaction is not a failure here: an aborted
+    /// transaction wrote nothing, so this opens another and tries again until
+    /// [`DEADLINE`]. [`Error::InDoubt`] is the exception and is never retried.
     ///
-    /// A write interrupted by a lost connection may be retried after it
-    /// has already committed, since nothing tells the client which of the
-    /// two happened. The retry rewrites the same key with the same value,
-    /// so the only trace of it is a second sequence number.
+    /// A write cut off by a lost connection may be retried after it already
+    /// committed, because the client cannot tell which happened. The retry
+    /// writes the same value to the same key, so the only trace is a second
+    /// seq.
     ///
     /// [`transaction`]: Client::transaction
     pub async fn write(&self, key: &[u8], value: Option<&[u8]>) -> Result<u64, Error> {
         let deadline = Instant::now() + DEADLINE;
         loop {
             match self.write_once(key, value).await {
-                // Nothing here needs reconsidering -- the value doesn't
-                // depend on what the key held -- so a lost key just
-                // means going round again, to the same deadline the rest
-                // of the client works to.
+                // The value does not depend on what the key held, so a lost key just
+                // means trying again, within the same deadline as the rest of the
+                // client.
                 Err(Error::Aborted { .. }) if Instant::now() < deadline => {
                     tokio::time::sleep(RETRY_DELAY).await;
                 }
@@ -923,33 +878,33 @@ impl Client {
     }
 
     /// One attempt at [`write`](Client::write): open a transaction, buffer the
-    /// one key, commit. A failure anywhere leaves `Transaction`'s `Drop`
-    /// to give the locks back rather than waiting for the deadline.
+    /// key, commit. On any failure, `Transaction`'s `Drop` gives the locks
+    /// back instead of waiting for the deadline.
     async fn write_once(&self, key: &[u8], value: Option<&[u8]>) -> Result<u64, Error> {
         let txn = self.transaction(IMPLICIT_TXN_TTL).await?;
         txn.write(key, value).await?;
         txn.commit().await
     }
 
-    /// Opens a transaction: reads and writes across any number of keys
-    /// that commit together, or not at all.
+    /// Open a transaction: reads and writes across any number of keys that
+    /// commit together, or not at all.
     ///
-    /// This is the only way to write, and the only way to read something
-    /// guaranteed current -- [`read`] outside a transaction may be
-    /// stale. A transaction reads what it needs, buffers the changes,
-    /// and commits them as a single raft entry: every key lands at one
-    /// sequence number, nobody else can write a key it has touched in
-    /// the meantime, and a read it made is still true when it commits.
-    /// That is what makes a read-modify-write possible.
+    /// This is the only way to write, and a way to read data that stays
+    /// current. A transaction reads what it needs, buffers changes, and
+    /// commits them as one raft entry:
+    /// - every key lands at one seq,
+    /// - nobody else can write a key it has touched meanwhile,
+    /// - every read it made is still true when it commits.
     ///
-    /// `ttl` is how long the cluster will hold its locks. Choose it by
-    /// how long the work between opening and committing actually takes,
-    /// not generously: until the transaction finishes, nobody else can
-    /// write the keys it has read.
+    /// That makes a read-modify-write possible.
     ///
-    /// Failing is normal and usually means try again -- see
-    /// [`Error::Aborted`], which always means nothing was written. The
-    /// one exception is [`Error::InDoubt`], which must not be replayed.
+    /// `ttl` is how long the cluster holds its locks. Choose it by how long the
+    /// work between opening and committing really takes, not generously: until
+    /// the transaction ends, nobody else can write the keys it read.
+    ///
+    /// A failure is normal and usually means "try again": see
+    /// [`Error::Aborted`], which always means nothing was written. The one
+    /// exception is [`Error::InDoubt`], which you must not replay.
     ///
     /// ```no_run
     /// # async fn f(client: raft5_client::Client) -> Result<(), raft5_client::Error> {
@@ -984,16 +939,16 @@ impl Client {
         })
     }
 
-    /// Reads `keys`, every one as of the same moment, at `consistency`.
+    /// Read `keys`, all as of the same moment, at `consistency`.
     ///
-    /// Duplicates are fine and are answered at each position. At most
+    /// Duplicate keys are fine and are answered at each position. At most
     /// [`raft5_shared::MAX_KEYS_PER_READ`] keys; more is refused before
-    /// anything is sent. The whole read is refused if any one key is one
-    /// this account may not read.
+    /// anything is sent. The whole read is refused if this account may not
+    /// read any one of the keys.
     ///
-    /// The answer may cover only a prefix of `keys` -- see [`Read`] for
-    /// when, and why a reissue is left to you. For a read whose keys must
-    /// also *stay* as read, use [`Transaction::read`].
+    /// The answer may cover only a prefix of `keys`: see [`Read`] for when,
+    /// and why the reissue is left to you. If the keys must also stay as
+    /// read, use [`Transaction::read`].
     pub async fn read(
         &self,
         keys: &[impl AsRef<[u8]>],
@@ -1003,14 +958,12 @@ impl Client {
         Ok(entries(keys, ok))
     }
 
-    /// [`read`], for the sequence numbers alone -- 0 for a key with no
-    /// value.
+    /// [`read`], for the seqs only: 0 for a key with no value.
     ///
-    /// Answered from an index of seqs without reading any value, so it
-    /// costs the same whatever the values weigh, and is never cut short.
-    /// This is the call for "has this changed since I last looked?";
-    /// [`read`] can answer that only by sending the whole value back for
-    /// you to discard.
+    /// Answered from the seq index without reading any value, so the cost
+    /// does not depend on value size, and the answer is never cut short. Use
+    /// it to ask "has this changed since I last looked?": [`read`] can answer
+    /// that only by sending back the whole value for you to discard.
     ///
     /// [`read`]: Client::read
     pub async fn read_versions(
@@ -1022,8 +975,8 @@ impl Client {
         Ok(versions(keys, ok))
     }
 
-    /// Walks the keys that had a value when `snapshot_id` was created --
-    /// including ones deleted since, and excluding ones created since.
+    /// Walk the keys that had a value when `snapshot_id` was created,
+    /// including keys deleted since and excluding keys created since.
     pub fn key_iterator_at(&self, snapshot_id: &[u8], start_key: &[u8]) -> KeyIterator {
         KeyIterator::new(
             self.clone(),
@@ -1034,21 +987,20 @@ impl Client {
         )
     }
 
-    /// Pins the current sequence number as a snapshot, so that reads at
-    /// [`Consistency::Snapshot`] and [`key_iterator_at`] can later see
-    /// the store exactly as it is now.
+    /// Save the current seq as a snapshot, so that reads at
+    /// [`Consistency::Snapshot`] and [`key_iterator_at`] can see the store as
+    /// it is now.
     ///
-    /// `id` must be unique; creating one that already exists is refused
-    /// rather than moving the existing snapshot forward. Passing `None`
-    /// uses this machine's clock, formatted as a timestamp -- which is
-    /// where a clock belongs, since the cluster has no wall clock of its
-    /// own and a leader-assigned one would be a replicated
-    /// non-determinism. A collision at the same millisecond comes back
-    /// as an ordinary already-exists, which [`create_snapshot`] retries
-    /// past with a suffix.
+    /// `id` must be unique: creating one that exists is refused, not used to
+    /// move the snapshot forward. `None` uses this machine's clock as a
+    /// timestamp. The clock belongs on the client: the cluster has no wall
+    /// clock, and a leader-assigned time would be replicated
+    /// non-determinism. Two defaults in the same millisecond collide as a
+    /// normal "already exists", which [`create_snapshot`] resolves with a
+    /// suffix.
     ///
-    /// Administrators only: until it is removed, a snapshot holds every
-    /// version of every key that has changed since it was taken.
+    /// Administrators only: until it is removed, a snapshot keeps every
+    /// version of every key that changed after it.
     ///
     /// [`key_iterator_at`]: Client::key_iterator_at
     /// [`create_snapshot`]: Client::create_snapshot
@@ -1059,10 +1011,9 @@ impl Client {
             None => {
                 let base = timestamp_id(now);
                 match self.create_snapshot_once(base.as_bytes(), now).await {
-                    // Two snapshots defaulted in the same millisecond.
-                    // Disambiguating here rather than making the caller
-                    // do it: they asked for "a snapshot of now", and
-                    // which suffix it gets is not their problem.
+                    // Two snapshots defaulted in the same millisecond. Resolve it here: the
+                    // caller asked for "a snapshot of now", and the suffix is not its
+                    // problem.
                     Err(Error::Rejected(_)) => {
                         let mut last = Err(Error::Rejected("snapshot id taken".into()));
                         for n in 1..16u32 {
@@ -1096,8 +1047,8 @@ impl Client {
         .await
     }
 
-    /// Releases a snapshot. The versions it was holding become
-    /// collectable, and reads at it start failing. Administrators only.
+    /// Release a snapshot. The versions it kept can be collected, and reads
+    /// at it start to fail. Administrators only.
     pub async fn remove_snapshot(&self, id: &[u8]) -> Result<u64, Error> {
         let request = RemoveSnapshotRequest {
             snapshot_id: id.to_vec(),
@@ -1109,11 +1060,11 @@ impl Client {
         .await
     }
 
-    /// Every snapshot that currently exists.
+    /// Every snapshot that exists.
     ///
-    /// The only way to discover ids: snapshot records live in the
-    /// reserved range, which [`key_iterator`] hides. Possibly stale, on
-    /// the same terms as any read outside a transaction.
+    /// The only way to find ids: snapshot records live in the reserved range,
+    /// which [`key_iterator`] hides. Possibly stale, like any read outside a
+    /// transaction.
     ///
     /// [`key_iterator`]: Client::key_iterator
     pub async fn list_snapshots(&self) -> Result<Vec<SnapshotInfo>, Error> {
@@ -1125,13 +1076,13 @@ impl Client {
         .await
     }
 
-    /// Walks every key that currently has a value, in order, from
-    /// `start_key` on. Pass an empty slice to start at the beginning.
+    /// Walk every key that has a value now, in order, from `start_key` on.
+    /// Pass an empty slice to start at the beginning.
     ///
-    /// Outside a transaction, like [`read`], this is stale: each batch
-    /// is a local read of whichever node answered, and keys written
-    /// since may be missing. [`Transaction::key_iterator`] is the
-    /// current one.
+    /// Outside a transaction, like a [`read`] at [`Consistency::Stale`], this
+    /// is stale: each batch is a local read on whichever node answered, and
+    /// keys written since may be missing. For a current walk, use
+    /// [`Transaction::key_iterator`].
     ///
     /// ```no_run
     /// # async fn f(client: raft5_client::Client) -> Result<(), raft5_client::Error> {
@@ -1165,13 +1116,12 @@ impl Client {
         .await
     }
 
-    /// The one `Read` call underneath every read method, handing back the
-    /// keys it was asked about alongside the answer so the caller can
-    /// pair them up.
+    /// The one `Read` call behind every read method. Returns the keys it was
+    /// asked about with the answer, so the caller can pair them.
     ///
-    /// Checks the answer's shape: it may cover fewer keys than were
-    /// asked about, but never more, and never none of a non-empty list
-    /// -- the cluster always answers at least the first key.
+    /// Checks the shape of the answer: it may cover fewer keys than asked,
+    /// but never more, and never none of a non-empty list (the cluster always
+    /// answers at least the first key).
     async fn read_inner(
         &self,
         keys: &[impl AsRef<[u8]>],
@@ -1205,19 +1155,19 @@ impl Client {
         Ok((request.keys, ok))
     }
 
-    /// Adds a server to the cluster, at the address its *peer* API is
-    /// reachable on -- the one other nodes replicate to, which the
-    /// leader dials (over the cluster's peer mTLS, if it has any) to ask
-    /// the server its id and client address. It joins as a non-voting
-    /// learner and is promoted automatically once it has caught up (Raft
-    /// §4.2.1), so this one call is the whole operation.
+    /// Add a server to the cluster, at the address of its peer API (the one
+    /// other nodes replicate to). The leader dials it there (over the
+    /// cluster's peer mTLS, if any) to ask the server its id and client
+    /// address. It joins as a non-voting learner and is promoted
+    /// automatically when it catches up (Raft §4.2.1), so this one call is the
+    /// whole operation.
     ///
-    /// The scheme of `peer_address` doesn't matter: the leader dials it
-    /// over TLS or not according to its own configuration.
+    /// The scheme of `peer_address` does not matter: the leader uses TLS or
+    /// not, as its own configuration says.
     ///
-    /// Returns once the change has committed. Only one membership change
-    /// may be in flight at a time; a call that collides with another is
-    /// retried like any other transient refusal.
+    /// Returns once the change commits. Only one membership change can be in
+    /// flight at a time; a call that collides with another is retried like
+    /// any other temporary refusal.
     pub async fn add_server(&self, peer_address: &str) -> Result<(), Error> {
         let request = AddServerRequest {
             peer_address: peer_address.to_string(),
@@ -1229,8 +1179,7 @@ impl Client {
         .await
     }
 
-    /// Removes a server from the cluster. Returns once the change has
-    /// committed.
+    /// Remove a server from the cluster. Returns once the change commits.
     pub async fn remove_server(&self, server_id: &str) -> Result<(), Error> {
         let request = RemoveServerRequest {
             server_id: server_id.to_string(),
@@ -1242,10 +1191,10 @@ impl Client {
         .await
     }
 
-    /// Changes the cluster's heartbeat interval, which every election
-    /// and lease timeout is derived from. Returns once the change has
-    /// committed. Raise it for nodes far apart: it should comfortably
-    /// exceed the round trip between any two servers.
+    /// Change the cluster's heartbeat interval, from which every election and
+    /// lease timeout is derived. Returns once the change commits. Raise it for
+    /// nodes far apart: it should be well above the round trip between any two
+    /// servers.
     pub async fn set_heartbeat(&self, heartbeat_ms: u64) -> Result<(), Error> {
         let request = SetHeartbeatRequest {
             heartbeat_millis: heartbeat_ms,
@@ -1256,9 +1205,8 @@ impl Client {
         .await
     }
 
-    /// The heartbeat interval the cluster is running at, as the node
-    /// this client is talking to sees it -- which, like [`read`], may
-    /// briefly lag a change that has only just been made.
+    /// The cluster's heartbeat interval, as the node this client talks to
+    /// sees it. Like a stale [`read`], it may briefly lag a change just made.
     ///
     /// [`read`]: Client::read
     pub async fn heartbeat_ms(&self) -> Result<u64, Error> {
@@ -1270,10 +1218,9 @@ impl Client {
         .await
     }
 
-    /// Every member of the cluster, and whether each votes yet, as the
-    /// leader has the configuration -- which a follower's may briefly
-    /// lag. A server added with [`add_server`] shows as non-voting until
-    /// it has caught up.
+    /// Every member of the cluster, and whether each votes yet, from the
+    /// leader's configuration (a follower's may briefly lag). A server added
+    /// with [`add_server`] shows as non-voting until it catches up.
     ///
     /// [`add_server`]: Client::add_server
     pub async fn members(&self) -> Result<Membership, Error> {
@@ -1302,19 +1249,18 @@ impl Client {
         .await
     }
 
-    /// Forms a single-node cluster around the node called `server_id`
-    /// (Raft §4.4), which must be one of this client's endpoints. Every
-    /// other node joins that cluster through [`add_server`] instead.
+    /// Form a single-node cluster around the node named `server_id` (Raft
+    /// §4.4), which must be one of this client's endpoints. Every other node
+    /// joins that cluster through [`add_server`].
     ///
-    /// Sent to each endpoint in turn: a node refuses a `server_id` that
-    /// isn't its own, so the guard decides which one acts on it, and a
-    /// node that already belongs to a cluster refuses outright. Unlike
-    /// every other call this one does not retry -- bootstrapping is
-    /// irreversible, and a node that has only just started may need a
-    /// moment before it can accept one.
+    /// Sent to each endpoint in turn. A node refuses a `server_id` that is not
+    /// its own, so the guard picks which node acts, and a node already in a
+    /// cluster refuses outright. Unlike every other call, this one does not
+    /// retry: bootstrap cannot be undone, and a node that just started may need
+    /// a moment before it accepts one.
     ///
-    /// `heartbeat_ms` is the new cluster's heartbeat interval -- `None`
-    /// for the server's default. See [`set_heartbeat`].
+    /// `heartbeat_ms` is the new cluster's heartbeat interval, or `None` for
+    /// the server's default. See [`set_heartbeat`].
     ///
     /// [`add_server`]: Client::add_server
     /// [`set_heartbeat`]: Client::set_heartbeat
@@ -1335,22 +1281,20 @@ impl Client {
             match kv.bootstrap(request.clone()).await {
                 Ok(resp) => match config_reply(resp) {
                     Reply::Ok(()) => return Ok(()),
-                    // The cluster's answer, not this node's mood, so
-                    // asking the next node would collect the same one.
+                    // The cluster's answer, not this node's state, so the next node would
+                    // give the same one.
                     Reply::Denied { reason, detail } => {
                         return Err(Error::Denied { reason, detail });
                     }
-                    // A membership change has no key and so no
-                    // precondition, and it is not a transaction; every
-                    // other variant is unreachable here, and each says
-                    // the same thing anyway -- this node said no.
+                    // A membership change has no key, no precondition, and no transaction.
+                    // Every other variant cannot happen here, and each means the same thing
+                    // anyway: this node said no.
                     _ => last = Some(format!("{} refused to bootstrap", node.key)),
                 },
-                // Reported rather than folded into the "nobody could
-                // serve it" below: an operator whose token is missing or
-                // whose identity is not the one this node was started
-                // with needs to be told that, not told the cluster was
-                // busy. Same reasoning as in `call_inner`.
+                // Report this, do not fold it into "nobody could serve it" below: an
+                // operator whose token is missing, or whose identity is not the one this
+                // node was started with, must be told so, not told the cluster was busy.
+                // Same reasoning as in `call_inner`.
                 Err(status) if status.code() == tonic::Code::Unauthenticated => {
                     return Err(Error::Unauthenticated(status.message().to_string()));
                 }
@@ -1366,9 +1310,8 @@ impl Client {
         })))
     }
 
-    /// `call`, plus a re-read of the membership on success: the client
-    /// has just changed who the cluster's members are, so its own view
-    /// of them is known to be out of date.
+    /// `call`, and then a re-read of the membership on success: the client
+    /// just changed the cluster's members, so its own view is out of date.
     async fn change_config<F, Fut>(&self, op: F) -> Result<(), Error>
     where
         F: Fn(Kv) -> Fut,
@@ -1381,18 +1324,17 @@ impl Client {
         Ok(())
     }
 
-    /// Logs in, and uses the resulting token for everything this client
-    /// does from here on -- including connections it already holds, and
-    /// every clone of it.
+    /// Log in, and use the resulting token for everything this client does
+    /// from now on, including connections it already holds and all of its
+    /// clones.
     ///
-    /// Against a cluster started without a signing secret this fails
-    /// with [`Denial::AuthDisabled`]: there is nothing to log in to.
+    /// Against a cluster started without a signing secret, this fails with
+    /// [`Denial::AuthDisabled`]: there is nothing to log in to.
     ///
-    /// The credentials are kept in memory so that a token expiring
-    /// mid-session can be replaced without the caller noticing. For a
-    /// caller unwilling to hold a password for the life of the client,
-    /// [`login_with_token`] does the same job without that -- at the
-    /// cost of surfacing the expiry.
+    /// The credentials stay in memory, so a token that expires mid-session is
+    /// replaced without the caller noticing. A caller that does not want to
+    /// hold a password for the client's lifetime can use [`login_with_token`]
+    /// instead, at the cost of seeing the expiry.
     ///
     /// [`login_with_token`]: Client::login_with_token
     pub async fn login(&self, username: &str, password: &str) -> Result<(), Error> {
@@ -1402,42 +1344,40 @@ impl Client {
         Ok(())
     }
 
-    /// Uses a token obtained elsewhere.
+    /// Use a token obtained elsewhere.
     ///
-    /// Nothing is validated here -- the first request to carry it is
-    /// what finds out whether the cluster agrees. No credentials are
-    /// stored, so an expiry is reported as
-    /// [`Error::Unauthenticated`] rather than quietly replaced.
+    /// Nothing is checked here: the first request that carries it finds out
+    /// whether the cluster accepts it. No credentials are stored, so an expiry
+    /// is reported as [`Error::Unauthenticated`], not silently replaced.
     pub fn login_with_token(&self, token: String) {
         self.router.set_token(Some(token));
         self.router.set_credentials(None);
     }
 
-    /// Forgets the token and any credentials held with it.
+    /// Forget the token and any credentials held with it.
     pub fn logout(&self) {
         self.router.set_token(None);
         self.router.set_credentials(None);
     }
 
-    /// Whether this client currently holds a token. Says nothing about
-    /// whether the cluster still accepts it.
+    /// Whether this client holds a token. Says nothing about whether the
+    /// cluster still accepts it.
     pub fn is_logged_in(&self) -> bool {
         self.router.has_token()
     }
 
     /// Who this client logged in as, if it logged in.
     ///
-    /// `None` for a client holding a token it was handed rather than one
-    /// it asked for: a token names its holder, but this client does not
-    /// read the tokens it carries.
+    /// `None` for a client that was given a token: a token names its holder,
+    /// but this client does not read the tokens it carries.
     pub fn username(&self) -> Option<String> {
         self.router.username()
     }
 
-    /// Creates an account. Administrators only.
+    /// Create an account. Administrators only.
     ///
-    /// `is_admin` decides whether the new account may in turn manage
-    /// accounts. Returns the sequence number the account was written at.
+    /// `is_admin` decides whether the new account may manage accounts in
+    /// turn. Returns the seq the account was written at.
     pub async fn create_user(
         &self,
         username: &str,
@@ -1456,11 +1396,11 @@ impl Client {
         .await
     }
 
-    /// Removes an account. Administrators only.
+    /// Remove an account. Administrators only.
     ///
-    /// A token already issued to that account goes on being accepted
-    /// until it expires -- nothing can un-issue one -- but it buys no
-    /// administrative rights from the moment the account is gone.
+    /// A token already issued to that account stays valid until it expires
+    /// (nothing can withdraw one), but it gives no administrative rights once
+    /// the account is gone.
     pub async fn delete_user(&self, username: &str) -> Result<u64, Error> {
         let request = DeleteUserRequest {
             username: username.to_string(),
@@ -1472,20 +1412,18 @@ impl Client {
         .await
     }
 
-    /// Mints an invitation, so that someone without an account can
-    /// create one for themselves. Administrators only.
+    /// Create an invitation, so someone without an account can create one
+    /// for themselves. Administrators only.
     ///
-    /// The returned [`NewInvite::token`] is the thing to pass on, and
-    /// this is the only moment it exists: the cluster stores a hash of
-    /// it and cannot produce it again.
+    /// Pass on the returned [`NewInvite::token`]. This is the only moment it
+    /// exists: the cluster stores a hash and cannot produce it again.
     ///
-    /// `is_admin` fixes what the resulting account will be -- an
-    /// administrator's decision, made here, not the recipient's.
-    /// `username`, if given, pins the invitation to that one name, so a
-    /// misdelivered invitation cannot become an account under an
-    /// unexpected one. `ttl` is refused outright if it is longer than
-    /// the cluster is willing to grant, rather than quietly shortened;
-    /// `Duration::ZERO` asks for the cluster's default.
+    /// - `is_admin` sets what the new account will be: the administrator
+    ///   decides here, not the recipient.
+    /// - `username`, if given, pins the invitation to that name, so a
+    ///   misdelivered invitation cannot become an account with another name.
+    /// - `ttl` is refused if it is longer than the cluster allows, not
+    ///   shortened. `Duration::ZERO` asks for the cluster's default.
     pub async fn create_invite(
         &self,
         is_admin: bool,
@@ -1504,21 +1442,20 @@ impl Client {
         .await
     }
 
-    /// Spends an invitation on a new account, choosing its password.
+    /// Use an invitation to create an account, and choose its password.
     ///
-    /// The one call on this client that needs no login -- a caller
-    /// holding an invitation is by definition someone with no account
-    /// yet. It does not log the client in either: the account exists
-    /// afterwards, and [`login`](Client::login) is what gets a token for
-    /// it.
+    /// The one call on this client that needs no login: a caller with an
+    /// invitation has no account yet. It does not log the client in either:
+    /// the account exists afterwards, and [`login`](Client::login) gets a
+    /// token for it.
     ///
-    /// The invitation is spent in the same transaction that writes the
-    /// account, so it works exactly once. Two failures leave it
-    /// unspent and are worth telling apart:
-    /// [`Denial::AlreadyExists`] means the username is taken and
-    /// another can be tried with the same token, while
-    /// [`Denial::BadInvite`] means the token itself is no good and a new
-    /// one has to come from whoever issued it.
+    /// The invitation is used up in the same transaction that writes the
+    /// account, so it works exactly once. Two failures leave it unused and are
+    /// worth telling apart:
+    /// - [`Denial::AlreadyExists`]: the username is taken; try another with
+    ///   the same token.
+    /// - [`Denial::BadInvite`]: the token itself is bad; get a new one from
+    ///   the issuer.
     pub async fn redeem_invite(
         &self,
         token: &str,
@@ -1530,10 +1467,9 @@ impl Client {
             username: username.to_string(),
             password: password.to_string(),
         };
-        // `call_inner(.., false)`: there are no credentials to fall back
-        // on here and nothing to fall back to. A client redeeming an
-        // invitation has no account to log in to -- that is what it is
-        // in the middle of creating.
+        // `call_inner(.., false)`: there are no credentials to fall back on. A
+        // client redeeming an invitation has no account to log in to; it is
+        // creating one.
         self.call_inner(
             |mut kv: Kv| {
                 let request = request.clone();
@@ -1544,10 +1480,10 @@ impl Client {
         .await
     }
 
-    /// Every invitation that is still outstanding. Administrators only.
+    /// Every open invitation. Administrators only.
     ///
-    /// Never the secrets -- those are gone. Lapsed invitations are not
-    /// listed: they cannot be spent, and the cluster sweeps them itself.
+    /// Never the secrets: those are gone. Lapsed invitations are not listed:
+    /// nobody can use them, and the cluster sweeps them itself.
     pub async fn list_invites(&self) -> Result<Vec<Invite>, Error> {
         self.call(|mut kv: Kv| async move {
             kv.list_invites(ListInvitesRequest {})
@@ -1557,13 +1493,13 @@ impl Client {
         .await
     }
 
-    /// Withdraws an outstanding invitation, by its
-    /// [`id`](Invite::id). Administrators only.
+    /// Withdraw an open invitation, by its [`id`](Invite::id). Administrators
+    /// only.
     ///
-    /// The remedy for one sent to the wrong person: the secret cannot be
-    /// recalled, only made worthless. An invitation that has already
-    /// been redeemed is [`Error::Rejected`] -- which is the answer worth
-    /// having, since it means someone got there first.
+    /// The fix for one sent to the wrong person: the secret cannot be
+    /// recalled, only made worthless. An invitation already redeemed gives
+    /// [`Error::Rejected`], which is the answer you need: someone used it
+    /// first.
     pub async fn revoke_invite(&self, invite_id: &str) -> Result<u64, Error> {
         let request = RevokeInviteRequest {
             invite_id: invite_id.to_string(),
@@ -1577,24 +1513,22 @@ impl Client {
 
     // -- groups and ACLs ----------------------------------------------
     //
-    // Every call here that *changes* something contends for one key --
-    // the permission epoch, which all of them write -- so two at once
-    // resolve the way any two conflicting transactions do and one may
-    // come back [`Error::Aborted`]. That is deliberate: it is what lets
-    // the cluster decide each of these against a view that cannot move
-    // underneath it, so that (say) a write grant being revoked cannot be
-    // spent in its last moment on an ACL granting it back. Replaying an
-    // aborted one is always safe, since it wrote nothing.
+    // Every call here that changes something writes one shared key, the
+    // permission epoch. So two at once resolve like any two conflicting
+    // transactions, and one may return [`Error::Aborted`]. This is on
+    // purpose: the cluster decides each change against a view that cannot
+    // move under it, so (for example) a write grant being revoked cannot be
+    // used in its last moment to write an ACL that grants it back. A replay
+    // of an aborted call is always safe: it wrote nothing.
     //
-    // Reading them contends for nothing.
+    // Reads contend for nothing.
 
-    /// Creates a group. Any authenticated account may, up to a
-    /// per-account quota; this client's account becomes its sole
-    /// administrator whether or not `admins` says so.
+    /// Create a group. Any authenticated account may, up to a per-account
+    /// quota. This client's account becomes its only administrator, whatever
+    /// `admins` says.
     ///
-    /// A group is a name for a set of principals and is worth something
-    /// only when an ACL names it, so creating one grants its creator
-    /// nothing they did not already have.
+    /// A group is a name for a set of principals and is useful only when an
+    /// ACL names it, so creating one gives its creator nothing new.
     pub async fn create_group(
         &self,
         name: &str,
@@ -1613,10 +1547,10 @@ impl Client {
         .await
     }
 
-    /// Deletes a group. Its administrators, or a cluster administrator.
+    /// Delete a group. Its administrators, or a cluster administrator.
     ///
-    /// ACLs that named it are left alone: a grant to a group that no
-    /// longer exists matches nobody.
+    /// ACLs that name it are left alone: a grant to a group that no longer
+    /// exists matches nobody.
     pub async fn delete_group(&self, name: &str) -> Result<u64, Error> {
         let request = DeleteGroupRequest {
             name: name.to_string(),
@@ -1628,12 +1562,12 @@ impl Client {
         .await
     }
 
-    /// Adds and removes members and administrators, in one transaction.
-    /// The group's administrators, or a cluster administrator.
+    /// Add and remove members and administrators, in one transaction. The
+    /// group's administrators, or a cluster administrator.
     ///
-    /// Additions are applied before removals, so a principal in both
-    /// lists ends up removed -- which is what makes "these exactly" a
-    /// single call that cannot land halfway.
+    /// Additions apply before removals, so a principal in both lists ends up
+    /// removed. That makes "exactly these" one call that cannot land half
+    /// done.
     pub async fn update_group(
         &self,
         name: &str,
@@ -1656,8 +1590,8 @@ impl Client {
         .await
     }
 
-    /// One group, as stored -- members and admins are not expanded, so a
-    /// nested group appears as itself.
+    /// One group, as stored: members and admins are not expanded, so a nested
+    /// group appears as itself.
     pub async fn get_group(&self, name: &str) -> Result<Group, Error> {
         let request = GetGroupRequest {
             name: name.to_string(),
@@ -1679,17 +1613,16 @@ impl Client {
         .await
     }
 
-    /// Writes the ACL governing a key prefix, replacing whatever it
-    /// held. An empty prefix governs every key there is.
+    /// Write the ACL that governs a key prefix, replacing what it held. An
+    /// empty prefix governs every key.
     ///
-    /// Requires `write` on that prefix -- which, by the longest-prefix
-    /// rule, means write on it or on a shorter prefix that governs it.
-    /// A cluster administrator may always.
+    /// Requires `write` on that prefix, which, by the longest-prefix rule,
+    /// means write on it or on a shorter prefix that governs it. A cluster
+    /// administrator may always.
     ///
-    /// What it will not accept is the *default*: creating an ACL where
-    /// no ACL currently decides is an administrator's act, because a key
-    /// nothing governs is open to everyone and that is permission to use
-    /// the key rather than authority over who else may.
+    /// It does not accept the default: creating an ACL where no ACL decides is
+    /// an administrator's act. A key nothing governs is open to everyone, and
+    /// that gives permission to use the key, not authority over who else may.
     pub async fn set_acl(
         &self,
         prefix: &[u8],
@@ -1706,12 +1639,12 @@ impl Client {
         .await
     }
 
-    /// Removes the ACL on a key prefix, so the next shorter one that has
-    /// one governs instead.
+    /// Remove the ACL on a key prefix, so the next shorter prefix with an ACL
+    /// governs instead.
     ///
-    /// Same authority as writing it, with the same exception from the
-    /// other side: a removal that would leave the prefix governed by
-    /// nothing, and so open to everyone, is an administrator's act.
+    /// Same authority as writing it, with the same exception from the other
+    /// side: a removal that leaves the prefix governed by nothing, and so open
+    /// to everyone, is an administrator's act.
     pub async fn delete_acl(&self, prefix: &[u8]) -> Result<u64, Error> {
         let request = DeleteAclRequest {
             prefix: prefix.to_vec(),
@@ -1723,12 +1656,11 @@ impl Client {
         .await
     }
 
-    /// Which ACL governs `key`, and what it grants this client's
-    /// account.
+    /// Which ACL governs `key`, and what it grants this client's account.
     ///
-    /// The question someone holding a [`Denial::NotPermitted`] actually
-    /// has, answered in one round trip rather than by reimplementing
-    /// group expansion against [`list_acls`](Client::list_acls).
+    /// The question a holder of [`Denial::NotPermitted`] has, answered in one
+    /// round trip, without reimplementing group expansion on top of
+    /// [`list_acls`](Client::list_acls).
     pub async fn get_acl(&self, key: &[u8]) -> Result<AclFor, Error> {
         let request = GetAclRequest { key: key.to_vec() };
         self.call(|mut kv: Kv| {
@@ -1738,8 +1670,8 @@ impl Client {
         .await
     }
 
-    /// Every ACL, shortest prefix first -- which is the order they take
-    /// effect in, least specific to most.
+    /// Every ACL, shortest prefix first: the order they take effect, least
+    /// specific to most.
     pub async fn list_acls(&self) -> Result<Vec<Acl>, Error> {
         self.call(|mut kv: Kv| async move {
             kv.list_acls(ListAclsRequest {}).await.map(list_acls_reply)
@@ -1747,12 +1679,12 @@ impl Client {
         .await
     }
 
-    /// Gets a token and starts using it, without touching whatever
-    /// credentials are stored.
+    /// Get a token and start to use it, without touching the stored
+    /// credentials.
     ///
-    /// `call_inner(.., false)`: `Login` is the one call that must not
-    /// answer an expired token by logging in again, which is what it is
-    /// in the middle of doing.
+    /// `call_inner(.., false)`: `Login` is the one call that must not answer
+    /// an expired token by logging in again, because that is what it is
+    /// doing.
     async fn refresh_token(&self, username: &str, password: &str) -> Result<(), Error> {
         let request = LoginRequest {
             username: username.to_string(),
@@ -1770,18 +1702,15 @@ impl Client {
 
         let token = match routed {
             Ok(token) => token,
-            // Nobody could be shown to be leading. For a cluster that
-            // has not been bootstrapped yet that is not a failure, it is
-            // the normal state -- and logging in is precisely what an
-            // operator has to do there, to get the token `Bootstrap`
-            // will ask for. A node with no configuration answers a login
-            // from the credentials it was started with and needs no
-            // leader to do it, so ask the nodes directly.
+            // No node could be shown to be leading. For a cluster not yet
+            // bootstrapped, that is normal, not a failure, and logging in is what an
+            // operator must do there to get the token `Bootstrap` asks for. A node
+            // with no configuration answers a login from its startup credentials
+            // and needs no leader, so ask the nodes directly.
             Err(Error::Unavailable(why)) => match self.login_directly(&request).await {
                 Ok(token) => token,
-                // Report the original complaint rather than the second
-                // one: "no leader" is the more useful of the two, and
-                // the direct attempt was the speculative one.
+                // Report the first complaint, not the second: "no leader" is more
+                // useful, and the direct attempt was a guess.
                 Err(Error::Unavailable(_)) => return Err(Error::Unavailable(why)),
                 Err(e) => return Err(e),
             },
@@ -1793,9 +1722,9 @@ impl Client {
 
     /// One `Login` per known endpoint, in turn, with no leader routing.
     ///
-    /// The fallback for a cluster with no leader to route to. Sent to
-    /// each node rather than one because this client's seeds may include
-    /// nodes that are not the one holding the startup credentials.
+    /// The fallback for a cluster with no leader. Sent to each node, not one,
+    /// because this client's seeds may include nodes that do not hold the
+    /// startup credentials.
     async fn login_directly(&self, request: &LoginRequest) -> Result<String, Error> {
         let mut last: Option<String> = None;
         for node in self.router.nodes() {
@@ -1803,9 +1732,8 @@ impl Client {
             match kv.login(request.clone()).await {
                 Ok(resp) => match login_reply(resp) {
                     Reply::Ok(token) => return Ok(token),
-                    // A refusal on the merits is the cluster's answer,
-                    // not this node's, so asking the next one would only
-                    // collect the same refusal again.
+                    // A refusal on the merits is the cluster's answer, not this node's, so
+                    // the next node would give the same refusal.
                     Reply::Denied { reason, detail } => {
                         return Err(Error::Denied { reason, detail });
                     }
@@ -1819,8 +1747,8 @@ impl Client {
         })))
     }
 
-    /// Runs one RPC against the leader, following redirects and retrying
-    /// transient refusals until [`DEADLINE`].
+    /// Run one RPC on the leader, following redirects and retrying temporary
+    /// refusals until [`DEADLINE`].
     async fn call<T, F, Fut>(&self, op: F) -> Result<T, Error>
     where
         F: Fn(Kv) -> Fut,
@@ -1829,9 +1757,9 @@ impl Client {
         self.call_inner(op, true).await
     }
 
-    /// `call`, saying whether an expired token may be replaced by
-    /// logging in again. Only `Login` itself passes `false`, so that
-    /// answering an expiry cannot recurse into answering an expiry.
+    /// `call`, with a flag that says whether an expired token may be replaced
+    /// by a new login. Only `Login` passes `false`, so handling an expiry
+    /// cannot recurse into handling an expiry.
     async fn call_inner<T, F, Fut>(&self, op: F, allow_relogin: bool) -> Result<T, Error>
     where
         F: Fn(Kv) -> Fut,
@@ -1852,31 +1780,27 @@ impl Client {
 
             match self.router.leader(hint.take()).await {
                 Ok(leader) => {
-                    // Bounded by whatever is left of the deadline rather
-                    // than by a timeout of its own: a write blocks until
-                    // it commits, and how long that may legitimately take
-                    // is exactly the question the deadline answers.
+                    // Limited by what is left of the deadline, not by its own timeout: a
+                    // write blocks until it commits, and the deadline is exactly how long
+                    // that may take.
                     match tokio::time::timeout(remaining, op(leader.kv)).await {
                         Ok(Ok(Reply::Ok(value))) => return Ok(value),
                         Ok(Ok(Reply::NotLeader(new_hint))) => {
                             self.router.forget(&leader.key);
                             last = Some(format!("{} is not the leader", leader.key));
                             hint = new_hint;
-                            // A hint is somewhere better to ask, right
-                            // now -- waiting first would only add
-                            // latency to a request that can be served.
+                            // A hint names a better node to ask now. Waiting would only add delay
+                            // to a request that can be served.
                             if hint.is_some() {
                                 continue;
                             }
                         }
-                        // The leader is the right node; the cluster just
-                        // isn't ready to answer yet. Keep the connection.
+                        // The leader is the right node; the cluster is not ready to answer yet.
+                        // Keep the connection.
                         Ok(Ok(Reply::Unavailable(why))) => last = Some(why),
-                        // Neither of these is this loop's to retry. An
-                        // aborted transaction has to be replayed whole,
-                        // reads included, which only its caller can do;
-                        // an in-doubt commit must not be replayed at
-                        // all.
+                        // Neither is this loop's to retry. An aborted transaction must be
+                        // replayed whole, reads included, which only its caller can do. An
+                        // in-doubt commit must not be replayed at all.
                         Ok(Ok(Reply::Aborted { reason, key })) => {
                             return Err(Error::Aborted { reason, key });
                         }
@@ -1884,28 +1808,22 @@ impl Client {
                         Ok(Ok(Reply::Denied { reason, detail })) => {
                             return Err(Error::Denied { reason, detail });
                         }
-                        // Before the `is_permanent` arm below, which
-                        // would otherwise turn these into `Rejected` and
-                        // lose the distinction.
+                        // Before the `is_permanent` arm below, which would turn these into
+                        // `Rejected` and lose the difference.
                         //
-                        // An expired token is the common case here, and
-                        // a client that knows what it logged in with can
-                        // simply get another. Once only: an identity the
-                        // cluster genuinely will not accept has to fail
-                        // rather than spin.
+                        // An expired token is the common case, and a client that knows its
+                        // login can get a new token. Only once: an identity the cluster really
+                        // rejects must fail, not loop.
                         Ok(Err(status)) if status.code() == tonic::Code::Unauthenticated => {
                             if allow_relogin
                                 && !relogged_in
                                 && let Some((username, password)) = self.router.credentials()
                             {
                                 relogged_in = true;
-                                // Boxed to break the type-level cycle:
-                                // this calls `refresh_token`, which
-                                // calls back into `call_inner`. It can
-                                // never recurse at runtime -- that call
-                                // passes `allow_relogin: false` -- but
-                                // the future's size would be infinite
-                                // without an indirection here.
+                                // Boxed to break a type-level cycle: this calls `refresh_token`, which
+                                // calls `call_inner`. It never recurses at runtime (that call passes
+                                // `allow_relogin: false`), but without indirection the future's size
+                                // would be infinite.
                                 let again =
                                     Box::pin(self.refresh_token(&username, &password)).await;
                                 if again.is_ok() {
@@ -1920,12 +1838,9 @@ impl Client {
                         Ok(Err(status)) if status.code() == tonic::Code::NotFound => {
                             return Err(Error::NotFound(status.message().to_string()));
                         }
-                        // A refusal that time cannot fix. Retrying it
-                        // would only spend the whole deadline arriving at
-                        // the same answer, and then report it as though
-                        // the cluster had been too busy -- which would
-                        // hide the actual reason in the one case where
-                        // the caller most needs to read it.
+                        // A refusal that time cannot fix. A retry would only spend the whole
+                        // deadline to reach the same answer, then report it as if the cluster
+                        // was busy, which hides the real reason when the caller most needs it.
                         Ok(Err(status)) if is_permanent(&status) => {
                             return Err(Error::Rejected(status.message().to_string()));
                         }
@@ -1939,8 +1854,8 @@ impl Client {
                         }
                     }
                 }
-                // Nobody could be shown to be leading this round -- an
-                // election, most likely. Worth another look shortly.
+                // No node could be shown to be leading this round, probably because of an
+                // election. Look again soon.
                 Err(Error::Unavailable(why)) => last = Some(why),
                 Err(e) => return Err(e),
             }
@@ -1950,15 +1865,14 @@ impl Client {
     }
 }
 
-/// Whether a `Status` says the request itself is wrong, rather than that
-/// this node happened not to be able to serve it. Deliberately a short
-/// list: anything not named here is retried, because treating a
-/// transient failure as permanent is the worse mistake of the two.
+/// Whether a `Status` says the request itself is wrong, not that this node
+/// could not serve it. A short list on purpose: anything not named here is
+/// retried, because treating a temporary failure as permanent is the worse
+/// mistake.
 ///
-/// `Unauthenticated`, `PermissionDenied` and `NotFound` belong on that
-/// list too and are absent only because `call_inner` has already
-/// returned on all three, with error types that say more than
-/// `Rejected` would.
+/// `Unauthenticated`, `PermissionDenied` and `NotFound` also belong on the
+/// list. They are missing only because `call_inner` already returns on all
+/// three, with error types that say more than `Rejected`.
 fn is_permanent(status: &Status) -> bool {
     matches!(
         status.code(),
@@ -1966,18 +1880,18 @@ fn is_permanent(status: &Status) -> bool {
     )
 }
 
-/// Re-reads the cluster's membership from the node the client believes
-/// is leading, so that servers added since the client started are
-/// reachable and ones removed since are forgotten.
+/// Re-read the cluster's membership from the node the client believes is
+/// leading, so servers added after the client started are reachable and
+/// removed ones are forgotten.
 ///
 /// Holds only a `Weak`, so the task ends when the last [`Client`] is
-/// dropped rather than keeping it (and its connections) alive forever.
-/// There is nothing to refresh on a tick before any call has found a
-/// leader, so a tick with none is skipped.
+/// dropped, instead of keeping it and its connections alive forever. A
+/// tick before any call has found a leader has nothing to refresh, so it is
+/// skipped.
 ///
-/// Before the first tick, the seeds are tried in turn until one hands
-/// over a configuration, so the client's endpoints are the cluster's own
-/// as soon as any seed is reachable rather than after the first request.
+/// Before the first tick, it tries the seeds in turn until one returns a
+/// configuration. So the client's endpoints become the cluster's own as
+/// soon as any seed is reachable, not after the first request.
 fn spawn_config_refresh(router: Weak<Router>) {
     tokio::spawn(async move {
         if let Some(router) = router.upgrade() {
@@ -2069,8 +1983,8 @@ fn list_snapshots_reply(resp: tonic::Response<ListSnapshotsResponse>) -> Reply<V
 
 /// Milliseconds since the Unix epoch, by this machine's clock.
 ///
-/// The cluster has no wall clock, so a timestamp only ever means "what
-/// the client that asked believed the time to be".
+/// The cluster has no wall clock, so a timestamp only means "what the
+/// client that asked believed the time was".
 fn unix_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2079,7 +1993,7 @@ fn unix_millis() -> u64 {
 }
 
 /// A default snapshot id: the timestamp, in a form the server's id
-/// character set accepts and that sorts chronologically.
+/// character set accepts, and that sorts by time.
 fn timestamp_id(unix_ms: u64) -> String {
     format!("t{unix_ms}")
 }
@@ -2189,7 +2103,7 @@ fn login_reply(resp: tonic::Response<LoginResponse>) -> Reply<String> {
     }
 }
 
-/// An `Invite` off the wire.
+/// An `Invite` from the wire.
 fn invite_from_wire(invite: raft5_shared::raft5::client::Invite) -> Invite {
     Invite {
         id: invite.invite_id,
@@ -2203,9 +2117,8 @@ fn invite_from_wire(invite: raft5_shared::raft5::client::Invite) -> Invite {
 fn create_invite_reply(resp: tonic::Response<CreateInviteResponse>) -> Reply<NewInvite> {
     match resp.into_inner().result {
         // A reply with the token but no record is treated like any other
-        // half-filled one. It is not papered over with a default,
-        // because an invitation shown with no expiry would read as one
-        // that never lapses.
+        // incomplete reply. It is not filled with a default, because an
+        // invitation shown with no expiry would read as one that never lapses.
         Some(create_invite_response::Result::Ok(ok)) => match ok.invite.map(invite_from_wire) {
             Some(invite) => Reply::Ok(NewInvite {
                 token: ok.token,
@@ -2267,9 +2180,8 @@ fn delete_user_reply(resp: tonic::Response<DeleteUserResponse>) -> Reply<u64> {
     }
 }
 
-/// An `AuthError` off the wire. An unrecognized kind is still a refusal
-/// -- reported as such rather than retried, since a cluster that named a
-/// reason meant it.
+/// An `AuthError` from the wire. An unknown kind is still a refusal, not
+/// retried: a cluster that names a reason means it.
 fn denied<T>(error: raft5_shared::raft5::client::AuthError) -> Reply<T> {
     Reply::Denied {
         reason: auth_error::Kind::try_from(error.kind)
@@ -2305,29 +2217,27 @@ fn empty_response<T>() -> Reply<T> {
 /// An open transaction: reads and buffered writes across any number of
 /// keys, which commit together or not at all.
 ///
-/// Held on the leader, not here -- this is a handle to state that lives
-/// there, which is why it has a deadline and why losing the leader ends
-/// it. Nothing it buffers is written until [`commit`]; dropping it,
-/// losing the connection, or simply taking too long all leave the store
-/// exactly as it was.
+/// The state lives on the leader; this is a handle to it. That is why it
+/// has a deadline, and why losing the leader ends it. Nothing it buffers
+/// is written until [`commit`]. Dropping it, losing the connection, or
+/// taking too long all leave the store as it was.
 ///
-/// Every failure short of [`Error::InDoubt`] means nothing was written,
-/// so the usual response is to open another transaction and do it all
-/// again -- including the reads, which is why this library doesn't retry
-/// for you: it doesn't know what they were.
+/// Every failure except [`Error::InDoubt`] means nothing was written, so
+/// the usual response is to open a new transaction and do it all again,
+/// reads included. That is why this library does not retry for you: it
+/// does not know what the reads were.
 ///
 /// [`commit`]: Transaction::commit
 pub struct Transaction {
     client: Client,
     id: Vec<u8>,
-    /// Whether the cluster has already been told this transaction is
-    /// over, so `Drop` doesn't send a redundant request after a commit
-    /// or an explicit abort.
+    /// Whether the cluster already knows this transaction is over, so `Drop`
+    /// does not send a second request after a commit or an explicit abort.
     finished: bool,
 }
 
-/// Just the id -- the client behind it is shared machinery, not part of
-/// what identifies this transaction.
+/// Only the id: the client behind it is shared machinery, not part of
+/// what identifies the transaction.
 impl std::fmt::Debug for Transaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Transaction({})", hex(&self.id))
@@ -2339,17 +2249,16 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 impl Transaction {
-    /// Reads `keys` as part of this transaction, holding every one of
-    /// them against conflicting writes until the transaction finishes.
+    /// Read `keys` as part of this transaction, and hold every one of them
+    /// against conflicting writes until the transaction ends.
     ///
-    /// A key this transaction has already buffered a write for reads
-    /// back as that write -- a transaction sees its own changes. `seq`
-    /// always describes *committed* state even then, since a buffered
-    /// write has no sequence number yet.
+    /// A key this transaction already wrote reads back as that write: a
+    /// transaction sees its own changes. `seq` still describes committed
+    /// state, because a buffered write has no seq yet.
     ///
-    /// Every key is locked before any is read, including any the answer
-    /// leaves out when it is cut short (see [`Read`]) -- so reissuing for
-    /// the rest sees exactly the state this call would have.
+    /// Every key is locked before any is read, including keys the answer
+    /// leaves out when it is cut short (see [`Read`]). So a reissue for the
+    /// rest sees exactly the state this call would have.
     pub async fn read(&self, keys: &[impl AsRef<[u8]>]) -> Result<Read<Entry>, Error> {
         let (keys, ok) = self
             .client
@@ -2358,17 +2267,16 @@ impl Transaction {
         Ok(entries(keys, ok))
     }
 
-    /// The sequence numbers `keys`' values were written at, without
-    /// fetching the values -- 0 for a key with no value.
+    /// The seqs of `keys`' values, without the values: 0 for a key with no
+    /// value.
     ///
     /// Holds the keys against conflicting writes for the rest of the
-    /// transaction exactly as [`read`] does, so this is the cheap half of
-    /// a check-then-write: take the versions, decide, write, commit, and
-    /// nobody else can have touched the keys in between.
+    /// transaction, like [`read`]. So this is the cheap half of a
+    /// check-then-write: get the versions, decide, write, commit, and nobody
+    /// else can have touched the keys in between.
     ///
-    /// The answer describes *committed* state even for a key this
-    /// transaction has itself buffered a write for -- a buffered write
-    /// has no sequence number until the commit assigns one.
+    /// The answer describes committed state, even for a key this transaction
+    /// wrote: a buffered write has no seq until the commit gives it one.
     ///
     /// [`read`]: Transaction::read
     pub async fn read_versions(&self, keys: &[impl AsRef<[u8]>]) -> Result<Read<Version>, Error> {
@@ -2383,19 +2291,18 @@ impl Transaction {
         Some(read_request::Consistency::TransactionId(self.id.clone()))
     }
 
-    /// Walks every key that currently has a value, in order, from
-    /// `start_key` on, as part of this transaction.
+    /// Walk every key that has a value now, in order, from `start_key` on, as
+    /// part of this transaction.
     ///
-    /// Every key it hands back joins the read set and is held against
-    /// conflicting writes until the transaction finishes, exactly as
-    /// [`read`] does -- and what this transaction has buffered is
-    /// reflected, so a key it wrote appears and one it deleted does not.
+    /// Every key it returns joins the read set and is held against
+    /// conflicting writes until the transaction ends, like [`read`]. The walk
+    /// includes this transaction's buffered changes: a key it wrote appears,
+    /// and a key it deleted does not.
     ///
-    /// The *range* is not locked, only the keys. These are per-key
-    /// locks, so a key that didn't exist when the walk passed its
-    /// position can still be created by someone else -- a phantom. A
-    /// transaction that must not miss such a key cannot get that
-    /// guarantee here.
+    /// Only the keys are locked, not the range. The locks are per key, so
+    /// someone else can still create a key at a position the walk already
+    /// passed (a phantom). A transaction that must not miss such a key cannot
+    /// get that guarantee here.
     ///
     /// [`read`]: Transaction::read
     pub fn key_iterator(&self, start_key: &[u8]) -> KeyIterator {
@@ -2408,14 +2315,12 @@ impl Transaction {
         )
     }
 
-    /// Buffers a write to `key` (or a delete, if `value` is `None`) and
-    /// takes the key exclusively.
+    /// Buffer a write to `key` (or a delete, if `value` is `None`) and take
+    /// the key exclusively.
     ///
-    /// Nothing is written here, which is why there is no sequence number
-    /// to return. The value is held on the leader until [`commit`],
-    /// which is what lets every key in the transaction land at the same
-    /// moment -- and is where the one sequence number for all of them
-    /// comes from.
+    /// Nothing is written here, so there is no seq to return. The value waits
+    /// on the leader until [`commit`], which is what lets every key in the
+    /// transaction land at the same moment, under one seq.
     ///
     /// [`commit`]: Transaction::commit
     pub async fn write(&self, key: &[u8], value: Option<&[u8]>) -> Result<(), Error> {
@@ -2432,24 +2337,22 @@ impl Transaction {
             .await
     }
 
-    /// Commits everything this transaction buffered, as one entry.
+    /// Commit everything this transaction buffered, as one entry.
     ///
-    /// Returns the sequence number all of its keys were written at --
-    /// one entry, so one seq for the lot. A transaction that buffered no
-    /// writes commits at 0: there was nothing to append, so there is no
-    /// sequence number to name.
+    /// Returns the seq that all its keys were written at: one entry, one seq.
+    /// A transaction that buffered no writes returns 0: nothing was appended,
+    /// so there is no seq.
     ///
-    /// Returns only once the entry has committed *and* been applied on
-    /// the leader, so a transactional read that follows reflects every
-    /// key of it. A plain [`Client::read`] may not: it can be answered
-    /// by a node this entry hasn't reached yet.
+    /// Returns only after the entry is committed and applied on the leader, so
+    /// a later transactional or linearizable read sees all its keys. A stale
+    /// [`Client::read`] may not: a node the entry has not reached yet can
+    /// answer it.
     pub async fn commit(mut self) -> Result<u64, Error> {
         let request = CommitTransactionRequest {
             transaction_id: self.id.clone(),
         };
-        // Set before the call, not after: whether it succeeds or fails,
-        // the cluster is done with this transaction, and a `Drop` that
-        // then went and said so again would only be noise.
+        // Set before the call, not after: success or failure, the cluster is done
+        // with this transaction, and `Drop` saying so again would only be noise.
         self.finished = true;
         self.client
             .call(|mut kv: Kv| {
@@ -2459,12 +2362,11 @@ impl Transaction {
             .await
     }
 
-    /// Gives up the transaction, releasing its locks now rather than
-    /// when its deadline passes. Nothing it buffered is written.
+    /// Give up the transaction and release its locks now, not at its
+    /// deadline. Nothing it buffered is written.
     ///
-    /// The same thing dropping it does, except that this waits for the
-    /// cluster to confirm -- worth it when the next thing you do needs
-    /// those keys.
+    /// The same as dropping it, except that this waits for the cluster to
+    /// confirm. Use it when your next step needs those keys.
     pub async fn abort(mut self) -> Result<(), Error> {
         self.finished = true;
         Self::send_drop(&self.client, self.id.clone()).await
@@ -2484,16 +2386,15 @@ impl Transaction {
 }
 
 impl Drop for Transaction {
-    /// Tells the cluster to let the locks go.
+    /// Tell the cluster to release the locks.
     ///
-    /// Best-effort by necessity -- `Drop` cannot await, so this can only
-    /// spawn the request and hope. That is fine: the transaction's
-    /// deadline releases the same locks regardless, and this only makes
-    /// it happen sooner. Use [`abort`] instead when you need to know it
-    /// landed.
+    /// Best effort: `Drop` cannot await, so this can only spawn the request.
+    /// That is fine: the transaction's deadline releases the same locks
+    /// anyway, and this only makes it sooner. Use [`abort`] if you need to
+    /// know it happened.
     ///
-    /// Outside a Tokio runtime there is nothing to spawn onto, so this
-    /// does nothing at all and the deadline does the work.
+    /// Outside a Tokio runtime there is nothing to spawn on, so this does
+    /// nothing and the deadline does the work.
     ///
     /// [`abort`]: Transaction::abort
     fn drop(&mut self) {
@@ -2509,32 +2410,32 @@ impl Drop for Transaction {
     }
 }
 
-/// Walks a cluster's keys in order, a batch at a time.
+/// Walk a cluster's keys in order, one batch at a time.
 ///
 /// Built by [`Client::key_iterator`] (a stale walk) or
-/// [`Transaction::key_iterator`] (one whose keys are locked as they are
-/// handed over). Not a [`std::iter::Iterator`]: every batch is a round
-/// trip, so advancing has to be awaited.
+/// [`Transaction::key_iterator`] (keys locked as they are returned). Not a
+/// [`std::iter::Iterator`]: each batch is a round trip, so each step must
+/// be awaited.
 ///
-/// The cost is one RPC per [`batch_size`] keys rather than one per key.
-/// Keys already fetched are handed out from memory, and the next batch
-/// is asked for only when the last one runs out -- so a caller that
-/// stops early never pays for the rest.
+/// The cost is one RPC per [`batch_size`] keys, not one per key. Fetched
+/// keys come from memory, and the next batch is requested only when the
+/// current one runs out, so a caller that stops early never pays for the
+/// rest.
 ///
 /// [`batch_size`]: KeyIterator::batch_size
 pub struct KeyIterator {
     client: Client,
-    /// What the walk asks for: a transaction, a snapshot, or nothing at
-    /// all. Fixed when the iterator is made, so every batch is asked
-    /// for on the same terms -- a walk that changed consistency
-    /// half-way would not describe any one state of the store.
+    /// What the walk asks for: a transaction, a snapshot, or nothing. Fixed
+    /// when the iterator is made, so every batch uses the same terms. A walk
+    /// that changed consistency midway would not describe any one state of
+    /// the store.
     consistency: Option<get_keys_request::Consistency>,
-    /// Where the next batch starts, inclusive. `None` once the cluster
-    /// has said there is nothing after what we have.
+    /// Where the next batch starts, inclusive. `None` once the cluster has
+    /// said there is nothing after what we have.
     next_start: Option<Vec<u8>>,
     batch_size: u32,
-    /// The current batch, reversed so that taking the next key is a
-    /// `pop` off the end rather than a shift off the front.
+    /// The current batch, reversed, so the next key is a `pop` from the end,
+    /// not a shift from the front.
     buffer: Vec<Vec<u8>>,
 }
 
@@ -2554,9 +2455,9 @@ impl KeyIterator {
     }
 
     /// How many keys to fetch per round trip. Defaults to
-    /// [`DEFAULT_KEY_BATCH`]; a server that won't scan this many in one
-    /// call refuses rather than shortening it, so the error surfaces
-    /// here rather than as a quietly smaller batch.
+    /// [`DEFAULT_KEY_BATCH`]. A server that will not scan this many in one call
+    /// refuses instead of sending fewer, so the error shows up here, not as a
+    /// silently smaller batch.
     #[must_use]
     pub fn batch_size(mut self, keys: u32) -> Self {
         self.batch_size = keys;
@@ -2565,10 +2466,9 @@ impl KeyIterator {
 
     /// The next key, or `None` at the end of the keyspace.
     ///
-    /// Answered from the buffer when it can be; otherwise this is where
-    /// the round trip happens. Inside a transaction, that round trip is
-    /// also where the next batch's keys are locked, so this is a point
-    /// at which the transaction can be aborted -- see [`Error::Aborted`].
+    /// Answered from the buffer when possible; otherwise this makes the round
+    /// trip. In a transaction, that round trip also locks the next batch's
+    /// keys, so the transaction can abort here: see [`Error::Aborted`].
     pub async fn next(&mut self) -> Result<Option<Vec<u8>>, Error> {
         loop {
             if let Some(key) = self.buffer.pop() {
@@ -2584,17 +2484,14 @@ impl KeyIterator {
                 .await?;
             let mut keys = batch.keys;
 
-            // Where to go next. The server's own cursor when it sent
-            // one, because only it knows why the batch ended: a walk
-            // can stop having examined far more keys than it kept --
-            // hidden by an ACL, or deleted by the transaction -- and
-            // then there is no last key to derive a cursor from.
+            // Where to go next. Use the server's cursor when it sends one, because
+            // only the server knows why the batch ended: a walk can examine many
+            // more keys than it keeps (hidden by an ACL, or deleted by the
+            // transaction), and then there is no last key to derive a cursor from.
             //
-            // Otherwise the last key of this batch with a single zero
-            // byte appended, which is the smallest key that can sort
-            // after it, so nothing between the two can be skipped --
-            // there is nothing between them. That is also what an older
-            // server, which sends no cursor, needs.
+            // Otherwise, use the batch's last key with one zero byte appended. That
+            // is the smallest key that sorts after it, so nothing can be skipped. A
+            // server that sends no cursor needs this too.
             self.next_start = match batch.next_start_key {
                 Some(next) => Some(next),
                 None if batch.has_more => keys.last().map(|last| {
@@ -2605,11 +2502,9 @@ impl KeyIterator {
                 None => None,
             };
 
-            // An empty batch used not to be able to carry `has_more`.
-            // It can now -- a walk that examined its whole budget
-            // without finding a key this caller may see is exactly
-            // that -- so the loop goes round on the cursor rather than
-            // stopping, and stops only when there is no cursor left.
+            // An empty batch can still have more: a walk that used its whole budget
+            // without finding a key this caller may see. So continue on the cursor,
+            // and stop only when there is no cursor left.
             if keys.is_empty() {
                 if self.next_start.is_some() {
                     continue;
@@ -2621,11 +2516,11 @@ impl KeyIterator {
         }
     }
 
-    /// Everything from here to the end of the keyspace, in order.
+    /// Every key from here to the end of the keyspace, in order.
     ///
-    /// Convenient for a keyspace known to be small; for one that isn't,
-    /// prefer [`next`] and stop when you have what you need, since this
-    /// keeps going -- and, inside a transaction, keeps locking.
+    /// Useful for a keyspace known to be small. For a large one, prefer
+    /// [`next`] and stop when you have what you need: this keeps going, and in
+    /// a transaction it keeps locking.
     ///
     /// [`next`]: KeyIterator::next
     pub async fn collect(mut self) -> Result<Vec<Vec<u8>>, Error> {

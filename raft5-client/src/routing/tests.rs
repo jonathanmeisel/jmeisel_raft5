@@ -25,9 +25,9 @@ fn a_client_needs_somewhere_to_start() {
     ));
 }
 
-/// The cluster is the authority on its own membership: a seed it doesn't
-/// list has left (or never joined), and a member we were never seeded
-/// with is somewhere new to ask.
+/// The cluster decides its own membership: a seed it does not list has left
+/// (or never joined), and a member we were never seeded with is a new place
+/// to ask.
 #[test]
 fn adopting_a_configuration_replaces_the_seed_list() {
     let router = router(&["http://a:1", "http://gone:1"]);
@@ -47,15 +47,15 @@ fn adopting_a_configuration_replaces_the_seed_list() {
     );
 }
 
-/// What makes a `leader_hint` actionable: it names a server, and only
-/// the configuration says where that server's client API is.
+/// What makes a `leader_hint` usable: it names a server, and only the
+/// configuration says where that server's client API is.
 #[tokio::test]
 async fn a_hint_is_followed_once_the_configuration_names_the_server() {
     let router = router(&["http://a:1"]);
 
-    // Nothing known yet, so the hint can't be resolved and the leader
-    // has to be discovered instead -- which, with nothing listening,
-    // fails rather than dialing anywhere.
+    // Nothing is known yet, so the hint cannot be resolved and the leader must
+    // be discovered, which, with nothing listening, fails instead of dialing
+    // anywhere.
     assert!(matches!(
         router.leader(Some("b".to_string())).await,
         Err(Error::Unavailable(_))
@@ -74,8 +74,8 @@ async fn a_hint_is_followed_once_the_configuration_names_the_server() {
     );
 }
 
-// `connect_lazy` dials nothing, but it still registers with the
-// reactor, so remembering a leader needs a runtime under it.
+// `connect_lazy` dials nothing, but it still registers with the reactor,
+// so remembering a leader needs a runtime.
 #[tokio::test]
 async fn a_leader_that_leaves_the_cluster_is_forgotten() {
     let router = router(&["http://a:1", "http://b:1"]);
@@ -91,8 +91,8 @@ async fn a_leader_that_leaves_the_cluster_is_forgotten() {
     );
 }
 
-/// A node with no configuration at all -- not bootstrapped, not yet
-/// added to a cluster -- knows less than the client does.
+/// A node with no configuration (not bootstrapped, not yet added to a
+/// cluster) knows less than the client does.
 #[test]
 fn an_empty_configuration_is_not_adopted() {
     let router = router(&["http://a:1"]);

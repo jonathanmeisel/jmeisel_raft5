@@ -1,256 +1,222 @@
 //! Transaction state and the lock table, for `grpc::KvService`.
 //!
-//! In memory, on the leader, and nowhere else. That is not a shortcut --
-//! it is what makes the scheme correct. A transaction can only commit by
-//! appending to the log, which only a leader can do, so a transaction
-//! whose leader is gone cannot commit no matter what any other node
-//! believes. Nothing here needs to be replicated, and replicating it
-//! would only create state that could outlive the thing it describes.
+//! This state lives in memory on the leader only. That is what makes the
+//! design correct: only a leader can append to the log, so a transaction
+//! whose leader is gone can never commit. Nothing here is replicated,
+//! because replicated state could outlive the leader it belongs to.
 //!
 //! # Isolation
 //!
-//! Strict two-phase locking. A transactional read takes a shared lock on
-//! the key and holds it to the end; a buffered write takes an exclusive
-//! one, or upgrades the shared lock the same transaction already holds;
-//! every lock is released together, after the commit has been applied (or
-//! the transaction has gone away). Two transactions that touch a key in
-//! conflicting ways therefore cannot interleave, which is what makes the
-//! result serializable.
+//! Strict two-phase locking:
+//! - A transactional read takes a shared lock and holds it to the end.
+//! - A buffered write takes an exclusive lock, or upgrades the shared
+//!   lock the same transaction holds.
+//! - All locks are released together, after the commit is applied or
+//!   the transaction ends.
 //!
-//! Every holder is a transaction, because a transaction is the only way
-//! to write anything (see `client.proto`). Nothing can change a key out
-//! from under a transaction that has read it, so a read set is always a
-//! record of something still true.
+//! Two transactions that conflict on a key cannot interleave, so the
+//! result is serializable. A transaction is the only way to write (see
+//! `client.proto`), so every lock holder is a transaction, and a read
+//! set always describes data that is still true.
 //!
-//! # Conflicts: nothing ever waits
+//! # Conflicts: nothing waits
 //!
-//! A request that cannot have a lock is refused immediately. No caller
-//! holds a lock while waiting for another, so there is no wait-for graph
-//! and deadlock is not possible -- not detected and resolved, but absent.
+//! A request that cannot get a lock is refused at once. Nobody holds a
+//! lock while it waits for another, so deadlock cannot occur.
 //!
-//! Fail-fast alone would be deadlock-free and still starve: two
-//! transactions grabbing the same two keys in opposite orders can abort
-//! each other forever, each retry as doomed as the last. So conflicts are
-//! settled by age (wound-wait): a transaction older than everything
-//! blocking it *wounds* those holders -- aborts them and takes the lock --
-//! while a younger one is refused. Ages come from `Txn::priority`, a
-//! counter, so they are a total order with no ties.
+//! Fail-fast alone can starve: two transactions that take the same two
+//! keys in opposite orders can abort each other forever. So conflicts
+//! are settled by age (wound-wait). A transaction older than every
+//! holder in its way *wounds* them (aborts them and takes the lock); a
+//! younger one is refused. `Txn::priority` is a counter, so ages have no
+//! ties.
 //!
-//! One kind of holder is never wounded, for one reason: its writes may
-//! already be in the raft log, and an appended entry cannot be recalled.
-//! A transaction that has begun committing is therefore immune.
+//! A transaction that has started to commit is never wounded: its
+//! entry may already be in the log, and an appended entry cannot be
+//! recalled.
 //!
-//! What that guarantees: the *oldest* open transaction is never refused
-//! by another open transaction, since it wounds them all. It can still be
-//! refused by one already committing, but that finishes in bounded time
-//! -- one append plus its apply -- so a retry makes progress. Every other
-//! transaction gets there by becoming the oldest, which it does simply by
-//! outliving the ones ahead of it.
+//! Result: the oldest open transaction is never refused by another open
+//! one. A committing transaction can still refuse it, but a commit ends
+//! in bounded time (one append and its apply), so a retry makes
+//! progress. Every other transaction gets its turn by becoming the
+//! oldest.
 //!
 //! # Deadlines
 //!
-//! Every transaction carries one, and a transaction past it holds
-//! nothing: the next request to collide with one of its locks releases
-//! them on the spot (`acquire` below), rather than waiting for a sweeper
-//! tick. Lock-release latency measured in sweeper periods would show up
-//! as unexplained stalls on a contended key, when what is actually
-//! holding it is a transaction that died some time ago. The sweeper is
-//! only a reclaimer of memory for transactions nobody happens to collide
-//! with.
+//! A transaction past its deadline holds nothing. The next request that
+//! collides with one of its locks releases them on the spot (see
+//! `acquire`). If release waited for the sweeper, a dead transaction
+//! would cause unexplained stalls on a busy key. The sweeper only
+//! reclaims memory for transactions that nobody collides with.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-/// The longest a transaction may hold its locks. A cap rather than a
-/// clamp: a caller that asked for longer has made an assumption this
-/// server will not honour, and silently giving it a shorter lease than it
-/// asked for would let it act on that assumption anyway.
+/// The longest time a transaction may hold its locks.
+/// A request for more is refused, not clamped: the caller would act
+/// as if it had the longer lease.
 ///
-/// Pulled in two directions. A transaction's locks block everyone else
-/// from the same keys for as long as they are held, and every write in
-/// the system is a transaction, so a long cap means a stuck client can
-/// make a hot key unwritable for that long. But a
-/// `MAX_TRANSACTION_BYTES` transaction is uploaded as many `Write`
-/// calls that must *all* land before this expires, or the locks go and
-/// the work is wasted; at 10 MiB, five seconds would demand a sustained
-/// 2 MB/s with nothing to spare. Fifteen sets that floor around
-/// 700 KB/s, which is a bar any usable link clears.
+/// Two limits pull on this value:
+/// - Every write is a transaction, so a long cap lets a stuck client
+///   block a hot key for that long.
+/// - A max-size transaction (`MAX_TRANSACTION_BYTES`) is sent as many
+///   `Write` calls that must all land before it expires. 15s needs
+///   about 700 KB/s; 5s would need 2 MB/s.
 ///
-/// So the two constants are related: raising `MAX_TRANSACTION_BYTES`
-/// without raising this makes large transactions fail by timing out
-/// mid-upload, for reasons that look nothing like their actual cause.
+/// If you raise `MAX_TRANSACTION_BYTES`, raise this too, or large
+/// transactions time out mid-upload with an error that hides the cause.
 pub const MAX_TRANSACTION_TTL: Duration = Duration::from_secs(15);
 
-/// How many transactions may be open on this node at once. Creating one
-/// is a client asking the server to allocate memory and hold locks, so
-/// there has to be a point at which the answer is no; without it a
-/// client that retries in a loop leaks one per attempt until each TTL
-/// runs out.
+/// The most transactions open on this node at once. Each one holds
+/// memory and locks, so there must be a limit. Without it, a client
+/// that retries in a loop leaks one transaction per attempt until each
+/// TTL runs out.
 pub const MAX_OPEN_TRANSACTIONS: usize = 1024;
 
-/// How much one transaction may buffer.
+/// The most data one transaction may buffer.
 ///
-/// This is not tidiness, and it is not really about memory. A
-/// transaction commits as a single log entry, and an entry too large to
-/// replicate never commits -- and, because it is already in the log and
-/// the leader keeps re-proposing it, nothing after it ever commits
-/// either. The only safe place to refuse it is here, before anything
-/// reaches the log at all. `raft`'s cap chain is the other end of that
-/// argument: everything downstream is sized so that a transaction this
-/// large always replicates, and a static assert there enforces it.
+/// This protects the log, not memory. A transaction commits as one log
+/// entry. An entry too large to replicate never commits, and because
+/// the leader keeps sending it, no later entry commits either. So the
+/// only safe place to refuse it is here, before it reaches the log.
+/// `raft` sizes everything downstream so that an entry this large
+/// always replicates, and a static assert there checks it.
 ///
-/// Counted in raw key and value bytes, which is a little under what the
-/// entry actually costs on disk and on the wire; the headroom between
-/// this and `raft::MAX_ENTRY_BYTES` is what covers the difference.
+/// Counted in raw key and value bytes. The real entry is a little
+/// larger; the gap to `raft::MAX_ENTRY_BYTES` covers that.
 ///
-/// There is deliberately no separate limit on the number of keys. Bytes
-/// are what cost memory and wire time, `entry_size` charges every key an
-/// overhead so a great many tiny ones still add up, and a second limit
-/// would only be another number to explain without bounding anything
-/// this one doesn't.
+/// There is no separate key-count limit. `entry_size` charges each key
+/// an overhead, so many tiny keys still add up.
 pub const MAX_TRANSACTION_BYTES: usize = raft5_shared::MAX_TRANSACTION_BYTES;
 
-/// How much *every* open transaction on this node may buffer between
-/// them.
+/// The most data all open transactions on this node may buffer together.
 ///
-/// The per-transaction cap alone bounds nothing useful: multiplied by
-/// `MAX_OPEN_TRANSACTIONS` it permits gigabytes, all of it held on the
-/// leader before a single byte has been proposed. This is the number
-/// that actually decides how much memory a client can make this node
-/// hold.
+/// The per-transaction cap times `MAX_OPEN_TRANSACTIONS` is gigabytes,
+/// all held on the leader before anything is proposed. This is the
+/// number that limits how much memory clients can make this node hold.
 ///
-/// It is not the whole story: a leader is also buffering in-flight
-/// replication (roughly `MAX_REPLICATION_BATCH_BYTES` per peer, twice
-/// over between the encoded batch and the entries it came from) and a
-/// follower its reassembly buffer, none of which is counted here.
-/// Budget for something like this plus a few hundred megabytes, not for
-/// this alone.
+/// It does not count everything: a leader also buffers replication in
+/// flight (about `MAX_REPLICATION_BATCH_BYTES` per peer, twice over),
+/// and a follower buffers reassembly. Budget for this plus a few
+/// hundred megabytes.
 pub const MAX_BUFFERED_BYTES_NODE_WIDE: usize = 256 * 1024 * 1024;
 
-/// Charged per buffered key on top of its bytes, so that a transaction
-/// of a million empty keys is not free. Roughly what a key costs in map
-/// overhead here plus framing in the entry it becomes.
+/// An extra charge per buffered key, so that a million empty keys are
+/// not free. About what a key costs in map overhead plus entry framing.
 const PER_KEY_OVERHEAD: usize = 64;
 
-/// Opaque, server-generated, and random rather than sequential so that a
-/// client holding a stale id cannot address a transaction that isn't
-/// theirs.
+/// Server-generated and random, not sequential, so a client with a
+/// stale id cannot reach another client's transaction.
 pub type TxnId = [u8; 16];
 
 /// What a transaction buffered, in key order. `None` is a delete.
 pub type BufferedWrites = Vec<(Vec<u8>, Option<Vec<u8>>)>;
 
-/// Which keys a transaction has buffered, in order, and whether each is
-/// a delete. Values omitted -- see `Locks::buffered_from`.
+/// The keys a transaction buffered, in order, and whether each is a
+/// delete. No values: see `Locks::buffered_from`.
 pub type BufferedKeys = Vec<(Vec<u8>, bool)>;
 
-/// What kind of access a request wants, and what a lock grants.
+/// The access a request wants, and the access a lock grants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Read,
     Write,
 }
 
-/// One key's lock.
+/// The lock on one key.
 #[derive(Debug)]
 enum LockState {
-    /// Shared, held by everyone in the set.
+    /// Shared, held by every transaction in the set.
     ///
-    /// A set of owners rather than a reference count, which is the
-    /// obvious encoding and the wrong one: a transaction that reads the
-    /// same key twice would bump a count to two while its read set stayed
-    /// at one entry, and then "the only reader is me, so I may upgrade"
-    /// would be false for a transaction that *is* the only reader.
-    /// Read-then-write is the commonest shape a transaction has. With a
-    /// set, acquiring twice is idempotent, "only me" is exactly
-    /// `holders == {me}`, and releasing cannot leak a phantom holder.
+    /// A set, not a reference count. With a count, a transaction that reads
+    /// a key twice counts as two readers, so "I am the only reader, so I
+    /// may upgrade" fails for read-then-write, the most common shape. With
+    /// a set, a second acquire does nothing, "only me" is
+    /// `holders == {me}`, and a release cannot leave a phantom holder.
     Read { holders: HashSet<TxnId> },
     Write { owner: TxnId },
 }
 
-/// Why a transaction is no longer usable. Kept on the transaction rather
-/// than deleting it, so its owner finds out *why* on their next request
-/// instead of being told it never existed.
+/// Why a transaction can no longer be used. Kept on the transaction, so
+/// that its owner learns the reason on the next request instead of
+/// hearing that the transaction never existed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AbortReason {
     /// Its deadline passed.
     Expired,
-    /// An older transaction took one of its locks. Nothing was written,
-    /// so replaying it is safe.
+    /// An older transaction took one of its locks. Nothing was written, so
+    /// a replay is safe.
     Wounded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxnState {
     Open,
-    /// Its writes are on their way to the log. Past this point it cannot
-    /// be wounded or expired: the entry may already exist.
+    /// Its writes are going to the log. From here it cannot be wounded or
+    /// expired, because the entry may already exist.
     Committing,
     Aborted(AbortReason),
 }
 
 #[derive(Debug)]
 pub struct Txn {
-    /// Lower is older, and older wins. A counter rather than a timestamp:
-    /// a total order with no ties and no dependence on clock resolution,
-    /// and "older" here only ever means "created earlier on this leader".
+    /// Lower is older, and older wins. A counter, not a timestamp: it gives
+    /// a total order with no ties and does not depend on clock resolution.
     priority: u64,
     deadline: Instant,
-    /// The leader term this was created under. A transaction does not
-    /// survive a change of leader -- see `Locks::wipe`.
+    /// The leader term this transaction was created under. A transaction
+    /// does not survive a leader change: see `Locks::observe_term`.
     pub term: u64,
     reads: HashSet<Vec<u8>>,
-    /// Buffered, not written: nothing here has been proposed to raft
-    /// until the transaction commits. `None` is a delete.
+    /// Buffered only: nothing here goes to raft until the commit. `None`
+    /// is a delete.
     writes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     buffered_bytes: usize,
     state: TxnState,
 }
 
-/// Why a request could not have the lock it asked for.
+/// Why a request did not get the lock it asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refused {
-    /// A holder this requester is not allowed to wound. Naming the key is
-    /// the only part of this a caller can act on.
+    /// A holder this requester may not wound. The key is the only part a
+    /// caller can act on.
     Conflict { key: Vec<u8> },
-    /// The transaction is no longer usable.
+    /// The transaction can no longer be used.
     Aborted(AbortReason),
-    /// No transaction by that id -- never created, or reclaimed long
-    /// enough ago that even the tombstone is gone.
+    /// No transaction has this id: it was never created, or its tombstone
+    /// is already reclaimed.
     Unknown,
-    /// The leader changed under it. Its reads were validated against the
-    /// leader that served them, so it cannot be finished anywhere else.
+    /// The leader changed. The reads were checked against the old leader,
+    /// so the transaction cannot finish anywhere else.
     LeaderChanged,
-    /// The request was refused before it could be attempted: too many
-    /// transactions open, or too much buffered in this one.
+    /// Refused before any attempt: too many transactions are open, or this
+    /// one has buffered too much.
     TooMuch(&'static str),
 }
 
-/// Everything under one lock. A synchronous `Mutex` with no `.await`
-/// beneath it, the same discipline the rest of this crate uses for
-/// small shared maps.
+/// All shared state, behind one lock. A synchronous `Mutex` that is
+/// never held across `.await`, as for other small shared maps in this
+/// crate.
 #[derive(Debug, Default)]
 struct Shared {
     next_priority: u64,
-    /// The leader term the table currently reflects, so a change can be
-    /// noticed. `None` before this node has led at all.
+    /// The leader term the table reflects, so that a change is noticed.
+    /// `None` before this node has been leader.
     term: Option<u64>,
     txns: HashMap<TxnId, Txn>,
     locks: HashMap<Vec<u8>, LockState>,
-    /// The sum of `buffered_bytes` over every transaction still holding
-    /// its buffer, against `MAX_BUFFERED_BYTES_NODE_WIDE`. Maintained by
-    /// `buffer_write` and `forget_buffer`, which are the only two places
-    /// a transaction's buffer grows or goes away.
+    /// The sum of `buffered_bytes` over all transactions that still hold a
+    /// buffer, checked against `MAX_BUFFERED_BYTES_NODE_WIDE`. Only
+    /// `buffer_write` and `forget_buffer` change it.
     buffered_total: usize,
 }
 
 impl Shared {
-    /// Grant `owner` `mode` on `key`, or say why not.
+    /// Give `owner` `mode` on `key`, or say why not.
     ///
-    /// The single place `locks` is ever inserted into, and the only place
-    /// the conflict rules live. Both callers -- transactional read and
-    /// buffered write -- come through here, so there is one description
-    /// of what conflicts with what rather than two that have to agree.
+    /// The only place that inserts into `locks`, and the only place that
+    /// holds the conflict rules. Reads and writes both come here, so there
+    /// is one definition of a conflict.
     fn acquire(&mut self, key: &[u8], owner: TxnId, mode: Mode, now: Instant) -> Result<(), Refused> {
         loop {
             let blockers = self.blockers(key, owner, mode);
@@ -259,8 +225,8 @@ impl Shared {
                 return Ok(());
             }
 
-            // Expired holders first: cheaper than wounding, and unlike
-            // wounding it doesn't depend on who is asking.
+            // Release expired holders first. It is cheaper than wounding, and the
+            // result does not depend on who asks.
             let mut released_any = false;
             for blocker in &blockers {
                 if self.is_expired_open(*blocker, now) {
@@ -272,7 +238,7 @@ impl Shared {
                 continue;
             }
 
-            // Wound: only a transaction older than every holder still in
+            // Wound only when this transaction is older than every holder still in
             // its way.
             if let Some(mine) = self.txns.get(&owner).map(|t| t.priority)
                 && blockers.iter().all(|b| self.is_woundable(*b, mine))
@@ -287,17 +253,16 @@ impl Shared {
         }
     }
 
-    /// Who currently holds `key` in a way that conflicts with `owner`
-    /// wanting `mode`. The requester is never its own blocker: a
-    /// transaction re-reading a key it has read, or rewriting a key it
-    /// has written, is not in conflict with itself.
+    /// Who holds `key` in a way that conflicts with `owner` wanting `mode`.
+    /// The requester never blocks itself: re-reading or rewriting its own
+    /// key is not a conflict.
     fn blockers(&self, key: &[u8], owner: TxnId, mode: Mode) -> Vec<TxnId> {
         match (self.locks.get(key), mode) {
             (None, _) => Vec::new(),
-            // Shared against shared: no conflict, whoever else holds it.
+            // Shared with shared: no conflict.
             (Some(LockState::Read { .. }), Mode::Read) => Vec::new(),
-            // Shared against exclusive: everyone but the requester is in
-            // the way. An empty result here is the upgrade case.
+            // Shared with exclusive: everyone but the requester is in the way.
+            // An empty result is the upgrade case.
             (Some(LockState::Read { holders }), Mode::Write) => {
                 holders.iter().copied().filter(|h| *h != owner).collect()
             }
@@ -311,18 +276,17 @@ impl Shared {
         }
     }
 
-    /// Record the grant. Only ever called with no blockers, so replacing
-    /// a shared lock with an exclusive one here is the upgrade -- by then
-    /// the requester is provably its only holder.
+    /// Record the grant. Called only when there are no blockers, so
+    /// replacing a shared lock with an exclusive one here is the upgrade:
+    /// the requester is then the only holder.
     fn install(&mut self, key: &[u8], owner: TxnId, mode: Mode) {
         match mode {
             Mode::Read => match self.locks.get_mut(key) {
                 Some(LockState::Read { holders }) => {
                     holders.insert(owner);
                 }
-                // A key this requester already holds exclusively needs no
-                // shared lock on top: the exclusive one is stronger, and
-                // downgrading it here would be a silent loss of exclusion.
+                // The requester already holds this key exclusively. A shared lock on
+                // top adds nothing, and a downgrade would silently lose exclusion.
                 Some(LockState::Write { .. }) => {}
                 None => {
                     self.locks.insert(
@@ -342,11 +306,10 @@ impl Shared {
 
     /// Drop `owner`'s hold on `key`, if it still has one.
     ///
-    /// The only place `locks` is ever removed from. Every release goes
-    /// through here -- a commit, an abort, the sweeper -- because the
-    /// owner check is what makes a *late* release safe: a release that
-    /// just removed the key would happily delete a lock somebody else
-    /// has since taken.
+    /// The only place that removes from `locks`. Every release (commit,
+    /// abort, sweeper) comes here, because the owner check makes a late
+    /// release safe: a plain remove could delete a lock that someone else
+    /// has taken since.
     fn release(&mut self, key: &[u8], owner: TxnId) {
         let Some(state) = self.locks.get_mut(key) else {
             return;
@@ -369,19 +332,18 @@ impl Shared {
             .is_some_and(|t| t.state == TxnState::Open && t.deadline <= now)
     }
 
-    /// Whether `blocker` can be pushed out of the way by a transaction of
-    /// age `mine`. See the module doc for why `Committing` is immune.
+    /// Whether a transaction of age `mine` may push `blocker` aside. See
+    /// the module doc for why `Committing` is immune.
     fn is_woundable(&self, blocker: TxnId, mine: u64) -> bool {
         self.txns
             .get(&blocker)
             .is_some_and(|t| t.state == TxnState::Open && t.priority > mine)
     }
 
-    /// Mark a transaction unusable and give up everything it held.
+    /// Mark a transaction as unusable and release all it holds.
     ///
-    /// The transaction itself stays in the map as a tombstone so its
-    /// owner's next request can be told *why* rather than "no such
-    /// transaction"; `sweep` reclaims it later.
+    /// The transaction stays in the map as a tombstone, so that its owner's
+    /// next request learns why. `sweep` reclaims it later.
     fn abort(&mut self, id: TxnId, reason: AbortReason) {
         let Some(txn) = self.txns.get_mut(&id) else {
             return;
@@ -394,17 +356,15 @@ impl Shared {
         for key in held {
             self.release(&key, id);
         }
-        // Whatever it buffered will never be written now, so it stops
-        // counting against the node's budget immediately -- the
-        // tombstone left behind is a reason, not a payload.
+        // Its buffer will never be written, so it stops counting against the
+        // node budget now. The tombstone keeps only the reason.
         self.forget_buffer(id);
     }
 
-    /// Give up a transaction's buffered writes and the budget they held.
+    /// Drop a transaction's buffered writes and the budget they held.
     ///
-    /// Idempotent, and the only place besides `buffer_write` that moves
-    /// `buffered_total`, so the two stay in step by there being nowhere
-    /// else for them to drift.
+    /// Safe to call twice. This and `buffer_write` are the only code that
+    /// changes `buffered_total`, so the two cannot drift apart.
     fn forget_buffer(&mut self, id: TxnId) {
         let Some(txn) = self.txns.get_mut(&id) else {
             return;
@@ -414,8 +374,8 @@ impl Shared {
         txn.writes.clear();
     }
 
-    /// Release everything `id` holds without changing its state -- for a
-    /// transaction that is finishing normally rather than being aborted.
+    /// Release all that `id` holds without changing its state, for a
+    /// transaction that ends normally.
     fn release_all(&mut self, id: TxnId) {
         let Some(txn) = self.txns.get(&id) else {
             return;
@@ -444,19 +404,17 @@ impl Locks {
         self.shared.lock().unwrap()
     }
 
-    /// Note the leader term this node is serving under, discarding every
-    /// transaction and every transactional lock if it has changed.
+    /// Record the leader term this node serves under. If it changed,
+    /// discard every transaction and every lock.
     ///
-    /// A transaction belongs to the leader that created it: its reads
-    /// were validated against that leader's state and its commit can only
-    /// happen there. A new term means none of that holds any more, and
-    /// keeping the locks would only make keys unwritable on behalf of
+    /// A transaction belongs to the leader that created it: its reads were
+    /// checked against that leader, and only that leader can commit it.
+    /// After a term change, its locks would only block keys for
     /// transactions that can never commit.
     ///
-    /// Safe to do while a commit is still in flight: its `CommitGuard`
-    /// releases through `discard`, which finds the transaction already
-    /// gone from `txns` and does nothing, rather than removing locks
-    /// that now belong to somebody else.
+    /// Safe while a commit is in flight: its `CommitGuard` releases through
+    /// `discard`, which finds the transaction gone and does nothing. It
+    /// does not remove locks that now belong to someone else.
     pub fn observe_term(&self, term: Option<u64>) {
         let mut shared = self.lock();
         if shared.term == term {
@@ -470,12 +428,11 @@ impl Locks {
 
     /// Reclaim expired transactions and the locks they still hold.
     ///
-    /// A backstop, not the mechanism: `acquire` already releases an
-    /// expired transaction's locks the moment anyone collides with them,
-    /// so this only matters for a transaction nobody happens to want
-    /// anything from -- which costs memory rather than progress.
-    /// Tombstones are reclaimed a grace period past their deadline, late
-    /// enough that their owner has had a chance to be told why.
+    /// A backstop only: `acquire` releases an expired transaction's locks
+    /// as soon as someone collides with them. This handles transactions
+    /// that nobody collides with, which cost memory but not progress.
+    /// Tombstones stay for a grace period past their deadline, so their
+    /// owners can still learn why.
     pub fn sweep(&self, now: Instant, tombstone_grace: Duration) {
         let mut shared = self.lock();
         let expired: Vec<TxnId> = shared
@@ -492,7 +449,7 @@ impl Locks {
             .retain(|_, t| t.state == TxnState::Open || t.deadline + tombstone_grace > now);
     }
 
-    /// Open a transaction under leader term `term`, returning its id.
+    /// Open a transaction under leader term `term`, and return its id.
     pub fn create(&self, term: u64, ttl: Duration, id: TxnId) -> Result<TxnId, Refused> {
         if ttl > MAX_TRANSACTION_TTL {
             return Err(Refused::TooMuch("the requested transaction lifetime is too long"));
@@ -518,10 +475,9 @@ impl Locks {
         Ok(id)
     }
 
-    /// Run `f` against a usable transaction, or say why there isn't one.
-    /// Every transactional request starts here, which is how an aborted
-    /// transaction's owner learns the reason rather than being told the
-    /// id is unknown.
+    /// Run `f` on a usable transaction, or say why there is none. Every
+    /// transactional request starts here, so the owner of an aborted
+    /// transaction learns the reason instead of "unknown id".
     fn with_open<T>(
         &self,
         id: TxnId,
@@ -531,39 +487,32 @@ impl Locks {
         match shared.txns.get(&id).map(|t| t.state) {
             None => Err(Refused::Unknown),
             Some(TxnState::Aborted(reason)) => Err(Refused::Aborted(reason)),
-            // A second commit on a transaction already committing is the
-            // caller's mistake, not a state to be shared.
+            // A second commit of a committing transaction is a caller error, not a
+            // state to report.
             Some(TxnState::Committing) => Err(Refused::Unknown),
             Some(TxnState::Open) => f(&mut shared),
         }
     }
 
-    /// Take read locks on every one of `keys` for `id` and record them
-    /// in the read set.
+    /// Take read locks on all of `keys` for `id`, and add them to the read
+    /// set.
     ///
-    /// Returns, position for position, what this transaction has already
-    /// buffered for each key -- read-your-own-writes, answered from the
-    /// buffer because the log knows nothing about it yet. `Some(None)` is
-    /// a buffered delete; `None` is a key this transaction has not
-    /// written.
+    /// Returns, for each position, what this transaction has buffered for
+    /// that key (read-your-own-writes): `Some(None)` is a buffered delete,
+    /// `None` is a key it has not written.
     ///
-    /// With `want_values` unset that answer is all `None`, and nothing
-    /// is cloned. A caller asking only for versions, or scanning for
-    /// keys, has no use for a buffered value -- a question about
-    /// committed state, which a buffered write cannot answer -- and
-    /// cloning one to throw it away is megabytes spent on nothing.
+    /// If `want_values` is false, every position is `None` and nothing is
+    /// cloned. A versions-only read or a key scan cannot use a buffered
+    /// value, and a clone could cost megabytes.
     ///
-    /// Not atomic, and deliberately so: a refusal part-way leaves the
-    /// locks already taken in place. They belong to the read set now,
-    /// and the transaction gives them up when it ends like any other.
-    /// Unwinding them would be wrong as well as pointless -- this
-    /// transaction may have *wounded* someone to get one, and handing it
-    /// back would not undo that.
+    /// Not atomic, by design: if a key is refused part-way, the locks
+    /// already taken stay. They are part of the read set and are released
+    /// when the transaction ends. Undoing them would not help: this
+    /// transaction may have wounded another one to get them.
     ///
-    /// A key this transaction has already buffered a write for takes no
-    /// read lock: it holds the stronger exclusive one already, and
-    /// asking for a shared lock on top would be asking to upgrade
-    /// against itself.
+    /// A key this transaction already wrote takes no read lock: it holds
+    /// the stronger exclusive lock, and a shared lock on top would be an
+    /// upgrade against itself.
     pub fn read_many(
         &self,
         id: TxnId,
@@ -579,9 +528,9 @@ impl Locks {
                     continue;
                 }
                 shared.acquire(key, id, Mode::Read, now)?;
-                // `acquire` can wound *this* transaction only if it is
-                // younger than a holder, in which case it returned an
-                // error above; so the entry is still here and still open.
+                // `acquire` wounds this transaction only if it is younger than a
+                // holder, and then it returns an error above. So the entry is still
+                // here and still open.
                 shared
                     .txns
                     .get_mut(&id)
@@ -594,15 +543,14 @@ impl Locks {
         })
     }
 
-    /// Which keys at or after `start` this transaction has buffered, and
-    /// whether each is a delete -- what a key scan needs to fold its own
+    /// The keys at or after `start` that this transaction buffered, and
+    /// whether each is a delete. A key scan uses this to merge its own
     /// uncommitted changes into what the store says.
     ///
-    /// Keys only, no values, so the cost is the transaction's key count
-    /// rather than its megabytes. Every buffered key from `start` on,
-    /// not a bounded prefix of them: a scan has to know about *every*
-    /// delete it might walk past, or it would hand back a key this
-    /// transaction has already removed.
+    /// Keys only, so the cost scales with the key count, not the value
+    /// bytes. Returns every buffered key from `start` on, not a bounded
+    /// prefix: a scan must know every delete it might pass, or it returns a
+    /// key this transaction has removed.
     pub fn buffered_from(&self, id: TxnId, start: &[u8]) -> Result<BufferedKeys, Refused> {
         self.with_open(id, |shared| {
             Ok(shared.txns[&id]
@@ -613,8 +561,8 @@ impl Locks {
         })
     }
 
-    /// Take (or upgrade to) a write lock on `key` for `id` and buffer
-    /// `value` against it. `None` buffers a delete.
+    /// Take (or upgrade to) a write lock on `key` for `id`, and buffer
+    /// `value` for it. `None` buffers a delete.
     pub fn buffer_write(
         &self,
         id: TxnId,
@@ -623,9 +571,8 @@ impl Locks {
     ) -> Result<(), Refused> {
         self.with_open(id, |shared| {
             let txn = &shared.txns[&id];
-            // Rewriting a key this transaction already buffered replaces
-            // that value rather than adding to it, so the old one comes
-            // back out of both budgets.
+            // A rewrite of a buffered key replaces the old value, so the old size
+            // comes out of both budgets.
             let previous = txn.writes.get(key).map(|v| entry_size(key, v.as_deref()));
             let size = entry_size(key, value.as_deref());
             let delta = size as isize - previous.unwrap_or(0) as isize;
@@ -635,9 +582,8 @@ impl Locks {
             if projected > MAX_TRANSACTION_BYTES {
                 return Err(Refused::TooMuch("the transaction has buffered too much"));
             }
-            // Checked separately, and worth a distinct message: this one
-            // is not about the caller's own transaction being too big,
-            // and shrinking it may not help.
+            // A separate check and message: this limit is not about the caller's
+            // own transaction, and a smaller transaction may not help.
             if projected_node_wide > MAX_BUFFERED_BYTES_NODE_WIDE {
                 return Err(Refused::TooMuch(
                     "this node is already holding as much buffered transaction data as it will",
@@ -657,13 +603,12 @@ impl Locks {
         })
     }
 
-    /// Move a transaction to `Committing` and hand back what it buffered,
+    /// Move a transaction to `Committing`, and return its buffered writes
     /// in key order.
     ///
-    /// Past this point it can no longer be wounded or expired, which is
-    /// the point: its writes are about to exist in the log, and nothing
-    /// here could take them back. The caller owns releasing it afterwards
-    /// -- see `CommitGuard`.
+    /// From here it cannot be wounded or expired: its writes are about to
+    /// go into the log, and nothing here can take them back. The caller
+    /// must release it afterwards: see `CommitGuard`.
     pub fn begin_commit(
         &self,
         id: TxnId,
@@ -673,11 +618,10 @@ impl Locks {
         let writes = self.with_open(id, |shared| {
             let txn = &shared.txns[&id];
             if txn.term != term {
-                // The leader that validated this transaction's reads is
-                // not the leader being asked to commit it. (Normally
-                // `Locks::observe_term` has already discarded it and
-                // this never fires; it is here because a commit is the
-                // one request where guessing wrong is unrecoverable.)
+                // The leader that checked this transaction's reads is not the leader
+                // asked to commit it. `Locks::observe_term` normally discards it first,
+                // so this rarely fires. It stays because a wrong guess at commit cannot
+                // be undone.
                 shared.abort(id, AbortReason::Expired);
                 return Err(Refused::LeaderChanged);
             }
@@ -706,18 +650,18 @@ impl Locks {
         ))
     }
 
-    /// Give up a transaction and everything it holds. Idempotent, and
-    /// silent about an id it doesn't know: committing and then dropping
-    /// is the ordinary client path, and the drop shouldn't have to know
-    /// whether it lost the race with its own commit.
+    /// Give up a transaction and all it holds. Safe to call twice, and
+    /// quiet about an unknown id: commit-then-drop is the normal client
+    /// path, and the drop should not need to know if it lost a race with
+    /// its own commit.
     pub fn discard(&self, id: TxnId) {
         let mut shared = self.lock();
         shared.release_all(id);
         shared.txns.remove(&id);
     }
 
-    /// The leader term this transaction was created under, and whether
-    /// it is still usable at all.
+    /// The leader term this transaction was created under, if it is still
+    /// usable.
     pub fn term_of(&self, id: TxnId) -> Result<u64, Refused> {
         self.with_open(id, |shared| Ok(shared.txns[&id].term))
     }
@@ -732,7 +676,7 @@ impl Locks {
         self.lock().locks.contains_key(key)
     }
 
-    /// What every open transaction is holding between them, against
+    /// What all open transactions buffer together, against
     /// `MAX_BUFFERED_BYTES_NODE_WIDE`.
     #[cfg(test)]
     pub(crate) fn buffered_total(&self) -> usize {
@@ -749,22 +693,21 @@ impl Locks {
     }
 }
 
-/// Roughly what one buffered mutation costs, for the size cap. An
-/// estimate on purpose: what it is guarding is the encoded size of the
-/// log entry, and being approximately right well below the real ceiling
-/// is worth more than being exactly right at it.
+/// The approximate cost of one buffered mutation, for the size cap. An
+/// estimate on purpose: it guards the encoded entry size, and being
+/// roughly right well below the real limit is better than being exact
+/// at it.
 fn entry_size(key: &[u8], value: Option<&[u8]>) -> usize {
     key.len() + value.map_or(0, <[u8]>::len) + PER_KEY_OVERHEAD
 }
 
-/// A committing transaction's locks, released when the commit resolves
-/// however it resolves.
+/// The locks of a committing transaction, released when the commit
+/// ends, however it ends.
 ///
-/// A `Drop` impl rather than a line at the end of the commit path, so
-/// that an error -- or a panic, or the task being dropped outright --
-/// releases them too. A transaction stuck in `Committing` is exempt from
-/// expiry by design, so locks leaked here would be held until the term
-/// ended.
+/// A `Drop` impl, not a line at the end of the commit path, so that an
+/// error, a panic, or a dropped task also releases them. A transaction
+/// in `Committing` never expires, so a leaked lock would last until the
+/// term ends.
 pub struct CommitGuard {
     locks: Locks,
     id: TxnId,
@@ -776,12 +719,11 @@ impl Drop for CommitGuard {
     }
 }
 
-/// A fresh transaction id.
+/// A new random transaction id.
 ///
-/// `RandomState` exists to give `HashMap` an unpredictable seed per
-/// instance, so a fresh hasher's initial state is already random without
-/// writing anything through it -- the same trick `raft::random_jitter_millis`
-/// uses, and for the same reason: this does not need a `rand` dependency.
+/// Each `RandomState` gets a random seed, so a new hasher's output is
+/// already random. `raft::random_jitter_millis` uses the same trick, to
+/// avoid a `rand` dependency.
 pub fn fresh_id() -> TxnId {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};

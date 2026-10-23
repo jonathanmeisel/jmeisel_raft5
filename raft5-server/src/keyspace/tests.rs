@@ -4,8 +4,8 @@ fn valid(username: &str) -> bool {
     validate_username(username).is_ok()
 }
 
-/// The empty key has no first byte, so it is not reserved -- clients can
-/// write it today and this must not change that.
+/// The empty key has no first byte, so it is not reserved: clients can
+/// write it, and this must not change that.
 #[test]
 fn the_empty_key_is_not_reserved() {
     assert!(!is_reserved(b""));
@@ -18,8 +18,8 @@ fn only_keys_starting_with_the_reserved_byte_are_reserved() {
 
     assert!(!is_reserved(&[1]));
     assert!(!is_reserved(b"alice"));
-    // The reserved byte anywhere but first is an ordinary key: the
-    // prefix is what is carved out, not the byte.
+    // The reserved byte anywhere but first is a normal key: the prefix is set
+    // aside, not the byte.
     assert!(!is_reserved(b"alice\0"));
 }
 
@@ -28,9 +28,9 @@ fn a_user_key_is_reserved() {
     assert!(is_reserved(&user_key("alice")));
 }
 
-/// The property `user_key` actually has to have: every name
-/// `validate_username` accepts lands inside the reserved range, so no
-/// account record can be written somewhere a client could reach it.
+/// The property `user_key` must have: every name `validate_username`
+/// accepts lands inside the reserved range, so no account record can be
+/// written where a client could reach it.
 #[test]
 fn every_valid_username_produces_a_reserved_key() {
     for username in ["a", "alice", "A.B_c-9", &"u".repeat(MAX_USERNAME_LEN)] {
@@ -42,8 +42,8 @@ fn every_valid_username_produces_a_reserved_key() {
     }
 }
 
-/// `user_key` appends the name to its prefix with no separator after it,
-/// so this is the property that makes that append safe.
+/// `user_key` appends the name to its prefix with no separator after it, so
+/// this property makes that append safe.
 #[test]
 fn distinct_usernames_produce_distinct_keys() {
     let names = ["a", "ab", "b", "alice", "alice.bob", "alice_bob", "a-b"];
@@ -70,8 +70,8 @@ fn an_over_long_username_is_refused() {
 }
 
 /// The separator `user_key` builds its prefix from, a NUL that would put
-/// the name back at the top of the reserved range, and anything else
-/// that could make two names meet in one key.
+/// the name back at the top of the reserved range, and anything else that
+/// could make two names meet in one key.
 #[test]
 fn a_username_cannot_contain_anything_that_would_let_it_escape_its_prefix() {
     for username in [
@@ -92,15 +92,15 @@ fn an_invite_key_is_reserved() {
 }
 
 /// The same property `user_key` needs, for the same reason: the id is
-/// appended to a fixed prefix with nothing after it, so the character
-/// set has to be what stops a key climbing back out.
+/// appended to a fixed prefix with nothing after it, so the character set
+/// must stop a key from escaping.
 #[test]
 fn every_valid_invite_id_produces_a_reserved_key() {
     for id in [
         "a".repeat(INVITE_ID_LEN),
         "-".repeat(INVITE_ID_LEN),
         "_".repeat(INVITE_ID_LEN),
-        // The shape a real one has: `invite_id` is base64 of a SHA-256.
+        // The shape a real id has: `invite_id` is base64 of a SHA-256.
         crate::auth::invite_id("some token"),
     ] {
         assert!(
@@ -111,9 +111,8 @@ fn every_valid_invite_id_produces_a_reserved_key() {
     }
 }
 
-/// An id is never a name anybody picked -- every one this cluster issues
-/// is the base64 of a hash -- so anything that is not exactly that shape
-/// is refused rather than accommodated.
+/// Nobody picks an id (every id this cluster issues is base64 of a hash),
+/// so anything not exactly that shape is refused, not accepted.
 #[test]
 fn an_invite_id_that_is_not_a_hash_is_refused() {
     for id in [
@@ -121,9 +120,9 @@ fn an_invite_id_that_is_not_a_hash_is_refused() {
         "short",
         &"a".repeat(INVITE_ID_LEN - 1),
         &"a".repeat(INVITE_ID_LEN + 1),
-        // Right length, wrong alphabet: base64 padding, the separator
-        // the prefix is built from, and a NUL that would put the id back
-        // at the top of the reserved range.
+        // Right length, wrong alphabet: base64 padding, the separator the prefix is
+        // built from, and a NUL that would put the id back at the top of the
+        // reserved range.
         &format!("{}=", "a".repeat(INVITE_ID_LEN - 1)),
         &format!("{}/", "a".repeat(INVITE_ID_LEN - 1)),
         &format!("{}\0", "a".repeat(INVITE_ID_LEN - 1)),
@@ -136,8 +135,7 @@ fn an_invite_id_that_is_not_a_hash_is_refused() {
 }
 
 /// Accounts and invitations share the `\0auth/` prefix, so this is worth
-/// stating: no username can produce the key of an invitation, or the
-/// other way round.
+/// stating: no username can produce an invitation's key, or the reverse.
 #[test]
 fn a_user_key_and_an_invite_key_can_never_meet() {
     let id = crate::auth::invite_id("some token");
@@ -145,13 +143,13 @@ fn a_user_key_and_an_invite_key_can_never_meet() {
     assert!(!user_key(&id).starts_with(INVITE_PREFIX));
 }
 
-/// The generalisation of the test above, now that there are five things
-/// in the reserved range rather than two.
+/// The general form of the test above, for every range in the reserved
+/// space.
 ///
-/// Every record range must be disjoint from every other, *and* from the
-/// one key that stands alone. A prefix that were a prefix of another
-/// would be worse than a collision: a listing over the shorter one would
-/// hand back the longer one's records as if they were its own.
+/// Every record range must be disjoint from every other, and from the one
+/// key that stands alone. A prefix of another prefix would be worse than a
+/// collision: a listing over the shorter one would return the longer one's
+/// records as its own.
 #[test]
 fn no_two_reserved_prefixes_can_ever_meet() {
     let ranges = [
@@ -159,8 +157,8 @@ fn no_two_reserved_prefixes_can_ever_meet() {
         ("invite", INVITE_PREFIX),
         ("group", GROUP_PREFIX),
         ("acl", ACL_PREFIX),
-        // Not a range: the whole key, treated as one so that the
-        // "nothing under another" check covers it too.
+        // Not a range: the whole key, treated as one so the "nothing under
+        // another" check covers it too.
         ("epoch", EPOCH_KEY),
     ];
     for (i, (one, a)) in ranges.iter().enumerate() {
@@ -174,9 +172,9 @@ fn no_two_reserved_prefixes_can_ever_meet() {
     }
 }
 
-/// A name and a group name are the same shape, so the interesting thing
-/// is that they land in different places -- and that neither can reach
-/// the epoch key, which has no separator to hide behind.
+/// A username and a group name have the same shape, so what matters is that
+/// they land in different places, and that neither can reach the epoch key,
+/// which has no separator to hide behind.
 #[test]
 fn a_group_key_is_reserved_and_meets_nothing_else() {
     for name in ["a", "oncall", "A.B_c-9", &"g".repeat(MAX_USERNAME_LEN)] {
@@ -210,9 +208,8 @@ fn a_group_name_is_held_to_the_same_rule_as_a_username() {
 }
 
 /// The property that makes `acl_key` safe for bytes no character set
-/// restricts: *any* prefix, including the ones that would walk straight
-/// out of an unencoded append, lands inside the ACL range and comes back
-/// out unchanged.
+/// limits: any prefix, including ones that would escape an unencoded append,
+/// lands inside the ACL range and comes back out unchanged.
 #[test]
 fn any_key_prefix_at_all_round_trips_through_an_acl_key() {
     let prefixes: [&[u8]; 9] = [
@@ -239,8 +236,8 @@ fn any_key_prefix_at_all_round_trips_through_an_acl_key() {
     }
 }
 
-/// Injectivity, stated over the pairs most likely to break an encoding:
-/// one prefix of another, and the empty one against everything.
+/// Injectivity, over the pairs most likely to break an encoding: one prefix
+/// of another, and the empty one against everything.
 #[test]
 fn distinct_key_prefixes_produce_distinct_acl_keys() {
     let prefixes: [&[u8]; 6] = [b"", b"a", b"ab", b"b", b"app/", b"app/sub/"];
@@ -257,8 +254,8 @@ fn an_over_long_acl_prefix_is_refused() {
     assert!(validate_acl_prefix(&[0u8; MAX_ACL_PREFIX_LEN + 1]).is_err());
 }
 
-/// A suffix this module could not have written is a corrupt record, not
-/// a request to refuse -- so it reports rather than panics.
+/// A suffix this module could not have written is a corrupt record, not a
+/// request to refuse, so it reports instead of panicking.
 #[test]
 fn a_suffix_that_is_not_hex_decodes_to_nothing() {
     for suffix in [b"abc".as_slice(), b"zz", b"0g", b"AB"] {

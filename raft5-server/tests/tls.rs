@@ -1,10 +1,10 @@
-//! TLS on both ports, through real sockets: mTLS between peers, and TLS
-//! or mTLS on the client API, with a private CA and with a bare
-//! self-signed certificate trusted as its own anchor.
+//! TLS on both ports, through real sockets: mTLS between peers, and TLS or
+//! mTLS on the client API, with a private CA and with a bare self-signed
+//! certificate used as its own anchor.
 //!
-//! The cluster tests prove the peer RPCs all run over mTLS by needing
-//! every one of them: a learner can't be promoted without replication,
-//! and a follower can't read a write that was never replicated to it.
+//! The cluster tests prove that all peer RPCs run over mTLS by needing
+//! every one of them: a learner cannot be promoted without replication, and
+//! a follower cannot read a write that was never replicated to it.
 
 mod common;
 
@@ -37,8 +37,8 @@ fn peer_tls(identity: Identity, ca: Certificate, server_name: Option<&str>) -> P
     }
 }
 
-/// Bootstraps `nodes[0]`, adds the rest, and checks that a write made
-/// through the leader reaches every one of them.
+/// Bootstrap `nodes[0]`, add the rest, and check that a write made through
+/// the leader reaches every one of them.
 async fn form_cluster_and_replicate(nodes: &[&TestNode]) {
     let first = nodes[0];
     bootstrap(&first.client(), &first.id).await;
@@ -56,7 +56,7 @@ async fn form_cluster_and_replicate(nodes: &[&TestNode]) {
 #[tokio::test]
 async fn peers_replicate_over_mtls_with_a_private_ca() {
     let ca = TestCa::new();
-    // One certificate shared by every node, as the deployment plan has it.
+    // One certificate shared by every node, as in the intended deployment.
     let shared = ca.leaf(LOCAL);
     let tls = TestTls {
         peer: Some(peer_tls(shared.identity(), ca.certificate(), None)),
@@ -75,9 +75,9 @@ async fn peers_replicate_over_mtls_with_a_private_ca() {
     );
 }
 
-/// A bare self-signed certificate, trusted as its own anchor, naming
-/// none of the addresses it is actually reached at -- only the fixed
-/// name every peer checks it against instead.
+/// A bare self-signed certificate, used as its own anchor, that names none
+/// of the addresses it is reached at, only the fixed name every peer checks
+/// it against instead.
 #[tokio::test]
 async fn peers_replicate_with_a_self_signed_cert_and_a_fixed_server_name() {
     let shared = certs::self_signed(&["raft5-peer"]);
@@ -95,10 +95,10 @@ async fn peers_replicate_with_a_self_signed_cert_and_a_fixed_server_name() {
     form_cluster_and_replicate(&[&n1, &n2]).await;
 }
 
-/// Addresses recorded as `http://` -- every address in a cluster that
-/// predates TLS -- are still dialed over TLS once it is on. tonic would
-/// dial them in plaintext as written, and the TLS-only peer port would
-/// refuse that, so replicating at all is the proof.
+/// Addresses recorded as `http://` (as in a cluster configured without TLS)
+/// are still dialed over TLS once TLS is on. tonic would dial them in
+/// plaintext as written, and the TLS-only peer port would refuse that, so
+/// replication working at all is the proof.
 #[tokio::test]
 async fn http_addresses_in_the_log_are_still_dialed_over_tls() {
     let ca = TestCa::new();
@@ -120,7 +120,7 @@ async fn http_addresses_in_the_log_are_still_dialed_over_tls() {
     );
 }
 
-/// Calls `Identify` on a peer API, dialed however `endpoint` says.
+/// Call `Identify` on a peer API, dialed as `endpoint` says.
 async fn identify(endpoint: Endpoint) -> Result<(), String> {
     let channel = endpoint.connect().await.map_err(|e| e.to_string())?;
     RaftPeerClient::new(channel)
@@ -175,7 +175,7 @@ async fn the_peer_port_refuses_anyone_without_a_trusted_certificate() {
         "a caller with no certificate was answered"
     );
 
-    // A certificate from some other CA.
+    // A certificate from another CA.
     let stranger = TestCa::new().leaf(LOCAL);
     let impostor = ClientTlsConfig::new()
         .ca_certificate(ca.certificate())
@@ -186,7 +186,7 @@ async fn the_peer_port_refuses_anyone_without_a_trusted_certificate() {
     );
 }
 
-/// Calls `GetConfig` on a client API, dialed however `endpoint` says.
+/// Call `GetConfig` on a client API, dialed as `endpoint` says.
 async fn get_config(endpoint: Endpoint) -> Result<(), String> {
     let channel = endpoint.connect().await.map_err(|e| e.to_string())?;
     KvClient::new(channel)
@@ -264,8 +264,8 @@ async fn the_client_api_requires_a_certificate_once_given_a_client_ca() {
         "a client with no certificate was answered"
     );
 
-    // Signed by the CA the *server* uses, not the one clients are
-    // checked against.
+    // Signed by the CA the server uses, not the one clients are checked
+    // against.
     let wrong_issuer = ClientTlsConfig::new()
         .ca_certificate(server_ca.certificate())
         .identity(server_ca.leaf(&["some-client"]).identity());
@@ -275,8 +275,8 @@ async fn the_client_api_requires_a_certificate_once_given_a_client_ca() {
     );
 }
 
-/// A client certificate is a gate on connecting, not a login: the token
-/// is still required on everything that required it before.
+/// A client certificate is a gate on connecting, not a login: the token is
+/// still required on everything that requires one.
 #[tokio::test]
 async fn mtls_does_not_stand_in_for_a_token() {
     let ca = TestCa::new();

@@ -1,9 +1,9 @@
 //! Structured ownership of background tasks.
 //!
-//! Nothing Raft-specific lives here: `Task` is simply a spawned future
-//! plus the token that stops it, with `stop` as the only way to get rid
-//! of one. See the parent module's "Cancellation" section for why this
-//! codebase refuses to hold a bare `JoinHandle`.
+//! Nothing here is Raft-specific: a `Task` is a spawned future plus the
+//! token that stops it, and `stop` is the only way to get rid of one. See
+//! the parent module's "Cancellation" section for why this codebase never
+//! holds a bare `JoinHandle`.
 
 use std::future::Future;
 
@@ -13,27 +13,25 @@ use tokio_util::sync::CancellationToken;
 
 use super::Event;
 
-/// A spawned background task together with the token that stops it.
+/// A spawned background task, with the token that stops it.
 ///
-/// Every background task in this module is owned by one of these, and the
-/// only way to get rid of one is `stop`, which signals *and then waits*.
-/// That is the whole point: a `JoinHandle::abort` (or, worse, a handle
-/// simply dropped) leaves the task's last poll wherever it happened to
-/// be, so whatever it was holding -- an `Arc<RaftLog>`, and with it the
-/// database lock -- can outlive the node that owned it. `stop` guarantees
-/// the task has actually returned before the owner moves on.
+/// Every background task in this module is owned by one of these, and only
+/// `stop` gets rid of one: it signals, then waits. That is the point. A
+/// `JoinHandle::abort` (or a dropped handle) leaves the task wherever its
+/// last poll stopped, so what it held (an `Arc<RaftLog>`, and with it the
+/// database lock) can outlive the node. `stop` guarantees the task has
+/// returned before the owner moves on.
 pub(crate) struct Task {
     cancel: CancellationToken,
     handle: JoinHandle<()>,
 }
 
 impl Task {
-    /// Spawns `body`, handing it a fresh child of `parent`. The child
-    /// relationship is what makes cancellation propagate downward without
-    /// any of these tasks knowing about each other: cancelling the node's
-    /// root token stops every task at once, while `stop` on an individual
-    /// `Task` (a leader dropping one peer's replication, say) cancels only
-    /// that one.
+    /// Spawn `body`, and give it a new child of `parent`. The child relation
+    /// makes cancellation flow downward without these tasks knowing each other:
+    /// cancelling the node's root token stops every task at once, while `stop`
+    /// on one `Task` (a leader dropping one peer's replication, for example)
+    /// cancels only that one.
     pub(super) fn spawn<F>(
         parent: &CancellationToken,
         body: impl FnOnce(CancellationToken) -> F,
@@ -46,34 +44,31 @@ impl Task {
         Self { cancel, handle }
     }
 
-    /// Signals the task to stop and waits until it actually has.
+    /// Signal the task to stop, and wait until it has.
     ///
-    /// A `JoinError` here is either a panic (already reported by the
-    /// default panic hook, and not something this layer can do anything
-    /// about) or an abort that nothing in this module performs -- either
-    /// way the task is over, which is all the caller is waiting for.
+    /// A `JoinError` here is a panic (the default panic hook already reported
+    /// it, and this layer can do nothing about it) or an abort that nothing in
+    /// this module does. Either way the task is over, which is all the caller
+    /// waits for.
     pub(super) async fn stop(self) {
         self.signal();
         let _ = self.handle.await;
     }
 
-    /// Signals without waiting. Only useful as the first half of
-    /// `stop_all`.
+    /// Signal without waiting. Only useful as the first half of `stop_all`.
     pub(super) fn signal(&self) {
         self.cancel.cancel();
     }
 
-    /// The runtime's id for the spawned task -- for tests asserting that
-    /// a task was (or was not) restarted, since two `Task`s are otherwise
-    /// indistinguishable from the outside.
+    /// The runtime's id for the spawned task, for tests that check whether a
+    /// task was restarted: two `Task`s look the same from outside otherwise.
     #[cfg(test)]
     pub(super) fn id(&self) -> tokio::task::Id {
         self.handle.id()
     }
 
-    /// Stops a whole group of tasks, signalling every one of them before
-    /// joining any -- so they wind down concurrently instead of serially,
-    /// each waiting out the one ahead of it.
+    /// Stop a group of tasks: signal all of them before joining any, so they
+    /// wind down concurrently, not one after another.
     pub(super) async fn stop_all(tasks: impl IntoIterator<Item = Task>) {
         let tasks: Vec<Task> = tasks.into_iter().collect();
         for task in &tasks {
@@ -85,16 +80,15 @@ impl Task {
     }
 }
 
-/// Awaits `fut` unless `cancel` fires first; `None` means cancelled.
+/// Await `fut` unless `cancel` fires first; `None` means cancelled.
 ///
-/// Deliberately *not* used around a `store::Store` call. Those run on the
-/// blocking pool, and dropping the future awaiting one doesn't stop it --
-/// it keeps running on its own worker thread, still holding whatever it
-/// captured, typically an `Arc<RaftLog>` and with it the database lock.
-/// Storage work is short and bounded, so every such await is left to
-/// complete; only genuinely open-ended waits (a peer RPC, a heartbeat
-/// sleep, a channel send into an event loop that may already have stopped
-/// draining) are wrapped in this.
+/// Never used around a `store::Store` call, on purpose. Those run on the
+/// blocking pool, and dropping the future that awaits one does not stop
+/// it: it keeps running on its worker thread, still holding what it
+/// captured (usually an `Arc<RaftLog>`, and with it the database lock).
+/// Storage work is short and bounded, so every such await runs to
+/// completion. Only open-ended waits (a peer RPC, a heartbeat sleep, a
+/// send into an event loop that may have stopped reading) use this.
 pub(super) async fn until_cancelled<T>(
     cancel: &CancellationToken,
     fut: impl Future<Output = T>,
@@ -106,10 +100,10 @@ pub(super) async fn until_cancelled<T>(
     }
 }
 
-/// `until_cancelled` for the common "push an event and keep going unless
-/// there's no one left to push to" step. `true` means the caller should
-/// carry on; `false` means it should return, either because it was
-/// cancelled or because the event loop is gone.
+/// `until_cancelled` for the common step "push an event and continue,
+/// unless nobody is left to push to". `true` means the caller continues;
+/// `false` means it returns, because it was cancelled or the event loop is
+/// gone.
 pub(super) async fn send_event(
     cancel: &CancellationToken,
     tx: &mpsc::Sender<Event>,

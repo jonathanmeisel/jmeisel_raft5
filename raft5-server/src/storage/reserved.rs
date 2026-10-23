@@ -1,16 +1,15 @@
 //! Walking the records the cluster keeps for itself.
 //!
-//! Several things now live as ordinary key/value pairs under a fixed
-//! prefix in the reserved range -- checkpoints under `\0snap/`, accounts
-//! under `\0auth/user/`, invitations under `\0auth/invite/` -- for the
-//! reasons `crate::keyspace` gives. Each of them needs the same
-//! question answered at some point: which of these exist right now?
+//! Several kinds of record live as normal key/value pairs under a fixed
+//! prefix in the reserved range (checkpoints under `\0snap/`, accounts under
+//! `\0auth/user/`, invitations under `\0auth/invite/`), for the reasons
+//! `crate::keyspace` gives. Each needs to answer the same question: which
+//! of these exist now?
 //!
-//! That question is not a plain range scan, because `versions` holds a
-//! chain of rows per key rather than one row. This module is the one
-//! place that knows how to collapse those chains back into "the records
-//! that currently exist", so a new reserved range gets listings without
-//! bringing its own copy of the walk.
+//! That is not a plain range scan, because `versions` holds a chain of
+//! rows per key, not one row. This module is the one place that knows how
+//! to reduce those chains to "the records that exist now", so a new
+//! reserved range gets listings without its own copy of the walk.
 
 use super::codec::{Kind, chain_start, row_kind, row_seq, row_user_key};
 use super::{RaftLog, Result, StorageError};
@@ -20,19 +19,18 @@ use super::{RaftLog, Result, StorageError};
 pub type VersionedRecord = (Vec<u8>, u64, Vec<u8>);
 
 impl RaftLog {
-    /// Walk the head row of every record under `prefix` that currently
-    /// exists, in key order, skipping ones whose head is a tombstone --
-    /// those are removed records whose rows the GC has not collected
-    /// yet.
+    /// Walk the head row of every record under `prefix` that exists now, in
+    /// key order, skipping heads that are tombstones (removed records whose
+    /// rows the GC has not collected yet).
     ///
-    /// `f` is handed the part of the key after `prefix`, the seq the
-    /// record was written at, and the row itself -- which is what a
-    /// caller needs in order to go and read the value, and what lets a
-    /// caller that does not care about the value avoid reading one.
+    /// `f` gets the part of the key after `prefix`, the seq the record was
+    /// written at, and the row itself. That is what a caller needs to read
+    /// the value, and lets a caller that does not need the value skip reading
+    /// it.
     ///
-    /// One iterator over the prefix rather than a seek per record, for
-    /// the reason `scan_as_of` gives: a single pinned nonce, so the walk
-    /// sees one point in time.
+    /// One iterator over the prefix, not a seek per record, for the reason
+    /// `scan_as_of` gives: one pinned nonce, so the walk sees one point in
+    /// time.
     pub(super) fn for_each_live_record(
         &self,
         prefix: &[u8],
@@ -64,17 +62,16 @@ impl RaftLog {
         Ok(())
     }
 
-    /// Every live record under `prefix`, as (key suffix, seq, value)
-    /// triples in key order.
+    /// Every live record under `prefix`, as (key suffix, seq, value) triples in
+    /// key order.
     ///
-    /// [`list_records_under`] without the seq, for the listings that do
-    /// not care; everything said there about bounds and about a record
-    /// vanishing mid-listing applies here.
+    /// [`list_records_under`] with the seq, for listings that need it. What is
+    /// said there about bounds, and about a record that disappears mid-listing,
+    /// applies here.
     ///
-    /// The seq is the one the record was last written at, which is what
-    /// lets a caller tell a record it has already seen from one that has
-    /// changed since -- and, for the permission snapshot, what it
-    /// reports so a client can do the same.
+    /// The seq is the one the record was last written at. It lets a caller
+    /// tell a record it has seen from one that changed since, and the
+    /// permission snapshot reports it so clients can do the same.
     ///
     /// [`list_records_under`]: RaftLog::list_records_under
     pub fn list_versioned_records_under(&self, prefix: &[u8]) -> Result<Vec<VersionedRecord>> {
@@ -93,18 +90,17 @@ impl RaftLog {
         Ok(out)
     }
 
-    /// Every live record under `prefix`, as (key suffix, value) pairs in
-    /// key order.
+    /// Every live record under `prefix`, as (key suffix, value) pairs in key
+    /// order.
     ///
-    /// For the listings that need what is *in* each record. A record
-    /// whose row is gone by the time it is read is left out rather than
-    /// failing the listing: between the walk naming it and this reading
-    /// it, the GC can have collected one a concurrent removal
-    /// tombstoned, which is a record on its way out either way.
+    /// For listings that need the content of each record. A record whose row
+    /// is gone when it is read is left out, not a failure: between the walk
+    /// naming it and this read, the GC can collect a record that a concurrent
+    /// removal turned into a tombstone, which is going away either way.
     ///
-    /// Deliberately unbounded, because the ranges it is used on are: a
-    /// caller that expects a range to grow without limit wants paging
-    /// and should not be using this.
+    /// Unbounded on purpose, because the ranges it is used on are bounded. A
+    /// caller that expects a range to grow without limit needs paging and
+    /// should not use this.
     pub fn list_records_under(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut rows = Vec::new();
         self.for_each_live_record(prefix, |id, _, row| {

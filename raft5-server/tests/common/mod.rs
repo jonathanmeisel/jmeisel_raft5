@@ -1,8 +1,8 @@
-//! Shared setup for integration tests: spinning up real
-//! `raft5_server::run` nodes on real localhost sockets and driving them
-//! purely through the client gRPC API, with retries for the transient
-//! refusals that are a normal part of startup/election/replication
-//! (rather than fixed sleeps guessing how long those take).
+//! Shared setup for integration tests: start real `raft5_server` nodes
+//! (`serve_config`) on real localhost sockets and drive them only through
+//! the client gRPC API, retrying the temporary refusals that are normal
+//! during startup, elections and replication (instead of fixed sleeps that
+//! guess how long those take).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -24,48 +24,45 @@ pub mod certs;
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_DELAY: Duration = Duration::from_millis(20);
 
-/// A connected client for a node's client API. `KvClient`'s own RPC
-/// methods take `&mut self`, but the `Channel` underneath is cheap to
-/// clone and safe to use concurrently, so every function below takes
-/// `&Arc<Client>` and clones a private, owned copy out of it to actually
-/// make a call -- the `Arc` is what lets many callers (and `TestNode`
-/// itself) share the one connection without each dialing their own.
+/// A connected client for a node's client API. `KvClient`'s RPC methods
+/// take `&mut self`, but the `Channel` under it is cheap to clone and safe
+/// to use concurrently. So every function below takes `&Arc<Client>` and
+/// clones its own copy to make a call; the `Arc` lets many callers (and
+/// `TestNode` itself) share one connection instead of each dialing its own.
 pub type Client = KvClient<Channel>;
 
-/// A node started for a test: its own fresh database directory and fixed
-/// addresses, plus a background task running the real
-/// `raft5_server::run` server loop, the token that stops it, and a
-/// client already connected to it -- all `None` while deliberately shut
-/// down via `shut_down` (as opposed to torn down for good via `Drop`).
+/// A node started for a test: its own new database directory and fixed
+/// addresses, plus a background task running the real server loop
+/// (`raft5_server::serve_config`), the token that stops it, and a client
+/// connected to it. All `None` while the node is shut down on purpose with
+/// `shut_down` (as opposed to removed for good by `Drop`).
 pub struct TestNode {
     pub id: String,
     pub client_addr: SocketAddr,
     pub peer_addr: SocketAddr,
     pub db_dir: PathBuf,
-    /// How this node signs and checks tokens, or `None` for a node that
-    /// keeps no accounts -- which is what every test that predates
-    /// authentication gets, and why they need no changes.
+    /// How this node signs and checks tokens, or `None` for a node that keeps
+    /// no accounts, which is what most tests use.
     auth: Option<raft5_server::auth::AuthConfig>,
     tls: TestTls,
     running: Option<RunningNode>,
-    /// Private: reached only through the `client()` accessor, so a test
-    /// that reaches for this while the node is down gets a clear panic
-    /// instead of a `None` it has to unwrap itself.
+    /// Private: reached only through `client()`, so a test that uses it while
+    /// the node is down gets a clear panic instead of a `None` to unwrap.
     client: Option<Arc<Client>>,
 }
 
-/// How a test node uses TLS. The default is none at all, which is what
-/// every test that predates TLS gets.
+/// How a test node uses TLS. The default is no TLS at all, which is what
+/// most tests use.
 #[derive(Clone, Default)]
 pub struct TestTls {
     pub peer: Option<raft5_server::PeerTls>,
     pub client: Option<raft5_server::ClientApiTls>,
-    /// How this harness's own client dials the client API. Needed
-    /// whenever `client` is set.
+    /// How this harness's own client dials the client API. Needed whenever
+    /// `client` is set.
     pub dial: Option<ClientTlsConfig>,
-    /// Advertise both APIs as `http://` even with TLS on, the way a
-    /// cluster that predates TLS has its addresses recorded -- so a test
-    /// can check they are still dialed over TLS.
+    /// Advertise both APIs as `http://` even with TLS on, as a cluster
+    /// configured without TLS records its addresses, so a test can check that
+    /// they are still dialed over TLS.
     pub advertise_http: bool,
 }
 
@@ -91,7 +88,7 @@ impl TestNode {
         Self::start(id, Some(auth), tls).await
     }
 
-    /// A node that requires a token on every RPC but `Login` and
+    /// A node that requires a token on every RPC except `Login` and
     /// `GetConfig`.
     pub async fn with_auth(id: &str, auth: raft5_server::auth::AuthConfig) -> Self {
         Self::start(id, Some(auth), TestTls::default()).await
@@ -102,11 +99,10 @@ impl TestNode {
         auth: Option<raft5_server::auth::AuthConfig>,
         tls: TestTls,
     ) -> Self {
-        // `try_init` rather than `init`: every test in the binary calls
-        // this, all in the same process (possibly concurrently, since
-        // tests run on their own threads by default), and `init` panics
-        // on a second call. Ignoring the error is fine either way -- the
-        // first call to succeed is the one whose filter/format wins.
+        // `try_init`, not `init`: every test in the binary calls this, in the same
+        // process (possibly at the same time, since tests run on their own threads
+        // by default), and `init` panics on a second call. Ignoring the error is
+        // fine: the first call that succeeds sets the filter and format.
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .with_test_writer()
@@ -126,16 +122,15 @@ impl TestNode {
         node
     }
 
-    /// (Re-)starts this node's server task against its existing identity,
-    /// addresses, and database -- what a real restart looks like:
-    /// membership and log persist in `db_dir` across it, so the node
-    /// rejoins whatever cluster it left off in rather than coming back
-    /// uninitialized. Also (re-)connects `client`, retrying while the
-    /// listener is still coming up. Panics if it's already running.
+    /// Start (or restart) this node's server task with its existing identity,
+    /// addresses and database, as a real restart does: membership and log
+    /// persist in `db_dir`, so the node rejoins the cluster it was in instead
+    /// of coming back uninitialized. Also (re)connects `client`, retrying while
+    /// the listener comes up. Panics if the node is already running.
     ///
-    /// No retry on the database lock: `shut_down` doesn't return until
-    /// the previous incarnation has fully finished, in-flight storage
-    /// work included, so there is nothing left holding it by this point.
+    /// No retry on the database lock: `shut_down` does not return until the
+    /// previous instance has fully finished, in-flight storage work included,
+    /// so nothing still holds it.
     pub async fn start_up(&mut self) {
         assert!(
             self.running.is_none(),
@@ -181,13 +176,12 @@ impl TestNode {
         self.client = Some(Arc::new(connect(self.client_addr, self.tls.dial.clone()).await));
     }
 
-    /// Stops this node and waits for it to actually be gone -- sockets
-    /// released, database lock released, every background task joined --
-    /// before returning, so a `start_up` right after gets a clean slate.
-    /// Drops `client` too, so nothing can go on using a connection to a
-    /// node that is no longer there. Leaves the database alone, so the
-    /// node comes back from `start_up` with everything it had before. A
-    /// no-op if it isn't running.
+    /// Stop this node and wait until it is really gone (sockets released,
+    /// database lock released, every background task joined) before returning,
+    /// so a `start_up` right after gets a clean start. Drops `client` too, so
+    /// nothing can keep using a connection to a node that is gone. Leaves the
+    /// database alone, so the node comes back from `start_up` with everything
+    /// it had. Does nothing if it is not running.
     pub async fn shut_down(&mut self) {
         self.client = None;
         if let Some(RunningNode { cancel, task }) = self.running.take() {
@@ -196,9 +190,8 @@ impl TestNode {
         }
     }
 
-    /// This node's client. Panics if it isn't currently running --
-    /// either it was never started, or it's been `shut_down` and not yet
-    /// `start_up` again.
+    /// This node's client. Panics if it is not running: never started, or
+    /// `shut_down` and not yet `start_up` again.
     pub fn client(&self) -> Arc<Client> {
         self.client
             .clone()
@@ -208,11 +201,10 @@ impl TestNode {
 
 impl Drop for TestNode {
     fn drop(&mut self) {
-        // Best-effort: `Drop` can't `.await` the way `shut_down` does, so
-        // this only signals. That's fine here -- nothing after this needs
-        // the addresses or the database back, and cancelling still means
-        // the node winds itself down properly rather than being abandoned
-        // mid-flight the way an `abort` would leave it.
+        // Best effort: `Drop` cannot `.await` like `shut_down` does, so this only
+        // signals. That is fine: nothing after this needs the addresses or the
+        // database back, and cancelling still lets the node shut itself down
+        // properly instead of being abandoned midway, as an `abort` would leave it.
         if let Some(running) = self.running.take() {
             running.cancel.cancel();
         }
@@ -220,8 +212,8 @@ impl Drop for TestNode {
     }
 }
 
-/// Binds an ephemeral local port and immediately releases it, for handing
-/// a real address to a node before its server exists yet.
+/// Bind an ephemeral local port and release it at once, to give a node a
+/// real address before its server exists.
 fn free_local_addr() -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener.local_addr().expect("local_addr")
@@ -246,10 +238,10 @@ fn deadline() -> Instant {
     Instant::now() + OVERALL_TIMEOUT
 }
 
-/// Connects to a node's client API, retrying while its server is still
-/// coming up (the listener may not have bound yet right after spawning).
-/// Internal to `TestNode::start_up` -- callers elsewhere get a client via
-/// `TestNode::client` instead of dialing their own.
+/// Connect to a node's client API, retrying while its server comes up (the
+/// listener may not be bound right after spawning). Used only by
+/// `TestNode::start_up`; other code gets a client through
+/// `TestNode::client` instead of dialing its own.
 async fn connect(addr: SocketAddr, tls: Option<ClientTlsConfig>) -> Client {
     let until = deadline();
     loop {
@@ -271,10 +263,10 @@ async fn connect(addr: SocketAddr, tls: Option<ClientTlsConfig>) -> Client {
     }
 }
 
-/// Bootstraps `server_id` into a single-node cluster, retrying: right
-/// after `spawn_node`, the node's gRPC service exists but the state
-/// machine hasn't necessarily reached `Uninitialized` internally, so an
-/// immediate `Bootstrap` can transiently race that.
+/// Bootstrap `server_id` into a single-node cluster, with retries: right
+/// after the node starts, its gRPC service exists but the state machine may
+/// not have reached `Uninitialized` yet, so an immediate `Bootstrap` can
+/// briefly race that.
 pub async fn bootstrap(client: &Arc<Client>, server_id: &str) {
     let mut client = (**client).clone();
     let until = deadline();
@@ -296,9 +288,9 @@ pub async fn bootstrap(client: &Arc<Client>, server_id: &str) {
     }
 }
 
-/// Adds `node` to the cluster this client's node leads, retrying on
-/// `NotLeader`/`ConfigChangeInProgress`-style transient refusals (e.g. a
-/// membership change from a previous call still committing).
+/// Add `node` to the cluster this client's node leads, retrying on
+/// temporary refusals such as `NotLeader` or `ConfigChangeInProgress` (for
+/// example, a membership change from a previous call still committing).
 pub async fn add_server(client: &Arc<Client>, node: &TestNode) {
     let server_id = &node.id;
     let mut client = (**client).clone();
@@ -323,15 +315,13 @@ pub async fn add_server(client: &Arc<Client>, node: &TestNode) {
     }
 }
 
-/// Writes `key`/`value` through this client's node, retrying while it
-/// isn't (yet) the leader -- e.g. immediately after `bootstrap`, before
-/// the resulting single-node election has finished. Returns the seq the
-/// write committed at.
+/// Write `key`/`value` through this client's node, retrying while it is
+/// not (yet) the leader, for example right after `bootstrap`, before the
+/// single-node election finishes. Returns the seq the write committed at.
 ///
-/// A transaction is the only way to write, so this opens one of its own
-/// around the single key, exactly as `raft5_client::Client::write` does;
-/// an attempt that loses the key to a contending transaction is retried
-/// along with everything else.
+/// A transaction is the only way to write, so this opens one around the
+/// single key, as `raft5_client::Client::write` does. An attempt that loses
+/// the key to another transaction is retried like everything else.
 pub async fn write(client: &Arc<Client>, key: &[u8], value: Option<&[u8]>) -> u64 {
     let until = deadline();
     loop {
@@ -350,10 +340,8 @@ pub async fn write(client: &Arc<Client>, key: &[u8], value: Option<&[u8]>) -> u6
     }
 }
 
-/// A (possibly stale) local read of `key`, or `None` if it currently has
-/// no value.
-/// Opens a transaction on `client`, retrying while the cluster is still
-/// settling. Returns the transaction id.
+/// Open a transaction on `client`, retrying while the cluster settles.
+/// Returns the transaction id.
 pub async fn begin(client: &Arc<Client>, ttl: Duration) -> Vec<u8> {
     use raft5_shared::raft5::client::{CreateTransactionRequest, create_transaction_response};
 
@@ -376,9 +364,9 @@ pub async fn begin(client: &Arc<Client>, ttl: Duration) -> Vec<u8> {
     }
 }
 
-/// Buffers one write into `id`, asserting it was accepted. Named for
-/// the transaction rather than after the RPC, to keep it apart from
-/// `write` above -- which is a whole transaction of its own.
+/// Buffer one write into `id`, and assert it was accepted. Named after the
+/// transaction, not the RPC, to keep it apart from `write` above, which is
+/// a whole transaction of its own.
 pub async fn txn_write(client: &Arc<Client>, id: &[u8], key: &[u8], value: Option<&[u8]>) {
     let mut client = (**client).clone();
     let resp = client
@@ -397,7 +385,7 @@ pub async fn txn_write(client: &Arc<Client>, id: &[u8], key: &[u8], value: Optio
     );
 }
 
-/// Commits `id`, returning the sequence number, or the refusal.
+/// Commit `id`, and return the seq or the refusal.
 pub async fn commit(
     client: &Arc<Client>,
     id: &[u8],
@@ -419,6 +407,7 @@ pub async fn commit(
     }
 }
 
+/// A (possibly stale) local read of `key`, or `None` if it has no value now.
 pub async fn read(client: &Arc<Client>, key: &[u8]) -> Option<Vec<u8>> {
     let mut client = (**client).clone();
     let resp = client
@@ -436,10 +425,9 @@ pub async fn read(client: &Arc<Client>, key: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// This node's current cluster configuration, straight from its own log
-/// (Raft §4.1 -- reflects a change as soon as it's appended, not only
-/// once it commits). Empty if it hasn't been bootstrapped or added to a
-/// cluster yet.
+/// This node's current cluster configuration, from its own log (Raft §4.1:
+/// it shows a change as soon as it is appended, not only once committed).
+/// Empty if the node is not yet bootstrapped or added to a cluster.
 pub async fn config(client: &Arc<Client>) -> Vec<ClusterMember> {
     let mut client = (**client).clone();
     client
@@ -450,13 +438,12 @@ pub async fn config(client: &Arc<Client>) -> Vec<ClusterMember> {
         .members
 }
 
-/// Waits until `server_id` shows up as a *voting* member of `client`'s
-/// node's configuration -- e.g. after `add_server` joins it as a
-/// learner, waiting here for its automatic promotion (Raft §4.2.1) to
-/// land. This matters beyond just membership: a config with fewer voters
-/// than intended changes what majority means, so a caller that needs a
-/// specific voter count (e.g. before deliberately taking one down) has
-/// to confirm it, not assume promotion already finished.
+/// Wait until `server_id` shows up as a voting member in the configuration
+/// of `client`'s node, for example after `add_server` joins it as a
+/// learner, to wait for its automatic promotion (Raft §4.2.1). This matters
+/// beyond membership: fewer voters than intended changes what a majority
+/// is, so a caller that needs a specific voter count (for example, before
+/// stopping one on purpose) must confirm it, not assume promotion is done.
 pub async fn wait_until_voter(client: &Arc<Client>, server_id: &str) {
     let until = deadline();
     loop {
@@ -472,10 +459,10 @@ pub async fn wait_until_voter(client: &Arc<Client>, server_id: &str) {
     }
 }
 
-/// Polls `client`'s node until its own local state reflects `key ==
-/// value` at (at least) `min_seq` -- a follower applies a commit
-/// asynchronously as `AppendEntries` batches arrive, so this isn't
-/// instantaneous the way the leader's own post-write read is.
+/// Poll `client`'s node until its own local state shows `key == value` at
+/// `min_seq` or later. A follower applies a commit asynchronously as
+/// `AppendEntries` batches arrive, so this is not instant like the leader's
+/// own read after a write.
 pub async fn assert_eventually_reads(client: &Arc<Client>, key: &[u8], value: &[u8], min_seq: u64) {
     let mut client = (**client).clone();
     let until = deadline();
@@ -504,17 +491,15 @@ pub async fn assert_eventually_reads(client: &Arc<Client>, key: &[u8], value: &[
     }
 }
 
-/// Finds the cluster's current leader among `nodes`, by asking each of
-/// them in turn for its configuration and retrying the whole set until
-/// one says `is_leader`. Only a node that has caught up on what it
-/// inherited and still holds a live read quorum says so (see
-/// `grpc::KvService::get_config`), so this is leader discovery backed by
-/// an actual quorum check, not a guess at which node to send further
-/// requests to.
+/// Find the cluster's current leader among `nodes`: ask each in turn for its
+/// configuration, and retry the whole set until one says `is_leader`. Only a
+/// node that has caught up on what it inherited and still holds a live read
+/// quorum says so (see `grpc::KvService::get_config`), so this is leader
+/// discovery backed by a real quorum check, not a guess.
 ///
-/// Nodes that are down (`shut_down`, so their client is gone) are
-/// skipped rather than treated as a failure -- same as one that's merely
-/// lost the leadership race this round.
+/// Nodes that are down (`shut_down`, so their client is gone) are skipped,
+/// not treated as a failure, like a node that lost the leadership race this
+/// round.
 pub async fn find_leader<'a>(nodes: &[&'a TestNode]) -> &'a TestNode {
     let until = deadline();
     loop {

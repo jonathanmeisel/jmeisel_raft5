@@ -24,9 +24,9 @@ fn round_trips_through_bytes() {
 
 #[test]
 fn majority_counts_voters_only() {
-    // Three voters need two, and adding learners must not change
-    // that -- otherwise adding a server would immediately raise the
-    // bar for committing the very entry that added it.
+    // Three voters need two, and adding learners must not change that.
+    // Otherwise adding a server would at once raise the bar for committing the
+    // entry that added it.
     assert_eq!(
         config(&[("a", true), ("b", true), ("c", true)]).majority(),
         2
@@ -70,9 +70,8 @@ fn edits_produce_a_new_configuration_without_mutating_the_old() {
     assert!(promoted.is_voter("b"));
     assert_eq!(promoted.majority(), 2, "promotion raises the quorum bar");
 
-    // Re-adding an existing id updates it in place rather than
-    // duplicating -- two entries for one server would corrupt every
-    // count derived from `members`.
+    // Adding an existing id again updates it in place, not a duplicate: two
+    // entries for one server would corrupt every count derived from `members`.
     let readded = promoted.with_member(member("b", false));
     assert_eq!(readded.members.len(), 2);
     assert!(!readded.is_voter("b"));

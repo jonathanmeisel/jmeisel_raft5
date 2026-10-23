@@ -1,13 +1,12 @@
-//! The `versions` row-key encoding, on its own.
+//! The `versions` row-key encoding, alone.
 //!
-//! This is where the subtle correctness of the whole multi-version
-//! layout lives, so it is tested without a `RaftLog`, a keyspace or any
-//! I/O -- the properties below are properties of the bytes.
+//! The subtle correctness of the whole multi-version layout lives here, so
+//! it is tested without a `RaftLog`, a keyspace or any I/O: these are
+//! properties of the bytes.
 
 use super::*;
 
-/// Every row key for `key`, newest first, as the keyspace would order
-/// them.
+/// Every row key for `key`, newest first, in keyspace order.
 fn rows(key: &[u8], seqs: &[u64]) -> Vec<Vec<u8>> {
     let mut rows: Vec<_> = seqs
         .iter()
@@ -19,10 +18,10 @@ fn rows(key: &[u8], seqs: &[u64]) -> Vec<Vec<u8>> {
 
 /// The case the naive `key || seq` encoding gets wrong.
 ///
-/// `"ab" || seq` sorts *inside* the range `["a" || 00.., "a" || ff..]`,
-/// so without escaping a scan of `"a"`'s versions would return `"ab"`'s
-/// rows, and `"a"`'s own versions would not even be adjacent. Both
-/// halves are asserted, because they fail independently.
+/// `"ab" || seq` sorts inside the range `["a" || 00.., "a" || ff..]`, so
+/// without escaping, a scan of `"a"`'s versions would return `"ab"`'s rows,
+/// and `"a"`'s own versions would not even be adjacent. Both halves are
+/// asserted, because they fail independently.
 #[test]
 fn one_keys_rows_never_stray_into_a_longer_keys_range() {
     let a = rows(b"a", &[1, 2, 3]);
@@ -44,8 +43,8 @@ fn one_keys_rows_never_stray_into_a_longer_keys_range() {
         );
     }
 
-    // And contiguity: sorting every row of both together leaves "a"'s
-    // three in one unbroken run.
+    // And contiguity: sorting all rows of both together leaves "a"'s three in
+    // one unbroken run.
     let mut all: Vec<_> = a.iter().chain(ab.iter()).cloned().collect();
     all.sort();
     let positions: Vec<_> = all
@@ -57,7 +56,7 @@ fn one_keys_rows_never_stray_into_a_longer_keys_range() {
     assert_eq!(positions, [0, 1, 2], "\"a\"'s rows are not contiguous");
 }
 
-/// Row keys sort by user key first, then by *descending* seq.
+/// Row keys sort by user key first, then by descending seq.
 #[test]
 fn rows_sort_by_key_then_newest_first() {
     let mut rows = [
@@ -83,8 +82,8 @@ fn rows_sort_by_key_then_newest_first() {
     );
 }
 
-/// The ordering property in general, over the awkward cases rather than
-/// the convenient ones.
+/// The ordering property in general, over the awkward cases, not the easy
+/// ones.
 #[test]
 fn row_key_order_matches_key_then_descending_seq() {
     let keys: [&[u8]; 9] = [
@@ -106,8 +105,8 @@ fn row_key_order_matches_key_then_descending_seq() {
                 for &sb in &seqs {
                     let left = row_key(ka, sa, Kind::Value);
                     let right = row_key(kb, sb, Kind::Value);
-                    // Descending seq within a key, so the comparison
-                    // that should match is on the complement.
+                    // Seq descends within a key, so the comparison that should match is on
+                    // the complement.
                     let want = (ka, !sa).cmp(&(kb, !sb));
                     assert_eq!(left.cmp(&right), want, "({ka:?}, {sa}) vs ({kb:?}, {sb})");
                 }
@@ -141,9 +140,9 @@ fn a_row_key_round_trips_through_its_accessors() {
     }
 }
 
-/// `chain_end` must be above every row of its own key and no higher than
-/// the first row of any key above it -- otherwise a bounded scan either
-/// truncates a key's versions or bleeds into the next key.
+/// `chain_end` must be above every row of its own key and not above the
+/// first row of any later key. Otherwise a bounded scan either cuts a key's
+/// versions short or runs into the next key.
 #[test]
 fn chain_end_bounds_exactly_one_key() {
     let keys: [&[u8]; 6] = [b"", b"\x00", b"a", b"a\x00", b"ab", b"b"];
@@ -170,9 +169,9 @@ fn chain_end_bounds_exactly_one_key() {
     }
 }
 
-/// The identity that lets "the current value" and "the value as of S"
-/// be one code path: seeking at `u64::MAX` is seeking to the very start
-/// of the key's rows.
+/// The identity that makes "the current value" and "the value as of S" one
+/// code path: seeking at `u64::MAX` seeks to the very start of the key's
+/// rows.
 #[test]
 fn seeking_at_max_is_the_head_of_the_chain() {
     for key in [b"".as_slice(), b"k".as_slice(), b"\x00".as_slice()] {
@@ -183,7 +182,7 @@ fn seeking_at_max_is_the_head_of_the_chain() {
 }
 
 /// A seek lands on the newest row at or before `as_of`, including when
-/// `as_of` is exactly a seq that exists and when it is one below.
+/// `as_of` is exactly an existing seq and when it is one below.
 #[test]
 fn a_seek_selects_the_newest_row_at_or_before_it() {
     let key = b"k";
@@ -206,9 +205,9 @@ fn a_seek_selects_the_newest_row_at_or_before_it() {
 }
 
 /// A tombstone and a value at the same seq would be two different rows,
-/// and the tombstone sorts first -- which is why `apply_committed` must
-/// never write both. Pinned here so the encoding's part of that
-/// invariant is visible where the encoding is.
+/// and the tombstone sorts first, which is why `apply_committed` must never
+/// write both. Kept here so the encoding's part of that rule is visible
+/// next to the encoding.
 #[test]
 fn a_tombstone_sorts_before_a_value_at_the_same_seq() {
     let tomb = row_key(b"k", 7, Kind::Tombstone);
@@ -223,7 +222,7 @@ fn a_malformed_row_key_is_refused_rather_than_misread() {
     assert!(row_chain(b"short").is_err());
     assert!(row_user_key(b"short").is_err());
 
-    // A kind byte that is neither of the two there are.
+    // A kind byte that is neither of the two kinds.
     let mut row = row_key(b"k", 1, Kind::Value);
     *row.last_mut().unwrap() = 9;
     assert!(row_kind(&row).is_err());

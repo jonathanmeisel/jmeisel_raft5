@@ -8,14 +8,14 @@ fn group(name: &str) -> Principal {
     Principal::Group(name.to_string())
 }
 
-/// A snapshot built the way the server builds one: from encoded records
-/// keyed the way a listing of each reserved range returns them.
+/// A snapshot built as the server builds one: from encoded records keyed
+/// as a listing of each reserved range returns them.
 fn snapshot(
     groups: &[(&str, GroupRecord)],
     acls: &[(&[u8], AclRecord)],
 ) -> Permissions {
-    // Seqs ascend so the assertions can tell one record from another;
-    // nothing about the evaluation depends on them.
+    // Seqs ascend, so the assertions can tell records apart; the evaluation
+    // does not depend on them.
     let groups = groups
         .iter()
         .enumerate()
@@ -63,9 +63,9 @@ fn an_acl_record_round_trips() {
     assert_eq!(AclRecord::from_bytes(&bytes).unwrap(), record);
 }
 
-/// postcard is not self-describing, so a record from a newer node is not
-/// something this one can make sense of -- and saying so is the whole
-/// value of the version byte being first.
+/// postcard is not self-describing, so this node cannot make sense of a
+/// record from a newer node, and saying so is what the version byte being
+/// first is for.
 #[test]
 fn a_record_from_a_future_version_is_refused() {
     let mut record = group_of(&[user("alice")]);
@@ -77,8 +77,8 @@ fn a_record_from_a_future_version_is_refused() {
     assert!(AclRecord::from_bytes(&record.to_bytes().unwrap()).is_err());
 }
 
-/// An ACL naming a principal whose name could never be stored is a grant
-/// that could never match, so it is refused where it is written.
+/// An ACL that names a principal whose name could never be stored is a
+/// grant that could never match, so it is refused when written.
 #[test]
 fn a_principal_must_be_nameable() {
     assert!(user("alice").validate().is_ok());
@@ -91,8 +91,7 @@ fn a_principal_must_be_nameable() {
 
 // -- the default ------------------------------------------------------
 
-/// The property every existing cluster depends on: with no ACLs, nobody
-/// is denied anything.
+/// With no ACLs, nobody is denied anything.
 #[test]
 fn a_cluster_with_no_acls_allows_everything() {
     let perms = snapshot(&[], &[]);
@@ -103,9 +102,9 @@ fn a_cluster_with_no_acls_allows_everything() {
     }
 }
 
-/// `Default` is permission to use the key, not authority over who else
-/// may. Without this, any account could write an ACL on the empty prefix
-/// and lock out the cluster.
+/// `Default` is permission to use the key, not authority over who else may.
+/// Without this, any account could write an ACL on the empty prefix and
+/// lock out the cluster.
 #[test]
 fn the_default_allows_writes_but_confers_no_authority_over_acls() {
     assert!(Decision::Default.permits(Right::Write));
@@ -115,8 +114,8 @@ fn the_default_allows_writes_but_confers_no_authority_over_acls() {
     assert!(!Decision::Denied.permits_acl_change());
 }
 
-/// An ACL on the empty prefix governs every key there is, which is how a
-/// cluster takes the opposite posture.
+/// An ACL on the empty prefix governs every key, which is how a cluster
+/// closes everything by default.
 #[test]
 fn an_acl_on_the_empty_prefix_governs_everything() {
     let perms = snapshot(&[], &[(b"", acl(&[(user("alice"), Right::Read)]))]);
@@ -127,11 +126,11 @@ fn an_acl_on_the_empty_prefix_governs_everything() {
 
 // -- longest prefix ---------------------------------------------------
 
-/// The rule, and the thing most likely to be got wrong: the deciding ACL
-/// is the one on the longest prefix that *exists*, not the longest one
-/// that happens to mention the caller. `bob` is named at `app/` and is
-/// still denied `app/secret/x`, because a shorter grant does not survive
-/// a longer ACL that leaves him out.
+/// The rule, and the part most likely to be wrong: the deciding ACL is the
+/// one on the longest prefix that exists, not the longest that mentions the
+/// caller. `bob` is named at `app/` and is still denied `app/secret/x`,
+/// because a shorter grant does not survive a longer ACL that leaves him
+/// out.
 #[test]
 fn the_longest_acl_that_exists_decides_not_the_longest_that_grants() {
     let perms = snapshot(
@@ -150,14 +149,14 @@ fn the_longest_acl_that_exists_decides_not_the_longest_that_grants() {
     assert_eq!(perms.decide("bob", b"other"), Decision::Default);
 }
 
-/// An ACL's prefix matches the key it is written for exactly, not only
-/// keys strictly under it.
+/// An ACL's prefix matches the key it is written for exactly, not only keys
+/// strictly under it.
 #[test]
 fn an_acl_governs_the_key_equal_to_its_own_prefix() {
     let perms = snapshot(&[], &[(b"app", acl(&[(user("alice"), Right::Read)]))]);
     assert_eq!(perms.decide("bob", b"app"), Decision::Denied);
-    // A byte prefix is a byte prefix: `apple` is under `app` whether or
-    // not a separator was intended.
+    // A byte prefix is a byte prefix: `apple` is under `app`, whether or not a
+    // separator was intended.
     assert_eq!(perms.decide("bob", b"apple"), Decision::Denied);
     assert_eq!(perms.decide("bob", b"ap"), Decision::Default);
 }
@@ -188,8 +187,8 @@ fn write_satisfies_a_requirement_for_read() {
     assert!(!Decision::Granted(Right::Read).permits(Right::Write));
 }
 
-/// A principal reachable twice takes the higher grant, so adding someone
-/// to a group can only ever widen what they hold, never narrow it.
+/// A principal reachable twice gets the higher grant, so adding someone to
+/// a group can only widen what they hold, never narrow it.
 #[test]
 fn several_matching_entries_give_the_highest_right() {
     let perms = snapshot(
@@ -214,9 +213,8 @@ fn membership_of_a_named_group_grants_what_the_group_holds() {
     assert_eq!(perms.decide("bob", b"app/x"), Decision::Denied);
 }
 
-/// The whole point of a group being able to contain a group: `alice` is
-/// in `interns`, `interns` is in `staff`, `staff` is in `everyone`, and
-/// the ACL names only `everyone`.
+/// Why a group can contain a group: `alice` is in `interns`, `interns` is in
+/// `staff`, `staff` is in `everyone`, and the ACL names only `everyone`.
 #[test]
 fn membership_is_transitive_through_nested_groups() {
     let perms = snapshot(
@@ -236,8 +234,8 @@ fn membership_is_transitive_through_nested_groups() {
     assert!(perms.groups_of("bob").is_empty());
 }
 
-/// Nesting deeper than the walk will go is not a hang and not a panic:
-/// it is simply not membership, which is the safe way to run out.
+/// Nesting deeper than the walk goes is not a hang and not a panic: it is
+/// simply not membership, which is the safe way to run out.
 #[test]
 fn nesting_beyond_the_depth_bound_stops_rather_than_granting() {
     let deep = MAX_GROUP_DEPTH + 3;
@@ -255,8 +253,8 @@ fn nesting_beyond_the_depth_bound_stops_rather_than_granting() {
     assert!(!inside.contains(&format!("g{}", deep - 1)));
 }
 
-/// Cycles are refused where edges are added, so one here means a record
-/// this node did not write. It must still terminate.
+/// Cycles are refused when edges are added, so one here means a record this
+/// node did not write. The walk must still end.
 #[test]
 fn a_cycle_in_the_group_graph_terminates() {
     let perms = snapshot(
@@ -272,7 +270,7 @@ fn a_cycle_in_the_group_graph_terminates() {
     assert_eq!(perms.decide("alice", b"k"), Decision::Granted(Right::Read));
 }
 
-/// An ACL may name a group that does not exist -- a grant that matches
+/// An ACL may name a group that does not exist: a grant that matches
 /// nobody, which is how a dangling reference should fail.
 #[test]
 fn an_acl_naming_a_group_that_does_not_exist_grants_nothing() {
@@ -340,8 +338,8 @@ fn the_snapshot_reports_what_it_holds() {
     assert_eq!(perms.acl_seq(b"nope/"), 0);
 }
 
-/// What `DeleteAcl` has to ask before permitting a removal: with this
-/// ACL gone, what would govern the prefix then?
+/// What `DeleteAcl` must ask before it allows a removal: with this ACL
+/// gone, what would govern the prefix?
 #[test]
 fn governing_within_answers_what_removal_would_fall_back_to() {
     let perms = snapshot(
@@ -359,8 +357,8 @@ fn governing_within_answers_what_removal_would_fall_back_to() {
         perms.governing_within(prefix, prefix.len() - 1).map(|(p, _)| p),
         Some(b"app/".as_slice())
     );
-    // Removing `app/` leaves nothing, which is the default -- and so is
-    // an administrator's act.
+    // Removing `app/` leaves nothing, which is the default, and so an
+    // administrator's act.
     assert_eq!(perms.governing_within(b"app/", 3), None);
 }
 
@@ -372,8 +370,8 @@ fn an_empty_snapshot_has_never_seen_a_permission_change() {
     assert_eq!(perms.decide("alice", b"anything"), Decision::Default);
 }
 
-/// A record that will not decode fails the build rather than quietly
-/// dropping out of it -- a dropped ACL is a subtree that silently opens.
+/// A record that does not decode fails the build instead of silently
+/// dropping out: a dropped ACL is a subtree that silently opens.
 #[test]
 fn a_record_that_will_not_decode_fails_the_build() {
     let junk = vec![0xff, 0xff];

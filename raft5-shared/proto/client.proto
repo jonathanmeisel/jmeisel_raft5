@@ -4,336 +4,309 @@ package raft5.client;
 
 import "cluster.proto";
 
-// Node-to-client API. Served on a separate port from the peer-to-peer
-// RaftPeer service (raft.proto), since the two have different auth/network
-// exposure requirements (client access vs. mTLS between known cluster
-// members).
+// The client API. It runs on a separate port from the peer service
+// RaftPeer (raft.proto), because the two have different auth and network
+// exposure (client access vs. mTLS between known members).
 service Kv {
   // Buffer a write (or a delete, if `value` is unset) into a transaction.
-  // Nothing is written here: the value is held on the leader until
-  // CommitTransaction, which is where a sequence number comes from. A
-  // transaction is the only way to write, so a caller writing one key
-  // still opens one -- see the transaction block below for why that is
-  // the whole protocol rather than a special case of it.
+  // Nothing is written here: the value waits on the leader until
+  // CommitTransaction, which assigns the seq. A transaction is the only way
+  // to write, so a caller that writes one key still opens one. See the
+  // transaction section below for why.
   rpc Write(WriteRequest) returns (WriteResponse);
 
-  // Read any number of keys, every one of them as of the same moment,
-  // at whichever consistency `ReadRequest.consistency` asks for -- stale
-  // by default, linearizable on request, as part of a transaction, or as
-  // of a snapshot.
+  // Read any number of keys, all as of the same moment, at the consistency
+  // that `ReadRequest.consistency` asks for: stale by default,
+  // linearizable, in a transaction, or as of a snapshot.
   //
-  // `versions_only` asks for the sequence numbers alone, answered
-  // without ever reading a value, so what it costs does not depend on
-  // how large the values are. That is the cheap way to ask "has this
-  // changed since I last looked?": a full read can answer it only by
-  // sending back the whole value for the caller to discard, which for a
-  // large one is megabytes over the wire to learn eight bytes.
+  // `versions_only` returns only the seqs and never reads a value, so the
+  // cost does not depend on value size. It is the cheap way to ask "has this
+  // changed since I last looked?". A full read can answer that only by
+  // sending back the whole value for the caller to discard: megabytes on
+  // the wire to learn eight bytes.
   rpc Read(ReadRequest) returns (ReadResponse);
 
-  // Walk the keys that currently have a value, in order, starting at
-  // `start_key`. Consistency follows Read's: inside a transaction every
-  // key handed back is read-locked, at a snapshot it is the key set as
-  // of that snapshot, and otherwise it is a possibly-stale local read.
+  // Walk the keys that have a value now, in order, from `start_key`.
+  // Consistency is as for Read: in a transaction every returned key is
+  // read-locked, at a snapshot it is the key set as of that snapshot, and
+  // otherwise it is a possibly stale local read.
   rpc GetKeys(GetKeysRequest) returns (GetKeysResponse);
 
-  // Pin the current sequence number under `snapshot_id`, so that Read
-  // and GetKeys can later be pointed at it and see the store
-  // exactly as it was at this moment -- however much it changes
-  // afterwards.
+  // Save the current seq under `snapshot_id`, so Read and GetKeys can later
+  // see the store exactly as it is now, however much it changes after.
   //
-  // Administrators only. A snapshot is a storage commitment, not a
-  // read: until it is removed, every key overwritten or deleted after
-  // it keeps the version this snapshot can still see.
+  // Administrators only. A snapshot is a storage commitment, not a read:
+  // until it is removed, every key overwritten or deleted after it keeps
+  // the version this snapshot sees.
   rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
 
-  // Release a snapshot. The versions it was holding become collectable,
-  // and reads at it start failing. Administrators only.
+  // Release a snapshot. The versions it kept can be collected, and reads at
+  // it start to fail. Administrators only.
   rpc RemoveSnapshot(RemoveSnapshotRequest) returns (RemoveSnapshotResponse);
 
-  // Every snapshot that currently exists. The only way to discover
-  // ids: snapshot records live in the reserved range, which GetKeys
-  // hides. Possibly stale, like any read outside a transaction.
+  // Every snapshot that exists. The only way to find ids: snapshot records
+  // live in the reserved range, which GetKeys hides. Possibly stale, like
+  // any read outside a transaction.
   rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
 
-  // Cluster membership changes, one server at a time (single-server
-  // change, not joint consensus -- simpler to reason about; joint
-  // consensus for atomic multi-member changes can come later if needed).
+  // Cluster membership changes, one server at a time (single-server change,
+  // not joint consensus, because it is simpler to reason about). Atomic
+  // multi-member changes are not supported.
   //
   // Administrators only, on a cluster that keeps accounts: these are the
-  // most destructive calls this service has, and removing the wrong
-  // server can cost a cluster its quorum.
+  // most destructive calls on this service, and removing the wrong server
+  // can cost the cluster its quorum.
   rpc AddServer(AddServerRequest) returns (ConfigChangeResponse);
   rpc RemoveServer(RemoveServerRequest) returns (ConfigChangeResponse);
-  // Change the cluster's heartbeat interval, and every timeout derived
-  // from it. Replicated like a membership change, and subject to the
-  // same one-change-at-a-time rule. Administrators only, for the same
-  // reason: too short a heartbeat for the network between the nodes
-  // leaves the cluster unable to keep a leader.
+  // Change the cluster's heartbeat interval, and every timeout derived from
+  // it. Replicated like a membership change, with the same
+  // one-change-at-a-time rule. Administrators only, for the same reason: a
+  // heartbeat too short for the network leaves the cluster unable to keep a
+  // leader.
   rpc SetHeartbeat(SetHeartbeatRequest) returns (ConfigChangeResponse);
 
-  // Form a single-node cluster around this node (Raft §4.4). Refused by
-  // any node that already has a configuration or a non-empty log:
-  // bootstrapping twice is how one cluster silently becomes two, each
-  // half believing it is the whole. A server meant to *join* an existing
-  // cluster is added via AddServer on that cluster's leader instead, and
-  // receives its configuration by replication.
+  // Form a single-node cluster around this node (Raft §4.4). A node that
+  // already has a configuration or a non-empty log refuses: a second
+  // bootstrap is how one cluster silently becomes two, each half believing
+  // it is the whole. To join an existing cluster, call AddServer on that
+  // cluster's leader; the new server gets its configuration by replication.
   rpc Bootstrap(BootstrapRequest) returns (ConfigChangeResponse);
 
-  // The cluster configuration currently in force on this node -- whatever
-  // its own log's tail says (Raft §4.1: on append, not on commit), so it
-  // can reflect a change that hasn't finished committing yet. Empty
-  // `members` means this node hasn't been bootstrapped or added to a
-  // cluster yet. Answered by any node, not just the leader: membership is
-  // local, read-only state, unlike a write or a transactional read. Its
-  // `is_leader` is also how a client finds the leader in the first
-  // place, so this is the one call that is useful to send to a node
-  // precisely because you don't yet know what it is.
+  // The cluster configuration in force on this node: what its own log's
+  // tail says (Raft §4.1: on append, not on commit), so it can show a change
+  // that has not finished committing. Empty `members` means this node is not
+  // yet bootstrapped or added to a cluster.
+  //
+  // Any node answers, not only the leader: membership is local, read-only
+  // state. Its `is_leader` is how a client finds the leader, so this is the
+  // one call that is useful to send to a node exactly because you do not
+  // know what it is yet.
   rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
 
-  // Transactions. A transaction reads and buffers writes across any
-  // number of keys and commits them as a single log entry, so they
-  // become durable together and apply together.
+  // Transactions. A transaction reads and buffers writes across any number
+  // of keys and commits them as one log entry, so they become durable and
+  // apply together.
   //
-  // This is the only way to write, and the only way to read something
-  // guaranteed current. Collapsing both onto one mechanism is
-  // deliberate: a single-key write is a transaction of one key, which
-  // costs a round trip more than a dedicated call would and saves a
-  // second set of locking and failure rules that would have to agree
-  // with this one.
+  // This is the only way to write. Using one mechanism for everything is
+  // deliberate: a single-key write is a transaction of one key. That costs
+  // one more round trip than a dedicated call, but avoids a second set of
+  // locking and failure rules that would have to agree with this one.
   //
-  // Isolation is two-phase locking held in memory on the leader, which
-  // is why every one of these is refused by anyone else: a transaction
-  // belongs to the leader that created it and cannot outlive its term.
-  // Nothing is written until Commit -- Drop, a lost connection, or the
-  // deadline passing all leave the store exactly as it was.
+  // Isolation is two-phase locking, held in memory on the leader, so every
+  // other node refuses these calls: a transaction belongs to the leader that
+  // created it and cannot outlive its term. Nothing is written until Commit.
+  // Drop, a lost connection, or a passed deadline all leave the store as it
+  // was.
   rpc CreateTransaction(CreateTransactionRequest) returns (CreateTransactionResponse);
   rpc CommitTransaction(CommitTransactionRequest) returns (CommitTransactionResponse);
   rpc DropTransaction(DropTransactionRequest) returns (DropTransactionResponse);
 
   // Authentication.
   //
-  // Opt-in: a node started without a signing secret answers all three of
-  // these with AUTH_DISABLED and demands a token from nobody, which is
-  // the cluster exactly as it behaved before any of this existed.
+  // Optional: a node started without a signing secret answers these calls
+  // with AUTH_DISABLED and asks nobody for a token.
   //
-  // When it is on, every other RPC on this service needs a token. The
-  // two exceptions are below and above: Login, which is what issues one,
-  // and GetConfig, because a client has to be able to find the leader
-  // before it has anywhere to send a login.
+  // When it is on, every other RPC on this service needs a token, with
+  // these exceptions: Login, which issues tokens; GetConfig, because a
+  // client must find the leader before it can send a login; and
+  // RedeemInvite (see below).
 
   // Exchange a username and password for a token.
   //
-  // Answered only by the leader. The account is read linearizably, so a
-  // user deleted a moment ago cannot still log in by reaching a follower
-  // that hasn't heard about it -- the failure worth preventing, since a
-  // token handed out here is good until it expires.
+  // Only the leader answers. The account is read linearizably, so a user
+  // deleted a moment ago cannot log in through a follower that has not
+  // heard of the delete. That matters, because a token issued here is valid
+  // until it expires.
   //
-  // `password` is plaintext on the wire. Until this API is behind TLS,
+  // `password` is plaintext in the message. Without TLS on the client API,
   // anyone who can see the traffic can see it.
   rpc Login(LoginRequest) returns (LoginResponse);
 
-  // Add and remove accounts. Admin only, and the caller's admin rights
-  // are re-read from the store on each call rather than taken from the
-  // token -- a right baked into a token could not be taken back before
-  // that token expired.
+  // Add and remove accounts. Admin only. The caller's admin rights are read
+  // from the store on each call, not taken from the token: a right inside a
+  // token could not be withdrawn before the token expired.
   rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
   rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse);
 
-  // Invitations: accounts created by the person who will own them,
-  // rather than by an administrator on their behalf.
+  // Invitations: accounts created by the person who will own them, not by
+  // an administrator for them.
   //
-  // CreateUser asks an administrator to choose someone else's password,
-  // which means knowing it, typing it, and sending it to them over
-  // whatever channel is to hand. The invitation flow replaces that with
-  // a single-use secret: the administrator decides *that* an account may
-  // exist and what rights it gets, the recipient decides the username
-  // and the password, and no password is ever known to two people.
+  // With CreateUser, an administrator chooses someone else's password,
+  // which means knowing it, typing it, and sending it over some channel. An
+  // invitation replaces that with a single-use secret: the administrator
+  // decides that an account may exist and what rights it gets, the
+  // recipient chooses the username and password, and no password is known
+  // to two people.
   //
-  // What an invite is: 32 random bytes, handed out once by CreateInvite
-  // and never recoverable afterwards -- the cluster keeps only a SHA-256
-  // of them, so a leaked log, snapshot or database directory yields no
-  // usable invite. Redeeming one consumes it in the same transaction
-  // that writes the account, so a token works exactly once however many
-  // callers race to use it.
+  // An invite is 32 random bytes, given out once by CreateInvite and never
+  // recoverable. The cluster keeps only its SHA-256, so a leaked log,
+  // snapshot or database directory contains no usable invite. Redeeming an
+  // invite uses it up in the same transaction that writes the account, so a
+  // token works exactly once, however many callers race to use it.
 
-  // Mint an invitation. Administrators only.
+  // Create an invitation. Administrators only.
   //
-  // The rights the resulting account will have are fixed here, by the
-  // administrator, and are not the recipient's to choose -- an invite
-  // whose holder could ask for `is_admin` would be a way to promote
-  // oneself by accepting an invitation.
+  // The administrator sets the new account's rights here; the recipient
+  // cannot choose them. An invite whose holder could ask for `is_admin`
+  // would let anyone promote themselves.
   rpc CreateInvite(CreateInviteRequest) returns (CreateInviteResponse);
 
-  // Spend an invitation on a new account.
+  // Use an invitation to create an account.
   //
-  // The one RPC besides Login and GetConfig that is answered without a
-  // token, and it has to be: the caller is someone who has no account
-  // yet, which is the entire point of them holding an invite. The token
-  // is the credential, and is the only thing standing between this call
-  // and an open cluster.
+  // Answered without a token, like Login and GetConfig, by necessity: the
+  // caller has no account yet, which is why they hold an invite. The invite
+  // is the credential, and it is the only thing between this call and an
+  // open cluster.
   //
-  // Answered only by the leader. `password` is plaintext on the wire,
-  // exactly as Login's is, with the same caveat until this API is behind
-  // TLS.
+  // Only the leader answers. `password` is plaintext in the message, as for
+  // Login, with the same need for TLS.
   rpc RedeemInvite(RedeemInviteRequest) returns (RedeemInviteResponse);
 
-  // The invitations that are outstanding, with who issued each one and
-  // when it lapses -- never the secret, which no longer exists anywhere
-  // once CreateInvite has answered. Administrators only: an invite names
-  // the person who issued it and may name its intended recipient.
+  // The open invitations, with who issued each and when it lapses. Never
+  // the secret, which no longer exists once CreateInvite has answered.
+  // Administrators only: an invite names its issuer and may name its
+  // intended recipient.
   rpc ListInvites(ListInvitesRequest) returns (ListInvitesResponse);
 
-  // Withdraw an invitation that has not been redeemed. Administrators
-  // only. This is the remedy for one sent to the wrong address: there is
-  // no way to un-send the secret, only to make it worthless.
+  // Withdraw an invitation that has not been redeemed. Administrators only.
+  // This is the fix for one sent to the wrong address: the secret cannot be
+  // recalled, only made worthless.
   rpc RevokeInvite(RevokeInviteRequest) returns (RevokeInviteResponse);
 
-  // Permissions: groups, and access control lists on key prefixes.
+  // Permissions: groups, and access control lists (ACLs) on key prefixes.
   //
-  // Also opt-in, and in a stronger sense than authentication is. A key
-  // no ACL governs is open to every authenticated caller, exactly as
-  // every key was before any of this existed, so a cluster that writes
-  // no ACL behaves as it always did. ACLs restrict; they do not enable.
+  // Optional, even more than authentication. A key that no ACL governs is
+  // open to every authenticated caller, so a cluster that writes no ACL
+  // restricts nothing. ACLs restrict; they never grant extra access.
   //
-  // A key is governed by the ACL on the longest key prefix that has one
-  // -- the longest that *exists*, not the longest that happens to
-  // mention the caller. An ACL on `app/` naming only alice denies bob
-  // `app/config` outright rather than falling back to whatever a shorter
-  // prefix said, which is what makes an ACL a statement about a subtree
-  // and makes revoking access to one possible at all.
+  // The ACL on the longest key prefix that has one governs a key. That is
+  // the longest prefix with an ACL, not the longest that mentions the
+  // caller. An ACL on `app/` that names only alice denies bob `app/config`
+  // outright, and does not fall back to a shorter prefix. That makes an ACL
+  // a statement about a subtree, and makes revoking access to a subtree
+  // possible.
   //
-  // `write` subsumes `read`, and adds creating and deleting keys, and
-  // authority over the ACL of that prefix and of every longer one.
+  // `write` includes `read`, and adds creating and deleting keys, and
+  // authority over the ACL of that prefix and every longer one.
   //
-  // Administrators are outside all of it: `is_admin` is write everywhere
-  // and cannot be revoked by an ACL, since an administrator could
-  // rewrite that ACL anyway and locking one out would only mean locking
-  // out the cluster.
+  // Administrators are outside all of this: `is_admin` means write
+  // everywhere, and no ACL can revoke it. An administrator could rewrite
+  // that ACL anyway, and locking one out would only lock out the cluster.
 
-  // Create a group. Any authenticated caller may, up to a per-creator
-  // quota; the creator becomes its sole administrator.
+  // Create a group. Any authenticated caller may, up to a per-creator quota;
+  // the creator becomes its only administrator.
   //
-  // Unlike accounts, this is deliberately not an administrator's
-  // privilege. A group is a name for a set of people, useful only when
-  // an ACL names it, and an ACL is written by someone who already holds
-  // write on the prefix -- so creating one grants its creator nothing
-  // they did not already have.
+  // Unlike accounts, this is not an administrator's privilege, on purpose.
+  // A group is a name for a set of people, useful only when an ACL names
+  // it, and only someone who already holds write on a prefix can write its
+  // ACL. So creating a group gives its creator nothing new.
   rpc CreateGroup(CreateGroupRequest) returns (CreateGroupResponse);
 
   // Delete a group. Its administrators, or a cluster administrator.
   //
-  // ACLs that named it are left alone: a grant to a group that no longer
-  // exists matches nobody, which is how a dangling reference should
-  // fail. Rewriting every ACL that mentioned it would be a far larger
-  // operation with the same result.
+  // ACLs that name it are left alone: a grant to a group that no longer
+  // exists matches nobody, which is how a dangling reference should fail.
+  // Rewriting every ACL that names it would be far more work for the same
+  // result.
   rpc DeleteGroup(DeleteGroupRequest) returns (DeleteGroupResponse);
 
-  // Add and remove members and administrators, in one transaction.
-  // The group's administrators, or a cluster administrator.
+  // Add and remove members and administrators, in one transaction. The
+  // group's administrators, or a cluster administrator.
   //
-  // One RPC rather than four, because the interesting changes are not
-  // single edits: handing a group over is adding the new administrator
-  // and removing the old one, and that must not be able to land halfway.
-  // Removals are applied after additions, so a call that does both to
-  // the same principal removes it.
+  // One RPC, not four, because the useful changes are not single edits:
+  // handing a group over means adding the new administrator and removing
+  // the old one, and that must not land half done. Removals apply after
+  // additions, so a call that does both to one principal removes it.
   //
-  // A group must always have at least one administrator, and cannot be
-  // made to contain itself -- a cycle would make "who is in this group"
-  // a question with no answer.
+  // A group must always have at least one administrator, and cannot
+  // contain itself: a cycle would make "who is in this group" unanswerable.
   rpc UpdateGroup(UpdateGroupRequest) returns (UpdateGroupResponse);
 
-  // What a group contains and who administers it. Any authenticated
-  // caller: a group is a name for a set of people, and one that could
-  // not be looked up could not be reasoned about by anyone deciding
-  // whether to grant it anything.
+  // What a group contains and who administers it. Any authenticated caller:
+  // a group is a name for a set of people, and nobody could decide whether
+  // to grant it anything if they could not look it up.
   rpc GetGroup(GetGroupRequest) returns (GetGroupResponse);
   rpc ListGroups(ListGroupsRequest) returns (ListGroupsResponse);
 
-  // Write the ACL governing a key prefix, replacing whatever it held.
+  // Write the ACL that governs a key prefix, replacing what it held.
   //
-  // Requires `write` on that prefix -- which, by the longest-prefix
-  // rule, is exactly "write on this prefix or on a shorter one that
-  // governs it". A cluster administrator may always.
+  // Requires `write` on that prefix, which, by the longest-prefix rule, is
+  // "write on this prefix or on a shorter one that governs it". A cluster
+  // administrator may always.
   //
-  // What it does *not* accept is the default. A key nothing governs is
-  // open to everyone, and that is permission to use the key, not
-  // authority over who else may: without this, any account could write
-  // an ACL on the empty prefix and lock out the cluster. So creating an
-  // ACL where no ACL currently decides is an administrator's act.
+  // It does not accept the default. A key nothing governs is open to
+  // everyone, which gives permission to use the key, not authority over who
+  // else may. Without this rule, any account could write an ACL on the empty
+  // prefix and lock out the cluster. So creating an ACL where no ACL decides
+  // is an administrator's act.
   rpc SetAcl(SetAclRequest) returns (SetAclResponse);
 
-  // Remove the ACL on a key prefix, so the next shorter one that has one
-  // governs instead. Same authority as writing it -- with the same
-  // exception, from the other side: a removal that would leave the
-  // prefix governed by nothing, and so open to everyone, is an
-  // administrator's act.
+  // Remove the ACL on a key prefix, so the next shorter prefix with an ACL
+  // governs instead. Same authority as writing it, with the same exception
+  // from the other side: a removal that leaves the prefix governed by
+  // nothing, and so open to everyone, is an administrator's act.
   rpc DeleteAcl(DeleteAclRequest) returns (DeleteAclResponse);
 
-  // Read the ACLs. Any authenticated caller: these say who may reach
-  // which keys, which is not a secret from the people they are about,
-  // and a caller who could not read them could not tell a refusal from
-  // a bug.
+  // Read the ACLs. Any authenticated caller: they say who may reach which
+  // keys, which is no secret from the people they are about, and a caller
+  // who could not read them could not tell a refusal from a bug.
   //
-  // GetAcl answers about one key or prefix, including which prefix
-  // turned out to govern it, because that is the question someone
-  // holding a refusal actually has.
+  // GetAcl answers about one key or prefix, including which prefix governs
+  // it, because that is the question a caller with a refusal has.
   rpc GetAcl(GetAclRequest) returns (GetAclResponse);
   rpc ListAcls(ListAclsRequest) returns (ListAclsResponse);
 }
 
-// Carried in every response so a client can find the real leader without a
+// Sent in every response, so a client can find the real leader with no
 // separate discovery RPC.
 message RaftError {
-  reserved 3, 4; // a never-constructed `timeout`, and a write precondition
+  reserved 3, 4; // retired field numbers; do not reuse
   oneof kind {
     NotLeader not_leader = 1;
-    string unavailable = 2; // e.g. no leader elected yet
+    string unavailable = 2; // for example, no leader elected yet
     TransactionAborted aborted = 5;
   }
 }
 
-// A transaction that is no longer usable, and why. Every reason but
-// IN_DOUBT means nothing was written, so the caller is free to start
-// over and replay whatever it was doing.
+// A transaction that can no longer be used, and why. Every reason except
+// IN_DOUBT means nothing was written, so the caller may start over and
+// replay what it was doing.
 message TransactionAborted {
   enum Reason {
-    // A key was held by someone this transaction was not allowed to
-    // displace: an older transaction, or one already committing. `key`
-    // names it.
+    // A key was held by a transaction this one may not displace: an older
+    // one, or one already committing. `key` names the key.
     LOCK_CONFLICT = 0;
-    // Its deadline passed. Its locks are already gone.
+    // Its deadline passed. Its locks are already released.
     EXPIRED = 1;
-    // No such transaction on this node -- never created, or reclaimed
-    // long enough ago that even the record of its death is gone.
+    // No such transaction on this node: never created, or its record is
+    // already reclaimed.
     UNKNOWN = 2;
-    // The leader changed. A transaction's reads were validated against
-    // the leader that served them, so it cannot be finished anywhere
-    // else.
+    // The leader changed. The transaction's reads were checked against the
+    // old leader, so it cannot finish anywhere else.
     LEADER_CHANGED = 3;
-    // The commit reached the log and then this node stopped leading, so
-    // nothing here can say whether it committed or was rolled back.
-    // `seq` is where it went. Unlike every other reason, this one must
-    // NOT be retried: replaying a read-modify-write that already applied
-    // applies it twice.
+    // The commit reached the log, and then this node stopped leading, so
+    // nobody here can say if it committed or was rolled back. `seq` is where
+    // it went. Unlike every other reason, do NOT retry this one: replaying a
+    // read-modify-write that already applied applies it twice.
     IN_DOUBT = 4;
-    // An older transaction took one of this one's keys. Deliberate, and
-    // how the oldest transaction is guaranteed to make progress rather
-    // than two transactions aborting each other forever.
+    // An older transaction took one of this one's keys. On purpose: it
+    // guarantees the oldest transaction makes progress, instead of two
+    // transactions aborting each other forever.
     WOUNDED = 5;
   }
   Reason reason = 1;
-  optional bytes key = 2; // which key, for LOCK_CONFLICT
+  optional bytes key = 2; // the contended key, for LOCK_CONFLICT
   optional uint64 seq = 3; // where the entry went, for IN_DOUBT
 }
 
 message NotLeader {
-  // Best-known leader, if any. Client should retry there.
+  // The best-known leader, if any. The client should retry there.
   optional string leader_hint = 1;
 }
 
 // Buffer one key's change into a transaction. Nothing is written: the
-// value is held on the leader until CommitTransaction, and the key is
-// locked exclusively from here on.
+// value waits on the leader until CommitTransaction, and the key is
+// locked exclusively from now on.
 message WriteRequest {
   bytes transaction_id = 1;
   bytes key = 2;
@@ -342,182 +315,167 @@ message WriteRequest {
 
 message WriteResponse {
   oneof result {
-    // Buffered. There is no sequence number to give: nothing has been
-    // appended, and CommitTransaction is what assigns one -- to every
-    // key in the transaction at once.
+    // Buffered. There is no seq yet: nothing was appended, and
+    // CommitTransaction assigns one seq to every key in the transaction.
     bool ok = 1;
     RaftError error = 2;
-    // An ACL governs this key and does not grant the caller `write`.
-    // Raised here, where the key is buffered, rather than at commit:
-    // the caller finds out about the key it named, at the moment it
-    // named it, instead of losing a whole transaction's work later to
-    // an error that cannot say which key caused it.
+    // An ACL governs this key and does not grant the caller `write`. Raised
+    // when the key is buffered, not at commit: the caller learns about the key
+    // it named, when it named it, and does not lose a whole transaction later
+    // to an error that cannot say which key caused it.
     AuthError auth_error = 3;
   }
 }
 
 message ReadRequest {
-  // What to read. Answered positionally -- `ReadOk.entries[i]` is about
-  // `keys[i]` -- so a key may appear more than once and is answered at
-  // each position it appears in. At most `MAX_KEYS_PER_READ` (1024);
-  // more is refused rather than shortened, since it is a number the
-  // caller chose.
+  // The keys to read. Answered by position: `ReadOk.entries[i]` answers
+  // `keys[i]`, so a key may appear more than once and is answered at each
+  // position. At most `MAX_KEYS_PER_READ` (1024). More is refused, not
+  // shortened, because the caller chose the number.
   //
-  // The whole call is refused if any one key is reserved, or is one an
-  // ACL denies this caller `read` on. There is no partial answer to give
-  // in that case: a positional response cannot leave a key out without
-  // saying which, and saying which is the refusal.
+  // The whole call is refused if any key is reserved, or if an ACL denies
+  // this caller `read` on any key. No partial answer is possible: a
+  // positional response cannot leave out a key without saying which, and
+  // saying which is the refusal.
   repeated bytes keys = 1;
 
-  // The sequence numbers alone. No value is read -- not merely left out
-  // of the response, but never resolved from storage -- so this costs
-  // the same whatever the values weigh, and is never cut short.
+  // Return only the seqs. No value is read from storage at all, so the cost
+  // does not depend on value size, and the response is never cut short.
   bool versions_only = 2;
 
-  // What the caller wants guaranteed. Every mode reads all of `keys` as
-  // of one moment, `ReadOk.as_of`; they differ in what that moment is and
-  // in what happens afterwards.
+  // What the caller wants guaranteed. Every mode reads all `keys` as of one
+  // moment, `ReadOk.as_of`. The modes differ in what that moment is and in
+  // what happens after.
   //
-  // Leaving the whole field unset is a possibly-stale read, answered
-  // from local state by whichever node received it, with no check that
-  // it still leads -- the cheapest thing this service does, and the
-  // default because most reads can take it.
+  // Unset means a possibly stale read: the receiving node answers from
+  // local state, with no check that it still leads. This is the cheapest
+  // call on this service, and the default because most reads can accept it.
   oneof consistency {
-    // Read as part of this transaction: every key joins its read set and
-    // is held against conflicting writes until it finishes, and a key it
-    // has already buffered a write for reads back as that write. Only
-    // the transaction's own leader will serve one.
+    // Read as part of this transaction: every key joins its read set and is
+    // held against conflicting writes until it ends, and a key it already
+    // wrote reads back as that write. Only the transaction's own leader
+    // serves it.
     //
-    // Every key named is locked before any is read -- including any a
-    // shortened response leaves out -- so a reissue for the rest sees
-    // exactly what this call would have.
+    // Every key named is locked before any is read, including keys that a
+    // shortened response leaves out, so a reissue for the rest sees exactly
+    // what this call would have.
     bytes transaction_id = 3;
 
-    // Linearizable, without a transaction and without a lock. The node
-    // answering proves it still leads and still holds a read quorum, so
-    // the answer reflects everything committed anywhere in the cluster
-    // as of the moment it was given -- but nothing is held afterwards,
-    // so it may be stale by the time the caller acts on it. A caller
-    // that needs the keys to *stay* that way wants a transaction.
+    // Linearizable, with no transaction and no lock. The answering node
+    // proves it still leads and holds a read quorum, so the answer includes
+    // everything committed anywhere in the cluster at the moment it was
+    // given. Nothing is held after, so the keys may change before the caller
+    // acts. A caller that needs the keys to stay as read wants a transaction.
     Linearizable linearizable = 4;
 
     // Read as of the snapshot with this id: what the keys held at the
-    // sequence number that snapshot was created at, whatever has
-    // happened to them since -- including being deleted.
+    // snapshot's seq, whatever happened since, including deletes.
     //
-    // Stale in the same sense an unset `consistency` is, and for a
-    // stronger reason: it deliberately describes a moment that has
-    // already passed, so any node can serve it without proving it
-    // leads. An id no node knows is refused rather than answered as
-    // empty; on a node that has not yet applied the CreateSnapshot
-    // entry that is a transient condition reported like a permanent
-    // one, the same staleness a read of a just-written key has.
+    // Stale like an unset `consistency`, and more so: it describes a past
+    // moment on purpose, so any node can serve it without proving it leads.
+    // An id the node does not know is refused, not answered as empty. On a
+    // node that has not yet applied the CreateSnapshot entry, that is a
+    // temporary condition reported like a permanent one: the same staleness as
+    // a read of a key just written.
     bytes snapshot_id = 5;
   }
 }
 
-// A marker: a message rather than a bool so that "linearizable: false"
-// -- a present field asking for no guarantee -- is not something a
-// request can say.
+// A marker. A message, not a bool, so that "linearizable: false" (a
+// present field that asks for no guarantee) cannot be expressed.
 message Linearizable {}
 
 message ReadResponse {
   oneof result {
     ReadOk ok = 1;
     RaftError error = 2;
-    // An ACL governs one of the keys and does not grant the caller
-    // `read`; `detail` says which, by position. Refused rather than
-    // answered as absent, for the reason a reserved key is: "there is
-    // nothing here" is itself something to learn -- and so is "this key
-    // changed at seq N", which is why `versions_only` is refused too.
+    // An ACL governs one of the keys and does not grant the caller `read`;
+    // `detail` says which key, by position. Refused, not answered as absent,
+    // for the same reason as a reserved key: "there is nothing here" is also
+    // information, and so is "this key changed at seq N", which is why
+    // `versions_only` is refused too.
     AuthError auth_error = 3;
   }
 }
 
 message ReadOk {
-  // The sequence number every entry was read as of: each one is what
-  // its key held once every entry up to and including `as_of` had been
-  // applied, and nothing after.
+  // The seq that every entry was read as of: each entry is what its key held
+  // after every entry up to and including `as_of` was applied, and nothing
+  // after.
   //
-  // Unset or linearizable, that is the point this node had applied to
-  // when it answered. A stale reader can compare it with the seq its
-  // own last commit returned: anything lower means this node has not
-  // caught up with that write yet, and asking elsewhere (or again) gets
-  // read-your-writes without paying for a linearizable read.
+  // Unset or linearizable: the point this node had applied to when it
+  // answered. A stale reader can compare it with the seq its own last
+  // commit returned. A lower value means this node has not applied that
+  // write yet, and asking another node (or asking again) gives
+  // read-your-writes without the cost of a linearizable read.
   //
-  // At a snapshot, it is the snapshot's seq.
+  // At a snapshot: the snapshot's seq.
   //
-  // In a transaction it is committed state as of this point, with the
-  // transaction's own buffered writes laid over it -- the keys are all
-  // locked, so it stays true until the transaction ends.
+  // In a transaction: committed state as of this point, with the
+  // transaction's own buffered writes on top. All the keys are locked, so
+  // this stays true until the transaction ends.
   uint64 as_of = 1;
 
-  // One per key, in the order `keys` named them.
+  // One entry per key, in the order of `keys`.
   //
-  // Possibly fewer: once the values in a response would pass
-  // `MAX_READ_VALUE_BYTES` (10 MiB) it stops, and `entries` is a prefix
-  // of `keys`. The caller reissues for `keys[entries.len()..]`. There is
-  // always at least one entry -- no value that could have been written
-  // is larger than the budget -- so every call makes progress.
+  // There may be fewer: when the values in a response would pass
+  // `MAX_READ_VALUE_BYTES` (10 MiB), the response stops, and `entries` is a
+  // prefix of `keys`. The caller reissues for `keys[entries.len()..]`. There
+  // is always at least one entry (no writable value is larger than the
+  // budget), so every call makes progress.
   //
-  // A reissue is a new read with an `as_of` of its own. In a transaction
-  // and at a snapshot that makes no difference: the keys are locked, or
-  // the moment is fixed, so both halves describe the same state. Unset
-  // or linearizable it does -- the two halves are two moments, and
-  // comparing their `as_of`s says whether anything was applied between
-  // them.
+  // A reissue is a new read with its own `as_of`. In a transaction or at a
+  // snapshot that makes no difference: the keys are locked, or the moment is
+  // fixed, so both halves describe the same state. Unset or linearizable, it
+  // does: the halves are two moments, and comparing their `as_of` values
+  // shows whether anything was applied in between.
   //
   // No `has_more` field: a positional prefix already says exactly which
-  // keys are missing, which a key scan's batch length cannot.
+  // keys are missing.
   repeated KeyVersion entries = 2;
 }
 
 message KeyVersion {
-  // The seq the key's value was written at, or 0 if it had no value --
-  // never written, or deleted, which are the same thing here. Sequencing
-  // starts at 1, so 0 is free to mean that.
+  // The seq the key's value was written at, or 0 if it had no value (never
+  // written, or deleted: the same here). Seqs start at 1, so 0 is free for
+  // this.
   //
-  // Always committed state. A key a transaction has buffered a write for
-  // reads back with the value it buffered and the seq of the value it is
-  // replacing: a buffered write has no sequence number until the commit
-  // assigns one, so there is no other honest answer.
+  // Always committed state. A key the transaction wrote reads back with its
+  // buffered value and the seq of the value it replaces: a buffered write
+  // gets a seq only at commit, so there is no other honest answer.
   uint64 seq = 1;
 
-  // Unset when the key has no value, and always unset for a
-  // `versions_only` read.
+  // Unset when the key has no value, and always unset for a `versions_only`
+  // read.
   optional bytes value = 2;
 }
 
 message GetKeysRequest {
-  // Where to start, inclusive. Empty starts at the first key there is.
-  // A caller continuing a walk passes the last key it saw with a single
-  // zero byte appended, which is the next key there could be.
+  // Where to start, inclusive. Empty starts at the first key. A caller that
+  // continues a walk should use `GetKeysOk.next_start_key`.
   bytes start_key = 1;
-  // How many keys to return at most. 0 means the server's default (10).
-  // A request for more than the server is willing to scan in one call
-  // is refused rather than quietly shortened, for the same reason an
-  // over-long transaction lifetime is: a caller told "yes" would
-  // otherwise page as though it had a batch size it did not get.
+  // The most keys to return. 0 means the server's default (10). A request
+  // for more than the server scans in one call is refused, not shortened,
+  // as for transaction lifetimes: a caller told "yes" would page as if it
+  // had a batch size it did not get.
   uint32 max_keys = 2;
   // What the caller wants guaranteed, as in ReadRequest. Unset is a
-  // possibly-stale read on the same terms.
+  // possibly stale read on the same terms.
   oneof consistency {
-    // Walk as part of this transaction: every key returned joins its
-    // read set, exactly as Read does, and keys it has buffered writes
-    // for are reflected -- a buffered write makes a key appear, a
-    // buffered delete makes it disappear.
+    // Walk as part of this transaction: every returned key joins its read
+    // set, as with Read, and the transaction's buffered writes are included
+    // (a buffered write makes a key appear, a buffered delete makes it
+    // disappear).
     //
-    // Note what this does and does not promise. Every key handed back
-    // is locked, so none of them can change while the transaction
-    // lives. The *range* is not locked: these are per-key locks, not
-    // predicate locks, so a key that did not exist when the walk passed
-    // its position can still be created by someone else. A transaction
-    // that must not miss such a key cannot get that guarantee from
-    // here.
+    // What this does and does not promise: every returned key is locked, so
+    // none can change while the transaction lives. The range is not locked.
+    // These are per-key locks, not predicate locks, so someone else can still
+    // create a key at a position the walk already passed. A transaction that
+    // must not miss such a key cannot get that guarantee here.
     bytes transaction_id = 3;
 
-    // Walk the keys that had a value as of this snapshot -- including
-    // ones deleted since, and excluding ones created since.
+    // Walk the keys that had a value as of this snapshot, including keys
+    // deleted since and excluding keys created since.
     bytes snapshot_id = 4;
   }
 }
@@ -526,35 +484,34 @@ message GetKeysResponse {
   oneof result {
     GetKeysOk ok = 1;
     RaftError error = 2;
-    // No auth_error, deliberately, though every key this returns is
-    // permission-checked. Keys the caller may not read are omitted from
-    // the walk rather than refusing it: a scan asks about a range, not
-    // about a key, and "some of what is in here is not for you" would
-    // say more than handing back what is. It is also the only answer
-    // that composes -- a caller whose access is one subtree of a large
-    // store can still walk the store.
+    // No auth_error, on purpose, though every returned key is checked. Keys
+    // the caller may not read are left out instead of refusing the walk: a
+    // scan asks about a range, not a key, and "some of this is not for you"
+    // would say more than returning what is. It is also the only answer that
+    // composes: a caller whose access is one subtree of a large store can
+    // still walk the store.
   }
 }
 
 message Snapshot {
   bytes snapshot_id = 1;
-  // The sequence number this snapshot reads at.
+  // The seq this snapshot reads at.
   //
-  // Not stored in the record: it is the seq the record's own write
-  // landed at. That is why a snapshot is created once and never
-  // updated -- a second write would move it forward in time.
+  // Not stored in the record: it is the seq of the record's own write. That
+  // is why a snapshot is created once and never updated: a second write
+  // would move it forward in time.
   uint64 seq = 2;
-  // When the client that created it said it was doing so. For humans
-  // reading a listing; nothing depends on it, and nothing should -- it
-  // is one client's clock, recorded verbatim.
+  // When the creating client said it created it. For humans reading a
+  // listing; nothing depends on it, and nothing should: it is one client's
+  // clock, stored as given.
   uint64 created_unix_ms = 3;
 }
 
 message CreateSnapshotRequest {
-  // Chosen by the caller, and unique: creating one that already exists
-  // is refused rather than moving the existing one. Same character set
-  // as a username, and for the same reason -- it is appended to a fixed
-  // key prefix with no separator.
+  // Chosen by the caller, and unique: creating one that already exists is
+  // refused, not used to move it. Same character set as a username (plus
+  // `:` and `+`), for the same reason: it is appended to a fixed key prefix
+  // with no separator.
   bytes snapshot_id = 1;
   uint64 created_unix_ms = 2;
 }
@@ -594,44 +551,37 @@ message ListSnapshotsResponse {
 }
 
 message GetKeysOk {
-  // In ascending order, starting at or after `start_key`. Only keys
-  // that currently have a value: a deleted key is simply not here.
+  // In ascending order, at or after `start_key`. Only keys with a value
+  // now: a deleted key is not here.
   repeated bytes keys = 1;
-  // Whether the scan stopped because it hit `max_keys` rather than
-  // because it ran out of keys. Carried explicitly instead of being
-  // inferred from `keys.len() < max_keys`, which a transaction's
-  // buffered deletes can make wrong -- they can shorten a batch that
-  // was not the last one.
+  // Whether more keys may follow. Sent explicitly, not inferred from
+  // `keys.len() < max_keys`: buffered deletes and ACL filtering can shorten
+  // a batch that is not the last one.
   bool has_more = 2;
-  // Where the next batch starts, set whenever `has_more` is. A caller
-  // that has this should use it and not compute its own cursor.
+  // Where the next batch starts. Set whenever `has_more` is set. Use it;
+  // do not compute a cursor from the last key.
   //
-  // Appending a zero byte to the last key returned is the right next
-  // start only when the scan stopped because the batch filled. It can
-  // now also stop because it examined as many keys as the server will
-  // look at in one call -- which is what keeps a walk bounded when
-  // most of what it passes is filtered out, by an ACL or by a
-  // transaction's buffered deletes. A batch that ends that way can be
-  // short, or empty, while there is plenty left; there is no last key
-  // to derive a cursor from, so the server sends the one it stopped at.
+  // The last key plus a zero byte is the right next start only when the
+  // batch filled. A scan can also stop because it examined as many keys as
+  // the server looks at in one call, which keeps a walk bounded when most
+  // keys it passes are filtered out (by an ACL or buffered deletes). Such a
+  // batch can be short or empty while many keys remain, with no last key to
+  // derive a cursor from, so the server sends the key where it stopped.
   //
-  // An older server sends nothing here and can only stop the first way,
-  // so a client that prefers this and falls back to the zero-byte rule
-  // is correct against both.
+  // A server that does not send this stops only when the batch fills, so a
+  // client that uses this field when present, and the zero-byte rule
+  // otherwise, works with both.
   bytes next_start_key = 3;
 }
 
 message AddServerRequest {
-  // Once the new server's client API address, dialed for its
-  // `GetConfig`. That made adding a server depend on the leader being
-  // able to dial a client API, whose TLS it has no say in.
+  // Retired field; do not reuse.
   reserved 1;
   reserved "client_address";
-  // The new server's peer API address. The leader asks it (RaftPeer's
-  // `Identify`, over the peer mTLS it already uses) for the rest of
-  // what the configuration needs -- server_id and client API address --
-  // straight from the server being added, rather than trusting the
-  // caller to supply them correctly.
+  // The new server's peer API address. The leader asks the new server
+  // itself (RaftPeer's `Identify`, over the peer mTLS it already uses) for
+  // the rest of what the configuration needs, server_id and client API
+  // address, instead of trusting the caller to supply them correctly.
   string peer_address = 2;
 }
 
@@ -640,18 +590,18 @@ message RemoveServerRequest {
 }
 
 message SetHeartbeatRequest {
-  // 10 to 10000. Should comfortably exceed the round trip between any
-  // two servers: votes and lease probes time out after two heartbeats.
+  // 10 to 10000. Should be well above the round trip between any two
+  // servers: votes and lease probes time out after two heartbeats.
   uint64 heartbeat_millis = 1;
 }
 
 message BootstrapRequest {
   // Optional guard: if set, the node refuses unless this is its own id.
-  // Bootstrapping is irreversible, so it is worth being able to say out
-  // loud which node you believe you are talking to.
+  // Bootstrap cannot be undone, so it is worth stating which node you think
+  // you are talking to.
   string server_id = 1;
-  // The new cluster's heartbeat interval; 0 means the default (50ms).
-  // Can be changed later with SetHeartbeat.
+  // The new cluster's heartbeat interval; 0 means the default (50 ms).
+  // SetHeartbeat can change it later.
   uint64 heartbeat_millis = 2;
 }
 
@@ -659,9 +609,9 @@ message ConfigChangeResponse {
   oneof result {
     bool ok = 1;
     RaftError error = 2;
-    // Membership changes are administrators-only, so this carries the
-    // same NOT_ADMIN a CreateUser would -- one error type for "you may
-    // not do this", whichever call it was.
+    // Membership changes are admin only, so this carries the same NOT_ADMIN
+    // as CreateUser: one error type for "you may not do this", whatever the
+    // call.
     AuthError auth_error = 3;
   }
 }
@@ -671,32 +621,29 @@ message GetConfigRequest {}
 message GetConfigResponse {
   raft5.cluster.ClusterMember identity = 1;
   repeated raft5.cluster.ClusterMember members = 2;
-  // Whether this node is leading *now*: it has applied the no-op from
-  // its own term, so its state reflects everything any previous leader
-  // committed, and it still holds a quorum of leases, so it has not
-  // been deposed without noticing. A leader that fails either says
-  // false here, the same as a follower does -- including, briefly, one
-  // that has just won an election and not yet applied its own no-op.
-  // That is reported rather than waited for, so a client scanning for
-  // the leader is never held up by a node that isn't ready; it simply
+  // Whether this node leads right now: it has applied the no-op from its own
+  // term (so its state includes everything earlier leaders committed), and
+  // it still holds a quorum of leases (so it has not lost leadership without
+  // noticing). A leader that fails either check says false, like a
+  // follower. That includes, briefly, a leader that just won an election and
+  // has not applied its no-op. This is reported, not waited for, so a client
+  // looking for the leader is never held up by a node that is not ready; it
   // looks again.
   //
-  // This is how a client finds the leader. It is carried on GetConfig
-  // rather than a probe of its own because a client scanning for the
-  // leader wants the membership from each node it asks anyway -- a
-  // client seeded with one follower learns where everyone else is from
-  // the same answer that tells it this node is not the one.
+  // This is how a client finds the leader. It is on GetConfig, not a
+  // separate probe, because a client looking for the leader wants each
+  // node's membership anyway: a client seeded with one follower learns
+  // where the others are from the same answer that says this node is not
+  // the leader.
   bool is_leader = 3;
-  // The heartbeat interval this node is running at, from the same
-  // configuration as `members`. 0 from a node that has no configuration
-  // yet.
+  // The heartbeat interval this node runs at, from the same configuration as
+  // `members`. 0 from a node with no configuration yet.
   uint64 heartbeat_millis = 4;
 }
 
 // `ttl_ms` is how long the transaction may hold its locks. A value past
-// what this server is willing to grant is refused rather than quietly
-// shortened: a caller told "yes" to a lifetime it will not get would go
-// on to act as though it had one.
+// what the server allows is refused, not shortened: a caller told "yes"
+// to a lifetime it will not get would act as if it had it.
 message CreateTransactionRequest {
   uint64 ttl_ms = 1;
 }
@@ -714,19 +661,17 @@ message CommitTransactionRequest {
 
 message CommitTransactionResponse {
   oneof result {
-    // The sequence number every key in the transaction was written at --
-    // one entry, so one seq for all of them. Zero for a transaction that
-    // buffered no writes: there was nothing to append, so there is no
-    // sequence number to name.
+    // The seq every key in the transaction was written at: one entry, one
+    // seq. Zero for a transaction that buffered no writes: nothing was
+    // appended, so there is no seq.
     uint64 seq = 1;
     RaftError error = 2;
   }
 }
 
-// Give up a transaction and release its locks. Idempotent, and content
-// with an id it has never heard of: committing and then dropping is the
-// ordinary path, and a client shouldn't have to know whether its drop
-// raced its own commit.
+// Give up a transaction and release its locks. Safe to repeat, and fine
+// with an unknown id: commit-then-drop is the normal path, and a client
+// should not need to know whether its drop raced its own commit.
 message DropTransactionRequest {
   bytes transaction_id = 1;
 }
@@ -738,47 +683,45 @@ message DropTransactionResponse {
   }
 }
 
-// Why an authenticated request was not served -- as distinct from the
-// token itself being bad, which never reaches these RPCs.
+// Why an authenticated request was not served. A bad token is a different
+// case, and never reaches these RPCs.
 //
-// Carried in-band beside RaftError rather than as a gRPC status, for the
-// same reason a lock conflict is: these are answers, not failures to
-// answer, and a client that retried them would spend its whole deadline
-// arriving back here. An UNAUTHENTICATED status means one specific thing
-// instead -- the token was missing, forged, or expired -- and is raised
-// by the node's auth layer before any handler runs.
+// Sent in band next to RaftError, not as a gRPC status, like a lock
+// conflict: these are answers, not failures to answer, and a client that
+// retried them would spend its whole deadline getting the same answer. An
+// UNAUTHENTICATED status means one thing only (the token was missing,
+// forged, or expired), and the node's auth layer raises it before any
+// handler runs.
 message AuthError {
   enum Kind {
     UNSPECIFIED = 0;
-    // The username or the password was wrong. Which of the two is
-    // deliberately not said: naming the username as the valid half is
-    // handing over half a credential.
+    // The username or the password was wrong. Which one is not said, on
+    // purpose: naming the username as the valid half gives away half a
+    // credential.
     BAD_CREDENTIALS = 1;
     ALREADY_EXISTS = 2;
     NO_SUCH_USER = 3;
     // The caller is who they say they are, and is not an admin.
     NOT_ADMIN = 4;
-    // This node was started without a signing secret, so it has no
-    // accounts to consult and nothing to sign a token with.
+    // This node was started without a signing secret, so it has no accounts
+    // to check and nothing to sign a token with.
     AUTH_DISABLED = 5;
-    // The invitation offered is not one that can be spent: unknown,
-    // already redeemed, revoked, lapsed, or issued for a username other
-    // than the one being asked for. Which of those is deliberately not
-    // said in the `kind` -- `detail` says more, for a human, but a
-    // client has one thing to do about any of them, which is to ask the
-    // person who issued it for another.
+    // The invitation cannot be used: unknown, already redeemed, revoked,
+    // lapsed, or issued for another username. The `kind` does not say which,
+    // on purpose. `detail` says more, for a human, but a client has one fix
+    // for all: ask the issuer for another.
     BAD_INVITE = 6;
-    // An ACL governs this key, or this prefix, and does not grant the
-    // caller what the call needed. Deliberately not saying which ACL or
-    // what it does grant: GetAcl answers that, for a caller who may ask.
+    // An ACL governs this key or prefix and does not grant the caller what
+    // the call needs. It does not say which ACL or what it grants: GetAcl
+    // answers that, for a caller who may ask.
     NOT_PERMITTED = 7;
-    // There is no such group. Separate from NO_SUCH_USER because the
-    // two namespaces are separate -- a caller told "no such user" about
-    // a group name would go looking for an account.
+    // No such group. Separate from NO_SUCH_USER because the namespaces are
+    // separate: a caller told "no such user" about a group name would look for
+    // an account.
     NO_SUCH_GROUP = 8;
-    // There is no ACL on that exact prefix. Only DeleteAcl raises it,
-    // and it means the prefix itself has none -- a longer or shorter one
-    // may well, which is why this is not "there is no ACL here".
+    // No ACL on that exact prefix. Only DeleteAcl raises it. A longer or
+    // shorter prefix may have one, which is why this does not mean "no ACL
+    // applies here".
     NO_SUCH_ACL = 9;
   }
   Kind kind = 1;
@@ -792,9 +735,9 @@ message LoginRequest {
 
 message LoginOk {
   string token = 1;
-  // When the token stops being accepted, in seconds since the epoch.
-  // Carried explicitly so that a client never has to parse a JWT to know
-  // when to log in again.
+  // When the token stops being accepted, in seconds since the epoch. Sent
+  // explicitly, so a client never has to parse a JWT to know when to log in
+  // again.
   int64 expires_unix = 2;
 }
 
@@ -809,13 +752,13 @@ message LoginResponse {
 message CreateUserRequest {
   string username = 1;
   string password = 2;
-  // Whether this account may itself add and remove accounts.
+  // Whether this account may add and remove accounts too.
   bool is_admin = 3;
 }
 
 message CreateUserResponse {
   oneof result {
-    // The sequence number the account record was written at.
+    // The seq the account record was written at.
     uint64 seq = 1;
     RaftError error = 2;
     AuthError auth_error = 3;
@@ -835,47 +778,46 @@ message DeleteUserResponse {
 }
 
 message CreateInviteRequest {
-  // Whether the account this invite creates may itself manage accounts.
-  // The issuer's choice, never the recipient's.
+  // Whether the account this invite creates may manage accounts. The
+  // issuer's choice, never the recipient's.
   bool is_admin = 1;
-  // How long the invite may be spent for, from the moment the leader
-  // writes it. 0 means the server's default (24 hours). Longer than the
-  // server is willing to grant is refused rather than quietly shortened,
-  // for the reason CreateTransactionRequest.ttl_ms gives.
+  // How long the invite can be used, from when the leader writes it. 0
+  // means the server's default (24 hours). A value longer than the server
+  // allows is refused, not shortened, for the reason given in
+  // CreateTransactionRequest.ttl_ms.
   uint64 ttl_ms = 2;
-  // If set, the one username this invite may create. An invite meant for
-  // a particular person, rather than for whoever ends up holding it --
-  // it does not make the invite less of a secret, it just stops a
-  // misdelivered one from becoming an account under an unexpected name.
+  // If set, the only username this invite may create: an invite meant for
+  // one person, not for whoever holds it. It does not make the invite less
+  // secret; it stops a misdelivered one from becoming an account with an
+  // unexpected name.
   optional string username = 3;
 }
 
-// An invitation as everyone but its recipient sees it: everything about
-// it except the secret.
+// An invitation as everyone but its recipient sees it: everything except
+// the secret.
 message Invite {
-  // The SHA-256 of the token, in URL-safe base64. Derived rather than
-  // stored alongside the secret, so this is a name that can be written
-  // down, listed and revoked by without being worth anything to whoever
-  // reads it -- naming an invite does not help you spend it.
+  // The SHA-256 of the token, in URL-safe base64. Derived, not stored with
+  // the secret, so it is a name that can be written down, listed and used to
+  // revoke, without being worth anything to whoever reads it.
   string invite_id = 1;
   // The administrator who issued it.
   string issued_by = 2;
   bool is_admin = 3;
-  // The username it is pinned to, if it was pinned to one.
+  // The username it is pinned to, if any.
   optional string username = 4;
-  // When it stops being redeemable, by the leader's clock -- the only
-  // clock involved, since neither the issuer's nor the recipient's can
-  // be trusted to bound a credential.
+  // When it can no longer be redeemed, by the leader's clock. That is the
+  // only clock involved: neither the issuer's nor the recipient's clock can
+  // be trusted to limit a credential.
   uint64 expires_unix_ms = 5;
 }
 
 message CreateInviteOk {
-  // The secret, and the only time it is ever transmitted. The cluster
-  // keeps its hash, so an issuer who loses this has no way to recover it
-  // and has to revoke the invite and mint another.
+  // The secret. This is the only time it is sent. The cluster keeps its
+  // hash, so an issuer who loses this cannot recover it and must revoke the
+  // invite and create another.
   string token = 1;
   Invite invite = 2;
-  // The sequence number the invite record was written at.
+  // The seq the invite record was written at.
   uint64 seq = 3;
 }
 
@@ -890,17 +832,16 @@ message CreateInviteResponse {
 message RedeemInviteRequest {
   // The secret, exactly as CreateInvite gave it out.
   string token = 1;
-  // The account to create. Free for the recipient to choose, unless the
-  // invite pinned one, and subject to the same character set every other
-  // username is.
+  // The account to create. The recipient chooses it, unless the invite
+  // pins one, with the same character set as every username.
   string username = 2;
   string password = 3;
 }
 
 message RedeemInviteOk {
-  // The sequence number the account record was written at. The invite's
-  // removal landed at the same one: they are the same transaction, which
-  // is what makes an invite single-use.
+  // The seq the account record was written at. The invite's removal landed
+  // at the same seq: they are one transaction, which is what makes an invite
+  // single-use.
   uint64 seq = 1;
 }
 
@@ -908,9 +849,8 @@ message RedeemInviteResponse {
   oneof result {
     RedeemInviteOk ok = 1;
     RaftError error = 2;
-    // ALREADY_EXISTS here means the username is taken, and the invite
-    // has *not* been spent -- the caller is free to try another name
-    // with the same token.
+    // ALREADY_EXISTS here means the username is taken, and the invite was
+    // not used up: the caller may try another name with the same token.
     AuthError auth_error = 3;
   }
 }
@@ -918,9 +858,8 @@ message RedeemInviteResponse {
 message ListInvitesRequest {}
 
 message InviteList {
-  // In id order, which is hash order, which is no order at all --
-  // there is nothing meaningful to sort invites by that is not already
-  // in each one.
+  // In id order, which is hash order, which is no meaningful order: there
+  // is nothing to sort invites by that each one does not already show.
   repeated Invite invites = 1;
 }
 
@@ -933,7 +872,7 @@ message ListInvitesResponse {
 }
 
 message RevokeInviteRequest {
-  // As `Invite.invite_id` gives it, not the token itself.
+  // As `Invite.invite_id` gives it, not the token.
   string invite_id = 1;
 }
 
@@ -948,10 +887,10 @@ message RevokeInviteResponse {
 
 // Something a group or an ACL can name.
 //
-// A oneof rather than a name plus a kind enum, so that "a principal with
-// no kind set" is not a thing a request can contain. Users and groups
-// are separate namespaces: `user:ops` and `group:ops` are two different
-// principals, and nothing resolves one to the other.
+// A oneof, not a name plus a kind enum, so a request cannot contain "a
+// principal with no kind". Users and groups are separate namespaces:
+// `user:ops` and `group:ops` are two different principals, and neither
+// resolves to the other.
 message Principal {
   oneof kind {
     string user = 1;
@@ -961,16 +900,15 @@ message Principal {
 
 // What a principal may do with the keys an ACL governs.
 //
-// No UNSPECIFIED member, deliberately: proto3 would make it the default,
-// and a grant whose right was left unset would then be the one with the
-// lowest number rather than an error. Requests are refused unless they
-// name one of these explicitly.
+// RIGHT_UNSPECIFIED is the proto3 default, so a grant with the right left
+// unset is an error, not the lowest-numbered right. Requests are refused
+// unless they name RIGHT_READ or RIGHT_WRITE explicitly.
 enum Right {
   RIGHT_UNSPECIFIED = 0;
   // Read the keys under this prefix, and nothing else.
   RIGHT_READ = 1;
-  // Read, write, create and delete them -- and set the ACL of this
-  // prefix and of any longer one.
+  // Read, write, create and delete them, and set the ACL of this prefix and
+  // of any longer one.
   RIGHT_WRITE = 2;
 }
 
@@ -981,8 +919,7 @@ message AclEntry {
 
 // One access control list: the key prefix it governs and what it grants.
 message Acl {
-  // The prefix, exactly as it was set. The empty prefix governs every
-  // key there is.
+  // The prefix, exactly as set. The empty prefix governs every key.
   bytes prefix = 1;
   repeated AclEntry entries = 2;
   // The seq the record was written at.
@@ -990,15 +927,14 @@ message Acl {
 }
 
 message CreateGroupRequest {
-  // Same character set as a username, and for the same reason -- it is
-  // appended to a fixed key prefix with no separator. A separate
-  // namespace from usernames, though: a group may share a name with an
-  // account without being it.
+  // Same character set as a username, for the same reason: it is appended
+  // to a fixed key prefix with no separator. A separate namespace from
+  // usernames, though: a group may share a name with an account without
+  // being it.
   string name = 1;
-  // Optional initial contents, applied in the same transaction that
-  // creates the group. The creator is always an administrator of it,
-  // whatever these say, so that a group can never be created already
-  // unadministrable.
+  // Optional initial contents, applied in the transaction that creates the
+  // group. The creator is always one of its administrators, whatever these
+  // say, so a group can never start with no administrator.
   repeated Principal members = 2;
   repeated Principal admins = 3;
 }
@@ -1025,9 +961,9 @@ message DeleteGroupResponse {
 
 message UpdateGroupRequest {
   string name = 1;
-  // Additions first, then removals, so that a principal named in both
-  // ends up removed. That order is the one that makes "replace these
-  // members with those" a single call that cannot be read two ways.
+  // Additions first, then removals, so a principal named in both ends up
+  // removed. That order makes "replace these members with those" one call
+  // with only one meaning.
   repeated Principal add_members = 2;
   repeated Principal remove_members = 3;
   repeated Principal add_admins = 4;
@@ -1044,15 +980,14 @@ message UpdateGroupResponse {
 
 message Group {
   string name = 1;
-  // The account that created it. Recorded so a listing can say where a
-  // group came from; nothing but the per-creator quota depends on it,
-  // and an administrator of the group need not be this account.
+  // The account that created it. Stored so a listing can say where a group
+  // came from. Only the per-creator quota depends on it, and the group's
+  // administrators need not include this account.
   string created_by = 2;
   // Who may change the group. Separate from its members, and not
-  // implicitly part of them: administering a group is deciding who is
-  // in it, and being in it is holding whatever it has been granted.
-  // An administrator who wants the group's access adds themselves to
-  // it, which they may, and which then shows up here.
+  // implicitly members: administering a group means deciding who is in it,
+  // and being in it means holding what it was granted. An administrator who
+  // wants the group's access adds themselves as a member, which they may.
   repeated Principal admins = 3;
   repeated Principal members = 4;
   // The seq the record was last written at.
@@ -1074,9 +1009,9 @@ message GetGroupResponse {
 message ListGroupsRequest {}
 
 message GroupList {
-  // In name order, with members and admins as stored -- not expanded.
-  // A nested group appears as itself, because the nesting is the thing
-  // somebody reading a listing needs to see.
+  // In name order, with members and admins as stored, not expanded. A
+  // nested group appears as itself, because the nesting is what someone
+  // reading a listing needs to see.
   repeated Group groups = 1;
 }
 
@@ -1089,12 +1024,12 @@ message ListGroupsResponse {
 }
 
 message SetAclRequest {
-  // The key prefix to govern. Empty is legal and governs everything.
+  // The key prefix to govern. Empty is valid and governs everything.
   bytes prefix = 1;
-  // Replaces whatever the prefix held, rather than merging into it: a
-  // caller that read an ACL, decided what it should say, and sends that
-  // is writing what it meant, which a merge could not express -- there
-  // would be no way to take an entry away.
+  // Replaces what the prefix held; does not merge. A caller that read an
+  // ACL, decided what it should say, and sends that, writes what it meant.
+  // A merge could not express that: there would be no way to remove an
+  // entry.
   //
   // A principal may appear at most once.
   repeated AclEntry entries = 2;
@@ -1121,18 +1056,18 @@ message DeleteAclResponse {
 }
 
 message GetAclRequest {
-  // A key, or a prefix -- the same thing as far as this is concerned.
-  // The answer is about whichever ACL governs it.
+  // A key or a prefix: the same thing here. The answer is about whichever
+  // ACL governs it.
   bytes key = 1;
 }
 
 message GetAclOk {
-  // The ACL that governs `key`, absent if none does -- which means the
-  // key is open to every authenticated caller.
+  // The ACL that governs `key`, absent if none does. Then the key is open
+  // to every authenticated caller.
   optional Acl acl = 1;
-  // What that ACL grants the caller asking, absent when nothing governs
-  // the key. Answered here so that "may I write this?" is one round
-  // trip rather than a client reimplementing group expansion.
+  // What that ACL grants the caller, absent when nothing governs the key.
+  // Answered here so "may I write this?" is one round trip, not a client
+  // reimplementing group expansion.
   optional Right effective = 2;
 }
 
@@ -1147,9 +1082,8 @@ message GetAclResponse {
 message ListAclsRequest {}
 
 message AclList {
-  // In prefix order, shortest first where one is a prefix of another --
-  // which is the order they take effect in, read from least to most
-  // specific.
+  // In prefix order, shortest first where one is a prefix of another: the
+  // order they take effect, least specific to most.
   repeated Acl acls = 1;
 }
 

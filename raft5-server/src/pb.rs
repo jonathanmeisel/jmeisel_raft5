@@ -1,10 +1,9 @@
-//! Generated protobuf/gRPC types from `proto/*.proto` (see `build.rs`).
+//! Generated protobuf and gRPC types from `proto/*.proto` (see `build.rs`).
 //!
-//! `client` and `cluster` are generated in the `raft5-shared` crate (also
-//! used by the client library) and re-exported here so the rest of this
-//! crate can keep referring to them as `pb::raft5::client` /
-//! `pb::raft5::cluster`, alongside the `common`/`raft` types generated
-//! locally.
+//! `client` and `cluster` are generated in the `raft5-shared` crate (which
+//! the client library also uses) and re-exported here, so this crate can
+//! refer to them as `pb::raft5::client` and `pb::raft5::cluster`, next to
+//! the locally generated `common` and `raft` types.
 
 pub mod raft5 {
     pub mod common {
@@ -19,16 +18,16 @@ pub mod raft5 {
 
 // --- storage <-> wire conversions -----------------------------------------
 //
-// `storage::EntryPayload` and the `kind`/`writes`/`config` triple on
-// `raft5::common::LogEntry` describe the same thing in the two shapes
-// their formats allow: an enum on the Rust side, where illegal
-// combinations can simply not exist, and a tag beside optional fields on
-// the wire, where proto3 has no sum type. Crossing the boundary is where
-// that difference gets checked, so it gets checked in exactly one place.
+// `storage::EntryPayload` and the `kind`/`writes`/`config` fields of
+// `raft5::common::LogEntry` describe the same thing in the shapes their
+// formats allow: an enum in Rust, where illegal combinations cannot exist,
+// and a tag next to optional fields on the wire, where proto3 has no sum
+// type. The conversion is where the difference is checked, so it is
+// checked in one place.
 //
-// A follower re-appends replicated entries verbatim, so anything lost
-// here is lost from its copy of the log: not just the kind, but every
-// mutation a write carries.
+// A follower re-appends replicated entries exactly, so anything lost here
+// is lost from its log: not only the kind, but every mutation a write
+// carries.
 
 use crate::storage::{EntryPayload, Mutation};
 
@@ -76,11 +75,10 @@ impl From<crate::storage::LogEntry> for raft5::common::LogEntry {
 }
 
 /// Why a replicated entry could not be understood. A follower that gets
-/// one of these rejects the whole `AppendEntries` batch rather than
-/// appending something it has had to guess at: an entry it guessed wrong
-/// about would still match on (seq, term), so the divergence would never
-/// be detected by log matching and would become the cluster's truth at
-/// the next leader change.
+/// one rejects the whole `AppendEntries` batch, instead of appending
+/// something it had to guess. A wrong guess would still match on (seq,
+/// term), so log matching would never detect the divergence, and it would
+/// become the cluster's truth at the next leader change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnknownEntry;
 
@@ -91,27 +89,23 @@ impl std::fmt::Display for UnknownEntry {
 }
 
 impl raft5::common::LogEntry {
-    /// This entry's payload, or `UnknownEntry` if its kind is one this
-    /// build does not know.
+    /// This entry's payload, or `UnknownEntry` if this build does not know its
+    /// kind.
     ///
-    /// Deliberately *not* defaulting an unrecognized kind to a write. It
-    /// used to, back when the field's proto3 default (`PUT`) and a
-    /// one-key entry made that a harmless guess. It is not harmless now:
-    /// the guess would produce a write with no mutations -- an entry that
-    /// consumes a seq, satisfies log matching, and silently drops every
-    /// key a transaction was carrying.
+    /// An unknown kind is not treated as a write, on purpose: the guess would
+    /// produce a write with no mutations, an entry that uses a seq, passes log
+    /// matching, and silently drops every key a transaction carried.
     pub fn payload(&self) -> Result<EntryPayload, UnknownEntry> {
         self.clone().into_payload()
     }
 
     /// `payload`, consuming the entry.
     ///
-    /// Worth having as well as the borrowing one: this runs once per
-    /// entry in the follower's append loop, and `payload` has to clone
-    /// every `KeyValue` to build its result. For an entry carrying a
-    /// whole transaction that clone is the entry all over again, on the
-    /// hot path, for no reason -- the caller is finished with the
-    /// original either way.
+    /// Worth having next to the borrowing version: it runs once per entry in
+    /// the follower's append loop, and `payload` must clone every `KeyValue`
+    /// to build its result. For an entry with a whole transaction, that clone
+    /// is the entry again, on the hot path, for nothing: the caller is done
+    /// with the original anyway.
     pub fn into_payload(self) -> Result<EntryPayload, UnknownEntry> {
         match raft5::common::EntryKind::try_from(self.kind) {
             Ok(raft5::common::EntryKind::Write) => Ok(EntryPayload::Write(
@@ -125,9 +119,9 @@ impl raft5::common::LogEntry {
         }
     }
 
-    /// Whether this entry carries a cluster configuration, without
-    /// decoding the rest of it. An unrecognized kind is not a config --
-    /// the caller is about to reject the batch over it anyway.
+    /// Whether this entry carries a cluster configuration, without decoding
+    /// the rest of it. An unknown kind is not a configuration: the caller will
+    /// reject the batch for it anyway.
     pub fn is_config(&self) -> bool {
         raft5::common::EntryKind::try_from(self.kind) == Ok(raft5::common::EntryKind::Config)
     }

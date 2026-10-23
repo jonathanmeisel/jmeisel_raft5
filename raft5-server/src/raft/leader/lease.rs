@@ -1,19 +1,17 @@
-//! Asking peers whether they still recognise this leader.
+//! Asking peers whether they still recognize this leader.
 //!
-//! Deliberately separate from replication (see `super::replication`) and
+//! Separate from replication (see `super::replication`) on purpose, and
 //! much cheaper: a lease probe does no disk I/O on either side, so a
-//! follower busy appending a large batch can still answer one promptly.
-//! That is the whole point of the split -- it's what lets a leader learn
-//! it has lost its read quorum without waiting on `AppendEntries`.
+//! follower busy appending a large batch can still answer one quickly. That
+//! is the reason for the split: it lets a leader learn that it lost its read
+//! quorum without waiting on `AppendEntries`.
 
 use super::*;
 
-/// Sends one `GetLease` to `peer`, same shape as the other peer RPCs,
-/// bounded by the tight `timeout` (`Timing::lightweight_rpc_timeout`:
-/// this one does no disk I/O, so it should always be fast -- that's the
-/// whole point of keeping it separate from `AppendEntries`). `None` on
-/// any failure -- the caller (a lease-probing task, running continuously)
-/// just retries on its next probe.
+/// Send one `GetLease` to `peer`, like the other peer RPCs, within the
+/// tight `timeout` (`Timing::lightweight_rpc_timeout`: this does no disk
+/// I/O, so it should always be fast). `None` on any failure: the caller (a
+/// lease-probing task that runs continuously) retries on its next probe.
 async fn get_lease_from_peer(
     peer: &PeerInfo,
     req: GetLeaseRequest,
@@ -21,8 +19,8 @@ async fn get_lease_from_peer(
     timeout: Duration,
 ) -> Option<GetLeaseResponse> {
     // `lease_client`, not `client`: a probe on the same connection as a
-    // replication batch waits behind it, and a probe that waits is a
-    // probe that has already failed. See `PeerConnections`.
+    // replication batch waits behind it, and a probe that waits has already
+    // failed. See `PeerConnections`.
     let mut client = conns.lease_client(peer)?;
     let attempt = client.get_lease(req);
     match tokio::time::timeout(timeout, attempt).await {
@@ -31,15 +29,14 @@ async fn get_lease_from_peer(
     }
 }
 
-/// Repeatedly probes `peer` for a lease renewal every heartbeat --
-/// independent of, and much cheaper than, `spawn_replication`'s
-/// `AppendEntries`, so a follower busy appending a large batch doesn't
-/// prevent the leader from promptly learning whether it's still trusted.
-/// Every response is forwarded as `Event::GetLeaseResponse`, same pattern
-/// as replication and voting.
+/// Probe `peer` for a lease renewal every heartbeat. Separate from, and
+/// much cheaper than, `spawn_replication`'s `AppendEntries`, so a follower
+/// busy appending a large batch does not stop the leader from learning
+/// quickly whether it is still trusted. Every response is forwarded as
+/// `Event::GetLeaseResponse`, like replication and voting.
 ///
-/// Timing is re-read from `timing_rx` on every probe, so a heartbeat
-/// change takes effect on the next one.
+/// Timing is read from `timing_rx` on every probe, so a heartbeat change
+/// takes effect on the next one.
 pub(super) fn spawn_lease_prober(
     cancel: &CancellationToken,
     peer: PeerInfo,

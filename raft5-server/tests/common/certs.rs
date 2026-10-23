@@ -1,8 +1,8 @@
-//! Certificates for TLS tests, minted fresh by each test that needs
-//! them -- nothing checked in to expire, and no test trusting another's.
+//! Certificates for TLS tests, created fresh by each test that needs them:
+//! nothing checked in that can expire, and no test trusts another's.
 //!
 //! Compiled into every test binary that includes `common`, and into the
-//! client's tests by path, most of which use only part of it or none.
+//! client's tests by path; most use only part of it, or none.
 #![allow(dead_code)]
 
 use rcgen::{
@@ -22,8 +22,8 @@ impl Pem {
         Identity::from_pem(&self.cert, &self.key)
     }
 
-    /// This certificate as a trust anchor -- what a bare self-signed
-    /// certificate is trusted as.
+    /// This certificate as a trust anchor: how a bare self-signed certificate
+    /// is trusted.
     pub fn as_ca(&self) -> Certificate {
         Certificate::from_pem(&self.cert)
     }
@@ -52,8 +52,8 @@ impl TestCa {
         Certificate::from_pem(&self.pem)
     }
 
-    /// A leaf this CA signs, good as both a server and a client
-    /// certificate for `names` -- which is what a peer needs, being both.
+    /// A leaf this CA signs, valid as both a server and a client certificate
+    /// for `names`, which a peer needs, being both.
     pub fn leaf(&self, names: &[&str]) -> Pem {
         let key = KeyPair::generate().unwrap();
         let cert = leaf_params(names).signed_by(&key, &self.issuer).unwrap();

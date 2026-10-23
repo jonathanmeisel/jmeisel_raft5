@@ -6,7 +6,7 @@ fn config() -> AuthConfig {
     AuthConfig::new(SECRET, Duration::from_secs(3600), None)
 }
 
-/// A token this node issued, checked by a node holding the same secret.
+/// A token this node issued, checked by a node with the same secret.
 #[tokio::test]
 async fn a_token_round_trips() {
     let auth = config();
@@ -21,9 +21,8 @@ async fn a_token_round_trips() {
     );
 }
 
-/// The whole point of the shared secret: a node started with a different
-/// one is not part of this cluster's trust, and its tokens are worth
-/// nothing here.
+/// The point of the shared secret: a node started with a different one is
+/// outside this cluster's trust, and its tokens are worth nothing here.
 #[tokio::test]
 async fn a_token_signed_with_another_secret_is_refused() {
     let (token, _) = AuthConfig::new(b"some other secret", Duration::from_secs(3600), None)
@@ -36,8 +35,8 @@ async fn a_token_signed_with_another_secret_is_refused() {
     assert_eq!(status.code(), tonic::Code::Unauthenticated);
 }
 
-/// Well past the leeway `verify` allows for clock skew between the node
-/// that issued a token and the one checking it.
+/// Well past the leeway `verify` allows for clock skew between the issuing
+/// node and the checking node.
 #[tokio::test]
 async fn an_expired_token_is_refused() {
     let auth = config();
@@ -83,24 +82,23 @@ async fn the_wrong_password_does_not_verify() {
     );
 }
 
-/// Salted, so two accounts that happen to share a password do not share
-/// a hash -- which is what stops one cracked hash from being every
-/// account that reused it.
+/// Salted, so two accounts with the same password do not share a hash. That
+/// stops one cracked hash from exposing every account that reused it.
 #[tokio::test]
 async fn the_same_password_hashes_differently_every_time() {
     let one = hash_password("hunter42".to_string()).await.unwrap();
     let two = hash_password("hunter42".to_string()).await.unwrap();
     assert_ne!(one, two);
 
-    // Both still verify: the salt lives in the PHC string, not beside it.
+    // Both still verify: the salt is in the PHC string, not next to it.
     for hash in [one, two] {
         assert!(verify_password("hunter42".to_string(), hash).await.unwrap());
     }
 }
 
-/// A corrupt stored hash is an error, not a "wrong password". Reporting
-/// it as the latter would tell a user their password was wrong when in
-/// fact their account record is broken.
+/// A corrupt stored hash is an error, not a "wrong password". Reporting it
+/// as one would tell a user their password was wrong when their account
+/// record is broken.
 #[tokio::test]
 async fn an_unreadable_stored_hash_is_an_error_rather_than_a_refusal() {
     let status = verify_password("hunter42".to_string(), "not a PHC string".to_string())
@@ -117,9 +115,8 @@ async fn an_account_record_round_trips() {
     assert_eq!(decoded.version, RECORD_VERSION);
 }
 
-/// A record written by a node that understands a newer format is
-/// refused rather than read as though it were this one -- misreading
-/// `is_admin` is the failure worth avoiding here.
+/// A record written by a node that knows a newer format is refused, not
+/// read as this format: misreading `is_admin` is the failure to avoid here.
 #[tokio::test]
 async fn an_account_record_from_a_future_version_is_refused() {
     let mut record = UserRecord::new("alice".to_string(), "$argon2id$fake".to_string(), true);

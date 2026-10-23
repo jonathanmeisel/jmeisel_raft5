@@ -20,13 +20,11 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 fn open_temp() -> (Arc<RaftLog>, std::path::PathBuf) {
-    // A nanosecond timestamp alone isn't a reliable unique suffix under
-    // parallel test execution -- two tests starting at nearly the same
-    // instant can land on the same value (clock resolution, scheduling)
-    // and collide on the same directory, so a process-wide counter is
-    // layered on top (as a second path segment, not combined into the
-    // same u64, since combining risks collisions of its own) to
-    // guarantee uniqueness regardless.
+    // A nanosecond timestamp alone is not a reliable unique suffix when tests
+    // run in parallel: two tests that start at nearly the same moment can get
+    // the same value and collide on one directory. So a process-wide counter
+    // is added on top, as a second path segment (combining both into one u64
+    // could collide too).
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let mut path = std::env::temp_dir();
@@ -49,7 +47,7 @@ fn cleanup(path: &std::path::Path) {
     let _ = std::fs::remove_dir_all(path);
 }
 
-/// Buffers one key into `txn`, as a client's `Write` does.
+/// Buffer one key into `txn`, as a client's `Write` does.
 async fn buffer(
     svc: &KvService,
     txn: &[u8],
@@ -68,8 +66,8 @@ async fn buffer(
     .expect("a write response always carries a result")
 }
 
-/// A whole single-key write the way a client makes one: open a
-/// transaction, buffer the key, commit. Returns the seq it landed at.
+/// A whole single-key write, as a client makes one: open a transaction,
+/// buffer the key, commit. Returns the seq it landed at.
 async fn write(svc: &KvService, key: &[u8], value: Option<&[u8]>) -> u64 {
     let txn = begin_txn(svc, 5000).await;
     assert!(
@@ -79,7 +77,7 @@ async fn write(svc: &KvService, key: &[u8], value: Option<&[u8]>) -> u64 {
     commit(svc, txn).await
 }
 
-/// The seq a transaction that was expected to commit landed at.
+/// The seq of a transaction that is expected to commit.
 async fn commit(svc: &KvService, txn: Vec<u8>) -> u64 {
     let result = svc
         .commit_transaction(Request::new(CommitTransactionRequest {
@@ -95,14 +93,14 @@ async fn commit(svc: &KvService, txn: Vec<u8>) -> u64 {
     }
 }
 
-/// The one entry a one-key read answered. A one-key read is never cut
-/// short, so there is always exactly one.
+/// The one entry of a one-key read. A one-key read is never cut short, so
+/// there is always exactly one.
 fn only(ok: ReadOk) -> KeyVersion {
     assert_eq!(ok.entries.len(), 1, "a one-key read answers one key: {ok:?}");
     ok.entries.into_iter().next().unwrap()
 }
 
-/// A (stale, so always answerable) read of `key`.
+/// A stale read of `key` (so always answerable).
 async fn read(svc: &KvService, key: &[u8]) -> KeyVersion {
     let resp = svc
         .read(Request::new(ReadRequest {
@@ -119,9 +117,8 @@ async fn read(svc: &KvService, key: &[u8]) -> KeyVersion {
     }
 }
 
-/// A `KvService` on a node that has been bootstrapped into a
-/// single-node cluster and has won its election -- i.e. one that can
-/// actually serve a write.
+/// A `KvService` on a node bootstrapped into a single-node cluster that has
+/// won its election: one that can serve a write.
 async fn leader_kv_service(log: Arc<RaftLog>, node_id: &str) -> KvService {
     leader_kv_service_with_auth(log, node_id, None).await
 }
@@ -133,11 +130,10 @@ async fn leader_kv_service_with_auth(
     auth: Option<AuthConfig>,
 ) -> KvService {
     let (svc, mut role_rx) = kv_service_with_auth(log, node_id, auth);
-    // On a node that keeps accounts, bootstrapping is done by the
-    // administrator it was started with -- exactly the identity the auth
-    // layer would put here from that operator's token. Bootstrap then
-    // writes that administrator into the log, so the cluster comes up
-    // with one account already in it.
+    // On a node with accounts, the administrator it was started with
+    // bootstraps it: exactly the identity the auth layer would put here from
+    // that operator's token. Bootstrap then writes that administrator into the
+    // log, so the cluster starts with one account.
     let mut request = Request::new(BootstrapRequest::default());
     if let Some(admin) = svc
         .auth
@@ -156,18 +152,16 @@ async fn leader_kv_service_with_auth(
     })
     .await
     .expect("a bootstrapped single-node cluster should elect itself");
-    // The lock table learns which term it is serving from the first
-    // request that needs a leader, and discards everything it held if
-    // that term has changed. Doing it here means a test that takes a
-    // lock directly -- rather than through an RPC -- isn't holding one
-    // from before the node had a term at all, which any real caller
-    // could not be.
+    // The lock table learns its term from the first request that needs a
+    // leader, and discards everything if the term changed. Doing it here means
+    // a test that takes a lock directly (not through an RPC) does not hold one
+    // from before the node had a term, which no real caller could.
     svc.leader().expect("this node just became the leader");
     svc
 }
 
-/// A `KvService` on top of a running state machine, plus the handles
-/// a test needs to watch it.
+/// A `KvService` on a running state machine, plus the handles a test needs
+/// to watch it.
 fn kv_service(log: Arc<RaftLog>, node_id: &str) -> (KvService, watch::Receiver<RoleHandle>) {
     kv_service_with_auth(log, node_id, None)
 }
@@ -201,15 +195,14 @@ fn kv_service_with_auth(
 }
 
 /// A `RaftPeerService` for `node_id`, served on a real listener at an
-/// ephemeral port -- for tests where another node's `add_server` has to
-/// reach it for real (it calls `Identify` on whatever `peer_address`
-/// it's given).
+/// ephemeral port, for tests where another node's `add_server` must reach
+/// it (it calls `Identify` on the `peer_address` it is given).
 ///
-/// The address it *reports* is still a fake, unreachable one, same as
-/// `kv_service`: it is what the leader records and replicates to, so
-/// the new node never catches up and stays a learner, which is what
-/// lets a lone leader go on committing -- and remove it again -- by
-/// itself. Torn down by cancelling the returned token.
+/// The address it reports is still fake and unreachable, as in
+/// `kv_service`: that is what the leader records and replicates to, so the
+/// new node never catches up and stays a learner. That lets a lone leader
+/// keep committing, and remove it again, by itself. Stop it by cancelling
+/// the returned token.
 async fn spawn_reachable_peer_service(
     log: Arc<RaftLog>,
     node_id: &str,
@@ -323,17 +316,16 @@ async fn read_of_never_written_key_returns_no_value() {
     cleanup(&path);
 }
 
-/// A node that isn't the leader answers with a structured
-/// `NotLeader` rather than forwarding (Raft §6.2), so the client
-/// retries against the leader directly and exactly one node does the
-/// work.
+/// A non-leader answers with a structured `NotLeader` instead of
+/// forwarding (Raft §6.2), so the client retries on the leader and only one
+/// node does the work.
 #[tokio::test]
 async fn writes_to_a_non_leader_come_back_as_not_leader() {
     let (log, path) = open_temp();
     let (svc, _role_rx) = kv_service(log, "bystander");
 
-    // A write is a transaction, so a bystander refuses at the first
-    // step -- opening one -- rather than at the write itself.
+    // A write is a transaction, so a bystander refuses at the first step
+    // (opening one), not at the write itself.
     let create = svc
         .create_transaction(Request::new(CreateTransactionRequest { ttl_ms: 1000 }))
         .await
@@ -347,9 +339,9 @@ async fn writes_to_a_non_leader_come_back_as_not_leader() {
         other => panic!("expected NotLeader, got {other:?}"),
     }
 
-    // And so does a write naming a transaction it has never heard of,
-    // rather than reporting it as unknown -- which node you are asking
-    // is settled before which transaction you mean.
+    // It also refuses a write that names a transaction it never heard of,
+    // instead of reporting it as unknown: which node you ask is settled before
+    // which transaction you mean.
     match buffer(&svc, &[0u8; 16], b"k", Some(b"v")).await {
         write_response::Result::Error(e) => {
             assert!(matches!(e.kind, Some(raft_error::Kind::NotLeader(_))));
@@ -357,9 +349,9 @@ async fn writes_to_a_non_leader_come_back_as_not_leader() {
         other => panic!("expected NotLeader, got {other:?}"),
     }
 
-    // Membership changes take the same route. The leader check happens
-    // before `add_server` ever dials `peer_address`, so a bystander
-    // answers `NotLeader` without needing it to be reachable.
+    // Membership changes go the same way. The leader check runs before
+    // `add_server` dials `peer_address`, so a bystander answers `NotLeader`
+    // without needing it to be reachable.
     let add = svc
         .add_server(Request::new(AddServerRequest {
             peer_address: "http://127.0.0.1:9998".to_string(),
@@ -375,10 +367,10 @@ async fn writes_to_a_non_leader_come_back_as_not_leader() {
     cleanup(&path);
 }
 
-/// A read outside a transaction is served by whoever receives it,
-/// leader or not -- that is the whole of what it promises. A read
-/// inside one is refused by the same node, since it has neither the
-/// transaction nor a lock table to protect it.
+/// A read outside a transaction is served by any node, leader or not:
+/// that is all it promises. The same node refuses a read inside a
+/// transaction, because it has neither the transaction nor a lock table to
+/// protect it.
 #[tokio::test]
 async fn a_stale_read_is_served_without_a_leader() {
     let (log, path) = open_temp();
@@ -415,15 +407,15 @@ async fn a_stale_read_is_served_without_a_leader() {
 }
 
 /// How a client finds the leader: `GetConfig` says so, and only a node
-/// that is leading *now* -- caught up on what it inherited and still
-/// holding a quorum of leases -- says yes.
+/// leading now (caught up on what it inherited, and holding a quorum of
+/// leases) says yes.
 ///
-/// Note the window this polls through. Winning the election is not
-/// enough: the answer stays false until this leader's own no-op has
-/// been *applied*, because until then its state doesn't yet reflect
-/// everything a previous leader committed. `get_config` reports that
-/// rather than waiting for it, so a client scanning for the leader is
-/// never held up by a node that isn't ready -- it just looks again.
+/// Note the window this polls through. Winning the election is not enough:
+/// the answer stays false until this leader's own no-op is applied,
+/// because until then its state does not include everything an earlier
+/// leader committed. `get_config` reports that without waiting, so a client
+/// looking for the leader is never held up by a node that is not ready; it
+/// just looks again.
 #[tokio::test]
 async fn get_config_reports_whether_this_node_is_leading() {
     async fn is_leader(svc: &KvService) -> bool {
@@ -456,14 +448,14 @@ async fn get_config_reports_whether_this_node_is_leading() {
 }
 
 /// The whole add path through the client API: one call, and the new
-/// server is a member of the configuration in the leader's log.
+/// server is a member in the leader's log.
 #[tokio::test]
 async fn add_server_then_remove_server_round_trip_through_the_kv_service() {
     let (log, path) = open_temp();
     let svc = leader_kv_service(Arc::clone(&log), "solo").await;
 
-    // A real, reachable "new" node -- `add_server` calls `Identify` on
-    // it to learn its identity, so it has to actually answer.
+    // A real, reachable "new" node: `add_server` calls `Identify` on it to
+    // learn its identity, so it must answer.
     let (new_log, new_path) = open_temp();
     let (new_addr, new_cancel) = spawn_reachable_peer_service(new_log, "new").await;
 
@@ -483,9 +475,9 @@ async fn add_server_then_remove_server_round_trip_through_the_kv_service() {
     assert!(config.contains("new"));
     assert!(!config.is_voter("new"), "added as a learner");
 
-    // "new"'s peer address is unreachable, so it never catches up and
-    // stays a learner -- which means the cluster still commits on "solo"
-    // alone, and can therefore also remove it again.
+    // "new"'s peer address is unreachable, so it never catches up and stays a
+    // learner. So the cluster still commits on "solo" alone, and can remove it
+    // again.
     let removed = svc
         .remove_server(Request::new(RemoveServerRequest {
             server_id: "new".to_string(),
@@ -505,9 +497,9 @@ async fn add_server_then_remove_server_round_trip_through_the_kv_service() {
     cleanup(&new_path);
 }
 
-/// The operator-facing half of bootstrapping: the node names *itself*
-/// in the configuration it forms, so a client doesn't have to know
-/// (or be able to lie about) what address this node advertises.
+/// The operator side of bootstrap: the node names itself in the
+/// configuration it forms, so a client does not have to know (or be able
+/// to lie about) the address this node advertises.
 #[tokio::test]
 async fn bootstrap_forms_a_cluster_of_this_node_alone() {
     let (log, path) = open_temp();
@@ -528,7 +520,7 @@ async fn bootstrap_forms_a_cluster_of_this_node_alone() {
     assert_eq!(config.members[0].server_id, "solo");
     assert!(config.members[0].voting);
 
-    // A single-node cluster has no one to lose an election to.
+    // A single-node cluster has nobody to lose an election to.
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while !matches!(&*role_rx.borrow(), RoleHandle::Leader(_)) {
             role_rx.changed().await.unwrap();
@@ -540,9 +532,9 @@ async fn bootstrap_forms_a_cluster_of_this_node_alone() {
     cleanup(&path);
 }
 
-/// `GetConfig` reflects membership before it commits (Raft §4.1 --
-/// activation on append), and reports an empty cluster rather than an
-/// error for a node that hasn't been bootstrapped yet.
+/// `GetConfig` shows membership before it commits (Raft §4.1: it takes
+/// effect on append), and reports an empty cluster, not an error, for a
+/// node not yet bootstrapped.
 #[tokio::test]
 async fn get_config_reports_empty_before_bootstrap_and_the_new_member_right_after_add() {
     let (log, path) = open_temp();
@@ -588,9 +580,8 @@ async fn get_config_reports_empty_before_bootstrap_and_the_new_member_right_afte
     cleanup(&new_path);
 }
 
-/// Bootstrapping is irreversible, so a client that names the wrong
-/// node is told so rather than silently initializing the one it
-/// happened to reach.
+/// Bootstrap cannot be undone, so a client that names the wrong node is
+/// told so, instead of silently initializing whichever node it reached.
 #[tokio::test]
 async fn bootstrap_refuses_when_the_named_node_is_someone_else() {
     let (log, path) = open_temp();
@@ -609,17 +600,16 @@ async fn bootstrap_refuses_when_the_named_node_is_someone_else() {
     cleanup(&path);
 }
 
-/// End-to-end through the actual tonic service: confirms
-/// `RaftPeerService` is wired to a *running* state machine, not just
-/// that `raft::RaftPeerHandle` works in isolation (covered separately
-/// in `raft`'s own unit tests).
+/// End to end through the real tonic service: confirms `RaftPeerService` is
+/// connected to a running state machine, not only that
+/// `raft::RaftPeerHandle` works alone (that is covered in `raft`'s own unit
+/// tests).
 ///
 /// Over a real socket, because `AppendEntries` is a streaming RPC and
-/// `tonic::Streaming` has no public constructor -- the only way to hand
-/// the service one is to have tonic build it from an actual connection.
-/// That also makes this the one test that exercises the chunking and
-/// reassembly together, end to end; `reassemble_append_entries`'s own
-/// rules are tested directly below.
+/// `tonic::Streaming` has no public constructor: the only way to give the
+/// service one is to let tonic build it from a real connection. That also
+/// makes this the one test of chunking and reassembly together, end to
+/// end; the rules of `reassemble_append_entries` are tested directly below.
 #[tokio::test]
 async fn append_entries_and_request_vote_reach_the_running_state_machine() {
     use crate::pb::raft5::raft::raft_peer_client::RaftPeerClient;
@@ -672,16 +662,15 @@ async fn append_entries_and_request_vote_reach_the_running_state_machine() {
     assert_eq!(append_resp.term, 7);
     assert!(append_resp.success);
 
-    // The AppendEntries above just renewed this follower's lease on
-    // leader-1, so it'll refuse any vote request until that lease
-    // naturally expires -- and since this node's own candidacy timer
-    // shares that exact deadline, it may fire first instead (see
-    // raft::follower's `wait_for_vote_grant_or_role_change` for the
+    // The AppendEntries above just renewed this follower's lease on leader-1,
+    // so it refuses every vote request until that lease expires. This node's
+    // own candidacy timer has the same deadline, so it may fire first (see
+    // `wait_for_vote_grant_or_role_change` in raft::follower's tests for the
     // full reasoning). Retry until either happens.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let vote_resp = loop {
         if !matches!(&*role_rx.borrow(), raft::RoleHandle::Follower(_)) {
-            break None; // moved on to campaigning -- also proves the point
+            break None; // moved on to campaigning, which also proves the point
         }
         let resp = svc
             .request_vote(Request::new(RequestVoteRequest {
@@ -727,10 +716,10 @@ async fn begin_txn(svc: &KvService, ttl_ms: u64) -> Vec<u8> {
     }
 }
 
-/// A transaction id is fixed-width, so anything else is a malformed
-/// request rather than a transaction that happens not to exist -- worth
-/// distinguishing, since "no such transaction" is an ordinary answer a
-/// client is expected to handle and this is a bug in its caller.
+/// A transaction id has a fixed width, so any other length is a malformed
+/// request, not a transaction that does not exist. Worth telling apart:
+/// "no such transaction" is a normal answer a client must handle, while
+/// this is a bug in the caller.
 #[tokio::test]
 async fn a_malformed_transaction_id_is_an_invalid_argument() {
     let (log, path) = open_temp();
@@ -747,9 +736,8 @@ async fn a_malformed_transaction_id_is_an_invalid_argument() {
     cleanup(&path);
 }
 
-/// Asking for a lifetime the server will not honour is refused rather
-/// than quietly shortened: a client told "yes" would go on to act as
-/// though it had the lease it asked for.
+/// A lifetime the server will not grant is refused, not shortened: a
+/// client told "yes" would act as if it had the lease it asked for.
 #[tokio::test]
 async fn an_over_long_transaction_is_refused_rather_than_shortened() {
     let (log, path) = open_temp();
@@ -765,9 +753,9 @@ async fn an_over_long_transaction_is_refused_rather_than_shortened() {
     cleanup(&path);
 }
 
-/// Dropping is idempotent and content with an id it has never heard of:
-/// committing and then dropping is the ordinary client path, and a drop
-/// shouldn't have to know whether it raced its own commit.
+/// Dropping is safe to repeat and fine with an unknown id: commit-then-drop
+/// is the normal client path, and a drop should not need to know whether
+/// it raced its own commit.
 #[tokio::test]
 async fn dropping_a_transaction_twice_is_not_an_error() {
     let (log, path) = open_temp();
@@ -790,8 +778,8 @@ async fn dropping_a_transaction_twice_is_not_an_error() {
     cleanup(&path);
 }
 
-/// A transaction that was never opened -- or was dropped, or committed
-/// already -- is `UNKNOWN` rather than a silent success.
+/// A transaction that was never opened (or was dropped, or already
+/// committed) is `UNKNOWN`, not a silent success.
 #[tokio::test]
 async fn committing_an_unknown_transaction_says_so() {
     let (log, path) = open_temp();
@@ -820,8 +808,8 @@ async fn committing_an_unknown_transaction_says_so() {
     cleanup(&path);
 }
 
-/// The whole path through the service: read, buffer, commit, and every
-/// key visible at the one sequence number the entry landed at.
+/// The whole path through the service: read, buffer, commit, and every key
+/// visible at the one seq of the entry.
 #[tokio::test]
 async fn a_committed_transaction_makes_every_key_visible_at_one_seq() {
     let (log, path) = open_temp();
@@ -863,7 +851,7 @@ async fn a_committed_transaction_makes_every_key_visible_at_one_seq() {
 
 // --- key scans --------------------------------------------------------
 
-/// A scan, the way a client makes one.
+/// A scan, as a client makes one.
 async fn get_keys(
     svc: &KvService,
     start: &[u8],
@@ -914,9 +902,9 @@ async fn a_scan_walks_keys_in_order_from_where_it_is_told() {
     cleanup(&path);
 }
 
-/// `has_more` is what says whether to ask again, and appending a zero
-/// byte to the last key is how the next batch starts just past it --
-/// the paging contract `raft5_client::KeyIterator` is built on.
+/// `has_more` says whether to ask again, and the last key plus a zero byte
+/// starts the next batch just past it: the paging contract that
+/// `raft5_client::KeyIterator` relies on.
 #[tokio::test]
 async fn a_scan_pages_through_every_key_without_skipping_or_repeating() {
     let (log, path) = open_temp();
@@ -950,9 +938,9 @@ async fn a_scan_pages_through_every_key_without_skipping_or_repeating() {
     cleanup(&path);
 }
 
-/// Zero means the server's default rather than zero keys -- a proto3
-/// scalar cannot tell "unset" from "0", so the default has to be what
-/// the absent value means.
+/// Zero means the server's default, not zero keys: a proto3 scalar cannot
+/// tell "unset" from "0", so the default must be what the absent value
+/// means.
 #[tokio::test]
 async fn a_scan_with_no_max_uses_the_default() {
     let (log, path) = open_temp();
@@ -968,9 +956,9 @@ async fn a_scan_with_no_max_uses_the_default() {
     cleanup(&path);
 }
 
-/// Refused rather than quietly shortened, for the same reason an
-/// over-long transaction lifetime is: a caller paging in batches of N
-/// should not be told yes and handed something else.
+/// Refused, not shortened, as for an over-long transaction lifetime: a
+/// caller that pages in batches of N must not be told yes and given
+/// something else.
 #[tokio::test]
 async fn a_scan_of_absurdly_many_keys_is_refused_rather_than_shortened() {
     let (log, path) = open_temp();
@@ -989,8 +977,8 @@ async fn a_scan_of_absurdly_many_keys_is_refused_rather_than_shortened() {
     cleanup(&path);
 }
 
-/// A deleted key is simply not there -- the same collapsing of "deleted"
-/// and "never written" that a read does.
+/// A deleted key is simply not there: the same merging of "deleted" and
+/// "never written" that a read does.
 #[tokio::test]
 async fn a_scan_does_not_return_a_deleted_key() {
     let (log, path) = open_temp();
@@ -1005,10 +993,9 @@ async fn a_scan_does_not_return_a_deleted_key() {
     cleanup(&path);
 }
 
-/// A transaction sees its own uncommitted changes, the same way a read
-/// does: a key it has written is there even though the store has never
-/// heard of it, and one it has deleted is gone even though the store
-/// still has it.
+/// A transaction sees its own uncommitted changes, as a read does: a key it
+/// wrote is there although the store has never seen it, and a key it
+/// deleted is gone although the store still has it.
 #[tokio::test]
 async fn a_transactional_scan_reflects_what_the_transaction_buffered() {
     let (log, path) = open_temp();
@@ -1027,16 +1014,16 @@ async fn a_transactional_scan_reflects_what_the_transaction_buffered() {
         "the buffered write appears and the buffered delete does not"
     );
 
-    // And nobody outside it sees any of that until it commits.
+    // And nobody outside sees any of that until it commits.
     let (keys, _) = get_keys(&svc, b"", 10, None).await;
     assert_eq!(as_strings(&keys), ["a", "c"]);
 
     cleanup(&path);
 }
 
-/// A buffered delete shortens the batch it falls in without that
-/// meaning the walk is over -- which is exactly why `has_more` is
-/// reported rather than inferred from `keys.len() < max_keys`.
+/// A buffered delete shortens its batch without ending the walk, which is
+/// exactly why `has_more` is reported, not inferred from
+/// `keys.len() < max_keys`.
 #[tokio::test]
 async fn a_batch_shortened_by_a_buffered_delete_still_says_there_is_more() {
     let (log, path) = open_temp();
@@ -1055,9 +1042,8 @@ async fn a_batch_shortened_by_a_buffered_delete_still_says_there_is_more() {
     cleanup(&path);
 }
 
-/// The point of doing this inside a transaction: every key handed back
-/// is locked, so nobody else can change it for as long as the
-/// transaction lives.
+/// The point of scanning in a transaction: every returned key is locked, so
+/// nobody else can change it while the transaction lives.
 #[tokio::test]
 async fn a_transactional_scan_locks_every_key_it_returns() {
     let (log, path) = open_temp();
@@ -1069,8 +1055,8 @@ async fn a_transactional_scan_locks_every_key_it_returns() {
     let (keys, _) = get_keys(&svc, b"", 10, Some(&scanner)).await;
     assert_eq!(as_strings(&keys), ["a", "b"]);
 
-    // Younger, so it cannot wound its way past the read locks -- it is
-    // refused, naming the key it wanted.
+    // Younger, so it cannot wound its way past the read locks: it is refused,
+    // with the key it wanted.
     let younger = begin_txn(&svc, 5000).await;
     match buffer(&svc, &younger, b"b", Some(b"mine")).await {
         write_response::Result::Error(PbRaftError {
@@ -1085,8 +1071,8 @@ async fn a_transactional_scan_locks_every_key_it_returns() {
     cleanup(&path);
 }
 
-/// A scan outside a transaction is served by whoever receives it, with
-/// no leader check -- the same bargain the plain read makes.
+/// A scan outside a transaction is served by any node, with no leader
+/// check: the same terms as a plain read.
 #[tokio::test]
 async fn a_scan_outside_a_transaction_is_served_without_a_leader() {
     let (log, path) = open_temp();
@@ -1095,7 +1081,7 @@ async fn a_scan_outside_a_transaction_is_served_without_a_leader() {
     let (keys, has_more) = get_keys(&svc, b"", 10, None).await;
     assert!(keys.is_empty() && !has_more);
 
-    // One inside a transaction is not: this node has neither the
+    // A scan inside a transaction is not: this node has neither the
     // transaction nor a lock table to protect it.
     let result = svc
         .get_keys(Request::new(GetKeysRequest {
@@ -1148,8 +1134,8 @@ async fn reassemble(
     reassemble_append_entries(tokio_stream::iter(chunks.into_iter().map(Ok)), current_term).await
 }
 
-/// The round trip the wire depends on: whatever the leader chunked has
-/// to come back as the request it chunked, mutations and all.
+/// The round trip the wire depends on: what the leader chunked must come
+/// back as the request it chunked, mutations and all.
 #[tokio::test]
 async fn a_chunked_request_reassembles_into_exactly_what_was_sent() {
     let original = AppendEntriesRequest {
@@ -1180,8 +1166,8 @@ async fn a_chunked_request_reassembles_into_exactly_what_was_sent() {
     }
 }
 
-/// A batch large enough to span several chunks still arrives whole --
-/// the case the whole change exists for.
+/// A batch large enough to span several chunks still arrives whole: the
+/// main case chunking exists for.
 #[tokio::test]
 async fn a_batch_spanning_many_chunks_reassembles_whole() {
     let value = vec![7u8; 3 * 1024 * 1024];
@@ -1217,8 +1203,8 @@ async fn a_batch_spanning_many_chunks_reassembles_whole() {
     }
 }
 
-/// The header carries the term, so it has to arrive before anything can
-/// be decided about the body. A stream that opens with a fragment is
+/// The header carries the term, so it must arrive before anything can be
+/// decided about the body. A stream that starts with a fragment is
 /// malformed, not merely unwelcome.
 #[tokio::test]
 async fn a_stream_must_open_with_a_header() {
@@ -1234,9 +1220,9 @@ async fn a_stream_must_open_with_a_header() {
 }
 
 /// A leader behind this node's term is refused without its body being
-/// read -- but it is *refused*, with a normal response carrying the
-/// term, not errored. An error would reach the leader as a transport
-/// failure, and it would retry forever instead of stepping down.
+/// read, but refused with a normal response that carries the term, not an
+/// error. An error would reach the leader as a transport failure, and it
+/// would retry forever instead of stepping down.
 #[tokio::test]
 async fn a_stale_leaders_stream_is_refused_rather_than_errored() {
     let chunks = vec![header_chunk(3, 4), fragment(vec![0; 4])];
@@ -1246,9 +1232,9 @@ async fn a_stale_leaders_stream_is_refused_rather_than_errored() {
     }
 }
 
-/// The declared size is the sender's claim, and believing it enough to
-/// size a buffer would make one header an out-of-memory button. Refused
-/// on the claim alone, without allocating against it.
+/// The declared size is the sender's claim, and trusting it to size a
+/// buffer would let one header exhaust memory. Refused on the claim alone,
+/// without allocating for it.
 #[tokio::test]
 async fn an_absurd_declared_size_is_refused_without_allocating_it() {
     let chunks = vec![header_chunk(1, u64::MAX)];
@@ -1258,8 +1244,8 @@ async fn an_absurd_declared_size_is_refused_without_allocating_it() {
     }
 }
 
-/// ...and a sender that under-declares and then keeps sending is caught
-/// on what actually arrives, which is the number that costs memory.
+/// ...and a sender that under-declares and keeps sending is caught on what
+/// actually arrives, which is the number that costs memory.
 #[tokio::test]
 async fn a_body_over_the_limit_is_refused_however_it_was_declared() {
     let mut chunks = vec![header_chunk(1, 1)];
@@ -1273,9 +1259,9 @@ async fn a_body_over_the_limit_is_refused_however_it_was_declared() {
     }
 }
 
-/// A body that disagrees with its header is a broken sender rather than
-/// a policy refusal, so it is an error: there is nothing sensible to
-/// answer, and retrying the same bytes cannot help.
+/// A body that disagrees with its header is a broken sender, not a policy
+/// refusal, so it is an error: there is nothing sensible to answer, and
+/// retrying the same bytes cannot help.
 #[tokio::test]
 async fn a_body_that_disagrees_with_its_header_is_rejected() {
     let chunks = vec![header_chunk(1, 100), fragment(vec![0; 4])];
@@ -1285,9 +1271,8 @@ async fn a_body_that_disagrees_with_its_header_is_rejected() {
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
 }
 
-/// Anything after the header must be a fragment. A second header would
-/// mean two requests sharing one stream, which this protocol does not
-/// have a meaning for.
+/// Everything after the header must be a fragment. A second header would
+/// mean two requests on one stream, which this protocol has no meaning for.
 #[tokio::test]
 async fn a_second_header_mid_stream_is_rejected() {
     let chunks = vec![header_chunk(1, 0), header_chunk(1, 0)];
@@ -1299,16 +1284,14 @@ async fn a_second_header_mid_stream_is_rejected() {
 
 // --- the reserved keyspace --------------------------------------------
 //
-// `crate::keyspace` carves a prefix out of the key space for the
-// cluster's own state -- user accounts, today. These cover the four
-// points where the client API has to refuse to address it. The server's
-// own writes must still reach it, so each test that needs a reserved key
-// present seeds one through `append_directly`, which is the path
-// `CreateUser` will take.
+// `crate::keyspace` sets aside a key prefix for the cluster's own state
+// (accounts, invitations, groups, ACLs, checkpoints). These tests cover the
+// points where the client API must refuse to address it. The server's own
+// writes must still reach it, so each test that needs a reserved key seeds
+// one through `append_directly`, the path the server's own writes take.
 
-/// Puts a key into the store the way the server's own writes do: at the
-/// leader handle, below the gRPC boundary where reserved keys are
-/// refused.
+/// Put a key into the store the way the server's own writes do: at the
+/// leader handle, below the gRPC boundary where reserved keys are refused.
 async fn append_directly(svc: &KvService, key: &[u8], value: &[u8]) -> u64 {
     svc.leader()
         .expect("the test service leads")
@@ -1317,8 +1300,8 @@ async fn append_directly(svc: &KvService, key: &[u8], value: &[u8]) -> u64 {
         .expect("a direct append should commit")
 }
 
-/// The privilege-escalation guard. A client that could buffer this write
-/// could write its own account record and set `is_admin` on it.
+/// The guard against privilege escalation. A client that could buffer this
+/// write could write its own account record and set `is_admin` on it.
 #[tokio::test]
 async fn write_refuses_a_reserved_key() {
     let (log, path) = open_temp();
@@ -1338,8 +1321,8 @@ async fn write_refuses_a_reserved_key() {
     cleanup(&path);
 }
 
-/// Both branches: refused rather than answered as absent, because a
-/// password hash handed back is one to attack offline.
+/// Both branches: refused, not answered as absent, because a returned
+/// password hash can be attacked offline.
 #[tokio::test]
 async fn read_refuses_a_reserved_key_transactional_or_not() {
     let (log, path) = open_temp();
@@ -1381,9 +1364,9 @@ async fn get_keys_refuses_a_reserved_start_key() {
     cleanup(&path);
 }
 
-/// A walk from the very beginning starts at the empty key, which sorts
-/// below the whole reserved range -- so this is the scan that would
-/// reveal every account record if the filter were missing.
+/// A walk from the very start begins at the empty key, which sorts below
+/// the whole reserved range. So this is the scan that would reveal every
+/// account record if the filter were missing.
 #[tokio::test]
 async fn get_keys_does_not_reveal_reserved_keys() {
     let (log, path) = open_temp();
@@ -1404,10 +1387,10 @@ async fn get_keys_does_not_reveal_reserved_keys() {
     cleanup(&path);
 }
 
-/// Reserved keys are skipped inside the scan rather than filtered out of
-/// its result, so they must not consume any of the caller's batch. A
-/// client asking for three keys gets three, however many account records
-/// happen to sort before them.
+/// Reserved keys are skipped inside the scan, not filtered from its result,
+/// so they must not use up any of the caller's batch. A client that asks
+/// for three keys gets three, however many account records sort before
+/// them.
 #[tokio::test]
 async fn reserved_keys_do_not_shorten_a_batch_or_confuse_has_more() {
     let (log, path) = open_temp();
@@ -1420,8 +1403,7 @@ async fn reserved_keys_do_not_shorten_a_batch_or_confuse_has_more() {
         write(&svc, key, Some(b"v")).await;
     }
 
-    // Exactly as many keys as there are: a full batch, and nothing after
-    // it.
+    // Exactly as many keys as there are: a full batch, and nothing after it.
     let (keys, has_more) = get_keys(&svc, b"", 3, None).await;
     assert_eq!(as_strings(&keys), vec!["k1", "k2", "k3"]);
     assert!(
@@ -1429,8 +1411,8 @@ async fn reserved_keys_do_not_shorten_a_batch_or_confuse_has_more() {
         "three keys asked for and three that exist is the end of the walk"
     );
 
-    // One fewer than there are, so `has_more` has to notice the third --
-    // past three reserved keys that don't count towards it.
+    // One fewer than there are, so `has_more` must notice the third, past three
+    // reserved keys that do not count toward it.
     let (keys, has_more) = get_keys(&svc, b"", 2, None).await;
     assert_eq!(as_strings(&keys), vec!["k1", "k2"]);
     assert!(has_more, "there is a third key to come");
@@ -1440,11 +1422,10 @@ async fn reserved_keys_do_not_shorten_a_batch_or_confuse_has_more() {
 
 // --- accounts and tokens ----------------------------------------------
 //
-// The auth layer itself is not in the picture here: these drive the
-// handlers directly, supplying the caller's identity the way that layer
-// will. What they cover is everything underneath it -- who may do what,
-// what the store ends up holding, and the one window where a node has no
-// accounts to consult.
+// The auth layer itself is not involved here: these tests drive the
+// handlers directly and supply the caller's identity as that layer does.
+// They cover everything below it: who may do what, what the store ends up
+// holding, and the one window where a node has no accounts to check.
 
 const TEST_SECRET: &[u8] = b"a secret shared by every node in this test";
 
@@ -1465,14 +1446,14 @@ async fn startup_admin(username: &str, password: &str) -> InitialAdmin {
     }
 }
 
-/// A node that keeps accounts, bootstrapped by `root`, who is left in
-/// the store as its administrator with the password `hunter42`.
+/// A node with accounts, bootstrapped by `root`, who stays in the store as
+/// its administrator with the password `hunter42`.
 async fn authenticated_service(log: Arc<RaftLog>, node_id: &str) -> KvService {
     let admin = startup_admin("root", "hunter42").await;
     leader_kv_service_with_auth(log, node_id, auth_config(Some(admin))).await
 }
 
-/// A request carrying a verified identity, as the auth layer leaves it.
+/// A request with a verified identity, as the auth layer leaves it.
 fn as_user<T>(caller: &str, message: T) -> Request<T> {
     let mut request = Request::new(message);
     request.extensions_mut().insert(AuthContext {
@@ -1568,8 +1549,8 @@ fn created_seq(result: create_user_response::Result) -> u64 {
     }
 }
 
-/// With no secret there is nothing to sign a token with and no accounts
-/// to consult, so all three say so rather than half-working.
+/// With no secret, there is nothing to sign a token with and no accounts to
+/// check, so all three calls say so instead of half working.
 #[tokio::test]
 async fn the_account_rpcs_report_themselves_disabled_without_a_secret() {
     let (log, path) = open_temp();
@@ -1591,10 +1572,10 @@ async fn the_account_rpcs_report_themselves_disabled_without_a_secret() {
     cleanup(&path);
 }
 
-/// The window the startup administrator exists for. A node that has
-/// never been bootstrapped has no accounts and no leader to read them
-/// from, yet `Bootstrap` needs a token like everything else -- so the
-/// operator has to be able to authenticate against something.
+/// The window the startup administrator exists for. A node that was never
+/// bootstrapped has no accounts and no leader to read them from, yet
+/// `Bootstrap` needs a token like every other call, so the operator must be
+/// able to log in against something.
 #[tokio::test]
 async fn the_startup_admin_can_log_in_before_the_node_is_bootstrapped() {
     let (log, path) = open_temp();
@@ -1618,9 +1599,8 @@ async fn the_startup_admin_can_log_in_before_the_node_is_bootstrapped() {
     cleanup(&path);
 }
 
-/// Bootstrapping is what turns the startup administrator from a flag
-/// into an account, so that the cluster comes up with someone who can
-/// administer it.
+/// Bootstrap turns the startup administrator from a flag into an account,
+/// so the cluster starts with someone who can administer it.
 #[tokio::test]
 async fn bootstrapping_writes_the_startup_admin_into_the_store() {
     let (log, path) = open_temp();
@@ -1636,13 +1616,12 @@ async fn bootstrapping_writes_the_startup_admin_into_the_store() {
     cleanup(&path);
 }
 
-/// And the flag itself goes inert. It is gated on the node having a
-/// configuration rather than on the account being absent, so removing
-/// the administrator cannot quietly re-arm the password this node was
-/// started with.
+/// And the flag itself stops working. It depends on the node having a
+/// configuration, not on the account being absent, so removing the
+/// administrator cannot silently re-enable the startup password.
 ///
-/// The other face of that: this is also how a cluster can be locked out
-/// of itself. Deleting the last administrator is unrecoverable.
+/// The other side of that: this is also how a cluster can lock itself out.
+/// Deleting the last administrator cannot be undone.
 #[tokio::test]
 async fn the_startup_password_does_not_come_back_when_the_account_is_removed() {
     let (log, path) = open_temp();
@@ -1674,9 +1653,9 @@ async fn an_administrator_can_create_an_account_that_can_then_log_in() {
     cleanup(&path);
 }
 
-/// An account that does not exist and a password that is wrong get the
-/// same answer: saying which would confirm that a username is real, and
-/// a username is half of a credential.
+/// An account that does not exist and a wrong password get the same
+/// answer: saying which would confirm that a username exists, and a
+/// username is half of a credential.
 #[tokio::test]
 async fn an_unknown_account_and_a_wrong_password_are_refused_alike() {
     let (log, path) = open_temp();
@@ -1730,7 +1709,7 @@ async fn a_deleted_account_can_no_longer_log_in() {
     cleanup(&path);
 }
 
-/// Authenticating says who you are, not what you may do.
+/// Logging in says who you are, not what you may do.
 #[tokio::test]
 async fn an_ordinary_account_may_not_manage_accounts() {
     let (log, path) = open_temp();
@@ -1749,10 +1728,9 @@ async fn an_ordinary_account_may_not_manage_accounts() {
     cleanup(&path);
 }
 
-/// A token for an account that has since been deleted still verifies --
-/// nothing can un-issue one -- but it buys no administrative rights,
-/// because those are looked up on each call rather than asserted by the
-/// token.
+/// A token for an account that was deleted still verifies (nothing can
+/// withdraw one), but it gives no administrative rights, because those are
+/// looked up on each call, not stated in the token.
 #[tokio::test]
 async fn a_deleted_administrator_no_longer_manages_accounts() {
     let (log, path) = open_temp();
@@ -1769,7 +1747,7 @@ async fn a_deleted_administrator_no_longer_manages_accounts() {
 }
 
 /// The handlers never take the caller's word for who they are: with no
-/// identity put there by the auth layer, there is no caller.
+/// identity from the auth layer, there is no caller.
 #[tokio::test]
 async fn managing_accounts_without_a_verified_identity_is_refused() {
     let (log, path) = open_temp();
@@ -1789,8 +1767,8 @@ async fn managing_accounts_without_a_verified_identity_is_refused() {
 }
 
 /// Bootstrapping an authenticated node is the one call that cannot be
-/// authorized from the store, since there is nothing in it yet -- so it
-/// is authorized against the administrator the node was started with.
+/// authorized from the store, because the store is empty. So it is
+/// authorized against the administrator the node was started with.
 #[tokio::test]
 async fn only_the_startup_admin_may_bootstrap_an_authenticated_node() {
     let (log, path) = open_temp();
@@ -1812,8 +1790,8 @@ async fn only_the_startup_admin_may_bootstrap_an_authenticated_node() {
     cleanup(&path);
 }
 
-/// The two halves meeting: an account is a key/value pair, and the
-/// client API cannot see it.
+/// Both sides together: an account is a key/value pair, and the client API
+/// cannot see it.
 #[tokio::test]
 async fn an_account_is_invisible_through_the_client_api() {
     let (log, path) = open_temp();
@@ -1837,9 +1815,9 @@ async fn an_account_is_invisible_through_the_client_api() {
     cleanup(&path);
 }
 
-/// Membership changes are the most destructive calls this service has --
-/// removing the wrong server can cost a cluster its quorum -- so holding
-/// a token is not enough for them either.
+/// Membership changes are the most destructive calls on this service
+/// (removing the wrong server can cost the cluster its quorum), so a token
+/// alone is not enough for them either.
 #[tokio::test]
 async fn an_ordinary_account_may_not_change_cluster_membership() {
     let (log, path) = open_temp();
@@ -1887,15 +1865,15 @@ async fn an_ordinary_account_may_not_change_cluster_membership() {
     cleanup(&path);
 }
 
-/// And the administrator still can -- the check turns away the wrong
-/// caller, not the call.
+/// And the administrator still can: the check turns away the wrong caller,
+/// not the call.
 #[tokio::test]
 async fn an_administrator_may_still_change_cluster_membership() {
     let (log, path) = open_temp();
     let svc = authenticated_service(log, "kv-test").await;
 
-    // Removing a server that isn't a member is refused on its merits,
-    // which is the point: it got past the admin check to be judged.
+    // Removing a non-member is refused on its merits, which is the point: it
+    // passed the admin check and was judged.
     let answered = svc
         .remove_server(as_user(
             "root",
@@ -1918,7 +1896,7 @@ async fn an_administrator_may_still_change_cluster_membership() {
 
 // --- versions-only reads --------------------------------------------
 
-/// What a versions-only read of `key` reports, at whatever consistency.
+/// What a versions-only read of `key` reports, at any consistency.
 async fn version_at(
     svc: &KvService,
     key: &[u8],
@@ -1951,8 +1929,8 @@ async fn version_read_reports_the_seq_a_write_landed_at() {
 
     let seq = write(&svc, b"k", Some(b"v")).await;
     assert_eq!(version(&svc, b"k").await, seq);
-    // And agrees with what `Read` says about the same key, which is the
-    // property that makes it a substitute for one.
+    // It agrees with what a full read says about the same key, which is what
+    // makes it a substitute for one.
     assert_eq!(read(&svc, b"k").await.seq, seq);
 
     cleanup(&path);
@@ -1966,8 +1944,8 @@ async fn version_read_is_zero_for_a_key_with_no_value() {
     // Never written.
     assert_eq!(version(&svc, b"missing").await, 0);
 
-    // And deleted, which is the same answer -- `Read` does not
-    // distinguish the two either.
+    // And deleted, which gives the same answer: a full read does not tell the
+    // two apart either.
     write(&svc, b"k", Some(b"v")).await;
     write(&svc, b"k", None).await;
     assert_eq!(version(&svc, b"k").await, 0);
@@ -1977,9 +1955,9 @@ async fn version_read_is_zero_for_a_key_with_no_value() {
 
 #[tokio::test]
 async fn version_read_refuses_a_reserved_key_transactional_or_not() {
-    // As `read` does, and for a sharper reason: a seq is small enough to
-    // feel harmless, but "this account changed at seq N" is still the
-    // reserved range answering questions about itself.
+    // As for a full read, and for a sharper reason: a seq seems harmless, but
+    // "this account changed at seq N" is still the reserved range answering
+    // questions about itself.
     let (log, path) = open_temp();
     let svc = leader_kv_service(log, "kv-test").await;
     let key = crate::keyspace::user_key("alice");
@@ -2007,9 +1985,9 @@ async fn version_read_refuses_a_reserved_key_transactional_or_not() {
 
 #[tokio::test]
 async fn a_stale_version_read_is_served_without_a_leader() {
-    // The mirror of `a_stale_read_is_served_without_a_leader`: the
-    // default asks for no guarantee, so any node answers, while both
-    // guaranteed forms need a leader and this node is not one.
+    // The mirror of `a_stale_read_is_served_without_a_leader`: the default asks
+    // for no guarantee, so any node answers, while both guaranteed modes need
+    // a leader, and this node is not one.
     let (log, path) = open_temp();
     let (svc, _role_rx) = kv_service(log, "bystander");
 
@@ -2035,9 +2013,9 @@ async fn a_stale_version_read_is_served_without_a_leader() {
 
 #[tokio::test]
 async fn a_transactional_version_read_holds_the_key() {
-    // What proves the transactional path takes the lock rather than
-    // reading storage behind the lock table's back: another transaction
-    // must not be able to write the key afterwards.
+    // What proves the transactional path takes the lock, instead of reading
+    // storage behind the lock table's back: another transaction must not be
+    // able to write the key afterwards.
     let (log, path) = open_temp();
     let svc = leader_kv_service(log, "kv-test").await;
     write(&svc, b"k", Some(b"v")).await;
@@ -2070,10 +2048,10 @@ async fn a_transactional_version_read_holds_the_key() {
 
 #[tokio::test]
 async fn a_transactional_version_read_reports_committed_state_over_its_own_write() {
-    // A transaction asking about a key it has itself buffered gets the
-    // *committed* seq: the buffered write has no sequence number until
-    // the commit assigns one. It must also not deadlock on its own write
-    // lock, which is why the read side skips a key it already holds.
+    // A transaction that asks about a key it buffered gets the committed seq:
+    // a buffered write has no seq until the commit gives it one. It must also
+    // not deadlock on its own write lock, which is why the read side skips a
+    // key it already holds.
     let (log, path) = open_temp();
     let svc = leader_kv_service(log, "kv-test").await;
     let committed = write(&svc, b"k", Some(b"v")).await;
@@ -2100,10 +2078,10 @@ async fn a_transactional_version_read_reports_committed_state_over_its_own_write
 
 #[tokio::test]
 async fn a_linearizable_read_and_version_agree_with_the_stale_ones_on_a_leader() {
-    // On a settled single-node leader all three consistencies describe
-    // the same state, so this pins that the two new paths answer at all
-    // and answer the same thing -- their guarantee is about *when*, not
-    // about what.
+    // On a settled single-node leader, all three consistencies describe the
+    // same state, so this checks that the linearizable and transactional paths
+    // answer at all, and answer the same. Their guarantee is about when, not
+    // what.
     let (log, path) = open_temp();
     let svc = leader_kv_service(log, "kv-test").await;
     let seq = write(&svc, b"k", Some(b"v")).await;
@@ -2142,8 +2120,8 @@ async fn a_linearizable_read_and_version_agree_with_the_stale_ones_on_a_leader()
 
 // --- snapshots --------------------------------------------------------
 
-/// Create a snapshot on a node that keeps no accounts, so `require_admin`
-/// is satisfied by there being nobody to be an administrator.
+/// Create a snapshot on a node with no accounts, where `require_admin`
+/// passes because nobody can be an administrator.
 async fn make_snapshot(svc: &KvService, id: &[u8]) -> PbSnapshot {
     let result = svc
         .create_snapshot(Request::new(CreateSnapshotRequest {
@@ -2306,9 +2284,9 @@ async fn an_unknown_snapshot_is_refused_rather_than_answered_as_empty() {
     let svc = leader_kv_service(log, "kv-test").await;
     write(&svc, b"k", Some(b"v")).await;
 
-    // Answering an unknown id as "no value" would be indistinguishable
-    // from a snapshot taken before the key existed, which is exactly the
-    // confusion an explicit refusal avoids.
+    // Answering an unknown id as "no value" would look the same as a snapshot
+    // taken before the key existed, which is exactly the confusion an explicit
+    // refusal avoids.
     let status = read_at(&svc, b"nope", b"k").await.expect_err("unknown id");
     assert_eq!(status.code(), tonic::Code::NotFound);
     let status = snapshot_version_result(&svc, b"nope", b"k")
@@ -2346,9 +2324,8 @@ async fn a_removed_snapshot_stops_being_readable() {
 
 #[tokio::test]
 async fn creating_a_snapshot_twice_is_refused_rather_than_moving_it() {
-    // The invariant the whole feature rests on: a snapshot's seq is the
-    // seq of its own record, so a second write would silently move it
-    // forward in time.
+    // The rule the whole feature rests on: a snapshot's seq is the seq of its
+    // own record, so a second write would silently move it forward in time.
     let (log, path) = open_temp();
     let svc = leader_kv_service(log, "kv-test").await;
     let first = make_snapshot(&svc, b"s1").await;
@@ -2363,7 +2340,7 @@ async fn creating_a_snapshot_twice_is_refused_rather_than_moving_it() {
         .expect_err("a duplicate id should be refused");
     assert_eq!(result.code(), tonic::Code::AlreadyExists);
 
-    // And it still reads where it originally did.
+    // And it still reads where it did before.
     let listed = list_snapshots(&svc).await;
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].seq, first.seq);
@@ -2405,8 +2382,7 @@ async fn a_malformed_snapshot_id_is_refused() {
         assert_eq!(status.code(), tonic::Code::InvalidArgument, "id {id:?}");
     }
 
-    // An RFC-3339-ish timestamp, which is what the client defaults to,
-    // must be legal.
+    // An RFC 3339-style timestamp (the client's default id) must be valid.
     make_snapshot(&svc, b"2026-09-22T14:03:11.482Z").await;
 
     cleanup(&path);
@@ -2422,7 +2398,7 @@ async fn snapshot_records_are_invisible_to_a_key_walk() {
     let (keys, _) = get_keys(&svc, b"", 10, None).await;
     assert_eq!(keys, vec![b"visible".to_vec()]);
 
-    // And the record's key is unaddressable directly.
+    // And the record's key cannot be addressed directly.
     let status = svc
         .read(Request::new(ReadRequest {
             keys: vec![b"\0snap/s1".to_vec()],
@@ -2457,7 +2433,7 @@ async fn the_number_of_live_snapshots_is_capped() {
 }
 
 /// Managing snapshots is administration, not reading: a snapshot pins
-/// storage cluster-wide until someone releases it.
+/// storage across the cluster until someone releases it.
 #[tokio::test]
 async fn an_ordinary_account_may_not_manage_snapshots() {
     let (log, path) = open_temp();
@@ -2483,7 +2459,8 @@ async fn an_ordinary_account_may_not_manage_snapshots() {
         other => panic!("expected NOT_ADMIN, got {other:?}"),
     }
 
-    // An admin may, and then an ordinary account may not release it.
+    // An admin may create one, and then an ordinary account may not release
+    // it.
     let made = svc
         .create_snapshot(as_user(
             "root",
@@ -2519,7 +2496,7 @@ async fn an_ordinary_account_may_not_manage_snapshots() {
         other => panic!("expected NOT_ADMIN, got {other:?}"),
     }
 
-    // But reading at it needs no privilege at all: it is a read.
+    // But reading at it needs no privilege: it is a read.
     assert!(read_at(&svc, b"s1", b"anything").await.is_ok());
 
     cleanup(&path);
@@ -2527,13 +2504,12 @@ async fn an_ordinary_account_may_not_manage_snapshots() {
 
 // --- Invitations ---------------------------------------------------------
 //
-// The workflow these cover has two halves that never meet: an
-// administrator who decides an account may exist, and a person who
-// decides what it is called and what its password is. The tests below
-// are mostly about the seam between them -- what the invitation carries
-// across it, and what it must not.
+// The workflow has two sides that never meet: an administrator who
+// decides an account may exist, and a person who decides its name and
+// password. These tests are mostly about the boundary between them: what
+// the invitation carries across, and what it must not.
 
-/// Mints an invitation and hands back `(token, invite_id)`.
+/// Create an invitation and return `(token, invite_id)`.
 async fn create_invite(
     svc: &KvService,
     caller: &str,
@@ -2556,8 +2532,8 @@ async fn create_invite(
     .expect("create_invite always answers")
 }
 
-/// The ordinary case: an invitation for anyone, with the default
-/// lifetime, made by `root`.
+/// The normal case: an invitation for anyone, with the default lifetime,
+/// created by `root`.
 async fn invite(svc: &KvService) -> (String, String) {
     minted(create_invite(svc, "root", false, None, 0).await)
 }
@@ -2580,8 +2556,8 @@ fn invite_refusal(result: create_invite_response::Result) -> auth_error::Kind {
     }
 }
 
-/// `RedeemInvite` carries no identity by design, so this is the one
-/// account call built with a plain `Request`.
+/// `RedeemInvite` has no identity by design, so this is the one account
+/// call built with a plain `Request`.
 async fn redeem(
     svc: &KvService,
     token: &str,
@@ -2643,7 +2619,7 @@ async fn revoke(svc: &KvService, caller: &str, invite_id: &str) -> revoke_invite
 }
 
 /// The whole point of the feature, end to end: an administrator issues a
-/// secret, hands it over, and someone else turns it into an account
+/// secret and hands it over, and someone else turns it into an account
 /// whose password the administrator never knew.
 #[tokio::test]
 async fn an_invitation_becomes_an_account_its_issuer_cannot_log_in_as() {
@@ -2654,7 +2630,7 @@ async fn an_invitation_becomes_an_account_its_issuer_cannot_log_in_as() {
     assert!(redeemed_seq(redeem(&svc, &token, "alice", "correct horse").await) > 0);
 
     assert!(!login_token(login(&svc, "alice", "correct horse").await).is_empty());
-    // `root` chose nothing about this account but that it could exist.
+    // `root` chose nothing about this account except that it could exist.
     assert_eq!(
         login_refusal(login(&svc, "alice", "hunter42").await),
         auth_error::Kind::BadCredentials
@@ -2663,8 +2639,8 @@ async fn an_invitation_becomes_an_account_its_issuer_cannot_log_in_as() {
     cleanup(&path);
 }
 
-/// An invitation is spent in the same transaction that writes the
-/// account, which is the whole of "single use".
+/// An invitation is used up in the same transaction that writes the
+/// account, which is all "single use" means.
 #[tokio::test]
 async fn an_invitation_can_only_be_redeemed_once() {
     let (log, path) = open_temp();
@@ -2686,9 +2662,9 @@ async fn an_invitation_can_only_be_redeemed_once() {
     cleanup(&path);
 }
 
-/// The rights of the new account come from the invitation, which the
-/// redeemer cannot influence -- an invite whose holder could ask for
-/// `is_admin` would be a way to promote oneself by accepting one.
+/// The new account's rights come from the invitation, which the redeemer
+/// cannot change: an invite whose holder could ask for `is_admin` would let
+/// anyone promote themselves by accepting one.
 #[tokio::test]
 async fn the_invitation_decides_whether_the_new_account_is_an_administrator() {
     let (log, path) = open_temp();
@@ -2699,8 +2675,8 @@ async fn the_invitation_decides_whether_the_new_account_is_an_administrator() {
     redeemed_seq(redeem(&svc, &ordinary, "alice", "one").await);
     redeemed_seq(redeem(&svc, &privileged, "bob", "two").await);
 
-    // `create_user` is the admin-only call, so who can run it is the
-    // question these two accounts answer differently.
+    // `create_user` is admin-only, so who may run it is the question these two
+    // accounts answer differently.
     assert_eq!(
         create_refusal(create_user(&svc, "alice", "carol", "three", false).await),
         auth_error::Kind::NotAdmin
@@ -2710,9 +2686,9 @@ async fn the_invitation_decides_whether_the_new_account_is_an_administrator() {
     cleanup(&path);
 }
 
-/// Issuing one is an administrator's call. It grants an account, and
-/// possibly an administrator's account, so it is exactly as privileged
-/// as `CreateUser`.
+/// Issuing one is an administrator's call. It grants an account, possibly
+/// an administrator's account, so it is exactly as privileged as
+/// `CreateUser`.
 #[tokio::test]
 async fn only_an_administrator_may_issue_or_list_or_revoke_an_invitation() {
     let (log, path) = open_temp();
@@ -2747,8 +2723,8 @@ async fn only_an_administrator_may_issue_or_list_or_revoke_an_invitation() {
     cleanup(&path);
 }
 
-/// The remedy for an invitation sent to the wrong address: the secret
-/// cannot be recalled, only made worthless.
+/// The fix for an invitation sent to the wrong address: the secret cannot
+/// be recalled, only made worthless.
 #[tokio::test]
 async fn a_revoked_invitation_cannot_be_redeemed() {
     let (log, path) = open_temp();
@@ -2781,8 +2757,8 @@ async fn a_lapsed_invitation_cannot_be_redeemed() {
         redeem_refusal(redeem(&svc, &token, "alice", "one").await),
         auth_error::Kind::BadInvite
     );
-    // And the next issue sweeps it, so lapsed records do not pile up in
-    // the reserved range with nothing to remove them.
+    // And the next issue sweeps it, so lapsed records do not pile up in the
+    // reserved range with nothing to remove them.
     invite(&svc).await;
     assert_eq!(
         list_invites(&svc, "root").await.len(),
@@ -2793,9 +2769,8 @@ async fn a_lapsed_invitation_cannot_be_redeemed() {
     cleanup(&path);
 }
 
-/// A pinned invitation is still a secret; the pin is what stops a
-/// misdelivered one from quietly becoming an account under a name
-/// nobody expected.
+/// A pinned invitation is still a secret; the pin stops a misdelivered one
+/// from silently becoming an account with a name nobody expected.
 #[tokio::test]
 async fn an_invitation_pinned_to_a_username_refuses_any_other() {
     let (log, path) = open_temp();
@@ -2812,8 +2787,8 @@ async fn an_invitation_pinned_to_a_username_refuses_any_other() {
     cleanup(&path);
 }
 
-/// Choosing a name somebody already has is a thing the holder can fix by
-/// choosing another -- so it must not cost them the invitation.
+/// Choosing a name that is taken is something the holder can fix by
+/// choosing another, so it must not cost them the invitation.
 #[tokio::test]
 async fn a_name_that_is_taken_refuses_the_redemption_without_spending_it() {
     let (log, path) = open_temp();
@@ -2834,8 +2809,8 @@ async fn a_name_that_is_taken_refuses_the_redemption_without_spending_it() {
     cleanup(&path);
 }
 
-/// What a listing says, and what it deliberately does not: the token is
-/// gone, and a redeemed invitation is not an outstanding one.
+/// What a listing shows, and what it does not, on purpose: the token is
+/// gone, and a redeemed invitation is not an open one.
 #[tokio::test]
 async fn the_listing_shows_outstanding_invitations_and_never_their_secrets() {
     let (log, path) = open_temp();
@@ -2850,8 +2825,8 @@ async fn the_listing_shows_outstanding_invitations_and_never_their_secrets() {
     assert!(listed[0].is_admin);
     assert_eq!(listed[0].username.as_deref(), Some("alice"));
     assert!(listed[0].expires_unix_ms > 0);
-    // The id is a hash of the token, not the token: naming an invitation
-    // is not the same as being able to spend one.
+    // The id is a hash of the token, not the token: naming an invitation does
+    // not let you use it.
     assert_ne!(listed[0].invite_id, token);
 
     redeemed_seq(redeem(&svc, &token, "alice", "one").await);
@@ -2863,8 +2838,8 @@ async fn the_listing_shows_outstanding_invitations_and_never_their_secrets() {
     cleanup(&path);
 }
 
-/// Nothing about a token that is not one this cluster issued
-/// distinguishes it from one that was: both name no record.
+/// Nothing distinguishes a token this cluster did not issue from one it
+/// did: neither names a record.
 #[tokio::test]
 async fn a_token_this_cluster_never_issued_is_refused() {
     let (log, path) = open_temp();
@@ -2881,9 +2856,9 @@ async fn a_token_this_cluster_never_issued_is_refused() {
     cleanup(&path);
 }
 
-/// The lifetime is the cluster's policy. One past what it grants is
-/// refused rather than quietly shortened, so an issuer never hands out
-/// an invitation believing it good for longer than it is.
+/// The lifetime is cluster policy. A lifetime past what it grants is
+/// refused, not shortened, so an issuer never hands out an invitation
+/// believing it lasts longer than it does.
 #[tokio::test]
 async fn an_invitation_may_not_outlast_what_the_cluster_grants() {
     let (log, path) = open_temp();
@@ -2906,7 +2881,7 @@ async fn an_invitation_may_not_outlast_what_the_cluster_grants() {
 }
 
 /// With no secret there are no accounts to invite anyone into, so these
-/// say so rather than half-working -- the same answer `Login` and
+/// calls say so instead of half working: the same answer `Login` and
 /// `CreateUser` give.
 #[tokio::test]
 async fn the_invitation_rpcs_report_themselves_disabled_without_a_secret() {
@@ -2928,9 +2903,9 @@ async fn the_invitation_rpcs_report_themselves_disabled_without_a_secret() {
 // ---------------------------------------------------------------------
 // Permissions: groups and prefix ACLs.
 //
-// The handler-level half. These hand the service a verified identity
-// directly, as the rest of this file does; `tests/auth.rs` covers the
-// same ground through the real tower layer and real tokens.
+// The handler-level part. These give the service a verified identity
+// directly, like the rest of this file; `tests/auth.rs` covers the same
+// ground through the real tower layer and real tokens.
 // ---------------------------------------------------------------------
 
 fn pb_user(name: &str) -> PbPrincipal {
@@ -2972,7 +2947,7 @@ async fn set_acl(
     .expect("set_acl always answers")
 }
 
-/// `set_acl`, for the calls a test expects to work.
+/// `set_acl`, for calls a test expects to succeed.
 async fn must_set_acl(svc: &KvService, caller: &str, prefix: &[u8], entries: Vec<PbAclEntry>) -> u64 {
     match set_acl(svc, caller, prefix, entries).await {
         set_acl_response::Result::Seq(seq) => seq,
@@ -3049,11 +3024,10 @@ async fn update_group(
 
 /// `UpdateGroup` without unwrapping the transport error.
 ///
-/// A request that is malformed rather than merely refused -- one that
-/// would put a group inside itself, or leave it with no administrator --
-/// comes back as an `InvalidArgument` status, not in band. That is the
-/// same channel `reject_reserved` uses and the same one the client
-/// treats as permanent, so it is worth a helper that can see it.
+/// A malformed request (one that would put a group inside itself, or
+/// leave it with no administrator) returns an `InvalidArgument` status, not
+/// an in-band answer. That is the channel `reject_reserved` uses, which the
+/// client treats as permanent, so a helper that can see it is useful.
 async fn try_update_group(
     svc: &KvService,
     caller: &str,
@@ -3094,7 +3068,7 @@ async fn read_as(svc: &KvService, caller: &str, key: &[u8]) -> read_response::Re
 }
 
 /// A whole single-key write as `caller`. The transaction is opened and
-/// disposed of here, so a refusal leaves nothing behind.
+/// cleaned up here, so a refusal leaves nothing behind.
 async fn write_as(
     svc: &KvService,
     caller: &str,
@@ -3193,7 +3167,7 @@ fn ok_read(result: read_response::Result) -> KeyVersion {
 }
 
 /// A node with accounts, `root` as its administrator, and an ordinary
-/// account `alice` -- the shape nearly every test below wants.
+/// account `alice`: the setup almost every test below wants.
 async fn service_with_alice(log: Arc<RaftLog>, node_id: &str) -> KvService {
     let svc = authenticated_service(log, node_id).await;
     created_seq(create_user(&svc, "root", "alice", "hunter42", false).await);
@@ -3202,8 +3176,7 @@ async fn service_with_alice(log: Arc<RaftLog>, node_id: &str) -> KvService {
 
 // -- the default -------------------------------------------------------
 
-/// The property every existing cluster depends on across this upgrade:
-/// with no ACLs written, nothing is refused and nothing changes.
+/// With no ACLs written, nothing is refused and nothing changes.
 #[tokio::test]
 async fn without_any_acl_every_account_reaches_every_key() {
     let (log, path) = open_temp();
@@ -3225,8 +3198,8 @@ async fn without_any_acl_every_account_reaches_every_key() {
     cleanup(&path);
 }
 
-/// A cluster with no secret keeps no accounts, so there is nobody for an
-/// ACL to be about. Decided in one place, as `require_admin` decides it.
+/// A cluster with no secret keeps no accounts, so no ACL can be about
+/// anyone. Decided in one place, as `require_admin` decides it.
 #[tokio::test]
 async fn a_node_without_a_secret_enforces_no_acls_and_has_none_to_manage() {
     let (log, path) = open_temp();
@@ -3240,7 +3213,7 @@ async fn a_node_without_a_secret_enforces_no_acls_and_has_none_to_manage() {
         group_refusal(create_group(&svc, "root", "ops", vec![]).await),
         auth_error::Kind::AuthDisabled
     );
-    // And the data path is untouched -- no identity is even looked for.
+    // And the data path is untouched: no identity is even looked for.
     assert!(write(&svc, b"app/config", Some(b"v")).await > 0);
 
     cleanup(&path);
@@ -3248,8 +3221,8 @@ async fn a_node_without_a_secret_enforces_no_acls_and_has_none_to_manage() {
 
 // -- enforcement on the data path --------------------------------------
 
-/// An ACL on `app/` naming only `root` shuts `alice` out of that subtree
-/// and leaves the rest of the store exactly as open as it was.
+/// An ACL on `app/` that names only `root` shuts `alice` out of that
+/// subtree, and leaves the rest of the store as open as it was.
 #[tokio::test]
 async fn an_acl_denies_the_subtree_it_governs_and_nothing_else() {
     let (log, path) = open_temp();
@@ -3267,12 +3240,12 @@ async fn an_acl_denies_the_subtree_it_governs_and_nothing_else() {
         write_refusal(write_as(&svc, "alice", b"app/config", Some(b"x")).await),
         auth_error::Kind::NotPermitted
     );
-    // A delete is a write of no value, so the same check covers it.
+    // A delete is a write with no value, so the same check covers it.
     assert_eq!(
         write_refusal(write_as(&svc, "alice", b"app/config", None).await),
         auth_error::Kind::NotPermitted
     );
-    // The seq of a key is a fact about a key she may not read.
+    // A key's seq is a fact about a key she may not read.
     let refused = svc
         .read(as_user(
             "alice",
@@ -3320,9 +3293,8 @@ async fn an_acl_denies_the_subtree_it_governs_and_nothing_else() {
     cleanup(&path);
 }
 
-/// An administrator is never shut out by an ACL -- they could rewrite
-/// it anyway, and locking one out would only mean locking out the
-/// cluster.
+/// An ACL never shuts out an administrator: they could rewrite it anyway,
+/// and locking one out would only lock out the cluster.
 #[tokio::test]
 async fn an_administrator_is_never_denied_by_an_acl() {
     let (log, path) = open_temp();
@@ -3353,7 +3325,7 @@ async fn an_administrator_is_never_denied_by_an_acl() {
     cleanup(&path);
 }
 
-/// The longest ACL that *exists* decides, not the longest that grants.
+/// The longest ACL that exists decides, not the longest that grants.
 /// `alice` holds write on `app/` and is still shut out of `app/secret/`.
 #[tokio::test]
 async fn the_longest_prefix_with_an_acl_decides() {
@@ -3383,8 +3355,8 @@ async fn the_longest_prefix_with_an_acl_decides() {
     cleanup(&path);
 }
 
-/// An ACL on the empty prefix governs every key there is, which is how a
-/// cluster takes the closed posture.
+/// An ACL on the empty prefix governs every key, which is how a cluster
+/// closes everything by default.
 #[tokio::test]
 async fn an_acl_on_the_empty_prefix_closes_the_whole_store() {
     let (log, path) = open_temp();
@@ -3407,9 +3379,9 @@ async fn an_acl_on_the_empty_prefix_closes_the_whole_store() {
 
 // -- groups ------------------------------------------------------------
 
-/// Membership grants what the group holds, nesting and all -- and taking
-/// the member out takes the access away on the very next request, which
-/// is the test that the epoch key really does invalidate the cache.
+/// Membership grants what the group holds, through nesting too. Removing
+/// the member removes the access on the very next request, which tests that
+/// the epoch key really invalidates the cache.
 #[tokio::test]
 async fn group_membership_grants_access_and_removing_it_revokes_at_once() {
     let (log, path) = open_temp();
@@ -3426,7 +3398,7 @@ async fn group_membership_grants_access_and_removing_it_revokes_at_once() {
         "membership through a nested group should grant what the outer group holds"
     );
 
-    // Out of the inner group, and so out of the outer one.
+    // Out of the inner group, so out of the outer one.
     assert!(matches!(
         update_group(&svc, "root", "interns", vec![], vec![pb_user("alice")]).await,
         update_group_response::Result::Seq(_)
@@ -3440,9 +3412,9 @@ async fn group_membership_grants_access_and_removing_it_revokes_at_once() {
     cleanup(&path);
 }
 
-/// Creating a group is not an administrator's privilege -- it grants
-/// its creator nothing they did not already have -- but administering
-/// one is its own administrators' business.
+/// Creating a group is not an administrator's privilege (it gives its
+/// creator nothing new), but administering one is its own administrators'
+/// business.
 #[tokio::test]
 async fn anyone_may_create_a_group_and_only_its_admins_may_change_it() {
     let (log, path) = open_temp();
@@ -3489,8 +3461,8 @@ async fn anyone_may_create_a_group_and_only_its_admins_may_change_it() {
     cleanup(&path);
 }
 
-/// A cycle would make "who is in this group" a question with no answer,
-/// so the edge that would close one is refused where it is added.
+/// A cycle would make "who is in this group" unanswerable, so the edge
+/// that would close one is refused where it is added.
 #[tokio::test]
 async fn a_group_cannot_be_put_inside_itself() {
     let (log, path) = open_temp();
@@ -3499,8 +3471,8 @@ async fn a_group_cannot_be_put_inside_itself() {
     must_create_group(&svc, "root", "a", vec![]).await;
     must_create_group(&svc, "root", "b", vec![pb_group("a")]).await;
 
-    // `b` is already inside `a`'s would-be ancestry: a contains nothing,
-    // b contains a. Putting b into a closes the loop.
+    // `b` is already in `a`'s would-be ancestry: a contains nothing, b
+    // contains a. Putting b into a closes the loop.
     assert!(
         try_update_group(&svc, "root", members_only("a", vec![pb_group("b")], vec![]))
             .await
@@ -3513,9 +3485,9 @@ async fn a_group_cannot_be_put_inside_itself() {
             .await
             .is_err()
     );
-    // And at creation, against a group that already names the new one --
-    // naming a group that does not exist is allowed, so this is a cycle
-    // the new group walks into rather than one it could see coming.
+    // And at creation, against a group that already names the new one. Naming
+    // a group that does not exist is allowed, so this is a cycle the new group
+    // walks into, not one it could see coming.
     must_create_group(&svc, "root", "c", vec![pb_group("later")]).await;
     assert!(
         svc.create_group(as_user(
@@ -3529,7 +3501,7 @@ async fn a_group_cannot_be_put_inside_itself() {
         .await
         .is_err()
     );
-    // The edge that does not close a loop is fine.
+    // An edge that closes no loop is fine.
     assert!(matches!(
         update_group(&svc, "root", "b", vec![pb_user("alice")], vec![]).await,
         update_group_response::Result::Seq(_)
@@ -3538,9 +3510,9 @@ async fn a_group_cannot_be_put_inside_itself() {
     cleanup(&path);
 }
 
-/// A group with no administrators could never be changed again except by
-/// a cluster administrator, so the call that would empty the list is
-/// refused rather than leaving someone to discover it later.
+/// A group with no administrators could never change again except by a
+/// cluster administrator, so the call that would empty the list is refused,
+/// instead of someone finding out later.
 #[tokio::test]
 async fn a_group_must_keep_at_least_one_administrator() {
     let (log, path) = open_temp();
@@ -3581,7 +3553,7 @@ async fn a_group_must_keep_at_least_one_administrator() {
         .unwrap(),
         update_group_response::Result::Seq(_)
     ));
-    // And having handed it over, she is no longer the one who may.
+    // And after handing it over, she is no longer the one who may.
     let refused = update_group(&svc, "alice", "oncall", vec![pb_user("alice")], vec![]).await;
     assert!(
         matches!(&refused, update_group_response::Result::AuthError(e) if auth_kind(e) == auth_error::Kind::NotPermitted),
@@ -3591,9 +3563,9 @@ async fn a_group_must_keep_at_least_one_administrator() {
     cleanup(&path);
 }
 
-/// A group that does not exist is `NO_SUCH_GROUP`, not `NO_SUCH_USER`:
-/// the two namespaces are separate, and a caller told the wrong one
-/// would go looking in the wrong place.
+/// A group that does not exist is `NO_SUCH_GROUP`, not `NO_SUCH_USER`: the
+/// namespaces are separate, and a caller told the wrong one would look in
+/// the wrong place.
 #[tokio::test]
 async fn a_missing_group_is_reported_as_a_missing_group() {
     let (log, path) = open_temp();
@@ -3620,8 +3592,8 @@ async fn a_missing_group_is_reported_as_a_missing_group() {
 
 // -- authority over the ACLs themselves --------------------------------
 
-/// `write` on a prefix carries authority over that prefix's ACL and over
-/// every longer prefix's -- and stops exactly there.
+/// `write` on a prefix gives authority over that prefix's ACL and every
+/// longer prefix's, and stops exactly there.
 #[tokio::test]
 async fn write_on_a_prefix_carries_authority_over_its_acls() {
     let (log, path) = open_temp();
@@ -3637,7 +3609,7 @@ async fn write_on_a_prefix_carries_authority_over_its_acls() {
         vec![grant(pb_user("alice"), PbRight::Write)],
     )
     .await;
-    // The prefix itself: also hers, since her own ACL grants her write.
+    // The prefix itself: also hers, because her own ACL grants her write.
     must_set_acl(
         &svc,
         "alice",
@@ -3648,8 +3620,8 @@ async fn write_on_a_prefix_carries_authority_over_its_acls() {
         ],
     )
     .await;
-    // A sibling nothing governs: not hers, and not because she lacks a
-    // grant -- because nobody's grant reaches there.
+    // A sibling that nothing governs: not hers, and not because she lacks a
+    // grant, but because nobody's grant reaches there.
     assert_eq!(
         acl_refusal(set_acl(&svc, "alice", b"app2/", vec![grant(pb_user("alice"), PbRight::Write)]).await),
         auth_error::Kind::NotPermitted
@@ -3658,8 +3630,8 @@ async fn write_on_a_prefix_carries_authority_over_its_acls() {
     cleanup(&path);
 }
 
-/// `read` is not authority. Being able to see a subtree is not being
-/// able to decide who else may.
+/// `read` is not authority. Being able to see a subtree is not being able
+/// to decide who else may.
 #[tokio::test]
 async fn read_on_a_prefix_is_not_authority_over_its_acls() {
     let (log, path) = open_temp();
@@ -3682,8 +3654,8 @@ async fn the_default_is_not_authority_to_write_an_acl() {
     let (log, path) = open_temp();
     let svc = service_with_alice(log, "kv-test").await;
 
-    // Nothing governs anything yet, and `alice` can write every key --
-    // and still may not be the one to decide who else can.
+    // Nothing governs anything yet, and `alice` can write every key, but she
+    // still may not decide who else can.
     assert!(matches!(
         write_as(&svc, "alice", b"app/config", Some(b"v")).await,
         write_response::Result::Ok(true)
@@ -3696,15 +3668,15 @@ async fn the_default_is_not_authority_to_write_an_acl() {
         acl_refusal(set_acl(&svc, "alice", b"app/", vec![grant(pb_user("alice"), PbRight::Write)]).await),
         auth_error::Kind::NotPermitted
     );
-    // An administrator may, which is how the first ACL ever gets written.
+    // An administrator may, which is how the first ACL gets written.
     must_set_acl(&svc, "root", b"app/", vec![grant(pb_user("alice"), PbRight::Write)]).await;
 
     cleanup(&path);
 }
 
-/// The same rule from the other side: removing an ACL that nothing
-/// shorter would replace opens the subtree to everyone, so it is an
-/// administrator's act -- even for the account that holds write there.
+/// The same rule from the other side: removing an ACL that no shorter one
+/// would replace opens the subtree to everyone, so it is an administrator's
+/// act, even for the account that holds write there.
 #[tokio::test]
 async fn removing_the_last_acl_over_a_prefix_is_an_administrators_act() {
     let (log, path) = open_temp();
@@ -3724,7 +3696,7 @@ async fn removing_the_last_acl_over_a_prefix_is_an_administrators_act() {
         delete_acl(&svc, "alice", b"app/sub/").await,
         delete_acl_response::Result::Seq(_)
     ));
-    // `app/` falls back to nothing at all: not hers.
+    // `app/` falls back to nothing: not hers.
     let refused = delete_acl(&svc, "alice", b"app/").await;
     assert!(
         matches!(&refused, delete_acl_response::Result::AuthError(e) if auth_kind(e) == auth_error::Kind::NotPermitted),
@@ -3734,7 +3706,7 @@ async fn removing_the_last_acl_over_a_prefix_is_an_administrators_act() {
         delete_acl(&svc, "root", b"app/").await,
         delete_acl_response::Result::Seq(_)
     ));
-    // And with it gone, the subtree is open again.
+    // And once it is gone, the subtree is open again.
     assert!(matches!(
         read_as(&svc, "alice", b"app/config").await,
         read_response::Result::Ok(_)
@@ -3743,8 +3715,8 @@ async fn removing_the_last_acl_over_a_prefix_is_an_administrators_act() {
     cleanup(&path);
 }
 
-/// A prefix with no ACL of its own is `NO_SUCH_ACL`, which is not the
-/// same as "nothing governs the keys under it".
+/// A prefix with no ACL of its own is `NO_SUCH_ACL`, which is not the same
+/// as "nothing governs the keys under it".
 #[tokio::test]
 async fn removing_an_acl_that_is_not_there_says_so() {
     let (log, path) = open_temp();
@@ -3762,9 +3734,9 @@ async fn removing_an_acl_that_is_not_there_says_so() {
 
 // -- scans --------------------------------------------------------------
 
-/// Keys the caller may not read are left out of a walk rather than
-/// refusing it -- and, because they are skipped inside the scan rather
-/// than filtered after, they cost no batch length.
+/// Keys the caller may not read are left out of a walk instead of refusing
+/// it, and because they are skipped inside the scan, not filtered after,
+/// they use none of the batch.
 #[tokio::test]
 async fn a_scan_omits_what_the_caller_may_not_read_without_shortening_the_batch() {
     let (log, path) = open_temp();
@@ -3782,8 +3754,8 @@ async fn a_scan_omits_what_the_caller_may_not_read_without_shortening_the_batch(
     )
     .await;
 
-    // `hidden/` sorts before `open/`, so a naive filter-after-the-fact
-    // would hand back an empty first batch.
+    // `hidden/` sorts before `open/`, so a naive filter applied afterwards
+    // would return an empty first batch.
     let batch = get_keys_as(&svc, "alice", b"", 5).await;
     assert_eq!(
         as_strings(&batch.keys),
@@ -3791,8 +3763,8 @@ async fn a_scan_omits_what_the_caller_may_not_read_without_shortening_the_batch(
     );
     assert!(batch.has_more);
 
-    // An administrator sees everything, which is also the check that the
-    // filter is about the caller and not about the keys.
+    // An administrator sees everything, which also checks that the filter is
+    // about the caller, not about the keys.
     let batch = get_keys_as(&svc, "root", b"", 5).await;
     assert_eq!(
         as_strings(&batch.keys),
@@ -3802,9 +3774,9 @@ async fn a_scan_omits_what_the_caller_may_not_read_without_shortening_the_batch(
     cleanup(&path);
 }
 
-/// A walk of a store the caller can see almost none of stops at its
-/// budget and says where to resume, rather than becoming an O(keyspace)
-/// call. The cursor is the whole point: the batch can come back empty.
+/// A walk of a store the caller can see almost none of stops at its budget
+/// and says where to resume, instead of becoming an O(keyspace) call. The
+/// cursor is what matters: the batch can come back empty.
 #[tokio::test]
 async fn a_filtered_walk_pages_with_the_cursor_the_server_sends() {
     let (log, path) = open_temp();
@@ -3822,9 +3794,8 @@ async fn a_filtered_walk_pages_with_the_cursor_the_server_sends() {
     )
     .await;
 
-    // Walk it the way a client does, following the cursor. Without one,
-    // a batch that came back empty would end the walk and `zzz-visible`
-    // would never be reached.
+    // Walk it as a client does, following the cursor. Without one, an empty
+    // batch would end the walk, and `zzz-visible` would never be reached.
     let mut seen: Vec<Vec<u8>> = Vec::new();
     let mut start = Vec::new();
     loop {
@@ -3848,8 +3819,8 @@ async fn a_filtered_walk_pages_with_the_cursor_the_server_sends() {
 
 // -- reading the ACLs ---------------------------------------------------
 
-/// The question someone holding a refusal actually has: which ACL
-/// decided, and what does it give me?
+/// The question a caller with a refusal has: which ACL decided, and what
+/// does it give me?
 #[tokio::test]
 async fn get_acl_says_which_prefix_governs_and_what_it_grants() {
     let (log, path) = open_temp();
@@ -3881,8 +3852,8 @@ async fn get_acl_says_which_prefix_governs_and_what_it_grants() {
     };
     let acl = ok.acl.expect("an ACL governs that key");
     assert_eq!(acl.prefix, b"app/".to_vec());
-    // Granted through the group, which is what `effective` saves a
-    // client from working out for itself.
+    // Granted through the group, which `effective` saves a client from
+    // working out itself.
     assert_eq!(ok.effective, Some(PbRight::Read as i32));
 
     // A key nothing governs: no ACL, and no grant to report.
@@ -3907,10 +3878,9 @@ async fn get_acl_says_which_prefix_governs_and_what_it_grants() {
     cleanup(&path);
 }
 
-/// ACLs and groups are readable by anyone with an account: they say who
-/// may reach which keys, which is not a secret from the people they are
-/// about, and a caller who could not read them could not tell a refusal
-/// from a bug.
+/// Anyone with an account can read ACLs and groups: they say who may reach
+/// which keys, which is no secret from the people they are about, and a
+/// caller who could not read them could not tell a refusal from a bug.
 #[tokio::test]
 async fn any_account_may_read_the_acls_and_the_groups() {
     let (log, path) = open_temp();
@@ -3930,7 +3900,7 @@ async fn any_account_may_read_the_acls_and_the_groups() {
         Some(list_acls_response::Result::Ok(list)) => list.acls,
         other => panic!("expected a listing, got {other:?}"),
     };
-    // Shortest prefix first, which is the order they take effect in.
+    // Shortest prefix first: the order they take effect.
     assert_eq!(
         acls.iter().map(|a| a.prefix.clone()).collect::<Vec<_>>(),
         vec![b"a/".to_vec(), b"b/".to_vec()]
@@ -3954,9 +3924,8 @@ async fn any_account_may_read_the_acls_and_the_groups() {
 
 // -- the reserved range -------------------------------------------------
 
-/// Groups and ACLs live in the reserved range, so no client can reach
-/// them through the data path -- the check `reject_reserved` has always
-/// made, now covering three more prefixes.
+/// Groups and ACLs live in the reserved range, so no client can reach them
+/// through the data path: `reject_reserved` covers their prefixes too.
 #[tokio::test]
 async fn the_permission_records_are_not_reachable_as_keys() {
     let (log, path) = open_temp();
@@ -4024,7 +3993,7 @@ async fn read_keys(
         .expect("a read always answers"))
 }
 
-/// `read_keys`, for the reads a test expects to succeed.
+/// `read_keys`, for reads a test expects to succeed.
 async fn read_ok_keys(
     svc: &KvService,
     keys: &[&[u8]],
@@ -4052,9 +4021,9 @@ fn kv(seq: u64, value: Option<&[u8]>) -> KeyVersion {
     }
 }
 
-/// Positional: every key answered where it was named, a duplicate at
-/// each of its positions, a missing key at seq 0 -- and `as_of` at least
-/// as new as anything handed back.
+/// By position: every key answered where it was named, a duplicate at each
+/// of its positions, a missing key at seq 0, and `as_of` at least as new as
+/// anything returned.
 #[tokio::test]
 async fn a_read_answers_every_key_in_the_order_it_was_named() {
     let (log, path) = open_temp();
@@ -4074,8 +4043,7 @@ async fn a_read_answers_every_key_in_the_order_it_was_named() {
     cleanup(&path);
 }
 
-/// `versions_only` answers the same seqs a full read does, and no
-/// values.
+/// `versions_only` returns the same seqs as a full read, and no values.
 #[tokio::test]
 async fn a_versions_only_read_agrees_with_a_full_one_without_the_values() {
     let (log, path) = open_temp();
@@ -4095,8 +4063,8 @@ async fn a_versions_only_read_agrees_with_a_full_one_without_the_values() {
 }
 
 /// The guarantee the whole call exists for: keys written together are
-/// never read apart, however the read interleaves with commits -- stale
-/// or linearizable -- and `as_of` is never older than what was read.
+/// never read apart, however the read interleaves with commits (stale or
+/// linearizable), and `as_of` is never older than what was read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keys_committed_together_are_always_read_together() {
     let (log, path) = open_temp();
@@ -4120,8 +4088,8 @@ async fn keys_committed_together_are_always_read_together() {
         async move {
             for _ in 0..200 {
                 let ok = read_ok_keys(svc, &[b"a", b"b"], false, consistency.clone()).await;
-                // Before the first commit both are absent, which is
-                // also "the same".
+                // Before the first commit both are absent, which also counts as "the
+                // same".
                 let [a, b] = ok.entries.as_slice() else {
                     panic!("two keys, two entries: {ok:?}");
                 };
@@ -4136,8 +4104,8 @@ async fn keys_committed_together_are_always_read_together() {
     cleanup(&path);
 }
 
-/// Inside a transaction: its own writes laid over committed state, at
-/// the committed seq; every key named held against a younger writer.
+/// In a transaction: its own writes on top of committed state, at the
+/// committed seq, and every named key held against a younger writer.
 #[tokio::test]
 async fn a_transactional_read_overlays_its_own_writes_and_locks_every_key() {
     let (log, path) = open_temp();
@@ -4176,8 +4144,8 @@ async fn a_transactional_read_overlays_its_own_writes_and_locks_every_key() {
     cleanup(&path);
 }
 
-/// At a snapshot: as of its seq, with `as_of` saying so. A snapshot
-/// nobody created is not found; an empty id is malformed.
+/// At a snapshot: as of its seq, with `as_of` saying so. A snapshot nobody
+/// created is not found; an empty id is malformed.
 #[tokio::test]
 async fn a_read_at_a_snapshot_reads_every_key_as_of_it() {
     let (log, path) = open_temp();
@@ -4202,8 +4170,8 @@ async fn a_read_at_a_snapshot_reads_every_key_as_of_it() {
     cleanup(&path);
 }
 
-/// More keys than one read may name is refused, not shortened: it is a
-/// number the caller chose.
+/// More keys than one read may name is refused, not shortened: the caller
+/// chose the number.
 #[tokio::test]
 async fn a_read_of_too_many_keys_is_refused() {
     let (log, path) = open_temp();
@@ -4218,9 +4186,8 @@ async fn a_read_of_too_many_keys_is_refused() {
     cleanup(&path);
 }
 
-/// Past the value budget the answer is a prefix of the keys, never
-/// empty, so reissuing for the rest makes progress. Versions alone are
-/// never cut.
+/// Past the value budget, the answer is a prefix of the keys, never empty,
+/// so a reissue for the rest makes progress. Versions alone are never cut.
 #[tokio::test]
 async fn a_read_past_the_value_budget_answers_a_prefix() {
     let (log, path) = open_temp();
@@ -4247,9 +4214,9 @@ async fn a_read_past_the_value_budget_answers_a_prefix() {
     cleanup(&path);
 }
 
-/// In a transaction a shortened read has still locked every key, so the
-/// reissue sees the same state -- and a buffered value counts toward
-/// the budget like a committed one.
+/// In a transaction, a shortened read has still locked every key, so the
+/// reissue sees the same state, and a buffered value counts toward the
+/// budget like a committed one.
 #[tokio::test]
 async fn a_shortened_transactional_read_still_holds_the_keys_it_left_out() {
     let (log, path) = open_temp();
@@ -4288,8 +4255,8 @@ async fn a_reserved_key_anywhere_refuses_the_whole_read() {
     cleanup(&path);
 }
 
-/// One key the caller may not read refuses the whole read, naming it by
-/// position; an administrator is outside the ACL.
+/// One key the caller may not read refuses the whole read, and names the
+/// key by position; an administrator is outside the ACL.
 #[tokio::test]
 async fn one_denied_key_refuses_the_whole_read_and_says_which() {
     let (log, path) = open_temp();

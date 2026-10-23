@@ -1,26 +1,24 @@
-//! The async face of `storage`.
+//! The async interface to `storage`.
 //!
-//! `storage::RaftLog` is deliberately synchronous -- fjall's API is, and
-//! keeping the storage layer free of an executor is what lets it be
-//! reasoned about and tested without one. `Store` is the other half of
-//! that bargain: the single place where a synchronous storage call is put
-//! on the blocking pool, so that no async caller anywhere in the crate
-//! writes `spawn_blocking` itself.
+//! `storage::RaftLog` is synchronous on purpose: fjall's API is, and a
+//! storage layer free of an executor can be reasoned about and tested
+//! without one. `Store` is the other half of that deal: the only place
+//! that puts a synchronous storage call on the blocking pool, so no async
+//! caller in the crate writes `spawn_blocking` itself.
 //!
-//! That matters for more than tidiness. Blocking an executor thread on
-//! disk I/O -- even briefly -- stalls every other task scheduled on it,
+//! This matters for more than neatness. Blocking an executor thread on
+//! disk I/O, even briefly, stalls every other task on that thread,
 //! including the heartbeats and lease probes that decide whether this node
-//! is still considered alive. Having exactly one place that dispatches
-//! storage work means that rule cannot be forgotten at a new call site.
+//! is seen as alive. With one place that dispatches storage work, a new
+//! call site cannot forget the rule.
 //!
-//! `ChunkReader`/`ChunkWriter` are the other direction of the same
-//! bargain. `RaftLog::export_snapshot` and `install_snapshot` are
-//! written against `std::io::Write`/`Read` and already stream -- but
-//! both of their callers live in async code that moves the bytes over
-//! gRPC a message at a time, and the only way to join those two worlds
-//! used to be a `Vec<u8>` holding the entire snapshot. These are the
-//! seam instead: a blocking `Read`/`Write` on one side, an async
-//! channel on the other, and a bounded amount in flight between them.
+//! `ChunkReader` and `ChunkWriter` cover the other direction.
+//! `RaftLog::export_snapshot` and `install_snapshot` are written against
+//! `std::io::Write`/`Read` and stream, but their callers are async code
+//! that moves bytes over gRPC one message at a time. These two types join
+//! the two sides without holding a whole snapshot in a `Vec<u8>`: a
+//! blocking `Read`/`Write` on one side, an async channel on the other, and
+//! a bounded amount in flight between them.
 
 use std::io::{self, Read, Write};
 use std::sync::Arc;
@@ -29,25 +27,23 @@ use tokio::sync::mpsc;
 
 use crate::storage::{self, RaftLog};
 
-/// How much a `ChunkWriter` gathers before handing a chunk across, and
-/// so how large one `SnapshotChunk` is on the wire.
+/// How much a `ChunkWriter` collects before it hands a chunk across, and
+/// so the size of one `SnapshotChunk` on the wire.
 ///
-/// `export_snapshot` writes in small pieces -- a length prefix, a key, a
-/// value -- and a channel send per piece would cost far more than the
-/// copy this avoids. Small enough that `CHUNK_BACKLOG` of them is a
-/// modest amount of memory, and far under any message size limit, which
-/// is all the wire asks of it.
+/// `export_snapshot` writes in small pieces (a length prefix, a key, a
+/// value), and a channel send per piece would cost far more than the copy
+/// this avoids. Small enough that `CHUNK_BACKLOG` of them is modest memory,
+/// and far below any message size limit, which is all the wire needs.
 const CHUNK_SIZE: usize = 64 * 1024;
 
 /// How many chunks may be in flight between the async side and the
-/// blocking one. This times `CHUNK_SIZE` is the whole memory cost of a
-/// snapshot transfer, however large the snapshot is -- which is the
-/// entire point of these two types.
+/// blocking side. This times `CHUNK_SIZE` is the whole memory cost of a
+/// snapshot transfer, however large the snapshot is, which is the purpose
+/// of these two types.
 pub const CHUNK_BACKLOG: usize = 16;
 
-/// An async handle to this node's log. Cheap to clone -- it is an `Arc`
-/// and nothing else -- so every component that needs storage holds its
-/// own rather than borrowing one.
+/// An async handle to this node's log. Cheap to clone (it is only an
+/// `Arc`), so every component that needs storage holds its own.
 #[derive(Clone)]
 pub struct Store {
     log: Arc<RaftLog>,
@@ -58,22 +54,20 @@ impl Store {
         Self { log }
     }
 
-    /// Runs `f` against the log on the blocking pool.
+    /// Run `f` against the log on the blocking pool.
     ///
-    /// Takes a closure rather than mirroring `RaftLog`'s methods one for
-    /// one, and deliberately: several callers need a *composite*
-    /// operation -- match-then-truncate-then-append for an inbound
-    /// `AppendEntries`, or read-tail-then-build-batch for replication --
-    /// whose steps must not be interleaved with another writer's. One
-    /// closure is one blocking task, so composing inside `f` is what
-    /// keeps that property; composing out here, from several `run` calls,
-    /// would silently lose it.
+    /// Takes a closure instead of mirroring each `RaftLog` method, on purpose:
+    /// several callers need a composite operation (match, truncate and append
+    /// for an inbound `AppendEntries`; read the tail and build a batch for
+    /// replication) whose steps must not interleave with another writer. One
+    /// closure is one blocking task, so composing inside `f` keeps that
+    /// property; composing here, from several `run` calls, would silently lose
+    /// it.
     ///
-    /// A panic in `f` propagates. `spawn_blocking` only fails to join if
-    /// its closure panicked, so unwrapping that here -- rather than at
-    /// each of the callers that used to -- costs nothing and says the
-    /// policy once: a storage panic is fail-stop (see `raft`'s module
-    /// doc on why continuing past one is worse than not).
+    /// A panic in `f` propagates. `spawn_blocking` fails to join only if its
+    /// closure panicked, so unwrapping here costs nothing and states the policy
+    /// once: a storage panic is fail-stop (see `raft`'s module doc for why
+    /// continuing past one is worse).
     pub async fn run<T, F>(&self, f: F) -> T
     where
         F: FnOnce(&RaftLog) -> T + Send + 'static,
@@ -85,25 +79,13 @@ impl Store {
             .expect("storage task panicked")
     }
 
-    /// `run`, for the callers whose policy on a storage failure is to
-    /// stop rather than carry on with state they could not read or write.
-    /// `what` completes the sentence "failed to ...".
-    ///
-    /// This is most of the state machine: a role's event loop has no
-    /// meaningful way to recover from, say, being unable to read the term
-    /// at a log index -- proceeding on a guess is how a consensus
-    /// implementation silently violates its own safety properties. The
-    /// exceptions are the paths that genuinely can report the failure
-    /// onward (a client write) or retry it (storage maintenance), and
-    /// those use `run` and match on the `Result` themselves.
     /// `run`, but without waiting for the result.
     ///
-    /// For the one caller that has to consume a storage operation's
-    /// output *while it is still running* -- streaming a snapshot out to
-    /// a peer, where awaiting the export first is exactly the
-    /// buffer-it-all behaviour being removed. Still goes through here
-    /// rather than calling `spawn_blocking` at the call site, so this
-    /// module remains the only place that does.
+    /// For the one caller that must use a storage operation's output while it
+    /// still runs: streaming a snapshot to a peer, where awaiting the export
+    /// first is the buffer-everything behavior this avoids. It still goes
+    /// through here, not `spawn_blocking` at the call site, so this module stays
+    /// the only place that calls it.
     pub fn spawn<T, F>(&self, f: F) -> tokio::task::JoinHandle<T>
     where
         F: FnOnce(&RaftLog) -> T + Send + 'static,
@@ -113,6 +95,16 @@ impl Store {
         tokio::task::spawn_blocking(move || f(&log))
     }
 
+    /// `run`, for callers whose policy on a storage failure is to stop, not
+    /// to continue with state they could not read or write. `what`
+    /// completes the sentence "failed to ...".
+    ///
+    /// This is most of the state machine: a role's event loop cannot recover
+    /// from, for example, failing to read the term at a log index, and
+    /// guessing is how a consensus implementation silently breaks its own
+    /// safety. The exceptions are paths that can report the failure (a
+    /// client write) or retry it (storage maintenance); those use `run` and
+    /// handle the `Result` themselves.
     pub async fn expect<T, F>(&self, what: &'static str, f: F) -> T
     where
         F: FnOnce(&RaftLog) -> storage::Result<T> + Send + 'static,
@@ -126,18 +118,18 @@ impl Store {
 
 /// A blocking `Read` fed by an async producer.
 ///
-/// `install_snapshot` wants a `Read` and runs on the blocking pool;
-/// the chunks arrive on a gRPC stream in async code. This is the join:
-/// `blocking_recv` parks the blocking-pool thread (which is what that
-/// pool is for) until the next chunk arrives, so the snapshot is
-/// consumed as it comes in rather than assembled first.
+/// `install_snapshot` wants a `Read` and runs on the blocking pool, while
+/// the chunks arrive on a gRPC stream in async code. This joins them:
+/// `blocking_recv` parks the blocking-pool thread (which that pool is for)
+/// until the next chunk arrives, so the snapshot is read as it comes in,
+/// not assembled first.
 ///
-/// The producer closing its side is end-of-stream, which is exactly what
-/// a `Read` returning 0 means -- so a truncated transfer surfaces as
+/// The producer closing its side is end of stream, exactly what a `Read`
+/// returning 0 means. So a truncated transfer shows up as
 /// `install_snapshot` failing to parse, not as a silent short read.
 pub struct ChunkReader {
     rx: mpsc::Receiver<Vec<u8>>,
-    /// What's left of the chunk currently being handed out.
+    /// The rest of the chunk being handed out.
     current: Vec<u8>,
     at: usize,
 }
@@ -173,10 +165,10 @@ impl Read for ChunkReader {
 /// The mirror image: a blocking `Write` that hands its bytes to an async
 /// consumer, in chunks, with a bounded number in flight.
 ///
-/// A send failing means the consumer is gone -- the peer hung up, or the
-/// RPC was cancelled. That is reported as a broken pipe so
-/// `export_snapshot` stops walking the keyspace instead of finishing an
-/// export nobody is listening for.
+/// A failed send means the consumer is gone (the peer hung up, or the RPC
+/// was cancelled). That is reported as a broken pipe, so `export_snapshot`
+/// stops walking the keyspace instead of finishing an export nobody will
+/// read.
 pub struct ChunkWriter {
     tx: mpsc::Sender<Vec<u8>>,
     pending: Vec<u8>,

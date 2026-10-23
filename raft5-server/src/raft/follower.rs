@@ -1,29 +1,29 @@
-//! The follower role: answers AppendEntries (log-matching, §5.3 fast
+//! The follower role: answers AppendEntries (log matching, §5.3 fast
 //! backup) and RequestVote (§5.4.1 up-to-date check), and starts an
-//! election if it hasn't heard from a leader in time. See the parent
-//! module's doc for how roles fit together generally.
+//! election if it does not hear from a leader in time. See the parent
+//! module's doc for how roles fit together.
 
 use tracing::info;
 
 use super::*;
 use crate::storage::StorageError;
 
-/// The outcome of matching+applying one `AppendEntries` call's `entries`
-/// against storage. Doesn't carry `term` -- that's `Common`'s concern, not
-/// storage's.
+/// The result of matching and applying one `AppendEntries` call's
+/// `entries` against storage. Has no `term`: that is `Common`'s concern,
+/// not storage's.
 struct AppendOutcome {
     success: bool,
     match_index: u64,
     conflict_index: Option<u64>,
     conflict_term: Option<u64>,
-    /// Whether this call may have changed the active cluster
-    /// configuration -- true if it appended a `Config` entry, and also
-    /// true if it truncated anything, since a rolled-back `Config` entry
-    /// reverts membership just as surely as a new one changes it.
+    /// Whether this call may have changed the active cluster configuration:
+    /// true if it appended a `Config` entry, and also true if it truncated
+    /// anything, because a rolled-back `Config` entry changes membership as
+    /// surely as a new one.
     ///
-    /// Necessary because a configuration takes effect on *append* (Raft
-    /// §4.1), so the follower has to react to it here rather than waiting
-    /// for it to commit. See `storage::RaftLog::current_config`.
+    /// Needed because a configuration takes effect on append (Raft §4.1), so
+    /// the follower must react here, not wait for commit. See
+    /// `storage::RaftLog::current_config`.
     config_may_have_changed: bool,
 }
 
@@ -39,14 +39,16 @@ impl AppendOutcome {
     }
 }
 
-/// The synchronous core of Raft's AppendEntries receiver logic (Raft paper
-/// §5.3), run on the blocking pool by `Follower::apply_append_entries`.
-/// Checks `prev_log_index`/`prev_log_term`, then walks `entries` against
-/// what's already in `log`: entries already present with a matching term
-/// are left alone, the first mismatch truncates the divergent suffix, and
-/// everything past the current tail is appended. `entries` is expected in
-/// ascending, gap-free `seq` order starting at `prev_log_index + 1` --
-/// guaranteed by the leader's own log being gap-free.
+/// The synchronous core of Raft's AppendEntries receiver (Raft paper §5.3),
+/// run on the blocking pool by `Follower::apply_append_entries`.
+///
+/// - Check `prev_log_index` and `prev_log_term`.
+/// - Walk `entries` against `log`: leave entries already present with a
+///   matching term, truncate the divergent suffix at the first mismatch,
+///   and append everything past the current tail.
+///
+/// `entries` must be in ascending `seq` order with no gaps, starting at
+/// `prev_log_index + 1`. The leader's log has no gaps, so this holds.
 fn apply_append_entries_sync(
     log: &RaftLog,
     prev_log_index: u64,
@@ -57,9 +59,9 @@ fn apply_append_entries_sync(
         match log.term_at(prev_log_index)? {
             Some(term) if term == prev_log_term => {}
             Some(conflict_term) => {
-                // Fast-backup (§5.3): point the leader at the first index
-                // of the conflicting term, so it can skip the whole run in
-                // one round trip instead of backing up one index at a time.
+                // Fast backup (§5.3): point the leader at the first index of the
+                // conflicting term, so it can skip the whole run in one round trip
+                // instead of backing up one index at a time.
                 let mut conflict_index = prev_log_index;
                 while conflict_index > 1 {
                     match log.term_at(conflict_index - 1)? {
@@ -70,8 +72,8 @@ fn apply_append_entries_sync(
                 return Ok(AppendOutcome::reject(conflict_index, Some(conflict_term)));
             }
             None => {
-                // Our log doesn't even reach prev_log_index -- point the
-                // leader at right after whatever we actually have.
+                // Our log does not reach prev_log_index: point the leader just past what
+                // we have.
                 let next_expected = match log.last_entry()? {
                     Some((seq, _)) => seq + 1,
                     None => 1,
@@ -86,30 +88,26 @@ fn apply_append_entries_sync(
     let mut appended_from = None;
     for (i, entry) in entries.iter().enumerate() {
         match log.term_at(entry.seq)? {
-            // Already present with the same term -- by the Log Matching
-            // Property the rest of our log up to here already matches
-            // too, so there's nothing to do.
+            // Already present with the same term. By the Log Matching Property, the
+            // rest of our log up to here matches too, so there is nothing to do.
             Some(term) if term == entry.term => {
                 match_index = entry.seq;
             }
-            // Either a conflicting entry (wrong term) or nothing here yet
-            // -- either way, this entry and everything after it in the
-            // batch needs to be (re-)written.
+            // A conflicting entry (wrong term) or no entry yet: either way, this entry
+            // and everything after it in the batch must be written.
             other => {
                 if other.is_some() {
                     log.truncate_from(entry.seq)?;
-                    // Conservative: we don't check whether the discarded
-                    // suffix actually held a `Config` entry, only that
-                    // something was discarded. Truncation is rare, and
-                    // reloading when nothing changed is free.
+                    // Conservative: we do not check whether the discarded suffix held a
+                    // `Config` entry, only that something was discarded. Truncation is rare,
+                    // and a reload with no change costs nothing.
                     config_may_have_changed = true;
                 }
                 config_may_have_changed |= entries[i..].iter().any(LogEntry::is_config);
-                // Where the rest of the batch starts. Appended below
-                // rather than here so the entries can be *moved* into
-                // the log: an entry carrying a whole transaction is
-                // large, and `payload()` would clone every mutation of
-                // it on a path that is about to drop the original.
+                // Where the rest of the batch starts. Appended below, not here, so the
+                // entries can be moved into the log: an entry with a whole transaction is
+                // large, and `payload()` would clone every mutation of it just before the
+                // original is dropped.
                 appended_from = Some(i);
                 break;
             }
@@ -118,11 +116,10 @@ fn apply_append_entries_sync(
 
     if let Some(from) = appended_from {
         for fresh in entries.drain(from..) {
-            // `append_payload`, not `append`: the payload comes from the
-            // leader and has to be preserved verbatim -- its kind *and*
-            // every mutation it carries -- or our copy of the log stops
-            // matching theirs. An entry we cannot decode is refused
-            // rather than guessed at; see `pb::UnknownEntry`.
+            // `append_payload`, not `append`: the payload comes from the leader and
+            // must be kept exactly (its kind and every mutation), or our log stops
+            // matching the leader's. An entry we cannot decode is refused, not
+            // guessed at; see `pb::UnknownEntry`.
             let (expected_seq, expected_term, expected_writes) =
                 (fresh.seq, fresh.term, fresh.writes.len());
             let payload = fresh.into_payload().map_err(|_| {
@@ -151,34 +148,31 @@ fn apply_append_entries_sync(
     })
 }
 
-/// Watches `lease_expires_at_rx` and fires `Event::ElectionTimeout` once
-/// the lease it tracks has genuinely expired -- no fresh deadline pushed
-/// (by `Follower::renew_lease`, from *either* the event loop or
-/// `RaftPeerHandle::get_lease`'s fully independent fast path -- see the
-/// module doc on why that one specifically must never be blockable) for a
-/// full lease -- *and* an additional random `fuzz(0, lease)` on top of
-/// that. The lease length is re-read on every pass, so a heartbeat change
-/// applies from the next deadline on.
+/// Watch `lease_expires_at_rx`, and push `Event::ElectionTimeout` once the
+/// tracked lease has really expired: no new deadline for a full lease,
+/// plus a random `fuzz(0, lease)` on top.
 ///
-/// Two sequential phases rather than one combined random draw,
-/// deliberately: the first (one lease, no jitter) is a clean,
-/// deterministic detection that contact was actually lost, not muddied by
-/// randomness; only the second phase is randomized, to stagger multiple
-/// followers' actual campaign start times and avoid a synchronized
-/// thundering herd.
+/// New deadlines come from `Follower::renew_lease`, either on the event
+/// loop or on the independent fast path in `RaftPeerHandle::get_lease`
+/// (see the module doc for why that path must never block). The lease
+/// length is read again on every pass, so a heartbeat change applies from
+/// the next deadline on.
 ///
-/// `None` (no lease ever established, e.g. right at node startup) gets
-/// the same full grace period as a fresh grant would, timed from when
-/// this watcher itself started (i.e. this `Follower` period began) rather
-/// than recomputed on every loop iteration -- recomputing against
-/// `Instant::now()` each time would make the deadline a perpetually
-/// moving target that never actually arrives.
+/// Two phases in sequence, not one random draw, on purpose:
+/// - The first (one lease, no jitter) is a clean, fixed detection that
+///   contact was really lost.
+/// - Only the second is random, to spread out the followers' campaign
+///   start times and avoid a synchronized stampede.
 ///
-/// Reactive rather than an abort-and-respawn timer, on purpose: a
-/// `watch::Receiver` wakes up on `changed()` regardless of *which* writer
-/// pushed the update, so this correctly restarts from scratch on a fresh
-/// deadline from either source without either one needing to reach into
-/// the other's task.
+/// `None` (no lease yet, for example at node start) gets the same full
+/// grace period as a new grant, timed from when this watcher started (when
+/// this `Follower` period began). Recomputing it from `Instant::now()` on
+/// each loop would make a deadline that keeps moving and never arrives.
+///
+/// Reactive, not an abort-and-respawn timer, on purpose: a
+/// `watch::Receiver` wakes on `changed()` whoever pushed the update, so a
+/// new deadline from either source restarts the wait, and neither source
+/// needs to reach into the other's task.
 fn spawn_lease_expiration_watcher(
     cancel: &CancellationToken,
     mut lease_rx: watch::Receiver<Option<Instant>>,
@@ -214,12 +208,12 @@ fn spawn_lease_expiration_watcher(
                     if changed.is_err() {
                         return;
                     }
-                    continue; // renewed mid-fuzz -- restart from the top
+                    continue; // renewed mid-fuzz: restart from the top
                 }
             }
-            // The deadline could have moved again right as the fuzz
-            // elapsed (a race between the two `select!` arms) -- double
-            // check before actually declaring the lease dead.
+            // The deadline could have moved again just as the fuzz elapsed (a race
+            // between the two `select!` arms), so check again before declaring the
+            // lease dead.
             let still_expired = match *lease_rx.borrow() {
                 Some(deadline) => Instant::now() >= deadline,
                 None => true,
@@ -234,12 +228,11 @@ fn spawn_lease_expiration_watcher(
 }
 
 /// What a follower publishes as its role: `Uninitialized` while it has no
-/// cluster configuration at all, `Follower` once it has one. The two are
-/// the same role internally -- an uninitialized node answers every RPC
-/// and is replicated to exactly like a follower, which is how a server
-/// added to an existing cluster receives the very `Config` entry that
-/// initializes it. The distinction is for clients: only one of the two
-/// can be bootstrapped.
+/// cluster configuration, `Follower` once it has one. Internally both are
+/// the same role: an uninitialized node answers every RPC and accepts
+/// replication like a follower, which is how a server added to a cluster
+/// receives the `Config` entry that initializes it. The difference is for
+/// clients: only an uninitialized node can be bootstrapped.
 fn follower_handle(common: &Common, leader_hint: Option<String>) -> RoleHandle {
     if common.config.members.is_empty() {
         RoleHandle::Uninitialized
@@ -255,21 +248,18 @@ pub struct Follower {
 }
 
 impl Follower {
-    // See the comment on `Leader::new` re: this not returning `Self`.
+    // See the comment on `Leader::new` about this not returning `Self`.
     #[allow(clippy::new_ret_no_self)]
     pub async fn new(mut common: Common) -> (Role, Common) {
-        // A fresh `Follower` period means this node has (or just got) a
-        // reason to believe a leader exists -- any backoff accumulated
-        // from a past run of failed election attempts no longer applies,
-        // so the next one starts fresh at the base timeout again.
+        // A new `Follower` period means this node has (or just got) a reason to
+        // believe a leader exists. Backoff from earlier failed elections no longer
+        // applies, so the next one starts at the base timeout.
         common.election_attempt = 0;
         common.publish_role(follower_handle(&common, None));
 
-        // A learner -- or a server that has been removed from the
-        // configuration -- never campaigns, so it gets no election timer
-        // at all rather than one whose every firing has to be discarded.
-        // Being promoted to voter re-enters `Follower`, which is what
-        // arms one.
+        // A learner, or a server removed from the configuration, never campaigns,
+        // so it gets no election timer at all, instead of one whose every firing
+        // must be ignored. Promotion to voter re-enters `Follower`, which arms one.
         let election_timer = if common.is_voter() {
             spawn_lease_expiration_watcher(
                 common.cancel_token(),
@@ -278,10 +268,9 @@ impl Follower {
                 common.event_tx.clone(),
             )
         } else {
-            // Nothing to watch for, but still a real `Task` rather than a
-            // bare handle: `shutdown` treats every role's timer the same
-            // way, and a `pending` future left to be dropped is exactly
-            // the loose end this is all meant to avoid.
+            // Nothing to watch, but still a real `Task`, not a bare handle:
+            // `shutdown` treats every role's timer the same way, and a `pending`
+            // future left to be dropped is exactly the loose end this design avoids.
             Task::spawn(common.cancel_token(), |cancel| async move {
                 cancel.cancelled().await;
             })
@@ -302,15 +291,15 @@ impl Follower {
         }
     }
 
-    /// Forms a single-node cluster around this node by appending
-    /// `config` as the first entry in the log (Raft §4.4).
+    /// Form a single-node cluster around this node by appending `config` as
+    /// the first log entry (Raft §4.4).
     ///
-    /// Refused unless this node has neither a configuration nor a single
-    /// log entry. Bootstrapping a node that already has either is how a
-    /// cluster gets silently split in two -- both halves would believe
-    /// they are the whole thing, and both could elect a leader. A server
-    /// meant to *join* an existing cluster is added from that cluster's
-    /// leader instead, and receives its configuration by replication.
+    /// Refused unless this node has no configuration and no log entry at all.
+    /// A bootstrap of a node that has either is how a cluster silently splits
+    /// in two: both halves would believe they are the whole cluster, and both
+    /// could elect a leader. A server meant to join an existing cluster is
+    /// added from that cluster's leader instead, and gets its configuration by
+    /// replication.
     async fn bootstrap(&mut self, config: ClusterConfig) -> Result<(), RaftError> {
         if !self.common.config.members.is_empty() {
             return Err(RaftError::AlreadyInitialized);
@@ -323,9 +312,9 @@ impl Follower {
                 if log.last_entry()?.is_some() {
                     return Ok(false);
                 }
-                // Term 1, not 0: 0 is the "before any term" sentinel that an
-                // empty log reports, and this entry has to be reachable by
-                // the §5.4.1 up-to-date check like any other.
+                // Term 1, not 0: 0 is the "before any term" value an empty log reports,
+                // and this entry must be reachable by the §5.4.1 up-to-date check like any
+                // other.
                 log.append_config(1, &bytes)?;
                 storage::Result::Ok(true)
             })
@@ -339,18 +328,16 @@ impl Follower {
         Ok(())
     }
 
-    /// Re-reads the cluster configuration, republishes this node's role
-    /// handle to match, and -- if its own right to vote changed --
-    /// re-enters `Follower` so the election timer is rebuilt: a learner
-    /// has none at all, and a node just promoted to voter needs one armed
-    /// (see `Follower::new`).
+    /// Read the cluster configuration again, republish this node's role
+    /// handle to match, and, if its own right to vote changed, re-enter
+    /// `Follower` so the election timer is rebuilt: a learner has none, and a
+    /// newly promoted voter needs one (see `Follower::new`).
     async fn reload_config(&mut self) -> Transition {
         let voting_changed = self.common.reload_config().await;
-        // Republished unconditionally: gaining (or losing) membership
-        // changes which handle we publish even when our right to vote is
-        // unaffected -- a server added as a learner goes from
-        // `Uninitialized` to `Follower` while staying a non-voter
-        // throughout.
+        // Always republish: gaining or losing membership changes which handle we
+        // publish, even when our right to vote does not change. A server added as
+        // a learner goes from `Uninitialized` to `Follower` while it stays a
+        // non-voter.
         self.common
             .publish_role(follower_handle(&self.common, self.leader_hint.clone()));
         if voting_changed {
@@ -360,26 +347,23 @@ impl Follower {
         }
     }
 
-    /// Called on any sign that campaigning right now would be premature:
-    /// a live leader's `AppendEntries`, a live leader's lease probe, or
-    /// granting our own vote to someone else (give them a chance to win
-    /// before also jumping in ourselves) -- these three cases are folded
-    /// into one shared deadline, so granting a vote also means refusing
-    /// *other* vote requests for one lease, same as genuine
-    /// leader contact would. Just publishes a fresh deadline; the
-    /// reactive watcher task picks it up on its own.
+    /// Called on any sign that campaigning now would be too early: a live
+    /// leader's `AppendEntries`, a live leader's lease probe, or granting our
+    /// own vote to someone else (give them a chance to win first). All three
+    /// share one deadline, so granting a vote also refuses other vote requests
+    /// for one lease, as real leader contact does. Only publishes a new
+    /// deadline; the reactive watcher task picks it up.
     fn renew_lease(&mut self) {
         self.common
             .lease_expires_at_tx
             .send_replace(Some(Instant::now() + self.common.timing().lease()));
     }
 
-    /// Whether we should refuse *any* vote request (real or pre-vote) for
-    /// someone other than our current leader, regardless of term or log
-    /// -- see the module doc on why a leader a majority can still reach
-    /// should never be disrupted by a competing election. `None` (no
-    /// lease ever established) is *not* active -- a node that's never
-    /// actually confirmed a leader has no one to protect.
+    /// Whether to refuse every vote request (real or pre-vote) for a node other
+    /// than our current leader, whatever its term or log. See the module doc
+    /// for why a leader that a majority can reach must never be disrupted by an
+    /// election. `None` (no lease yet) is not active: a node that never
+    /// confirmed a leader has nobody to protect.
     fn has_active_lease(&self) -> bool {
         match *self.common.lease_expires_at_rx.borrow() {
             Some(deadline) => Instant::now() < deadline,
@@ -387,25 +371,25 @@ impl Follower {
         }
     }
 
-    /// Runs `apply_append_entries_sync` on the blocking pool, then advances
-    /// `commit_tx` to `min(leader_commit, match_index)` (only if the
-    /// entries themselves matched) and `compact_tx` to `req.compact_seq`
-    /// (regardless -- it's independent of whether this particular batch of
-    /// entries matched, and by this point the caller has already confirmed
-    /// `req.term` is at least as current as ours, so the hint is trusted).
-    /// Panics on a storage failure -- see the module doc.
+    /// Run `apply_append_entries_sync` on the blocking pool, then:
+    /// - raise `commit_tx` to `min(leader_commit, match_index)`, only if the
+    ///   entries matched;
+    /// - raise `compact_tx` to `req.compact_seq` in all cases. It does not
+    ///   depend on this batch matching, and the caller has already confirmed
+    ///   that `req.term` is at least as current as ours, so the hint is
+    ///   trusted.
+    ///
+    /// Panics on a storage failure: see the module doc.
     async fn apply_append_entries(&mut self, req: &mut AppendEntriesRequest) -> AppendOutcome {
         let prev_log_index = req.prev_log_index;
         let prev_log_term = req.prev_log_term;
-        // Taken, not cloned. The entries have to move onto the blocking
-        // pool either way, and for a batch carrying a transaction the
-        // clone is a second copy of the whole thing for nothing -- the
-        // request has no further use for them. `req` keeps the scalars
-        // the caller still reads below.
+        // Taken, not cloned. The entries must move to the blocking pool either
+        // way, and for a batch with a transaction a clone is a second full copy for
+        // nothing: the request does not use them again. `req` keeps the scalars the
+        // caller reads below.
         let mut entries = std::mem::take(&mut req.entries);
-        // What this batch costs to take, and how much of a batch it
-        // actually is -- the follower's share of the round trip the
-        // leader is blocked on, measured where it is actually paid.
+        // What this batch costs to apply, and how big it is: the follower's share
+        // of the round trip the leader waits on, measured where it is paid.
         let entry_count = entries.len();
         let entry_bytes: usize = entries.iter().map(prost::Message::encoded_len).sum();
         let started = Instant::now();
@@ -476,8 +460,8 @@ impl Follower {
                     conflict_index: outcome.conflict_index,
                     conflict_term: outcome.conflict_term,
                 });
-                // Answer first, then react: the leader is waiting on this
-                // response, and reloading is our own bookkeeping.
+                // Answer first, then react: the leader waits for this response, and the
+                // reload is our own bookkeeping.
                 if outcome.config_may_have_changed {
                     self.reload_config().await
                 } else {
@@ -503,38 +487,34 @@ impl Follower {
                     .publish_role(follower_handle(&self.common, self.leader_hint.clone()));
                 self.renew_lease();
 
-                // `body` is consumed here, on the blocking pool, as the
-                // chunks arrive -- the sender is still pumping them in
-                // while this runs. Rejecting above instead drops it
-                // unread, which closes the channel and stops the pump.
+                // `body` is read here, on the blocking pool, as chunks arrive: the sender
+                // is still pumping them in while this runs. A rejection above drops it
+                // unread instead, which closes the channel and stops the pump.
                 self.common
                     .store
                     .expect("install snapshot", move |log| log.install_snapshot(&mut body))
                     .await;
 
-                // A snapshot only ever contains already-committed state
-                // (Leader Completeness) -- both watermarks can jump
-                // straight to it, same as AppendEntries's
-                // leader_commit/compact_seq hints do.
+                // A snapshot only contains committed state (Leader Completeness), so both
+                // watermarks can jump straight to it, as with AppendEntries's
+                // leader_commit and compact_seq hints.
                 self.common.advance_commit(header.last_included_index);
                 self.common.advance_compact(header.last_included_index);
 
                 let _ = respond_to.send(InstallSnapshotResponse {
                     term: self.common.current_term,
                 });
-                // An install wipes `log`, taking any `Config` entry with
-                // it; the snapshot's own header is where membership comes
-                // from now (see `storage::RaftLog::install_snapshot`), so
-                // this is never optional.
+                // An install wipes `log`, including any `Config` entry; membership now
+                // comes from the snapshot's header (see
+                // `storage::RaftLog::install_snapshot`), so this is never optional.
                 self.reload_config().await
             }
             Event::RequestVote { req, respond_to } => {
                 if self.has_active_lease() {
-                    // Refuse to disrupt a leader we've recently confirmed
-                    // is alive, regardless of term, log, or whether this
-                    // is a real vote or just a pre-vote -- this is what
-                    // stops a competing election from ever succeeding
-                    // against a leader a majority can still reach.
+                    // Do not disrupt a leader we recently confirmed is alive, whatever the
+                    // term, log, or kind of vote (real or pre-vote). This is what stops a
+                    // competing election from ever winning against a leader that a majority
+                    // can still reach.
                     let _ = respond_to.send(RequestVoteResponse {
                         term: self.common.current_term,
                         vote_granted: false,
@@ -564,24 +544,23 @@ impl Follower {
                 let accepted = outcome.is_ok();
                 let _ = respond_to.send(outcome);
                 if accepted {
-                    // We just became a voting member of a (single-node)
-                    // cluster, so re-enter `Follower` to get an election
-                    // timer -- there was none while uninitialized.
+                    // We just became a voting member of a single-node cluster, so re-enter
+                    // `Follower` to get an election timer; there was none while
+                    // uninitialized.
                     Transition::Become(Role::Follower)
                 } else {
                     Transition::Continue
                 }
             }
             Event::ElectionTimeout => {
-                // A learner (or a server that has been removed from the
-                // configuration) must never campaign: it has no vote, so
-                // it could never win, and a removed server campaigning is
-                // exactly the disruption §4.2.3 warns about. It still
-                // replicates and still answers RPCs -- it just waits.
+                // A learner (or a removed server) must never campaign: it has no vote, so
+                // it could never win, and a removed server that campaigns is the
+                // disruption §4.2.3 warns about. It still replicates and answers RPCs; it
+                // only waits.
                 //
-                // `Follower::new` doesn't arm a timer for such a node at
-                // all; this is here for the window where the
-                // configuration changes under an already-in-flight one.
+                // `Follower::new` arms no timer for such a node. This check covers the
+                // window where the configuration changes while a timer is already
+                // running.
                 if self.common.is_voter() {
                     Transition::Become(Role::PreCandidate)
                 } else {

@@ -1,15 +1,14 @@
 use super::*;
-// Only the tests reach into the replication step builder directly; the
-// leader itself only ever sees it from inside a replication task.
+// Only the tests use the replication step builder directly; the leader
+// itself only sees it from inside a replication task.
 use super::replication::{ReplicationStep, build_replication_step_sync};
 use crate::raft::test_support::*;
 
-/// A zero-peer "cluster" reaches majority on its own self-vote alone
-/// (see the immediate-majority check in `candidate::Campaign::start`),
-/// and then has no peers to wait on for commit either --
-/// `Event::LeaderTick` is what's responsible for noticing the leader's
-/// own growing log and advancing `commit_tx` without any peer
-/// response ever arriving to trigger it.
+/// A cluster with no peers reaches a majority on its self-vote alone (see
+/// the immediate-majority check in `candidate::Campaign::start`), and then
+/// has no peers to wait on for commit either. `Event::LeaderTick` notices
+/// the leader's growing log and advances `commit_tx` with no peer response
+/// to trigger it.
 #[tokio::test]
 async fn leader_commits_a_write_immediately_in_a_single_node_cluster() {
     let (mut role_rx, _peer_handle, path) = spawn_test_node(vec![]);
@@ -23,16 +22,15 @@ async fn leader_commits_a_write_immediately_in_a_single_node_cluster() {
     .await
     .expect("append_log should not hang with no peers to wait on")
     .unwrap();
-    // 2, not 1: seq 1 is the term-opening no-op `Leader::new` appends.
+    // 2, not 1: seq 1 is the term-opening no-op that `Leader::new` appends.
     assert_eq!(seq, 2);
 
     cleanup(&path);
 }
 
-/// Raft §5.4.2: a leader can only advance its commit index over an
-/// entry from its *own* term, so every term has to start with one --
-/// otherwise a leader that never gets a client write could never
-/// commit the tail it inherited.
+/// Raft §5.4.2: a leader can only advance its commit index over an entry
+/// from its own term, so every term must start with one. Otherwise a leader
+/// that never gets a client write could never commit its inherited tail.
 #[tokio::test]
 async fn a_new_leader_opens_its_term_with_a_noop() {
     let (log, mut role_rx, _peer_handle, _commit_rx, _compact_rx, path) =
@@ -48,17 +46,15 @@ async fn a_new_leader_opens_its_term_with_a_noop() {
     cleanup(&path);
 }
 
-/// A `Leader` with no tasks attached, for driving `recompute_*`
-/// directly. Nothing here talks to a peer, so the states these tests
-/// need -- a specific pattern of `peer_match_index` -- can just be
-/// set, rather than coaxed out of a real cluster.
-/// Hands back the `read_quorum` receiver alongside the leader, since
-/// that is what a test checking read quorum reads it from.
+/// A `Leader` with no tasks attached, for driving `recompute_*` directly.
+/// Nothing here talks to a peer, so the states these tests need (a specific
+/// pattern of `peer_match_index`) can just be set, instead of produced by a
+/// real cluster. Returns the `read_quorum` receiver with the leader, because
+/// a test that checks read quorum reads it there.
 fn bare_leader(common: Common) -> (Leader, watch::Receiver<bool>) {
     let (read_quorum_tx, read_quorum_rx) = watch::channel(false);
-    // A real `Task` (one that does nothing but wait to be stopped)
-    // rather than a bare handle, so these leaders tear down through
-    // exactly the same path as a live one.
+    // A real `Task` (one that only waits to be stopped), not a bare handle, so
+    // these leaders shut down through the same path as a live one.
     let tick_timer = Task::spawn(common.cancel_token(), |cancel| async move {
         cancel.cancelled().await;
     });
@@ -70,9 +66,8 @@ fn bare_leader(common: Common) -> (Leader, watch::Receiver<bool>) {
         peer_match_index: HashMap::new(),
         peer_lease_expiry: HashMap::new(),
         read_quorum_tx,
-        // No no-op appended here, so the Figure 8 / own-term gate is
-        // open from the start -- these tests set up the log state
-        // they want directly.
+        // No no-op appended here, so the Figure 8 own-term gate is open from the
+        // start: these tests set up the log state they want directly.
         noop_seq: 0,
         pending_config_seq: None,
         catch_up: HashMap::new(),
@@ -80,8 +75,8 @@ fn bare_leader(common: Common) -> (Leader, watch::Receiver<bool>) {
     (leader, read_quorum_rx)
 }
 
-/// A leader set up as if it had already committed its own
-/// term-opening no-op, so `propose_config`'s guards are open.
+/// A leader set up as if it had already committed its term-opening no-op,
+/// so `propose_config`'s guards are open.
 async fn ready_leader(
     members: &[(&str, bool)],
 ) -> (
@@ -102,10 +97,10 @@ async fn ready_leader(
     (log, leader, read_quorum_rx, path)
 }
 
-/// A server is added as a *learner* (§4.2.1): a member, replicated
-/// to, but with no vote. Adding it as a voter outright would let a
-/// server that is far behind count toward -- and so stall -- every
-/// quorum from the moment it joined.
+/// A server is added as a learner (§4.2.1): a member that gets replication
+/// but has no vote. Adding it as a voter at once would let a server that is
+/// far behind count toward (and so stall) every quorum from the moment it
+/// joined.
 #[tokio::test]
 async fn add_server_joins_as_a_non_voting_learner() {
     let (_log, mut leader, _rq, path) = ready_leader(&[("n0", true), ("v1", true)]).await;
@@ -134,9 +129,9 @@ async fn add_server_joins_as_a_non_voting_learner() {
     cleanup(&path);
 }
 
-/// Raft §4.1 allows only one membership change in flight at a time:
-/// two overlapping single-server changes can produce configurations
-/// with no majority in common.
+/// Raft §4.1 allows only one membership change in flight at a time: two
+/// overlapping single-server changes can produce configurations with no
+/// common majority.
 #[tokio::test]
 async fn only_one_membership_change_may_be_in_flight() {
     let (_log, mut leader, _rq, path) = ready_leader(&[("n0", true), ("v1", true)]).await;
@@ -176,9 +171,9 @@ async fn only_one_membership_change_may_be_in_flight() {
     cleanup(&path);
 }
 
-/// Ongaro 2015: a leader that hasn't yet committed an entry from its
-/// own term is still reading a configuration that a future leader
-/// could roll back, so it must not build a membership change on it.
+/// Ongaro 2015: a leader that has not yet committed an entry from its own
+/// term still reads a configuration that a later leader could roll back, so
+/// it must not build a membership change on it.
 #[tokio::test]
 async fn a_leader_will_not_change_membership_before_committing_its_own_term() {
     let config = cluster_config(&[("n0", true), ("v1", true)]);
@@ -210,7 +205,7 @@ async fn a_leader_will_not_change_membership_before_committing_its_own_term() {
     cleanup(&path);
 }
 
-/// Changes that can't apply are refused rather than producing a
+/// Changes that cannot apply are refused, instead of producing a
 /// configuration nobody could make progress under.
 #[tokio::test]
 async fn impossible_membership_changes_are_refused() {
@@ -234,13 +229,13 @@ async fn impossible_membership_changes_are_refused() {
         .unwrap_err();
     assert!(matches!(stranger, RaftError::InvalidConfigChange(_)));
 
-    // A refused change must not have consumed the one in-flight slot.
+    // A refused change must not use up the one in-flight slot.
     assert!(leader.pending_config_seq.is_none());
     cleanup(&path);
 }
 
-/// The last voter can't be removed: the entry removing it could never
-/// commit, since there would be no one left to form a quorum of the
+/// The last voter cannot be removed: the entry that removes it could never
+/// commit, because nobody would be left to form a quorum of the
 /// configuration it creates.
 #[tokio::test]
 async fn the_last_voter_cannot_be_removed() {
@@ -255,10 +250,10 @@ async fn the_last_voter_cannot_be_removed() {
     cleanup(&path);
 }
 
-/// A heartbeat change is a configuration change that leaves the
-/// membership alone -- and, since every running task re-reads its
-/// timing, it reaches them without any being restarted (which would
-/// cost each replication task its hard-won `next_index`).
+/// A heartbeat change is a configuration change that keeps the membership.
+/// Every running task reads its timing again, so the change reaches them
+/// without restarting any (which would cost each replication task its
+/// hard-won `next_index`).
 #[tokio::test]
 async fn set_heartbeat_retimes_the_leader_without_touching_membership() {
     let members = [("n0", true), ("v1", true), ("v2", true)];
@@ -306,11 +301,11 @@ async fn an_out_of_range_heartbeat_is_refused() {
     cleanup(&path);
 }
 
-/// A grant counts until the deadline its probe computed from when it
-/// was *sent*, not from when the answer happened to arrive: the
-/// follower started its promise on receipt, so anything later than the
-/// send would let the leader count a lease the follower had already
-/// let go of -- by as much as a whole round trip on a slow link.
+/// A grant counts until the deadline computed from when its probe was sent,
+/// not from when the answer arrived: the follower started its promise on
+/// receipt, so any later start would let the leader count a lease the
+/// follower already gave up, by as much as a whole round trip on a slow
+/// link.
 #[tokio::test]
 async fn a_lease_grant_counts_only_until_its_probes_deadline() {
     let config = cluster_config(&[("n0", true), ("v1", true), ("v2", true)]);
@@ -341,9 +336,9 @@ async fn a_lease_grant_counts_only_until_its_probes_deadline() {
     cleanup(&path);
 }
 
-/// Raft §4.2.2: a leader removing *itself* is the only node that can
-/// get that entry committed, so it keeps serving until it does --
-/// and steps down the instant it commits, not before.
+/// Raft §4.2.2: a leader that removes itself is the only node that can
+/// commit that entry, so it keeps serving until it does, and steps down the
+/// moment it commits, not before.
 #[tokio::test]
 async fn a_leader_that_removes_itself_serves_until_the_change_commits() {
     let (_log, mut leader, _rq, path) =
@@ -361,8 +356,8 @@ async fn a_leader_that_removes_itself_serves_until_the_change_commits() {
         "stepping down now would leave nobody able to finish the change"
     );
 
-    // A majority of the *new* configuration (v1 and v2, since we no
-    // longer count) acknowledges it.
+    // A majority of the new configuration (v1 and v2, since we no longer
+    // count) acknowledges it.
     leader.peer_match_index.insert("v1".to_string(), seq);
     leader.peer_match_index.insert("v2".to_string(), seq);
     leader.recompute_watermarks().await;
@@ -374,16 +369,16 @@ async fn a_leader_that_removes_itself_serves_until_the_change_commits() {
     cleanup(&path);
 }
 
-/// Raft §4.2.1: a learner is promoted once it finishes a catch-up
-/// round quickly enough to show it can keep up with the cluster in
-/// real time -- automatically, with no second client call.
+/// Raft §4.2.1: a learner is promoted once it finishes a catch-up round
+/// fast enough to show it can keep up in real time, automatically, with no
+/// second client call.
 #[tokio::test]
 async fn a_learner_that_keeps_up_is_promoted_automatically() {
     let (log, mut leader, _rq, path) =
         ready_leader(&[("n0", true), ("v1", true), ("l1", false)]).await;
 
-    // First response only starts the round; there is nothing yet to
-    // judge it by.
+    // The first response only starts the round; there is nothing to judge it
+    // by yet.
     leader.review_learner_progress().await;
     assert!(!leader.common.config.is_voter("l1"));
     assert!(leader.catch_up.contains_key("l1"));
@@ -408,10 +403,10 @@ async fn a_learner_that_keeps_up_is_promoted_automatically() {
     cleanup(&path);
 }
 
-/// A learner that reaches its target only after an election timeout
-/// has elapsed hasn't shown it can keep up -- it starts another
-/// round rather than being promoted. There is no failure path: it
-/// stays a learner, replicated to but invisible to every quorum.
+/// A learner that reaches its target only after an election timeout has
+/// not shown it can keep up, so it starts another round instead of being
+/// promoted. There is no failure path: it stays a learner, replicated to
+/// but counted in no quorum.
 #[tokio::test]
 async fn a_learner_that_lags_starts_another_round_instead() {
     let (log, mut leader, _rq, path) =
@@ -438,11 +433,11 @@ async fn a_learner_that_lags_starts_another_round_instead() {
     cleanup(&path);
 }
 
-/// A membership change adds and removes exactly the tasks that
-/// changed, and leaves the rest running: each replication task owns
-/// this leader's hard-won `next_index` for its peer, so restarting
-/// them all on every change would re-probe the whole cluster just
-/// because one server was added.
+/// A membership change adds and removes exactly the tasks that changed, and
+/// leaves the rest running: each replication task owns this leader's
+/// hard-won `next_index` for its peer, so restarting them all on every
+/// change would probe the whole cluster again because one server was
+/// added.
 #[tokio::test]
 async fn reconcile_peers_adds_and_removes_only_what_changed() {
     let before = cluster_config(&[("n0", true), ("v1", true), ("l1", false)]);
@@ -462,7 +457,7 @@ async fn reconcile_peers_adds_and_removes_only_what_changed() {
     );
     let untouched = leader.replication_tasks["v1"].id();
 
-    // Promote the learner and add a new one, in one new config.
+    // Promote the learner and add a new one, in one new configuration.
     let after = cluster_config(&[("n0", true), ("v1", true), ("l1", true), ("l2", false)]);
     log.append_config(1, &after.to_bytes()).unwrap();
     leader.common.reload_config().await;
@@ -486,10 +481,9 @@ async fn reconcile_peers_adds_and_removes_only_what_changed() {
     cleanup(&path);
 }
 
-/// A removed peer has to be forgotten, not just unsubscribed: a stale
-/// `peer_match_index` for a server that is no longer a member would
-/// go on being counted, pinning `compact_seq` at whatever index that
-/// server happened to stop at, forever.
+/// A removed peer must be forgotten, not only unsubscribed: a stale
+/// `peer_match_index` for a former member would keep being counted, and
+/// pin `compact_seq` at the index where that server stopped, forever.
 #[tokio::test]
 async fn removing_a_peer_stops_it_from_holding_back_compaction() {
     let before = cluster_config(&[("n0", true), ("v1", true), ("gone", true)]);
@@ -519,8 +513,8 @@ async fn removing_a_peer_stops_it_from_holding_back_compaction() {
 
     assert!(!leader.replication_tasks.contains_key("gone"));
     assert!(!leader.peer_match_index.contains_key("gone"));
-    // `reconcile_peers` recomputes on its own once a peer goes away,
-    // so this needs no further prompting.
+    // `reconcile_peers` recomputes by itself once a peer leaves, so nothing
+    // else is needed.
     assert_eq!(*compact_rx.borrow(), tail);
 
     cleanup(&path);
@@ -532,10 +526,10 @@ fn sorted_keys(tasks: &HashMap<String, Task>) -> Vec<&str> {
     ids
 }
 
-/// Commitment is decided by the voters alone (§4.2.1). A learner is
-/// replicated to like anyone else, but counting it toward the commit
-/// quorum would let an entry commit on the strength of a node that
-/// can't vote in the election that has to preserve it.
+/// Only voters decide commit (§4.2.1). A learner gets replication like
+/// anyone else, but counting it toward the commit quorum would let an entry
+/// commit because of a node that cannot vote in the election that must
+/// preserve it.
 #[tokio::test]
 async fn a_learners_replication_does_not_commit_anything() {
     let config = cluster_config(&[("n0", true), ("v1", true), ("l1", false)]);
@@ -554,14 +548,14 @@ async fn a_learners_replication_does_not_commit_anything() {
     let (mut leader, _read_quorum_rx) = bare_leader(common);
     assert_eq!(leader.common.majority(), 2, "two voters, so two to decide");
 
-    // Two of the three *members* hold the tail (us and the learner)
-    // -- but only one of the two voters does.
+    // Two of the three members hold the tail (us and the learner), but only
+    // one of the two voters does.
     leader.peer_match_index.insert("l1".to_string(), tail);
     leader.peer_match_index.insert("v1".to_string(), 0);
     leader.recompute_watermarks().await;
     assert_eq!(*commit_rx.borrow(), 0);
 
-    // The second voter is what actually decides it.
+    // The second voter is what decides it.
     leader.peer_match_index.insert("v1".to_string(), tail);
     leader.recompute_watermarks().await;
     assert_eq!(*commit_rx.borrow(), tail);
@@ -569,9 +563,8 @@ async fn a_learners_replication_does_not_commit_anything() {
     cleanup(&path);
 }
 
-/// Compaction draws on the opposite population: it physically
-/// discards entries, so it has to wait for everyone who might still
-/// need to be sent them -- very much including a learner that is
+/// Compaction uses the opposite group: it deletes entries, so it must wait
+/// for everyone who might still need them, including a learner that is
 /// still catching up.
 #[tokio::test]
 async fn compaction_waits_for_a_learner_that_commitment_ignores() {
@@ -591,8 +584,8 @@ async fn compaction_waits_for_a_learner_that_commitment_ignores() {
 
     let (mut leader, _read_quorum_rx) = bare_leader(common);
 
-    // Both voters have everything, so it commits -- but the learner
-    // is still behind, so nothing may be discarded yet.
+    // Both voters have everything, so it commits, but the learner is still
+    // behind, so nothing may be deleted yet.
     leader.peer_match_index.insert("v1".to_string(), tail);
     leader.peer_match_index.insert("l1".to_string(), 0);
     leader.recompute_watermarks().await;
@@ -606,9 +599,9 @@ async fn compaction_waits_for_a_learner_that_commitment_ignores() {
     cleanup(&path);
 }
 
-/// A read lease is a quorum too, so it is counted over voters only --
-/// otherwise a leader partitioned from every voter could still claim
-/// read quorum on the strength of learners alone.
+/// A read lease is a quorum too, so only voters count. Otherwise a leader
+/// cut off from every voter could still claim read quorum through learners
+/// alone.
 #[tokio::test]
 async fn read_quorum_counts_voters_only() {
     let config = cluster_config(&[("n0", true), ("v1", true), ("v2", true), ("l1", false)]);
@@ -617,8 +610,8 @@ async fn read_quorum_counts_voters_only() {
     let (mut leader, read_quorum_rx) = bare_leader(common);
     let live = Instant::now() + Timing::default().lease();
 
-    // Us plus a learner: two of four members, but only one of three
-    // voters -- short of the two a quorum needs.
+    // Us plus a learner: two of four members, but only one of three voters,
+    // short of the two a quorum needs.
     leader.peer_lease_expiry.insert("l1".to_string(), live);
     leader.recompute_lease_quorum();
     assert!(!*read_quorum_rx.borrow());
@@ -630,20 +623,20 @@ async fn read_quorum_counts_voters_only() {
     cleanup(&path);
 }
 
-/// Raft §5.4.2 / Figure 8: replication to a majority does *not*
-/// commit an entry from an earlier term -- a later leader can still
-/// overwrite it. `recompute_watermarks` has to hold `commit_seq` back
-/// until an entry from the current term reaches a majority, and only
-/// then commit the whole prefix at once.
+/// Raft §5.4.2 / Figure 8: replication to a majority does not commit an
+/// entry from an earlier term, because a later leader can still overwrite
+/// it. `recompute_watermarks` must hold `commit_seq` back until an entry
+/// from the current term reaches a majority, then commit the whole prefix
+/// at once.
 ///
-/// Drives `recompute_watermarks` directly rather than through a real
-/// cluster, since the point is precisely the state a leader can't be
-/// steered into from outside: a majority that has the inherited tail
-/// but not yet this term's no-op.
+/// Drives `recompute_watermarks` directly instead of through a real
+/// cluster, because the point is a state a leader cannot be steered into
+/// from outside: a majority that has the inherited tail but not yet this
+/// term's no-op.
 #[tokio::test]
 async fn commit_waits_for_an_entry_from_the_leaders_own_term() {
     let (log, path) = open_temp_log();
-    // A tail inherited from term 1 and never committed by its leader.
+    // A tail inherited from term 1, never committed by its leader.
     log.append(1, b"a", Some(b"1")).unwrap();
     let inherited = log.append(1, b"b", Some(b"2")).unwrap();
 
@@ -674,9 +667,9 @@ async fn commit_waits_for_an_entry_from_the_leaders_own_term() {
 
     let (mut leader, _read_quorum_rx) = bare_leader(common);
 
-    // p1 has the inherited entries but not the no-op. That's a
-    // majority (p1 and us) holding seq 2 -- and it still must not
-    // commit, because seq 2 is from term 1.
+    // p1 has the inherited entries but not the no-op. That is a majority (p1
+    // and us) holding seq 2, and it still must not commit, because seq 2 is
+    // from term 1.
     leader.peer_match_index.insert("p1".to_string(), inherited);
     leader.recompute_watermarks().await;
     assert_eq!(
@@ -685,8 +678,8 @@ async fn commit_waits_for_an_entry_from_the_leaders_own_term() {
         "an entry from a previous term must not commit on majority replication alone"
     );
 
-    // Once the term-7 no-op reaches p1, committing it commits
-    // everything before it too (Log Matching).
+    // Once the term-7 no-op reaches p1, committing it commits everything
+    // before it too (Log Matching).
     leader.peer_match_index.insert("p1".to_string(), noop);
     leader.recompute_watermarks().await;
     assert_eq!(*commit_rx.borrow(), noop);
@@ -694,16 +687,12 @@ async fn commit_waits_for_an_entry_from_the_leaders_own_term() {
     cleanup(&path);
 }
 
-/// Regression test for a race between `append_log` and
-/// `spawn_storage_maintenance_task`: both are independent `watch`
-/// subscribers of the same commit signal, and `watch` gives no
-/// ordering guarantee between separate subscribers waking up on the
-/// same update. Waiting on `commit_tx` directly (as `append_log` used
-/// to) could let it return *before* the maintenance task had actually
-/// run `apply_committed` for that seq -- `append_log` now waits on
-/// `applied_tx` instead, so the moment it returns, `get_latest` must
-/// already reflect the write with no polling or sleeping needed to
-/// observe it.
+/// `append_log` and `spawn_storage_maintenance_task` are separate `watch`
+/// subscribers of the same commit signal, and `watch` gives no order between
+/// subscribers that wake on the same update. Waiting on `commit_tx` could
+/// return before the maintenance task ran `apply_committed` for that seq.
+/// `append_log` waits on `applied_tx`, so when it returns, `get_latest` must
+/// already show the write, with no polling or sleeping.
 #[tokio::test]
 async fn append_log_does_not_return_until_latest_actually_reflects_it() {
     let (log, mut role_rx, _peer_handle, _commit_rx, _compact_rx, path) =
@@ -713,30 +702,27 @@ async fn append_log_does_not_return_until_latest_actually_reflects_it() {
 
     let seq = leader.append_log(b"k", Some(b"v")).await.unwrap();
 
-    // No wait, no poll: if this were racing the maintenance task
-    // instead of genuinely waiting for it, this would be flaky
-    // (occasionally observing `None` here).
+    // No wait, no poll: if this raced the maintenance task instead of really
+    // waiting for it, this would be flaky (sometimes seeing `None` here).
     assert_eq!(log.get_latest(b"k").unwrap(), Some((seq, b"v".to_vec())));
 
     cleanup(&path);
 }
 
-/// Regression test for a real, pre-existing bug found while adding the
-/// shared `evaluate_real_vote` helper: a leader used to grant *any*
-/// higher-term vote request unconditionally, without checking the
-/// candidate's log per §5.4.1 (only `Follower` did). A candidate whose
-/// log is behind must still be denied even though its term is higher.
+/// A leader must not grant a higher-term vote request without checking the
+/// candidate's log per §5.4.1. A candidate whose log is behind must be
+/// denied even though its term is higher.
 #[tokio::test]
 async fn leader_denies_a_higher_term_vote_if_the_candidates_log_is_behind() {
     let (mut role_rx, peer_handle, path) = spawn_test_node(vec![]);
     wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Leader(_))).await;
     let leader = expect_leader_handle(&role_rx.borrow());
 
-    // Give the leader a log entry so it has something to be ahead of.
+    // Give the leader a log entry, so it has something to be ahead of.
     leader.append_log(b"k", Some(b"v")).await.unwrap();
 
-    // Term is way higher, but the candidate's log is entirely empty --
-    // strictly behind the leader's one entry.
+    // The term is much higher, but the candidate's log is empty: behind the
+    // leader's one entry.
     let resp = peer_handle
         .request_vote(RequestVoteRequest {
             term: 999,
@@ -752,18 +738,18 @@ async fn leader_denies_a_higher_term_vote_if_the_candidates_log_is_behind() {
     cleanup(&path);
 }
 
-/// A zero-peer cluster trivially always has a quorum of leases (just
-/// itself), same as it trivially always has commit majority.
+/// A cluster with no peers always has a quorum of leases (just itself), as
+/// it always has a commit majority.
 #[tokio::test]
 async fn leader_has_read_quorum_immediately_in_a_single_node_cluster() {
     let (mut role_rx, _peer_handle, path) = spawn_test_node(vec![]);
     wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Leader(_))).await;
     let leader = expect_leader_handle(&role_rx.borrow());
 
-    // `RoleHandle::Leader` is published slightly before the first
-    // `recompute_lease_quorum()` call completes (there's an `.await`
-    // in between, for the commit/compact watermark read) -- poll
-    // briefly rather than asserting on the very first check.
+    // `RoleHandle::Leader` is published just before the first
+    // `recompute_lease_quorum()` call finishes (there is an `.await` between
+    // them, for the watermark read), so poll briefly instead of asserting on
+    // the very first check.
     tokio::time::timeout(Duration::from_millis(500), async {
         while !leader.has_read_quorum() {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -774,9 +760,9 @@ async fn leader_has_read_quorum_immediately_in_a_single_node_cluster() {
     cleanup(&path);
 }
 
-/// End-to-end over real sockets: once a leader's lease-prober task
-/// actually reaches a live peer and gets granted, it should count
-/// toward read quorum (majority with one peer needs both).
+/// End to end over real sockets: once a leader's lease-prober task reaches
+/// a live peer and gets a grant, the grant counts toward read quorum (a
+/// majority with one peer needs both).
 #[tokio::test]
 async fn leader_gains_read_quorum_once_a_real_peer_grants_its_lease() {
     use crate::grpc::RaftPeerService;
@@ -862,31 +848,30 @@ fn build_replication_step_returns_snapshot_when_prev_log_index_is_compacted() {
         log.append(1, format!("k{i}").as_bytes(), Some(b"v"))
             .unwrap();
     }
-    // `compact` clamps to what's been applied -- apply everything
-    // first so the compact below isn't a no-op.
+    // `compact` clamps to what is applied, so apply everything first, or the
+    // compact below would do nothing.
     log.apply_committed(5).unwrap();
-    // Removes entries 1-3; the floor lands at seq 3 (its term still
-    // answerable via the floor special-case in `term_at`).
+    // Removes entries 1-3; the floor lands at seq 3 (its term still answerable
+    // through the floor case in `term_at`).
     log.compact(4).unwrap();
 
-    // next_index = 4 -> prev_log_index = 3, exactly the floor -- still
-    // answerable, so this is an ordinary AppendEntries.
+    // next_index = 4 -> prev_log_index = 3, exactly the floor, which is still
+    // answerable, so this is a normal AppendEntries.
     let step = step_for(&log, 4);
     assert!(matches!(step, ReplicationStep::AppendEntries { .. }));
 
-    // next_index = 3 -> prev_log_index = 2, strictly below the floor --
-    // `term_at` can't answer for it, so this must fall back to a
-    // snapshot instead of guessing.
+    // next_index = 3 -> prev_log_index = 2, below the floor. `term_at` cannot
+    // answer for it, so this must fall back to a snapshot instead of guessing.
     let step = step_for(&log, 3);
     assert!(matches!(step, ReplicationStep::Snapshot));
 
     cleanup(&path);
 }
 
-/// Regression test for a gap the `term_at`-based check alone misses:
-/// `prev_log_index == 0` (a peer replaying from scratch) never calls
-/// `term_at` at all, so if the early entries it would need have
-/// *also* been compacted away, only the contiguity check catches it.
+/// A gap that the `term_at` check alone misses: `prev_log_index == 0` (a
+/// peer replaying from scratch) never calls `term_at`, so if the early
+/// entries it needs are also compacted away, only the contiguity check
+/// catches it.
 #[test]
 fn build_replication_step_returns_snapshot_when_replaying_from_scratch_hits_a_gap() {
     let (log, path) = open_temp_log();
@@ -903,23 +888,23 @@ fn build_replication_step_returns_snapshot_when_replaying_from_scratch_hits_a_ga
     cleanup(&path);
 }
 
-/// An ordinary replication step, with the arguments a test never varies
+/// A normal replication step, with the arguments a test never varies
 /// filled in. `heartbeat_only` is false: these tests are about what the
-/// builder decides to *send*, which is the case a probe round skips.
+/// builder decides to send, which a probe round skips.
 fn step_for(log: &RaftLog, next_index: u64) -> ReplicationStep {
     build_replication_step_sync(log, next_index, "leader-1".to_string(), 1, 0, 0, false).unwrap()
 }
 
-/// The batch is bounded by bytes, not by how far behind a peer happens
-/// to be. A short batch must still be a *contiguous prefix* starting at
-/// `next_index`, or the follower would be replayed with holes in its
-/// history -- and it must say there is more, so the caller comes
-/// straight back instead of sleeping between rounds.
+/// The batch is bounded by bytes, not by how far behind a peer is. A short
+/// batch must still be a contiguous prefix that starts at `next_index`, or
+/// the follower would get a history with holes. And it must say there is
+/// more, so the caller comes straight back instead of sleeping between
+/// rounds.
 #[test]
 fn build_replication_step_stops_at_the_byte_budget_and_says_there_is_more() {
     let (log, path) = open_temp_log();
-    // Each entry is comfortably over a megabyte, so a handful of them
-    // exceed any sane budget without the test having to know it.
+    // Each entry is well over a megabyte, so a few of them exceed any sane
+    // budget without the test needing to know it.
     let big = vec![0u8; 2 * 1024 * 1024];
     for i in 1..=16u64 {
         log.append(1, format!("k{i}").as_bytes(), Some(&big)).unwrap();
@@ -946,8 +931,8 @@ fn build_replication_step_stops_at_the_byte_budget_and_says_there_is_more() {
         );
     }
 
-    // Picking up where that left off eventually drains the log, and the
-    // last batch says so.
+    // Continuing from there eventually drains the log, and the last batch says
+    // so.
     let next = req.entries.len() as u64 + 1;
     let ReplicationStep::AppendEntries { req, .. } = step_for(&log, next) else {
         panic!("the rest of the log should replicate normally");
@@ -957,10 +942,10 @@ fn build_replication_step_stops_at_the_byte_budget_and_says_there_is_more() {
     cleanup(&path);
 }
 
-/// The escape hatch: one entry larger than the whole budget still has to
-/// be sent, or it could never replicate, never commit, and block
-/// everything behind it forever. This is why nothing larger than
-/// `MAX_ENTRY_BYTES` is allowed into the log in the first place.
+/// The escape hatch: one entry larger than the whole budget must still be
+/// sent, or it could never replicate, never commit, and would block
+/// everything behind it forever. That is why nothing larger than
+/// `MAX_ENTRY_BYTES` is allowed into the log.
 #[test]
 fn build_replication_step_always_sends_at_least_one_entry() {
     let (log, path) = open_temp_log();
@@ -982,12 +967,11 @@ fn build_replication_step_always_sends_at_least_one_entry() {
     cleanup(&path);
 }
 
-/// The case the old length check covered implicitly and a naive
-/// contiguity check would miss: every entry in the range is compacted
-/// away while `last_entry` still answers from the floor. Sending that as
-/// an empty batch reads as a heartbeat, so the follower replies
-/// `success` at the index it already had, `next_index` never moves, and
-/// the peer spins every tick with no progress and no snapshot.
+/// A case a naive contiguity check would miss: every entry in the range is
+/// compacted away while `last_entry` still answers from the floor. Sent as
+/// an empty batch, that reads as a heartbeat, so the follower replies
+/// `success` at the index it already had, `next_index` never moves, and the
+/// peer spins every tick with no progress and no snapshot.
 #[test]
 fn build_replication_step_returns_snapshot_when_the_whole_range_is_compacted() {
     let (log, path) = open_temp_log();
@@ -996,16 +980,15 @@ fn build_replication_step_returns_snapshot_when_the_whole_range_is_compacted() {
             .unwrap();
     }
     log.apply_committed(5).unwrap();
-    // Compacts everything: `log` is empty, but `last_entry` still
-    // reports seq 5 from the floor.
+    // Compacts everything: `log` is empty, but `last_entry` still reports seq 5
+    // from the floor.
     log.compact(6).unwrap();
     assert_eq!(log.last_entry().unwrap().map(|(seq, _)| seq), Some(5));
     assert!(log.entries_in_range(1, 6).unwrap().is_empty());
 
-    // next_index = 1 is the one that reaches this branch: prev_log_index
-    // is 0, so the `term_at` check above is skipped entirely, and
-    // `next_index <= last_index` holds because the floor says 5 -- so it
-    // fetches, and gets nothing.
+    // next_index = 1 reaches this branch: prev_log_index is 0, so the `term_at`
+    // check above is skipped, and `next_index <= last_index` holds because the
+    // floor says 5. So it fetches, and gets nothing.
     let step = step_for(&log, 1);
     assert!(
         matches!(step, ReplicationStep::Snapshot),
@@ -1015,14 +998,13 @@ fn build_replication_step_returns_snapshot_when_the_whole_range_is_compacted() {
     cleanup(&path);
 }
 
-/// End-to-end over real sockets: forces the exact scenario
-/// `ReplicationStep::Snapshot` exists for by directly rolling a
-/// follower's log back (simulating it falling behind) below where the
-/// leader's log has (also directly, bypassing the normal
-/// `compact_seq` machinery -- see the comment below) been compacted,
-/// then confirms the leader detects it and sends a real
-/// `InstallSnapshot` RPC that correctly restores the follower's
-/// missing history.
+/// End to end over real sockets: forces the scenario
+/// `ReplicationStep::Snapshot` exists for. It rolls a follower's log back
+/// (as if it fell behind) below the point where the leader's log was
+/// compacted (also done directly, not through the normal `compact_seq`
+/// path; see the comment below). Then it checks that the leader notices and
+/// sends a real `InstallSnapshot` RPC that restores the follower's missing
+/// history.
 #[tokio::test]
 async fn leader_sends_a_real_snapshot_to_a_peer_that_has_fallen_behind_compaction() {
     use crate::grpc::RaftPeerService;
@@ -1084,10 +1066,10 @@ async fn leader_sends_a_real_snapshot_to_a_peer_that_has_fallen_behind_compactio
         _ = wait_for_role(&mut role_rx_b, |r| matches!(r, RoleHandle::Leader(_))) => {}
     }
 
-    // Same leadership-can-still-shuffle-right-after-election tolerance
-    // as `raft::tests::leader_replicates_a_write_to_a_real_peer_and_commits_it`:
-    // retry against whoever's leader now rather than assuming the
-    // first leader observed stays leader, appending 5 distinct keys.
+    // Leadership can still move right after an election, as in
+    // `raft::tests::leader_replicates_a_write_to_a_real_peer_and_commits_it`:
+    // retry against the current leader instead of assuming the first leader
+    // seen stays leader, while appending 5 distinct keys.
     let (leader_log, follower_log) = loop {
         let a_is_leader = matches!(&*role_rx_a.borrow(), RoleHandle::Leader(_));
         let (leader, leader_log, follower_log) = if a_is_leader {
@@ -1130,8 +1112,8 @@ async fn leader_sends_a_real_snapshot_to_a_peer_that_has_fallen_behind_compactio
         }
     };
 
-    // Give the follower's own AppendEntries handling a moment to
-    // actually finish persisting the 5th entry before rolling it back.
+    // Give the follower's AppendEntries handling a moment to finish persisting
+    // the 5th entry before rolling it back.
     tokio::time::timeout(Duration::from_millis(1000), async {
         loop {
             if follower_log.get_latest(b"k4").unwrap().is_some() {
@@ -1143,31 +1125,25 @@ async fn leader_sends_a_real_snapshot_to_a_peer_that_has_fallen_behind_compactio
     .await
     .expect("follower should have replicated all 5 entries normally first");
 
-    // Simulate the follower having fallen behind: roll it back to
-    // just entry 2, out of band (the leader's replication task has no
-    // idea this happened).
+    // Simulate the follower falling behind: roll it back to entry 2, out of
+    // band (the leader's replication task does not know this happened).
     follower_log.truncate_from(3).unwrap();
 
-    // Directly compact the *leader's* log past where the follower now
-    // is -- bypassing `compact_seq`/`Common` entirely, since (as
-    // discussed while implementing this) `compact_seq`'s strict
-    // min-across-every-configured-peer semantics make it exceedingly
-    // hard to reach this precondition through normal two-node
-    // operation. Forcing it directly tests the RPC mechanics this
-    // test actually cares about, without relitigating that separate
-    // design question. `compact` clamps to `apply_committed`'s
-    // watermark, so that has to be caught up first too -- in normal
-    // operation `spawn_storage_maintenance_task` always does this,
-    // but this test can't rely on that having raced ahead by now.
+    // Compact the leader's log directly, past where the follower now is,
+    // bypassing `compact_seq` and `Common`: `compact_seq` is the minimum over
+    // every configured peer, which makes this precondition very hard to reach
+    // in normal two-node operation. Forcing it tests the RPC mechanics this
+    // test cares about. `compact` clamps to the applied watermark, so apply
+    // first: in normal operation `spawn_storage_maintenance_task` does that,
+    // but this test cannot rely on it having run yet.
     leader_log.apply_committed(5).unwrap();
     leader_log.compact(4).unwrap();
 
-    // The leader's next heartbeat attempt will be rejected (the
-    // follower's log no longer reaches where the leader still thinks
-    // it does), backing `next_index` down to a point the leader's own
-    // log can no longer answer for -- triggering a real
-    // `InstallSnapshot`. Wait for the follower to end up with the
-    // complete, correct state again.
+    // The leader's next heartbeat is rejected (the follower's log no longer
+    // reaches where the leader thinks it does), which backs `next_index` down
+    // to a point the leader's own log can no longer answer for, which triggers
+    // a real `InstallSnapshot`. Wait for the follower to have the complete,
+    // correct state again.
     tokio::time::timeout(Duration::from_millis(3000), async {
         loop {
             if (0..5u64).all(|i| {
@@ -1188,11 +1164,12 @@ async fn leader_sends_a_real_snapshot_to_a_peer_that_has_fallen_behind_compactio
     cleanup(&path_b);
 }
 
-/// Replication is woken by the log and the commit watermark rather than
-/// polled on a `Timing::default().heartbeat()` timer: an entry appended at an arbitrary moment
-/// reaches the peer, and the resulting commit index reaches it too,
-/// without waiting out a tick. On a poll-based loop each of those costs up
-/// to `Timing::default().heartbeat()`, so 20 sequential writes could not finish this fast.
+/// Replication is woken by the log and the commit watermark, not polled on
+/// a `Timing::default().heartbeat()` timer: an entry appended at any moment
+/// reaches the peer, and the resulting commit index reaches it too, without
+/// waiting for a tick. On a polling loop, each of those would cost up to
+/// `Timing::default().heartbeat()`, so 20 sequential writes could not finish
+/// this fast.
 #[tokio::test]
 async fn replication_is_woken_by_new_entries_rather_than_polled() {
     use crate::grpc::RaftPeerService;
@@ -1259,8 +1236,8 @@ async fn replication_is_woken_by_new_entries_rather_than_polled() {
     } else {
         expect_leader_handle(&role_rx_b.borrow())
     };
-    // Past the election's settling-in: the no-op has committed everywhere
-    // that matters, so what is measured below is steady state.
+    // Past the election's settling period: the no-op has committed everywhere
+    // that matters, so what is measured below is the steady state.
     tokio::time::timeout(Duration::from_secs(2), async {
         while !leader.has_read_quorum() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1290,8 +1267,8 @@ async fn replication_is_woken_by_new_entries_rather_than_polled() {
         heartbeat / 2
     );
 
-    // Both nodes learn the commit index promptly, the follower included --
-    // it only hears it via `leader_commit` on an `AppendEntries`.
+    // Both nodes learn the commit index quickly, the follower too: it only
+    // hears it through `leader_commit` on an `AppendEntries`.
     for rx in [&mut commit_rx_a, &mut commit_rx_b] {
         tokio::time::timeout(Timing::default().heartbeat() / 2, async {
             while *rx.borrow_and_update() < last_seq {

@@ -2,36 +2,35 @@ syntax = "proto3";
 
 package raft5.cluster;
 
-// The set of servers that make up the cluster, plus the heartbeat interval
-// the leader paces AppendEntries/RequestVote timing around.
+// The set of servers in the cluster, plus the heartbeat interval that the
+// leader's AppendEntries and RequestVote timing is based on.
 //
-// This is the cluster's *configuration*: it is stored as an ordinary log
-// entry (`storage::EntryKind::Config`), replicated like any other entry,
-// and takes effect on every node as soon as that entry is *appended* --
-// not when it commits. See `storage::RaftLog::current_config`.
+// This is the cluster's configuration. It is stored as a normal log entry
+// (`storage::EntryPayload::Config`), replicated like any other entry, and
+// takes effect on every node as soon as that entry is appended, not when
+// it commits. See `storage::RaftLog::current_config`.
 message ClusterConfig {
   repeated ClusterMember members = 1;
   uint64 heartbeat_millis = 2;
 }
 
-// A single cluster member. `server_id` matches the id used elsewhere in the
+// One cluster member. `server_id` matches the id used elsewhere in the
 // protocol (AddServerRequest/RemoveServerRequest in client.proto;
 // candidate_id/leader_id/from/to in raft.proto).
 message ClusterMember {
   string server_id = 1;
-  // Where this member's *peer* API (raft.proto) is reached -- used by the
-  // other servers, never by a client.
+  // Where this member's peer API (raft.proto) is reached. Only the other
+  // servers use it, never a client.
   string address = 2;
   // Whether this member votes in elections and counts toward the commit
-  // quorum. A non-voting member (a "learner") is replicated to like any
-  // other follower but is invisible to both quorums -- how a newly added
-  // server catches up without stalling the cluster (Raft §4.2.1).
+  // quorum. A non-voting member (a "learner") gets replication like any
+  // follower but counts in no quorum. That is how a new server catches up
+  // without stalling the cluster (Raft §4.2.1).
   bool voting = 3;
-  // Where this member's *client* API (client.proto) is reached. Carried in
-  // the configuration so that a client holding any one member's address can
-  // learn every other member's, and can turn a `NotLeader.leader_hint` --
-  // which names a server_id -- into somewhere to actually send its next
-  // request. The peer `address` is no use for that: the two APIs are served
-  // on separate ports.
+  // Where this member's client API (client.proto) is reached. In the
+  // configuration so a client with any one member's address can learn every
+  // other member's, and can turn a `NotLeader.leader_hint` (a server_id)
+  // into an address for its next request. The peer `address` cannot serve
+  // for that: the two APIs use separate ports.
   string client_address = 4;
 }

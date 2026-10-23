@@ -1,24 +1,23 @@
-//! A reproduction for the burst-commit latency sawtooth: a real
-//! three-node cluster taking ~1 MiB transactions, reporting each
-//! commit's latency in order so a ramp (and its reset) is visible rather
-//! than averaged away.
+//! A reproduction for the burst-commit latency sawtooth: a real three-node
+//! cluster taking ~1 MiB transactions, reporting each commit's latency in
+//! order, so a ramp (and its reset) is visible, not averaged away.
 //!
-//! Two shapes, because they stress different things. `sequential_burst`
-//! waits for each commit before starting the next, so there is never a
-//! queue and it measures one commit's cost. `concurrent_burst` uploads
-//! every transaction first and then fires all the commits at once, which
-//! is what builds a backlog.
+//! Two shapes, because they stress different things:
+//! - `sequential_burst` waits for each commit before starting the next, so
+//!   there is never a queue, and it measures one commit's cost.
+//! - `concurrent_burst` uploads every transaction first and then sends all
+//!   the commits at once, which builds a backlog.
 //!
-//! Ignored by default -- these are measurements, not assertions. Run:
+//! Ignored by default: these are measurements, not assertions. Run:
 //!
 //! ```text
 //! cargo test -p raft5-server --test commit_latency -- --ignored --nocapture
 //! ```
 //!
-//! **The database goes wherever `std::env::temp_dir()` points, which on
-//! this machine is `/tmp` -- a tmpfs, i.e. RAM.** A run there measures
-//! CPU and protocol only and cannot show anything I/O bound. To measure
-//! against a real disk, point `TMPDIR` at one:
+//! **The database goes wherever `std::env::temp_dir()` points, which is
+//! often `/tmp`, a tmpfs (RAM).** A run there measures CPU and protocol
+//! only and cannot show anything I/O bound. To measure on a real disk,
+//! point `TMPDIR` at one:
 //!
 //! ```text
 //! TMPDIR=/var/tmp cargo test -p raft5-server --test commit_latency -- --ignored --nocapture
@@ -31,14 +30,14 @@ use std::time::{Duration, Instant};
 
 use common::{Client, TestNode, add_server, begin, bootstrap, commit, txn_write, wait_until_voter};
 
-/// Matches the size the latency was reported at. `VALUE_KIB` overrides.
+/// The value size the latency was reported at. `VALUE_KIB` overrides it.
 fn value_bytes() -> usize {
     env_usize("VALUE_KIB", 1024) * 1024
 }
 
-/// "Up to 50 in short succession", as reported. `BURST` overrides --
-/// worth raising well past the 64 MiB memtable, since a short burst
-/// never flushes and so never shows anything flush- or compaction-bound.
+/// "Up to 50 in short succession", as reported. `BURST` overrides it. Worth
+/// raising well past the 64 MiB memtable, because a short burst never
+/// flushes and so never shows anything bound by flush or compaction.
 fn burst() -> usize {
     env_usize("BURST", 50)
 }
@@ -73,17 +72,16 @@ async fn sequential_burst() {
     let (n1, n2, n3) = cluster("slat").await;
     let client = n1.client();
 
-    // One buffer reused for every transaction: the point is to measure
-    // the server, not to allocate a megabyte per iteration in the loop.
+    // One buffer reused for every transaction: the point is to measure the
+    // server, not to allocate a megabyte per loop iteration.
     let value = vec![b'x'; value_bytes];
 
     let mut upload_ms = Vec::with_capacity(burst);
     let mut commit_ms = Vec::with_capacity(burst);
 
     for i in 0..burst {
-        // A distinct key per transaction, so nothing in the burst waits
-        // on another's lock and what is measured is the commit path
-        // rather than contention.
+        // A different key per transaction, so nothing in the burst waits on
+        // another's lock, and the commit path is measured, not contention.
         let key = format!("burst/{i:04}").into_bytes();
         let id = begin(&client, Duration::from_secs(10)).await;
 
@@ -112,8 +110,8 @@ async fn concurrent_burst() {
     let client = n1.client();
     let value = vec![b'x'; value_bytes];
 
-    // Upload everything first so the measured burst is the commits
-    // alone, rather than the uploads racing them.
+    // Upload everything first, so the measured burst is the commits alone, not
+    // uploads racing them.
     let mut ids = Vec::with_capacity(burst);
     for i in 0..burst {
         let key = format!("cburst/{i:04}").into_bytes();
@@ -152,8 +150,8 @@ fn ms_since(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
 
-/// Prints the series in order followed by its summary. The series is the
-/// point: a mean hides exactly the shape being investigated.
+/// Print the series in order, then its summary. The series is what matters:
+/// a mean hides exactly the shape under investigation.
 fn report(label: &str, samples: &[f64]) {
     println!("\n=== {label} -- {} samples, in order ===", samples.len());
     for (i, ms) in samples.iter().enumerate() {

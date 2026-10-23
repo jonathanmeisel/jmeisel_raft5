@@ -1,42 +1,37 @@
-//! gRPC service implementations wiring the generated proto types (`pb`)
-//! into `storage::RaftLog`.
+//! gRPC services that connect the generated proto types (`pb`) to
+//! `storage::RaftLog`.
 //!
-//! `KvService` is the client-facing half. Everything that changes state
-//! -- writes, membership changes, and a transactional read -- requires
-//! this node to be the leader, and a node that isn't answers `NotLeader`
-//! with whatever leader hint it has rather than forwarding (Raft §6.2),
-//! so the client retries against the leader directly and exactly one node
-//! does the work. A *stale* read is the one exception: it asks for no
-//! guarantee, so it is served locally by whoever receives it. `Bootstrap`
-//! is the other: by definition it targets a node with no leader at all.
+//! `KvService` serves clients:
+//! - Anything that changes state (writes, membership changes,
+//!   transactional reads) needs the leader. A follower answers
+//!   `NotLeader` with its leader hint and does not forward (Raft §6.2),
+//!   so the client retries on the leader and only one node does the
+//!   work.
+//! - A stale read asks for no guarantee, so any node serves it.
+//! - `Bootstrap` targets a node that has no leader at all.
 //!
-//! Every write goes through a transaction. `write` buffers a key into
-//! one and appends nothing; `commit` turns everything a transaction
-//! buffered into a single log entry. There is no second write path with
-//! its own locking and its own failure modes to keep in agreement with
-//! this one -- a single-key write is a transaction of one key. What
-//! protects a transaction's reads is `crate::txn`'s lock table rather
-//! than a precondition on a sequence number, which is what lets the
-//! whole of a read-modify-write be one atomic thing instead of two round
-//! trips with a race between them.
+//! Every write goes through a transaction. `write` buffers a key and
+//! appends nothing; `commit` turns the whole buffer into one log entry.
+//! A single-key write is a transaction of one key, so there is only one
+//! write path with one set of locking and failure rules. The lock table
+//! in `crate::txn` protects a transaction's reads, which makes a whole
+//! read-modify-write atomic, with no race between two round trips.
 //!
-//! Both `commit` and the transactional reads (`transactional_multi_read`
-//! for named keys, `transactional_scan` for a range of them) establish the same
-//! two things before answering: this leader's `latest` must be complete
-//! (`LeaderHandle::await_caught_up`), since `latest` reflects only
-//! *applied* entries and a fresh leader may still be catching up on a
-//! log tail it inherited; and it must still hold a quorum of leases
-//! (`LeaderHandle::has_read_quorum`), or it may have been deposed
-//! without knowing it yet.
+//! `commit` and the transactional reads (`transactional_multi_read`,
+//! `transactional_scan`) first make sure of two things:
+//! - The leader's `latest` is complete (`LeaderHandle::await_caught_up`).
+//!   `latest` shows only applied entries, and a new leader may still be
+//!   applying the log tail it inherited.
+//! - The leader still holds a quorum of leases
+//!   (`LeaderHandle::has_read_quorum`). Without it, the node may have
+//!   lost leadership without knowing.
 //!
-//! `RaftPeerService` is the peer-facing half, served on a separate port
-//! since the two have different network exposure. It forwards every call
-//! straight into a live `raft::RaftPeerHandle` -- whichever role the
-//! state machine is currently in decides how to answer. `install_snapshot`
-//! reassembles the incoming stream (transport-level work) but, like every
-//! other call here, never touches `storage::RaftLog` directly -- the term
-//! check and the actual install both happen on the far side of
-//! `RaftPeerHandle`, same as everything else.
+//! `RaftPeerService` serves the other nodes, on a separate port because
+//! its network exposure is different. It forwards every call to the live
+//! `raft::RaftPeerHandle`, and the current role decides the answer.
+//! `install_snapshot` reassembles the stream, but like every call here it
+//! never touches `storage::RaftLog` directly: the term check and the
+//! install happen behind `RaftPeerHandle`.
 
 use prost::Message;
 use tonic::transport::ClientTlsConfig;
@@ -96,17 +91,16 @@ use crate::store::ChunkReader;
 use crate::store::Store;
 use crate::txn::{AbortReason, BufferedKeys, Locks, Refused, TxnId};
 
-/// What `RaftLog::read_many` found, as the wire carries it.
+/// What `RaftLog::read_many` found, in wire form.
 ///
-/// A never-written key and a deleted key both read as "no value"
-/// (storage's `head_as_of` already collapses the two); seq 0 is never
-/// assigned, since sequencing starts at 1, so it doubles as the "never
-/// written" sentinel here.
+/// A key that was never written and a deleted key both read as "no
+/// value". Seq 0 is never assigned (sequencing starts at 1), so it marks
+/// "no value".
 ///
-/// `buffered` is a transaction's own writes, position for position, laid
-/// over what storage said -- empty outside one. A buffered value takes
-/// the place of the committed one but not its seq: a buffered write has
-/// none until the commit assigns it.
+/// `buffered` holds a transaction's own writes, by position, laid over
+/// what storage found. It is empty outside a transaction. A buffered
+/// value replaces the committed value but not its seq: a buffered write
+/// gets a seq only at commit.
 fn read_ok(
     as_of: u64,
     rows: Vec<ReadRow>,
@@ -127,7 +121,7 @@ fn read_ok(
     ReadOk { as_of, entries }
 }
 
-/// A scan's batch as the wire carries it.
+/// One scan batch, in wire form.
 fn get_keys_ok(batch: ScanBatch) -> GetKeysOk {
     GetKeysOk {
         keys: batch.keys,
@@ -136,70 +130,62 @@ fn get_keys_ok(batch: ScanBatch) -> GetKeysOk {
     }
 }
 
-/// How many keys `GetKeys` returns when the caller doesn't say.
+/// How many keys `GetKeys` returns when the caller does not say.
 const DEFAULT_MAX_KEYS: u32 = 10;
 
-/// The most keys one `GetKeys` will return.
+/// The most keys one `GetKeys` returns.
 ///
-/// Inside a transaction this is also a cap on how many read locks one
-/// call can take, which is the reason it isn't larger: every key a scan
-/// hands back is held until that transaction ends, so an unbounded scan
-/// would let one caller make an arbitrary stretch of the keyspace
-/// unwritable. Outside a transaction it is just a bound on the work and
-/// the response size.
+/// In a transaction, this also caps how many read locks one call takes.
+/// Every key a scan returns stays locked until the transaction ends, so
+/// an unbounded scan would let one caller block any part of the
+/// keyspace. Outside a transaction, it only bounds the work and the
+/// response size.
 const MAX_KEYS_PER_SCAN: u32 = 1024;
 
 /// How long an account write may hold its key.
 ///
-/// Short, because nothing human is in the loop: the whole
-/// read-modify-write happens server side within one raft round trip, so
-/// this only bounds how long a wedged admin call leaves an account
-/// unwritable.
+/// Short, because no human is involved: the whole read-modify-write runs
+/// on the server within one raft round trip. This only limits how long a
+/// stuck admin call can block an account.
 const ADMIN_TXN_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The lifetime an invitation gets when its issuer does not name one.
+/// The lifetime of an invitation when the issuer does not give one.
 ///
-/// A day: long enough to survive being sent to someone in another
-/// timezone and read the next morning, short enough that an invite
-/// forgotten in an inbox is not still spendable a month later.
+/// One day: long enough to reach someone in another time zone and be
+/// read the next morning, short enough that a forgotten invite cannot be
+/// used a month later.
 const DEFAULT_INVITE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
-/// The longest lifetime this cluster will grant one.
+/// The longest lifetime this cluster gives an invitation.
 ///
-/// An invitation is a credential that creates a credential, and the only
-/// thing bounding how long a leaked one stays dangerous is this. A week
-/// covers "I am on holiday until Monday"; anything past that is an
-/// account, not an invitation, and should be created as one.
+/// An invitation is a credential that creates a credential, and this is
+/// the only limit on how long a leaked one stays dangerous. A week
+/// covers "I am on holiday until Monday". For longer, create an account.
 const MAX_INVITE_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
 
-/// How many invitations may be outstanding at once.
+/// The most invitations that may be open at once.
 ///
-/// Unlike `MAX_LIVE_CHECKPOINTS` this does not protect the store from
-/// anything -- an invite record is a hundred bytes, and an administrator
-/// who wanted to fill the disk has `CreateUser` for that. What it bounds
-/// is the *listing*: `ListInvites` reads every outstanding record in one
-/// unpaged call, and this is the number that keeps that call small
-/// enough to be answered that way. Lapsed invitations are swept by the
-/// next `CreateInvite` rather than counted against it, so a cluster that
-/// issues a steady trickle never meets this at all.
+/// This does not protect the store (a record is about 100 bytes, and an
+/// admin who wants to fill the disk can use `CreateUser`). It bounds the
+/// listing: `ListInvites` reads every open record in one unpaged call.
+/// The next `CreateInvite` sweeps lapsed invitations instead of counting
+/// them, so a cluster with a steady trickle never reaches this limit.
 const MAX_LIVE_INVITES: usize = 64;
 
-/// How long `Bootstrap` will wait for this node to start leading before
-/// giving up on writing the administrator it was started with.
+/// How long `Bootstrap` waits for this node to become leader before it
+/// gives up on writing the startup administrator.
 ///
-/// Generous: a single-node cluster elects itself unopposed, so this is
-/// the cost of one election timeout and one no-op commit, not of
-/// agreement with anybody.
+/// Generous: a single-node cluster elects itself without opposition, so
+/// this covers one election timeout and one no-op commit.
 const BOOTSTRAP_ADMIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const BOOTSTRAP_ADMIN_RETRY: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// A transaction's refusal as the client protocol carries it.
+/// A transaction refusal, in client-protocol form.
 ///
-/// Every variant but `TooMuch` is an ordinary answer rather than an
-/// error, the same way a write conflict is: it says something specific
-/// about the transaction that the caller can act on. `TooMuch` is a
-/// genuine refusal to serve -- the request was never going to work at any
-/// time, against any state -- so it stays a `Status`.
+/// Every variant except `TooMuch` is a normal answer, like a write
+/// conflict: it tells the caller something it can act on. `TooMuch` is a
+/// real refusal to serve (the request can never work), so it stays a
+/// `Status`.
 fn txn_err(refused: Refused) -> Result<PbRaftError, Status> {
     let (reason, key) = match refused {
         Refused::Conflict { key } => (transaction_aborted::Reason::LockConflict, Some(key)),
@@ -226,14 +212,14 @@ fn aborted(
     }
 }
 
-/// Why a transactional request didn't happen: the transaction's own
-/// reasons, plus everything the state machine can refuse.
+/// Why a transactional request did not happen: the transaction's own
+/// reasons, plus all the state machine can refuse.
 enum TxnError {
     Refused(Refused),
     Raft(RaftError),
-    /// The commit reached the log and this node then stopped leading.
-    /// Carried separately from every other failure because it is the one
-    /// a client must not retry -- see `raft::AppendError`.
+    /// The commit reached the log, and then this node stopped leading. Kept
+    /// separate because a client must not retry it: see
+    /// `raft::AppendError`.
     InDoubt(u64),
     Internal(Status),
 }
@@ -274,10 +260,10 @@ fn txn_error(e: TxnError) -> Result<PbRaftError, Status> {
 
 /// Why an authentication RPC did not do what it was asked.
 enum AuthFailure {
-    /// Something about the request or the account. Reported to the
-    /// caller in band, as an `AuthError`.
+    /// A problem with the request or the account. Sent to the caller in
+    /// band, as an `AuthError`.
     Refused(auth_error::Kind, String),
-    /// The cluster could not serve the request at all.
+    /// The cluster could not serve the request.
     Cluster(TxnError),
 }
 
@@ -314,9 +300,9 @@ impl AuthFailure {
         Self::refused(auth_error::Kind::AuthDisabled, AUTH_DISABLED)
     }
 
-    /// One answer for "no such account" and "wrong password" alike.
-    /// Distinguishing them would confirm which usernames are real, and a
-    /// username is half of a credential.
+    /// The same answer for "no such account" and "wrong password". Two
+    /// answers would confirm which usernames exist, and a username is half
+    /// of a credential.
     fn bad_credentials() -> Self {
         Self::refused(
             auth_error::Kind::BadCredentials,
@@ -324,22 +310,21 @@ impl AuthFailure {
         )
     }
 
-    /// An invitation that cannot be spent. `why` is for a human to read
-    /// -- an invite holder is someone an administrator deliberately gave
-    /// a secret to, so telling them "that lapsed on Tuesday" rather than
-    /// a flat no costs nothing and saves a support conversation.
+    /// An invitation that cannot be used. `why` is for a human. The holder
+    /// got the secret from an admin on purpose, so a clear reason ("it
+    /// lapsed on Tuesday") costs nothing and saves a support call.
     fn bad_invite(why: &'static str) -> Self {
         Self::refused(auth_error::Kind::BadInvite, why)
     }
 }
 
-/// Which of the two error shapes a response should carry.
+/// Which of the two error forms a response carries.
 enum AuthReply {
     Raft(PbRaftError),
     Auth(PbAuthError),
 }
 
-/// An `AuthFailure` as the answer to a membership change.
+/// An `AuthFailure`, as the answer to a membership change.
 fn config_change_refusal(e: AuthFailure) -> Result<Response<ConfigChangeResponse>, Status> {
     Ok(Response::new(ConfigChangeResponse {
         result: Some(match auth_failure(e)? {
@@ -356,24 +341,21 @@ fn auth_failure(e: AuthFailure) -> Result<AuthReply, Status> {
     })
 }
 
-/// A transaction id off the wire. Fixed-width, so anything else is a
-/// malformed request rather than a transaction that happens not to
-/// exist.
+/// A transaction id from the wire. Ids have a fixed width, so any other
+/// length is a malformed request, not a missing transaction.
 fn txn_id(bytes: &[u8]) -> Result<TxnId, Status> {
     bytes
         .try_into()
         .map_err(|_| Status::invalid_argument("transaction_id must be 16 bytes"))
 }
 
-/// Refuses a client's attempt to address a key the cluster reserves for
-/// itself (`crate::keyspace`).
+/// Refuse a client request for a key the cluster reserves for itself
+/// (`crate::keyspace`).
 ///
-/// `invalid_argument` rather than `permission_denied`: no credential
-/// reaches these keys through this API, so the honest answer is that the
-/// key is not addressable here at all rather than that this caller may
-/// not have it. It is also already on the client's short list of
-/// permanent failures, so a caller learns this at once instead of after
-/// spending its whole retry deadline on an answer that will not change.
+/// `invalid_argument`, not `permission_denied`: no credential reaches
+/// these keys through this API, so the key is not addressable at all.
+/// The client also treats `invalid_argument` as permanent, so the caller
+/// learns at once instead of retrying until its deadline.
 fn reject_reserved(key: &[u8]) -> Result<(), Status> {
     if is_reserved(key) {
         return Err(Status::invalid_argument(
@@ -383,8 +365,8 @@ fn reject_reserved(key: &[u8]) -> Result<(), Status> {
     Ok(())
 }
 
-/// An invitation as the wire carries it: everything but the secret,
-/// which no longer exists anywhere by the time anyone can ask for this.
+/// An invitation in wire form: all but the secret, which no longer
+/// exists anywhere once anyone can ask for this.
 fn pb_invite(invite_id: String, record: InviteRecord) -> PbInvite {
     PbInvite {
         invite_id,
@@ -395,12 +377,11 @@ fn pb_invite(invite_id: String, record: InviteRecord) -> PbInvite {
     }
 }
 
-/// How long an invitation asked for with `ttl_ms` should last.
+/// How long an invitation with `ttl_ms` should last.
 ///
-/// Over the limit is refused rather than quietly shortened, exactly as
-/// an over-long transaction lifetime is and for the same reason: an
-/// issuer told "yes" would hand out an invitation believing it good for
-/// a month and hear about it when the recipient could not use it.
+/// A value over the limit is refused, not shortened, as for transaction
+/// lifetimes: an issuer told "yes" would believe the invite lasts a
+/// month and find out only when the recipient cannot use it.
 fn invite_ttl(ttl_ms: u64) -> Result<std::time::Duration, Status> {
     if ttl_ms == 0 {
         return Ok(DEFAULT_INVITE_TTL);
@@ -415,12 +396,11 @@ fn invite_ttl(ttl_ms: u64) -> Result<std::time::Duration, Status> {
     Ok(ttl)
 }
 
-/// Whether `record` may be spent, right now, on `username`.
+/// Whether `record` can be used now, for `username`.
 ///
-/// Both halves answer `BAD_INVITE` rather than saying anything more
-/// structured: from the holder's side an invitation that has lapsed and
-/// one that was meant for someone else call for the same thing, which is
-/// to go back to whoever issued it.
+/// Both failures answer `BAD_INVITE` with no more detail. To the holder,
+/// a lapsed invite and one meant for someone else need the same action:
+/// ask the issuer again.
 fn check_invite(record: &InviteRecord, username: &str) -> Result<(), AuthFailure> {
     if record.has_expired(crate::auth::now_unix_ms()) {
         return Err(AuthFailure::bad_invite(
@@ -435,12 +415,11 @@ fn check_invite(record: &InviteRecord, username: &str) -> Result<(), AuthFailure
     }
 }
 
-/// Who a request is from, for the records that want to say so.
+/// Who sent a request, for records that store it.
 ///
-/// Only sound after `require_admin` has run on a node that keeps
-/// accounts: it is that call which establishes there is an identity here
-/// at all. The error is the same one it would have raised, so a caller
-/// that forgets the ordering fails closed.
+/// Sound only after `require_admin` has run on a node with accounts:
+/// that call makes sure an identity is present. The error is the same as
+/// that call's, so a caller that gets the order wrong fails closed.
 fn caller(extensions: &tonic::Extensions) -> Result<String, AuthFailure> {
     extensions
         .get::<AuthContext>()
@@ -448,7 +427,7 @@ fn caller(extensions: &tonic::Extensions) -> Result<String, AuthFailure> {
         .ok_or_else(|| Status::unauthenticated("this request carried no verified identity").into())
 }
 
-/// A checkpoint as the wire carries it.
+/// A checkpoint in wire form.
 fn pb_snapshot(cp: Checkpoint) -> PbSnapshot {
     PbSnapshot {
         snapshot_id: cp.id,
@@ -457,18 +436,11 @@ fn pb_snapshot(cp: Checkpoint) -> PbSnapshot {
     }
 }
 
-/// How long a snapshot id may be.
+/// The longest allowed snapshot id.
 const MAX_SNAPSHOT_ID_LEN: usize = 128;
 
-/// Checks that `id` is one `checkpoint_key` can safely build a key from.
-///
-/// The character set is the point, not the length, and the reasoning is
-/// `keyspace::validate_username`'s exactly: the id is appended to a
-/// fixed prefix with no separator or escaping, so any byte that could
-/// make two ids collide -- or let one climb back out of the prefix --
-/// has to be excluded here rather than handled there. The set is wider
-/// than a username's only by `:` and `+`, so that an RFC-3339 timestamp
-/// is a legal id, which is what the client defaults to.
+/// Refuse an empty snapshot id in a read. An empty id means "no
+/// snapshot", which is an unset `consistency`, not a snapshot read.
 fn require_snapshot_id(id: &[u8]) -> Result<(), Status> {
     if id.is_empty() {
         return Err(Status::invalid_argument(
@@ -478,11 +450,19 @@ fn require_snapshot_id(id: &[u8]) -> Result<(), Status> {
     Ok(())
 }
 
-/// A read pointed at a snapshot this node does not have.
+/// A read that names a snapshot this node does not have.
 fn no_such_snapshot() -> Status {
     Status::not_found("no such snapshot; it may have been removed, or not reached this node yet")
 }
 
+/// Check that `checkpoint_key` can safely build a key from `id`.
+///
+/// The character set matters more than the length, for the reason given
+/// in `keyspace::validate_username`: the id is appended to a fixed prefix
+/// with no separator or escaping, so any byte that could make two ids
+/// collide, or escape the prefix, must be refused here. The set adds `:`
+/// and `+` to a username's, so that an RFC 3339 timestamp (the client's
+/// default id) is valid.
 fn validate_snapshot_id(id: &[u8]) -> Result<(), Status> {
     if id.is_empty() {
         return Err(Status::invalid_argument("a snapshot id cannot be empty"));
@@ -503,13 +483,12 @@ fn validate_snapshot_id(id: &[u8]) -> Result<(), Status> {
     Ok(())
 }
 
-/// An `AuthError` as the client protocol carries it.
+/// An `AuthError` in client-protocol form.
 ///
-/// In-band beside `RaftError` rather than a `Status`, for the same
-/// reason a lock conflict is: every one of these is an answer, and a
-/// client that retried it would spend its whole deadline arriving back
-/// at the same one. A bad *token* is the opposite case and stays a
-/// `Status` -- see `crate::auth`.
+/// Sent in band next to `RaftError`, not as a `Status`, like a lock
+/// conflict: each is an answer, and a client that retried it would get
+/// the same answer until its deadline. A bad token is the opposite case
+/// and stays a `Status`: see `crate::auth`.
 fn auth_err(kind: auth_error::Kind, detail: impl Into<String>) -> PbAuthError {
     PbAuthError {
         kind: kind as i32,
@@ -517,7 +496,7 @@ fn auth_err(kind: auth_error::Kind, detail: impl Into<String>) -> PbAuthError {
     }
 }
 
-/// What every auth RPC answers on a node started without a secret.
+/// The answer to every auth RPC on a node started without a secret.
 const AUTH_DISABLED: &str =
     "this node was started without a signing secret, so it keeps no accounts";
 
@@ -527,8 +506,8 @@ fn storage_err(e: StorageError) -> Status {
 
 fn raft_err(e: RaftError) -> Status {
     match e {
-        // Only reachable on the peer-facing service, where a structured
-        // client error would have nowhere to go.
+        // Only the peer service reaches this, where a structured client error
+        // has nowhere to go.
         RaftError::NotLeader { .. } => Status::failed_precondition("not leader"),
         RaftError::Storage(e) => storage_err(e),
         RaftError::Disconnected => Status::unavailable("raft event loop is not running"),
@@ -546,12 +525,11 @@ fn raft_err(e: RaftError) -> Status {
     }
 }
 
-/// `RaftError` as the structured error the client protocol carries, so a
-/// client can find the real leader from the response itself rather than
-/// needing a separate discovery RPC. Only `NotLeader` has somewhere
-/// useful to point; everything else is reported as a plain string, and
-/// genuine internal failures (storage, a dead event loop) stay `Status`
-/// errors rather than being dressed up as an ordinary answer.
+/// `RaftError` as the structured error of the client protocol, so that a
+/// client finds the real leader from the response, with no separate
+/// discovery RPC. Only `NotLeader` has something useful to point at;
+/// other errors are plain strings. Real internal failures (storage, a
+/// dead event loop) stay `Status` errors, not normal answers.
 fn client_err(e: RaftError) -> Result<PbRaftError, Status> {
     Ok(match e {
         RaftError::NotLeader { leader_hint } => PbRaftError {
@@ -569,20 +547,18 @@ fn client_err(e: RaftError) -> Result<PbRaftError, Status> {
     })
 }
 
-/// A refusal wrapped the same way `propose` wraps one -- for callers
-/// (`add_server`'s leader check) that need to answer this way before
-/// ever reaching `propose` itself.
+/// A refusal wrapped as `propose` wraps one, for callers (the leader
+/// check in `add_server`) that must answer before they reach `propose`.
 fn not_leader_response(e: RaftError) -> Result<Response<ConfigChangeResponse>, Status> {
     Ok(Response::new(ConfigChangeResponse {
         result: Some(config_change_response::Result::Error(client_err(e)?)),
     }))
 }
 
-/// The leader handle for this node, or the error to hand back to the
-/// client instead. Every write and every membership change goes through
-/// here: a follower answers `NotLeader` with whatever hint it has rather
-/// than forwarding, so a client retries against the leader directly
-/// (Raft §6.2) and there is exactly one node doing the work.
+/// This node's leader handle, or the error to send to the client. Every
+/// write and membership change goes through here. A follower answers
+/// `NotLeader` with its hint and does not forward, so the client retries
+/// on the leader (Raft §6.2) and only one node does the work.
 fn require_leader(role: &RoleHandle) -> Result<LeaderHandle, RaftError> {
     match role {
         RoleHandle::Leader(h) => Ok(h.clone()),
@@ -594,38 +570,36 @@ fn require_leader(role: &RoleHandle) -> Result<LeaderHandle, RaftError> {
 
 /// One batch of a key scan, and where the next one starts.
 ///
-/// A struct rather than a tuple because `has_more` and `next_start_key`
-/// are two different facts now: a batch can be short, or empty, and
-/// still have keys after it -- see `RaftLog::scan_as_of`'s budget.
+/// A struct, not a tuple, because `has_more` and `next_start_key` are
+/// separate facts: a batch can be short or empty and still have keys
+/// after it. See the budget in `RaftLog::scan_as_of`.
 struct ScanBatch {
     keys: Vec<Vec<u8>>,
     has_more: bool,
-    /// Where to resume, set whenever `has_more` is.
+    /// Where to resume. Set whenever `has_more` is set.
     next_start_key: Option<Vec<u8>>,
 }
 
 pub struct KvService {
     store: Store,
-    /// How this node's own identity reaches `Bootstrap` -- the
-    /// configuration it forms names itself, and only this node knows what
-    /// it is called and where its peers should dial it.
+    /// This node's own identity, for `Bootstrap`. The new configuration
+    /// names this node, and only this node knows its name and peer address.
     identity: ClusterMember,
     client_handle: ClientHandle,
-    /// Who holds what, and every open transaction. See `crate::txn`.
+    /// Who holds which locks, and every open transaction. See `crate::txn`.
     locks: Locks,
     /// How tokens are signed and checked, or `None` on a node started
-    /// without a secret -- which is what leaves this API open. Every
-    /// authorization check reads as "allowed" when this is `None`, so
-    /// that the open case lives in one place rather than in each
-    /// handler. See `crate::auth`.
+    /// without a secret, which leaves this API open. Every authorization
+    /// check reads "allowed" when this is `None`, so the open case is
+    /// decided in one place, not in each handler. See `crate::auth`.
     auth: Option<AuthConfig>,
     /// Every group and ACL, as of the last permission change this node
-    /// has applied. Shared across the clones tonic makes of this
-    /// service, and rebuilt only when the permission epoch moves. See
+    /// applied. Shared by the clones tonic makes of this service, and
+    /// rebuilt only when the permission epoch moves. See
     /// `grpc::permissions`.
     perms: permissions::PermsCache,
-    /// How `AddServer` dials the server it is asked to add: over the
-    /// same mTLS as every other peer, or `None` for plaintext.
+    /// How `AddServer` dials the server it adds: over the peer mTLS, or
+    /// `None` for plaintext.
     peer_tls: Option<ClientTlsConfig>,
 }
 
@@ -647,28 +621,27 @@ impl KvService {
         }
     }
 
-    /// Dials the servers `AddServer` is asked to add over mTLS, the way
-    /// the cluster's peers dial each other. Must match how this node's
-    /// own peer connections are configured: a server this node can't
-    /// reach the way it reaches peers would never get past being added.
+    /// Dial servers that `AddServer` adds over mTLS, as peers dial each
+    /// other. This must match this node's own peer connections: a server
+    /// this node cannot reach as a peer would never finish being added.
     pub fn with_peer_tls(mut self, tls: ClientTlsConfig) -> Self {
         self.peer_tls = Some(tls);
         self
     }
 
-    /// The lock table, for the shutdown-scoped sweeper `serve` spawns.
+    /// The lock table, for the sweeper that `serve` starts.
     pub fn locks(&self) -> Locks {
         self.locks.clone()
     }
 
-    /// This node's leader handle, having first told the lock table which
-    /// term it is answering in.
+    /// This node's leader handle, after telling the lock table which term
+    /// it answers in.
     ///
-    /// Every request that needs a leader goes through here rather than
-    /// `require_leader` directly, so the table notices a change of term
-    /// at the first request after it rather than at the next sweep. A
-    /// transaction cannot outlive the leader that created it, and the
-    /// sooner that is acted on, the sooner its keys are writable again.
+    /// Every request that needs a leader comes here, not to
+    /// `require_leader`, so the table sees a term change at the first
+    /// request after it, not at the next sweep. A transaction cannot outlive
+    /// its leader, and the sooner the table acts on that, the sooner its
+    /// keys are writable again.
     fn leader(&self) -> Result<LeaderHandle, RaftError> {
         let role = self.client_handle.role();
         let leader = require_leader(&role);
@@ -677,14 +650,13 @@ impl KvService {
         leader
     }
 
-    /// A transaction's leader: this node, and only if it is still the
-    /// one the transaction was created under.
+    /// A transaction's leader: this node, but only if it is still the leader
+    /// the transaction was created under.
     ///
-    /// The term check is belt to `observe_term`'s braces. `leader()`
-    /// already discards every transaction when the term changes, so a
-    /// transaction from a previous term is normally gone by the time
-    /// anyone asks for it; this catches the ordering where the same
-    /// request observes the change.
+    /// A second line of defense. `leader()` already discards all
+    /// transactions when the term changes, so an old transaction is normally
+    /// gone. This check catches the case where this same request is the one
+    /// that sees the change.
     fn transaction_leader(&self, id: TxnId) -> Result<LeaderHandle, TxnError> {
         let leader = self.leader()?;
         if self.locks.term_of(id)? != leader.term() {
@@ -693,17 +665,17 @@ impl KvService {
         Ok(leader)
     }
 
-    /// A transactional read of many keys: lock every one, then answer
-    /// them all from one storage snapshot.
+    /// A transactional read of many keys: lock all of them, then answer all
+    /// from one storage snapshot.
     ///
-    /// Every key is locked before any is read, including any the value
-    /// budget ends up leaving out of the answer -- which is what makes a
-    /// caller's reissue for the rest see exactly what this call would
-    /// have. Nothing it names can change until the transaction ends.
+    /// Every key is locked before any is read, including keys that the value
+    /// budget leaves out of the answer. So a reissue for the rest sees
+    /// exactly what this call would have. Nothing it names can change until
+    /// the transaction ends.
     ///
-    /// The snapshot is not what makes the keys agree with each other --
-    /// the locks are -- but it costs nothing, and it is what makes
-    /// `as_of` a point every committed value here is true at.
+    /// The locks, not the snapshot, make the keys agree. The snapshot costs
+    /// nothing and makes `as_of` a point at which every committed value here
+    /// is true.
     async fn transactional_multi_read(
         &self,
         id: TxnId,
@@ -714,9 +686,9 @@ impl KvService {
 
         let buffered = self.locks.read_many(id, &keys, !versions_only)?;
 
-        // A buffered value is the transaction's to supply, so storage is
-        // spared reading the committed one it would replace -- but it
-        // still counts toward the budget, which is about the response.
+        // The transaction supplies its buffered values, so storage does not
+        // read the committed values they replace. They still count toward the
+        // budget, because the budget is about the response.
         let fetches = keys
             .into_iter()
             .zip(&buffered)
@@ -731,7 +703,7 @@ impl KvService {
             .collect();
         match self.read_store(fetches, ReadPoint::Latest).await {
             Ok(MultiRead::Ok { as_of, rows }) => Ok(read_ok(as_of, rows, buffered)),
-            // `Latest` names no checkpoint to be missing.
+            // `Latest` names no checkpoint, so none can be missing.
             Ok(MultiRead::NoSuchCheckpoint) => {
                 Err(TxnError::Internal(Status::internal("a latest read found no checkpoint")))
             }
@@ -739,18 +711,18 @@ impl KvService {
         }
     }
 
-    /// One key, inside a transaction, value and all -- for the server's
-    /// own read-modify-writes, which read one record at a time.
+    /// One key in a transaction, with its value. For the server's own
+    /// read-modify-writes, which read one record at a time.
     async fn transactional_read(&self, id: TxnId, key: &[u8]) -> Result<KeyVersion, TxnError> {
         let mut ok = self
             .transactional_multi_read(id, vec![key.to_vec()], false)
             .await?;
-        // One key always fits: the budget never leaves out the first.
+        // One key always fits: the budget always keeps the first.
         Ok(ok.entries.remove(0))
     }
 
-    /// `RaftLog::read_many`, on the blocking pool, with the response's
-    /// value budget.
+    /// `RaftLog::read_many` on the blocking pool, with the response value
+    /// budget.
     async fn read_store(
         &self,
         keys: Vec<(Vec<u8>, Fetch)>,
@@ -761,9 +733,9 @@ impl KvService {
             .await
     }
 
-    /// A read of many keys outside a transaction, at `point` -- the
-    /// storage half of every non-transactional mode, whatever the caller
-    /// had to prove first.
+    /// A read of many keys outside a transaction, at `point`. This is the
+    /// storage step of every non-transactional mode, after the caller has
+    /// proved what its mode needs.
     async fn multi_read(
         &self,
         keys: Vec<Vec<u8>>,
@@ -782,13 +754,12 @@ impl KvService {
         }
     }
 
-    /// What a transaction must establish before it may answer a read:
-    /// this node leads the transaction's own term, its `latest` is
-    /// complete, and it still holds a quorum of leases.
+    /// What a transaction must prove before it answers a read: this node
+    /// leads the transaction's term, its `latest` is complete, and it still
+    /// holds a quorum of leases.
     ///
-    /// `transaction_leader` and `await_caught_up` come *before* the
-    /// caller takes any lock: a leader still catching up should not be
-    /// holding keys nobody can write while it does it.
+    /// These checks come before the caller takes any lock: a leader that is
+    /// still catching up must not hold keys that nobody can write meanwhile.
     async fn transaction_read_quorum(&self, id: TxnId) -> Result<(), TxnError> {
         let leader = self.transaction_leader(id)?;
         leader.await_caught_up().await?;
@@ -798,12 +769,12 @@ impl KvService {
         Ok(())
     }
 
-    /// One pass of a key scan: up to `limit` keys at or after `start`,
-    /// with `buffered` -- this transaction's own uncommitted changes, or
-    /// empty outside one -- folded in.
+    /// One pass of a key scan: up to `limit` keys at or after `start`, with
+    /// `buffered` (the transaction's own uncommitted changes, or empty)
+    /// merged in.
     ///
-    /// Returns the keys and whether the scan stopped early because it
-    /// filled up, which is what tells a caller there is another batch.
+    /// Returns the keys and whether the scan stopped because the batch was
+    /// full, which tells the caller that another batch exists.
     async fn scan(
         &self,
         start: Vec<u8>,
@@ -812,38 +783,33 @@ impl KvService {
         buffered: &BufferedKeys,
         filter: &Option<permissions::ScanFilter>,
     ) -> Result<ScanBatch, StorageError> {
-        // A key this transaction has deleted doesn't exist as far as it
-        // is concerned, so the scan skips it rather than returning it
-        // and filtering after -- which would shorten the batch for a
-        // reason the caller can't see.
+        // A key this transaction deleted does not exist for it, so the scan
+        // skips it. Filtering after the scan would shorten the batch for a
+        // reason the caller cannot see.
         let deleted: std::collections::HashSet<Vec<u8>> = buffered
             .iter()
             .filter(|(_, is_delete)| *is_delete)
             .map(|(key, _)| key.clone())
             .collect();
 
-        // One more than asked for, so "there is another batch" is
-        // something this saw rather than something the caller infers
-        // from a count -- see `GetKeysOk.has_more`.
+        // Ask for one more than needed, so "another batch exists" is something
+        // the scan saw, not something the caller guesses from a count. See
+        // `GetKeysOk.has_more`.
         let want = limit.saturating_add(1);
         let (committed, budget_cursor) = {
             let start = start.clone();
             let filter = filter.clone();
             self.store
                 .run(move |log| {
-                    // Folded into the skip closure rather than filtered
-                    // out of the result: a skipped key doesn't count
-                    // against `want`, so hiding the reserved range costs
-                    // the caller no batch length. Both callers -- the
-                    // transactional scan and the plain one -- come
-                    // through here, so this is the whole of `GetKeys`.
+                    // Reserved keys are skipped inside the walk, not filtered from the
+                    // result: a skipped key does not count against `want`, so hiding the
+                    // reserved range does not shorten the batch. Both the transactional
+                    // and the plain scan come here, so this covers all of `GetKeys`.
                     //
-                    // Keys an ACL hides join it on exactly those terms.
-                    // The filter is resolved before the walk, because
-                    // this closure runs on the blocking pool and cannot
-                    // read the store -- which is also why a walk that
-                    // hides nearly everything needs the budget below to
-                    // stop it walking the whole keyspace.
+                    // Keys hidden by an ACL are skipped the same way. The filter is built
+                    // before the walk, because this closure runs on the blocking pool and
+                    // cannot read the store. That is also why a walk that hides almost
+                    // everything needs the budget, or it would walk the whole keyspace.
                     log.scan_as_of(&start, as_of, want, permissions::SCAN_ROW_BUDGET, |key| {
                         deleted.contains(key)
                             || is_reserved(key)
@@ -853,20 +819,17 @@ impl KvService {
                 .await?
         };
 
-        // Buffered writes make keys appear that the store has never
-        // heard of. Merging them in can only add, so taking the first
-        // `limit` of the union is the same answer a merge of the two
-        // full streams would give.
+        // Buffered writes can add keys that the store does not have. Merging
+        // can only add keys, so the first `limit` of the union equals the
+        // result of merging the two full streams.
         let mut keys: Vec<Vec<u8>> = committed;
         keys.extend(
             buffered
                 .iter()
                 .filter(|(key, is_delete)| {
-                    // `is_reserved` is belt to `write`'s braces: a client
-                    // transaction is refused a reserved key at the RPC
-                    // boundary, so it should have none buffered. The
-                    // server's own transactions do, and none of them
-                    // scans -- but the cost of being sure is one
+                    // A second line of defense: `write` refuses reserved keys for client
+                    // transactions, so none should be buffered here. The server's own
+                    // transactions do buffer them, but never scan. The check costs one
                     // comparison.
                     !*is_delete && key.as_slice() >= start.as_slice() && !is_reserved(key)
                 })
@@ -875,10 +838,10 @@ impl KvService {
         keys.sort_unstable();
         keys.dedup();
 
-        // Two reasons to have more: the batch filled, or the walk ran
-        // out of budget before it could. The first derives its cursor
-        // from the last key kept; the second cannot -- there may be no
-        // key at all -- so it uses the one the walk stopped at.
+        // Two reasons to have more: the batch filled, or the walk ran out of
+        // budget first. A full batch takes its cursor from the last key kept.
+        // A budget stop may have no key at all, so it uses the key where the
+        // walk stopped.
         let filled = keys.len() > limit;
         keys.truncate(limit);
         let next_start_key = match &budget_cursor {
@@ -897,18 +860,19 @@ impl KvService {
         })
     }
 
-    /// A transactional key scan: find the keys, lock them, then look
-    /// again.
+    /// A transactional key scan: find the keys, lock them, then look again.
     ///
-    /// The second pass is what makes this a read rather than a guess.
-    /// A single-key read locks first and reads after, which a scan
-    /// cannot do -- it doesn't know which keys to lock until it has
-    /// looked. So it looks, locks what it found, and looks again: by
-    /// then nobody else can change any of those keys, and the second
-    /// answer is one this transaction can hold to. A key that vanished
-    /// in between is simply gone (we hold its lock and it isn't there);
-    /// one that appeared is a phantom this returns nothing about, since
-    /// these are per-key locks and the range itself is not held.
+    /// A single-key read locks first and reads after. A scan cannot: it does
+    /// not know which keys to lock until it looks. So it:
+    /// - looks,
+    /// - locks what it found,
+    /// - looks again.
+    ///
+    /// After the locks, nobody else can change those keys, so the second
+    /// answer is one the transaction can rely on. A key that disappeared in
+    /// between is gone (we hold its lock and it is not there). A key that
+    /// appeared is a phantom and is not returned: the locks are per key, and
+    /// the range is not locked.
     async fn transactional_scan(
         &self,
         id: TxnId,
@@ -936,11 +900,9 @@ impl KvService {
             .await
             .map_err(|e| TxnError::Raft(RaftError::Storage(e)))?;
 
-        // Only what the locks above actually cover. Anything else the
-        // second pass turned up arrived after this transaction looked,
-        // and handing it back unlocked would be exactly the unprotected
-        // data under a transaction's name that the lock table exists to
-        // prevent.
+        // Return only keys the locks cover. Other keys from the second pass
+        // appeared after this transaction looked, and returning them unlocked
+        // is exactly what the lock table prevents.
         let locked: std::collections::HashSet<&[u8]> =
             candidates.iter().map(Vec::as_slice).collect();
         let keys = batch
@@ -948,33 +910,30 @@ impl KvService {
             .into_iter()
             .filter(|key| locked.contains(key.as_slice()))
             .collect();
-        // The cursor comes from the second pass, which is the one whose
-        // answer this is. Filtering to what the locks cover can shorten
-        // the batch, which is one more reason the cursor is carried
-        // rather than derived from the last key returned.
+        // The cursor comes from the second pass, because that pass gives the
+        // answer. Filtering to locked keys can shorten the batch, which is
+        // another reason to send the cursor instead of deriving it from the
+        // last key.
         Ok(ScanBatch { keys, ..batch })
     }
 
-    /// Commit everything a transaction buffered, as one entry.
+    /// Commit all that a transaction buffered, as one entry.
     ///
-    /// The append runs in a task of its own owning the transaction's
-    /// locks, so they are released when the *entry* resolves rather than
-    /// when this call does. A client that disconnects mid-commit would
-    /// otherwise leave the transaction stuck part-way, and a part-way
-    /// transaction is deliberately exempt from expiry: its keys would
-    /// stay unwritable for the rest of the term.
+    /// The append runs in its own task, which owns the transaction's locks.
+    /// So the locks are released when the entry resolves, not when this call
+    /// returns. Otherwise a client that disconnects mid-commit would leave
+    /// the transaction half done, and a committing transaction never
+    /// expires: its keys would stay blocked for the rest of the term.
     async fn commit(&self, id: TxnId) -> Result<u64, TxnError> {
         let leader = self.transaction_leader(id)?;
         let (writes, guard) = self.locks.begin_commit(id, leader.term())?;
 
         if writes.is_empty() {
-            // Nothing to append, so nothing re-validates the point in
-            // time this transaction read at -- the raft round trip is
-            // what normally does that. Term equality alone isn't enough,
-            // since a partitioned leader still believes it holds its
-            // term; a lease quorum is. (Re-acquiring one in term T is
-            // impossible once a majority has moved to T', which is what
-            // makes this sound rather than merely reassuring.)
+            // There is nothing to append, so no raft round trip confirms the point
+            // in time this transaction read at. Term equality alone is not enough:
+            // a partitioned leader still believes it holds its term. A lease quorum
+            // is enough: nobody can get one in term T after a majority has moved to
+            // a later term.
             leader.await_caught_up().await?;
             if !leader.has_read_quorum() {
                 return Err(RaftError::NotLeader { leader_hint: None }.into());
@@ -988,10 +947,9 @@ impl KvService {
             .map(|(key, value)| Mutation { key, value })
             .collect();
 
-        // `.instrument(..)`: a span doesn't cross `tokio::spawn` on its
-        // own any more than it crosses `spawn_blocking` -- without this,
-        // `append_writes`'s span would show up as a disconnected root
-        // instead of nested under this RPC's.
+        // A span does not cross `tokio::spawn` (or `spawn_blocking`) by
+        // itself. Without `.instrument(..)`, the `append_writes` span would
+        // show up as a separate root, not under this RPC.
         let span = tracing::Span::current();
         tokio::spawn(
             async move {
@@ -1005,9 +963,9 @@ impl KvService {
         .map_err(Into::into)
     }
 
-    /// Shared body of `add_server`/`remove_server`: both are the same
-    /// operation with a different `ConfigChange`, and both answer
-    /// `NotLeader` rather than forwarding (Raft §6.2).
+    /// The shared body of `add_server` and `remove_server`: the same
+    /// operation with a different `ConfigChange`. Both answer `NotLeader`
+    /// instead of forwarding (Raft §6.2).
     async fn propose(
         &self,
         change: ConfigChange,
@@ -1026,14 +984,11 @@ impl KvService {
         }))
     }
 
-    /// What a lock-free linearizable read must establish: this node
-    /// leads, its `latest` is complete, and it still holds a quorum of
-    /// leases.
+    /// What a linearizable read without locks must prove: this node leads,
+    /// its `latest` is complete, and it still holds a quorum of leases.
     ///
-    /// The same proof `transaction_read_quorum` rests on, minus the
-    /// transaction -- nothing here belongs to one that would have to go
-    /// on holding the key afterwards, so nothing is locked and nothing
-    /// is held after the answer is given.
+    /// The same proof as `transaction_read_quorum`, without a transaction.
+    /// Nothing must stay held after the answer, so nothing is locked.
     async fn read_quorum(&self) -> Result<(), RaftError> {
         let leader = self.leader()?;
         leader.await_caught_up().await?;
@@ -1043,8 +998,8 @@ impl KvService {
         Ok(())
     }
 
-    /// A read that reflects everything committed anywhere in the
-    /// cluster, without taking a lock.
+    /// A read that includes everything committed anywhere in the cluster,
+    /// with no lock.
     async fn linearizable_read(&self, key: Vec<u8>) -> Result<Option<(u64, Vec<u8>)>, RaftError> {
         self.read_quorum().await?;
         self.store
@@ -1053,18 +1008,16 @@ impl KvService {
             .map_err(RaftError::Storage)
     }
 
-    /// `linearizable_read`, for a caller that wants the value and not the
-    /// seq it came at.
+    /// `linearizable_read`, for a caller that wants only the value.
     async fn linearizable_get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>, RaftError> {
         Ok(self.linearizable_read(key).await?.map(|(_, value)| value))
     }
 
-    /// Resolve a snapshot id to the seq it reads at.
+    /// Find the seq that a snapshot id reads at.
     ///
-    /// A local read, deliberately: the record's existence on this node
-    /// is itself the proof that this node has applied everything the
-    /// snapshot could need (see `storage::checkpoint`), so there is
-    /// nothing a leader could add.
+    /// A local read on purpose: if this node has the record, it has applied
+    /// everything the snapshot needs (see `storage::checkpoint`). A leader
+    /// could add nothing.
     async fn checkpoint_seq(&self, id: &[u8]) -> Result<u64, Status> {
         require_snapshot_id(id)?;
         let owned = id.to_vec();
@@ -1076,13 +1029,13 @@ impl KvService {
         found.ok_or_else(no_such_snapshot)
     }
 
-    /// Create a checkpoint: write its record, once, and report the seq
-    /// that write landed at -- which *is* the snapshot's seq.
+    /// Create a checkpoint: write its record once, and return the seq of
+    /// that write, which is the snapshot's seq.
     ///
-    /// The `put_user` shape verbatim, and for the same reason: the
-    /// read-and-then-write has to be one transaction or two callers
-    /// could both find the id absent and both create it, and the second
-    /// record would silently move the snapshot forward in time.
+    /// Same shape as `put_user`, for the same reason: the read and the write
+    /// must be one transaction. Otherwise two callers could both find the id
+    /// absent and both create it, and the second record would silently move
+    /// the snapshot forward in time.
     async fn create_checkpoint_inner(
         &self,
         extensions: &tonic::Extensions,
@@ -1132,8 +1085,7 @@ impl KvService {
     }
 
     /// `write_user` for checkpoints: `Some(created)` creates, `None`
-    /// removes, and either is refused if the record is not in the state
-    /// that implies.
+    /// removes. Each is refused if the record is not in the state it needs.
     async fn write_checkpoint(
         &self,
         id: TxnId,
@@ -1161,7 +1113,7 @@ impl KvService {
         Ok(self.commit(id).await?)
     }
 
-    /// The account record for `username`, read currently.
+    /// The account record for `username`, read linearizably.
     async fn load_user(&self, username: &str) -> Result<Option<UserRecord>, AuthFailure> {
         match self
             .linearizable_get(crate::keyspace::user_key(username))
@@ -1172,9 +1124,9 @@ impl KvService {
         }
     }
 
-    /// Writes an account record, or removes it when `record` is `None`,
-    /// in a transaction of its own -- see [`admin_txn`] for why that is
-    /// what this takes rather than an append.
+    /// Write an account record, or remove it when `record` is `None`, in its
+    /// own transaction. See [`admin_txn`] for why it uses a transaction and
+    /// not a plain append.
     ///
     /// [`admin_txn`]: KvService::admin_txn
     async fn put_user(
@@ -1187,35 +1139,28 @@ impl KvService {
             .await
     }
 
-    /// Runs `f` inside a transaction of the server's own, on the leader,
-    /// and releases what it held however it ends.
+    /// Run `f` in a server-owned transaction on the leader, and release what
+    /// it held however it ends.
     ///
-    /// Every administrative write is a read-modify-write -- whether the
-    /// record already exists is what decides if the call is allowed at
-    /// all -- so the check and the write have to be atomic against
-    /// another administrator doing the same thing at the same moment.
-    /// That is why these drive an ordinary transaction instead of
-    /// appending directly, and in turn why reserved keys are refused at
-    /// the RPC boundary rather than in `Locks`: the lock table cannot
-    /// tell this write from a client's, and must not.
+    /// Every admin write is a read-modify-write: whether the record exists
+    /// decides if the call is allowed. So the check and the write must be
+    /// atomic against another admin doing the same thing. That is why these
+    /// use a normal transaction, and why reserved keys are refused at the
+    /// RPC boundary and not in `Locks`: the lock table cannot tell this
+    /// write from a client's, and must not.
     ///
-    /// Nothing a client does can contend for these keys, since `write`
-    /// refuses them, so the only competition is another administrative
-    /// call. Two racing ones resolve the way any two transactions do,
-    /// and the loser is told its transaction aborted.
+    /// Clients cannot contend for these keys, because `write` refuses them.
+    /// Two admin calls that race resolve like any two transactions, and the
+    /// loser learns that its transaction aborted.
     ///
-    /// Clients and the server do share one thing, though: the open
-    /// transaction table. Enough concurrent client transactions to fill
-    /// `MAX_OPEN_TRANSACTIONS` will refuse this one too, surfacing as
-    /// `resource_exhausted`. Left as it is rather than given reserved
-    /// headroom, because an administrator retrying is a far smaller
-    /// problem than a second allocation rule to keep consistent with the
-    /// first.
+    /// Clients and the server do share the open-transaction table. Enough
+    /// client transactions to fill `MAX_OPEN_TRANSACTIONS` also refuse this
+    /// one, as `resource_exhausted`. We accept that: an admin retry is a
+    /// smaller problem than a second allocation rule.
     ///
-    /// The discard is explicit rather than a `Drop` guard: discarding a
-    /// transaction that already committed is a no-op, and the commit
-    /// path itself hands its locks to the task doing the append, so
-    /// there is nothing here that releasing early could cut short.
+    /// The discard is explicit, not a `Drop` guard. Discarding a committed
+    /// transaction does nothing, and the commit path gives its locks to the
+    /// append task, so an early release cannot cut anything short.
     async fn admin_txn<T>(
         &self,
         f: impl AsyncFnOnce(TxnId) -> Result<T, AuthFailure>,
@@ -1259,57 +1204,53 @@ impl KvService {
         Ok(self.commit(id).await?)
     }
 
-    /// The body of `write`: the two checks, then the buffer.
+    /// The body of `write`: two checks, then the buffer.
     ///
-    /// The ACL is consulted where the key is named rather than at
-    /// commit, so a caller learns which key it may not write, at the
-    /// moment it names one, instead of losing a whole transaction later
-    /// to an error that could not say. The cost is that a permission
-    /// withdrawn between here and the commit does not stop this write --
-    /// the same window a linearizable read has, and for the same reason:
-    /// nothing is held after an answer is given.
+    /// The ACL check happens when the key is named, not at commit. So the
+    /// caller learns which key it may not write, at the moment it names it,
+    /// and does not lose a whole transaction later to an error that cannot
+    /// say which key. The cost: a permission removed between here and the
+    /// commit does not stop this write. A linearizable read has the same
+    /// window, because nothing is held after an answer.
     async fn write_inner(
         &self,
         extensions: &tonic::Extensions,
         req: WriteRequest,
     ) -> Result<(), AuthFailure> {
         let id = txn_id(&req.transaction_id)?;
-        // The privilege-escalation guard. A client able to buffer a
-        // write to a reserved key could write its own account record,
-        // with `is_admin` set to whatever it liked.
+        // The guard against privilege escalation. A client that could buffer a
+        // write to a reserved key could write its own account record with any
+        // `is_admin` value.
         reject_reserved(&req.key)?;
-        // A delete is a write of no value, so this covers both.
+        // A delete is a write with no value, so this covers both.
         self.require_access(extensions, &req.key, Right::Write)
             .await?;
 
-        // Purely in-memory: nothing reaches the log until `commit`. The
-        // leader handle is fetched only for the term check inside
-        // `transaction_leader` -- a transaction cannot be added to from
-        // anywhere but the leader that created it.
+        // In memory only: nothing reaches the log until `commit`. The leader
+        // handle is fetched only for the term check in `transaction_leader`:
+        // only the leader that created a transaction can add to it.
         self.transaction_leader(id)?;
         self.locks.buffer_write(id, &req.key, req.value)?;
         Ok(())
     }
 
-    /// Checks that whoever sent this request is an administrator.
+    /// Check that the sender of this request is an administrator.
     ///
-    /// The token says who they are; the store says what they may do.
-    /// Read fresh on every call rather than carried as a claim, because
-    /// a right baked into a token cannot be withdrawn until that token
-    /// expires. These calls are rare and already pay a raft round trip,
-    /// so the read costs nothing worth saving.
+    /// The token says who they are; the store says what they may do. The
+    /// store is read on every call, not trusted from a token claim, because
+    /// a right inside a token cannot be withdrawn until the token expires.
+    /// These calls are rare and already pay a raft round trip, so the read
+    /// is cheap by comparison.
     async fn require_admin(&self, extensions: &tonic::Extensions) -> Result<(), AuthFailure> {
-        // A node with no secret keeps no accounts, so there is nobody to
-        // be an administrator and nothing to check against. This is the
-        // one place the open case is decided: every caller of this is
-        // spared having to remember it, and there is a single line to
-        // read when asking what an unauthenticated cluster permits.
+        // A node with no secret keeps no accounts, so there is no admin and
+        // nothing to check. This is the only place that decides the open case,
+        // so no caller has to remember it, and one line says what an
+        // unauthenticated cluster allows.
         if self.auth.is_none() {
             return Ok(());
         }
-        // Missing only if the auth layer did not run. That is a
-        // misconfiguration rather than a forged request, but the safe
-        // reading of the two is the same.
+        // Missing only if the auth layer did not run. That is a configuration
+        // error, not a forged request, but the safe response is the same.
         let Some(context) = extensions.get::<AuthContext>() else {
             return Err(
                 Status::unauthenticated("this request carried no verified identity").into(),
@@ -1317,13 +1258,11 @@ impl KvService {
         };
         match self.load_user(&context.username).await? {
             Some(user) if user.is_admin => Ok(()),
-            // Either not an admin, or an account deleted since its token
-            // was issued. Neither may proceed, and neither is told which
-            // it was.
-            // Deliberately not naming the operation: this guards
-            // account management and membership changes alike, and a
-            // message that named one of them would be wrong for the
-            // other.
+            // Either not an admin, or an account deleted after its token was
+            // issued. Neither may proceed, and the caller is not told which.
+            // The message does not name the operation: this guards account
+            // management and membership changes, and a name would be wrong for one
+            // of them.
             _ => Err(AuthFailure::refused(
                 auth_error::Kind::NotAdmin,
                 "this account is not an administrator",
@@ -1335,9 +1274,8 @@ impl KvService {
         let Some(auth) = self.auth.as_ref() else {
             return Err(AuthFailure::disabled());
         };
-        // A name that could never have been stored cannot match an
-        // account, and refusing it here keeps `user_key` to the shape it
-        // is sound for.
+        // A name that can never be stored cannot match an account. Refusing it
+        // here keeps `user_key` to the inputs it is safe for.
         crate::keyspace::validate_username(&req.username)?;
 
         let stored = self.password_hash_for(auth, &req.username).await?;
@@ -1352,19 +1290,16 @@ impl KvService {
         })
     }
 
-    /// What to check a login against: the stored account's hash, or --
-    /// on a node that is not yet part of any cluster -- the one this
-    /// node was started with.
+    /// The hash to check a login against: the stored account's hash, or, on
+    /// a node that is not yet in a cluster, the startup password's hash.
     ///
-    /// That fallback is what breaks the circle at the very beginning. A
-    /// fresh node has no accounts, and no leader to read them from, yet
-    /// `Bootstrap` needs a token like everything else; so the operator
-    /// has to be able to authenticate against something. It is gated on
-    /// the node having no configuration rather than on no account
-    /// existing, because the latter would quietly re-arm the startup
-    /// password the moment the last account was deleted. Once this node
-    /// has been bootstrapped or added to a cluster, the flag is inert
-    /// for good.
+    /// The fallback breaks the circle at the start. A new node has no
+    /// accounts and no leader to read them from, but `Bootstrap` needs a
+    /// token like every other call, so the operator must be able to log in
+    /// against something. The fallback depends on the node having no
+    /// configuration, not on there being no accounts: otherwise deleting the
+    /// last account would silently re-enable the startup password. Once the
+    /// node is in a cluster, the fallback never applies again.
     async fn password_hash_for(
         &self,
         auth: &AuthConfig,
@@ -1390,15 +1325,14 @@ impl KvService {
             .map(|user| user.password_hash))
     }
 
-    /// Checks that whoever is bootstrapping this node is the
-    /// administrator it was started expecting.
+    /// Check that the caller bootstrapping this node is the administrator it
+    /// was started with.
     ///
-    /// `require_admin` cannot be used here. It reads the store, and a
-    /// node with no cluster has no leader to read from -- which is the
-    /// very reason the startup administrator exists. So the check is
-    /// against that configured identity instead, which is also what
-    /// stops a token minted for some other cluster sharing this secret
-    /// from bootstrapping this node.
+    /// `require_admin` cannot work here: it reads the store, and a node with
+    /// no cluster has no leader to read from. That is why the startup
+    /// administrator exists. This check against the configured identity
+    /// also stops a token from another cluster with the same secret from
+    /// bootstrapping this node.
     fn require_startup_admin(&self, extensions: &tonic::Extensions) -> Result<(), Status> {
         let Some(auth) = self.auth.as_ref() else {
             return Ok(());
@@ -1416,17 +1350,15 @@ impl KvService {
         }
     }
 
-    /// Writes that administrator into the log, once this node is
-    /// actually leading.
+    /// Write the startup administrator into the log, once this node is
+    /// leader.
     ///
-    /// `client_handle.bootstrap` only installs the configuration; the
-    /// node still has to win its (unopposed) election and commit its own
-    /// no-op before anything can be appended. Hence the wait rather than
-    /// an immediate append -- and hence `Bootstrap` answering only once
-    /// this has happened, so that "ok" means there is an administrator
-    /// rather than that there will shortly be one.
+    /// `client_handle.bootstrap` only installs the configuration. The node
+    /// must still win its election (unopposed) and commit its no-op before
+    /// it can append. So this waits, and `Bootstrap` answers only after it:
+    /// "ok" means an administrator exists, not that one will exist soon.
     ///
-    /// Idempotent: a record already there is the end state this wants.
+    /// Safe to repeat: a record that already exists is the goal.
     async fn write_startup_admin(&self) -> Result<(), Status> {
         let Some(admin) = self
             .auth
@@ -1445,11 +1377,10 @@ impl KvService {
                 Err(_) if std::time::Instant::now() < deadline => {
                     tokio::time::sleep(BOOTSTRAP_ADMIN_RETRY).await;
                 }
-                // The configuration is installed and this node is a
-                // cluster, but nobody can administer it: the startup
-                // password stops working the moment a configuration
-                // exists. Said plainly, because the way out is to
-                // discard this node's directory and bootstrap again.
+                // The configuration is installed and this node is a cluster, but nobody
+                // can administer it: the startup password stops working once a
+                // configuration exists. Say so plainly, because the fix is to delete
+                // this node's directory and bootstrap again.
                 Err(_) => {
                     return Err(Status::internal(
                         "this node was bootstrapped but its administrator could not be written, \
@@ -1490,16 +1421,17 @@ impl KvService {
         self.put_user(&req.username, None).await
     }
 
-    /// Every outstanding invitation, split into the ones that can still
-    /// be spent and the ids of the ones that cannot.
+    /// Every open invitation, split into the ones that can still be used and
+    /// the ids of the ones that cannot.
     ///
-    /// A local read, not a linearizable one. Both callers can take that:
-    /// `ListInvites` is a listing, stale on the same terms as any read
-    /// outside a transaction, and `CreateInvite` uses it only to count
-    /// and to sweep -- an invitation this node has not heard of yet is
-    /// one more that goes uncounted and unswept, which costs a slot and
-    /// a sweep, not correctness. Nothing here decides whether an invite
-    /// may be *spent*; that happens under a lock in `redeem_invite`.
+    /// A local read, not a linearizable one. Both callers accept that:
+    /// - `ListInvites` is a listing, stale like any read outside a
+    ///   transaction.
+    /// - `CreateInvite` only counts and sweeps. An invite this node has not
+    ///   seen yet costs a slot and a sweep, not correctness.
+    ///
+    /// Whether an invite may be used is decided under a lock, in
+    /// `redeem_invite`.
     async fn read_invites(
         &self,
     ) -> Result<(Vec<(String, InviteRecord)>, Vec<String>), AuthFailure> {
@@ -1509,8 +1441,8 @@ impl KvService {
             .await
             .map_err(|e| AuthFailure::from(RaftError::Storage(e)))?;
 
-        // One `now` for the whole partition, so a listing cannot report
-        // two invitations expiring in the same millisecond differently.
+        // One `now` for the whole split, so two invitations that expire in the
+        // same millisecond cannot be classed differently.
         let now = crate::auth::now_unix_ms();
         let mut live = Vec::new();
         let mut lapsed = Vec::new();
@@ -1527,13 +1459,12 @@ impl KvService {
         Ok((live, lapsed))
     }
 
-    /// Mints an invitation and writes the cluster's half of it.
+    /// Create an invitation and write the cluster's half of it.
     ///
-    /// The secret exists in this process, in the response, and nowhere
-    /// else: what goes into the log is its SHA-256, which is also the
-    /// key the record is written under. So this is the only moment the
-    /// token is knowable, and an issuer who loses it has to revoke and
-    /// mint again -- there is nothing to look it up from.
+    /// The secret exists only in this process and in the response. The log
+    /// gets its SHA-256, which is also the record's key. So this is the only
+    /// moment the token is known, and an issuer who loses it must revoke and
+    /// create another: nothing can look it up.
     async fn create_invite_inner(
         &self,
         extensions: &tonic::Extensions,
@@ -1545,10 +1476,9 @@ impl KvService {
         self.require_admin(extensions).await?;
         let issued_by = caller(extensions)?;
 
-        // A name that could never be stored cannot be pinned to, and
-        // refusing it here means the pin is checked once, now, rather
-        // than by the recipient discovering their invitation is
-        // unusable.
+        // A name that can never be stored cannot be pinned to. Checking it now
+        // means the pin is checked once, here, and the recipient does not
+        // discover later that the invite is unusable.
         if let Some(username) = req.username.as_deref() {
             crate::keyspace::validate_username(username)?;
         }
@@ -1575,22 +1505,18 @@ impl KvService {
 
         let seq = self
             .admin_txn(async |id| {
-                // Two distinct 32-byte secrets hashing alike is not a
-                // thing that happens, so this is not a race being
-                // guarded against -- it is the invariant that a record
-                // is written once, stated where it could be violated.
+                // Two different 32-byte secrets do not hash alike, so this is not a race
+                // guard. It states the rule that a record is written once, at the place
+                // that rule could break.
                 if self.transactional_read(id, &key).await?.value.is_some() {
                     return Err(
                         Status::internal("the invitation drawn already exists; try again").into(),
                     );
                 }
-                // Lapsed invitations are swept here rather than by
-                // anything of their own. There is no timer in this
-                // cluster to hang an expiry on and no state machine hook
-                // to run one from, so the work is folded into the call
-                // that has a reason to care how many there are -- which
-                // keeps the reserved range from accumulating records
-                // that can never be spent again.
+                // Lapsed invitations are swept here. The cluster has no timer for
+                // expiry and no state machine hook to run one, so the work goes into
+                // the call that cares how many there are. This stops the reserved range
+                // from filling with records that can never be used.
                 for id_of_lapsed in &lapsed {
                     self.locks.buffer_write(
                         id,
@@ -1610,45 +1536,35 @@ impl KvService {
         })
     }
 
-    /// Spends an invitation on a new account.
+    /// Use an invitation to create an account.
     ///
-    /// Answered for anyone: this is the one write on the service that
-    /// runs without a token (see `auth::EXEMPT`), because its callers
-    /// are by definition people who have no account yet. The invitation
-    /// stands in for the token, and everything below turns on it.
+    /// Answered for anyone: this is the only write on the service that runs
+    /// without a token (see `auth::EXEMPT`), because its callers have no
+    /// account yet. The invitation takes the place of the token.
     ///
-    /// The checking happens twice on purpose, and the two are not the
-    /// same check.
+    /// The checks run twice on purpose, and they are not the same check:
+    /// - First, a plain read before any work. An anonymous caller can make
+    ///   this node do whatever it does before it decides, so that part must
+    ///   be cheap. Argon2 hashing costs 19 MiB and several milliseconds:
+    ///   worth it for a real redemption, not for random input.
+    /// - Second, inside the transaction, under a lock. This one counts.
+    ///   Between the two, the invite could be revoked, used by someone
+    ///   else, or lapse, and the account name could be taken. So the record
+    ///   is read again, and `is_admin` comes from the locked read: the
+    ///   account's rights must come from the invite as it was when it was
+    ///   used.
     ///
-    /// The first is a plain read, before any work: an anonymous caller
-    /// can ask this node to do whatever it does before it decides, so
-    /// what it does before it decides had better be cheap. Hashing a
-    /// password with Argon2 costs 19 MiB and several milliseconds --
-    /// worth paying for a real redemption, and not worth paying for a
-    /// stranger sending in garbage.
-    ///
-    /// The second is inside the transaction, under a lock, and is the
-    /// one that counts. Between the two the invitation could have been
-    /// revoked, spent by someone else, or lapsed; the account name could
-    /// have been taken. That is why the record is read again rather than
-    /// carried over, and why `is_admin` is taken from the *locked* read
-    /// -- the rights the account gets must come from the invitation as
-    /// it stood when it was spent, not as it stood when it was glanced
-    /// at.
-    ///
-    /// The account and the invitation's removal are buffered into one
-    /// transaction, so they land at one sequence number or not at all.
-    /// That is the whole of "single use": two callers racing with the
-    /// same token contend for the same key, and one of them loses.
+    /// The account and the invite's removal are buffered into one
+    /// transaction, so they land at one seq or not at all. That is what
+    /// makes an invite single-use: two callers with the same token contend
+    /// for the same key, and one of them loses.
     async fn redeem_invite_inner(&self, req: RedeemInviteRequest) -> Result<u64, AuthFailure> {
         if self.auth.is_none() {
             return Err(AuthFailure::disabled());
         }
-        // Bounded before it is hashed. Everything else about the token
-        // is answered by whether its hash names a record, which is the
-        // point of keying records by that hash -- but the hashing itself
-        // is work, and an anonymous caller does not get to choose how
-        // much of it to ask for.
+        // Limit the token size before hashing. The rest of the check is whether
+        // its hash names a record, but hashing is work, and an anonymous caller
+        // does not get to choose how much.
         if req.token.is_empty() || req.token.len() > crate::auth::MAX_INVITE_TOKEN_LEN {
             return Err(AuthFailure::bad_invite(
                 "that is not an invitation this cluster issued",
@@ -1667,9 +1583,9 @@ impl KvService {
         };
         check_invite(&InviteRecord::from_bytes(&bytes)?, &req.username)?;
 
-        // Outside the transaction: Argon2 is deliberately slow, and
-        // holding a lock on the account name for the length of it would
-        // make every redemption wait on every other one.
+        // Outside the transaction: Argon2 is slow on purpose, and holding a lock
+        // on the account name for that long would make each redemption wait for
+        // the others.
         let password_hash = crate::auth::hash_password(req.password).await?;
 
         self.admin_txn(async |id| {
@@ -1688,10 +1604,9 @@ impl KvService {
                 .value
                 .is_some()
             {
-                // Deliberately not spent. The holder chose a name
-                // somebody already has, which is a thing they can fix by
-                // choosing another -- and burning their invitation for
-                // it would leave them unable to.
+                // Do not use up the invite. The holder chose a name that is taken, which
+                // they can fix by choosing another. Burning the invite would leave them
+                // unable to.
                 return Err(AuthFailure::refused(
                     auth_error::Kind::AlreadyExists,
                     "that account already exists; the invitation has not been spent, so \
@@ -1717,10 +1632,9 @@ impl KvService {
         }
         self.require_admin(extensions).await?;
 
-        // Lapsed ones are left out rather than listed as expired. They
-        // cannot be spent and the next `CreateInvite` will sweep them,
-        // so reporting them would be reporting the cluster's own
-        // housekeeping as something to act on.
+        // Lapsed invites are not listed. Nobody can use them and the next
+        // `CreateInvite` sweeps them, so listing them would show the cluster's
+        // own housekeeping as something to act on.
         let (live, _) = self.read_invites().await?;
         Ok(live
             .into_iter()
@@ -1741,11 +1655,9 @@ impl KvService {
 
         let key = crate::keyspace::invite_key(&req.invite_id);
         self.admin_txn(async |id| {
-            // An id that is not here is `not_found` rather than a quiet
-            // success. Withdrawing an invitation is something an
-            // administrator does because they believe a live one is out
-            // there, and "already gone" is the answer they most need to
-            // hear -- it means someone spent it first.
+            // A missing id is `not_found`, not a silent success. An admin revokes an
+            // invite because they believe a live one exists, and "already gone" is
+            // what they most need to hear: someone used it first.
             if self.transactional_read(id, &key).await?.value.is_none() {
                 return Err(Status::not_found(
                     "there is no such invitation; it may have been redeemed already",
@@ -1764,8 +1676,8 @@ impl KvService {
         match bytes {
             Some(bytes) => ClusterConfig::from_bytes(&bytes)
                 .map_err(|_| StorageError::Corrupt("stored cluster config was corrupt")),
-            // Not bootstrapped or added to a cluster yet -- not an error,
-            // just an empty configuration.
+            // Not yet bootstrapped or added to a cluster: not an error, just an
+            // empty configuration.
             None => Ok(ClusterConfig::default()),
         }
     }
@@ -1777,8 +1689,8 @@ impl Kv for KvService {
         &self,
         request: Request<WriteRequest>,
     ) -> Result<Response<WriteResponse>, Status> {
-        // `into_parts` rather than `into_inner`: who the caller is lives
-        // in the extensions, and an ACL is about them.
+        // `into_parts`, not `into_inner`: the caller's identity is in the
+        // extensions, and the ACL check needs it.
         let (_, extensions, req) = request.into_parts();
         let result = self.write_inner(&extensions, req).await;
 
@@ -1795,27 +1707,26 @@ impl Kv for KvService {
 
     async fn read(&self, request: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {
         let (_, extensions, req) = request.into_parts();
-        // Refused rather than shortened: unlike the value budget, this
-        // is a number the caller chose and could have known.
+        // Refused, not shortened: unlike the value budget, the key count is the
+        // caller's choice and it can know the limit.
         if req.keys.len() > raft5_shared::MAX_KEYS_PER_READ {
             return Err(Status::resource_exhausted(
                 "that is more keys than this server will read in one call",
             ));
         }
 
-        // Before the branch, so it covers the transactional read too.
-        // Refused rather than answered as absent: a password hash handed
-        // back is one to attack offline, at leisure -- and even the seq
-        // of an account record is enough to watch the administration of
-        // a cluster one has no business watching.
+        // Before the branch, so it also covers the transactional read. Refused,
+        // not answered as absent: a returned password hash can be attacked
+        // offline, and even the seq of an account record lets someone watch
+        // the cluster's administration.
         for key in &req.keys {
             reject_reserved(key)?;
         }
 
-        // Likewise before the branch: every consistency reads the same
-        // keys, and which one was asked for has no bearing on whether
-        // this caller may have them. All or nothing, since a positional
-        // answer cannot leave a key out without saying which.
+        // Also before the branch: every mode reads the same keys, and the mode
+        // does not change whether this caller may read them. All or nothing,
+        // because a positional answer cannot leave out a key without saying
+        // which.
         if let Err(e) = self
             .require_access_all(&extensions, &req.keys, Right::Read)
             .await
@@ -1829,10 +1740,9 @@ impl Kv for KvService {
         }
 
         let result = match req.consistency {
-            // A transactional read is a different thing again: it takes
-            // locks, and it can be answered from what the transaction
-            // itself has buffered -- only this transaction's own leader,
-            // still holding a read quorum, will serve one.
+            // A transactional read takes locks and can answer from the
+            // transaction's buffer. Only the transaction's own leader, with a read
+            // quorum, serves it.
             Some(read_request::Consistency::TransactionId(id)) => {
                 let id = txn_id(&id)?;
                 match self
@@ -1844,10 +1754,9 @@ impl Kv for KvService {
                 }
             }
 
-            // Linearizable without a transaction: this node proves it
-            // still leads and still holds a read quorum, and then
-            // answers. No lock, so nothing is held once the answer is
-            // given -- the keys are free to change the moment after.
+            // Linearizable without a transaction: this node proves it still leads
+            // and holds a read quorum, then answers. Nothing is locked, so the keys
+            // can change right after the answer.
             Some(read_request::Consistency::Linearizable(_)) => match self.read_quorum().await {
                 Ok(()) => Ok(self
                     .multi_read(req.keys, req.versions_only, ReadPoint::Latest)
@@ -1855,9 +1764,8 @@ impl Kv for KvService {
                 Err(e) => Err(client_err(e)?),
             },
 
-            // A snapshot read. Stale by construction -- it describes a
-            // moment that has already passed -- so any node serves it,
-            // with no leader check and no quorum round.
+            // A snapshot read is stale by design (it describes a past moment), so
+            // any node serves it, with no leader check and no quorum round.
             Some(read_request::Consistency::SnapshotId(id)) => {
                 require_snapshot_id(&id)?;
                 Ok(self
@@ -1865,12 +1773,10 @@ impl Kv for KvService {
                     .await?)
             }
 
-            // `consistency` unset. Answered from local state by whoever
-            // received it, leader or not, with no read-quorum round and
-            // no wait to catch up. So it can be behind -- by a write
-            // still replicating on the leader, or by however far this
-            // node has fallen behind -- which `as_of` lets the caller
-            // see.
+            // `consistency` unset: answered from local state by any node, with no
+            // read-quorum round and no wait to catch up. So it can be behind, by a
+            // write still replicating or by however far this node lags. `as_of`
+            // shows the caller how far.
             None => Ok(self
                 .multi_read(req.keys, req.versions_only, ReadPoint::Latest)
                 .await?),
@@ -1889,22 +1795,19 @@ impl Kv for KvService {
         request: Request<GetKeysRequest>,
     ) -> Result<Response<GetKeysResponse>, Status> {
         let (_, extensions, req) = request.into_parts();
-        // `scan` would skip the whole reserved range anyway, so this
-        // refusal protects nothing the filter doesn't. It is here to say
-        // where the boundary is: a caller starting a walk at the very
-        // beginning passes an empty key, which is not reserved, so
-        // nothing legitimate asks for this.
+        // `scan` skips the reserved range anyway, so this refusal adds no
+        // protection. It marks the boundary: a walk from the start uses an
+        // empty key, which is not reserved, so no valid caller asks for this.
         reject_reserved(&req.start_key)?;
 
-        // What this caller may not read, resolved once for the whole
-        // call. Unlike `read`, a walk is never refused for it: keys the
-        // caller may not see are left out, so a caller whose access is
-        // one subtree of a large store can still walk the store.
+        // What this caller may not read, built once for the whole call. Unlike
+        // `read`, a walk is never refused for it: hidden keys are left out, so a
+        // caller with access to one subtree can still walk the store.
         let filter = self.scan_filter(&extensions).await?;
 
-        // Refused rather than shortened, so a caller paging in batches
-        // of N finds out it isn't getting N instead of silently getting
-        // a different shape of answer than it asked for.
+        // Refused, not shortened, so a caller that pages in batches of N learns
+        // that it is not getting N, instead of getting a different shape of
+        // answer.
         if req.max_keys > MAX_KEYS_PER_SCAN {
             return Err(Status::resource_exhausted(
                 "that is more keys than this server will scan in one call",
@@ -1928,18 +1831,17 @@ impl Kv for KvService {
             }));
         }
 
-        // A snapshot walk: the keys that had a value as of that seq,
-        // including ones deleted since and excluding ones created
-        // since. Stale by construction, so any node serves it.
+        // A snapshot walk: the keys that had a value at that seq, including keys
+        // deleted since and excluding keys created since. Stale by design, so
+        // any node serves it.
         let as_of = match &req.consistency {
             Some(get_keys_request::Consistency::SnapshotId(id)) => self.checkpoint_seq(id).await?,
             _ => u64::MAX,
         };
 
-        // Outside a transaction, the same terms as `read`: local state,
-        // no locks, whoever received it. There is nothing to merge --
-        // no transaction means no buffered writes -- and no second pass,
-        // since there are no locks for one to be taken under.
+        // Outside a transaction, the same terms as `read`: local state, no
+        // locks, any node. There is nothing to merge (no buffered writes) and
+        // no second pass (no locks to take).
         let batch = self
             .scan(req.start_key, as_of, limit, &BufferedKeys::new(), &filter)
             .await
@@ -1958,9 +1860,8 @@ impl Kv for KvService {
 
         let result = async {
             let leader = self.leader()?;
-            // The transaction's reads will be answered from `latest`, so
-            // a leader that may still be missing entries has no business
-            // opening one -- same precondition as a conditional write.
+            // The transaction's reads come from `latest`, so a leader that may
+            // still miss entries must not open one.
             leader.await_caught_up().await?;
             self.locks
                 .create(leader.term(), ttl, crate::txn::fresh_id())
@@ -1985,10 +1886,9 @@ impl Kv for KvService {
 
         Ok(Response::new(CommitTransactionResponse {
             result: Some(match result {
-                // `append_writes` returns only once the entry has
-                // committed *and* been applied, so by the time a client
-                // sees this seq, every key the transaction wrote reads
-                // back at it.
+                // `append_writes` returns only after the entry is committed and
+                // applied. So when a client sees this seq, every key the transaction
+                // wrote reads back at it.
                 Ok(seq) => commit_transaction_response::Result::Seq(seq),
                 Err(e) => commit_transaction_response::Result::Error(txn_error(e)?),
             }),
@@ -2000,9 +1900,8 @@ impl Kv for KvService {
         request: Request<DropTransactionRequest>,
     ) -> Result<Response<DropTransactionResponse>, Status> {
         let id = txn_id(&request.into_inner().transaction_id)?;
-        // Unconditional, and deliberately not leader-checked: giving up
-        // locks should never be refused, and a node that isn't the
-        // leader has none of this transaction's state to give up anyway.
+        // Always runs, with no leader check: giving up locks must never be
+        // refused, and a non-leader holds no state for this transaction anyway.
         self.locks.discard(id);
 
         Ok(Response::new(DropTransactionResponse {
@@ -2016,25 +1915,22 @@ impl Kv for KvService {
     ) -> Result<Response<ConfigChangeResponse>, Status> {
         let (_, extensions, req) = request.into_parts();
 
-        // Checked before the round trip below, not just inside `propose`:
-        // a follower has no business dialing the new server only to find
-        // out afterwards that it should have answered `NotLeader` and
-        // sent the caller elsewhere. `propose` still re-checks at the
-        // point of committing, since leadership can change during the
-        // round trip.
+        // Check leadership before the round trip below, not only in `propose`:
+        // a follower must not dial the new server only to learn that it should
+        // have answered `NotLeader`. `propose` checks again at commit time,
+        // because leadership can change during the round trip.
         if let Err(e) = require_leader(&self.client_handle.role()) {
             return not_leader_response(e);
         }
-        // And before it too: dialing the server named by a caller who
-        // may not do this is a side effect on that caller's say-so.
+        // Also check admin rights first: dialing a server that a caller names
+        // is a side effect, and only an admin may cause it.
         if let Err(e) = self.require_admin(&extensions).await {
             return config_change_refusal(e);
         }
 
-        // First, ask the new server who it is -- over its peer API,
-        // dialed exactly as it will be once it is a peer, so a server
-        // this node can't replicate to fails here rather than after
-        // it has been added.
+        // Ask the new server who it is, over its peer API, dialed exactly as it
+        // will be as a peer. A server this node cannot replicate to fails here,
+        // not after it is added.
         let mut client = RaftPeerClient::new(
             raft::peer_endpoint(&req.peer_address, self.peer_tls.as_ref())
                 .map_err(|e| Status::invalid_argument(format!("invalid address: {e}")))?
@@ -2063,7 +1959,7 @@ impl Kv for KvService {
             voting: true,
         };
 
-        // Check that the new server hasn't already been added to the configuration.
+        // Check that the configuration does not already include the new server.
         let config = self.get_config_internal().await.map_err(storage_err)?;
         for member in &config.members {
             if member.server_id == identity.server_id
@@ -2077,9 +1973,9 @@ impl Kv for KvService {
             }
         }
 
-        // Added as a learner, not a voter: see `ConfigChange::AddServer`.
-        // It is promoted automatically once it has caught up, so from a
-        // client's point of view this one call is the whole operation.
+        // Added as a learner, not a voter: see `ConfigChange::AddServer`. It is
+        // promoted automatically when it catches up, so for a client this one
+        // call is the whole operation.
         self.propose(ConfigChange::AddServer {
             server_id: identity.server_id,
             address: identity.address,
@@ -2110,8 +2006,8 @@ impl Kv for KvService {
         if let Err(e) = self.require_admin(&extensions).await {
             return config_change_refusal(e);
         }
-        // Checked here as well as by the leader, so an operator who typed
-        // a bad value is told so plainly rather than as a refused change.
+        // Checked here as well as on the leader, so an operator who typed a bad
+        // value gets a plain error, not a refused change.
         raft::check_heartbeat_ms(req.heartbeat_millis).map_err(Status::invalid_argument)?;
         self.propose(ConfigChange::SetHeartbeat {
             millis: req.heartbeat_millis,
@@ -2139,9 +2035,8 @@ impl Kv for KvService {
         };
         self.require_startup_admin(&extensions)?;
 
-        // A cluster of exactly one: the node is its own sole voter, so it
-        // wins the next election unopposed and can then serve AddServer
-        // to grow from there.
+        // A cluster of one: the node is its only voter, so it wins the next
+        // election unopposed and can then serve AddServer to grow.
         let config = ClusterConfig {
             members: vec![self.identity.clone()],
             heartbeat_millis,
@@ -2150,9 +2045,9 @@ impl Kv for KvService {
             .bootstrap(config)
             .await
             .map_err(raft_err)?;
-        // Before answering, not after: the startup password stops
-        // working the instant a configuration exists, so an operator
-        // told "ok" needs the replacement to already be in the log.
+        // Before the answer, not after: the startup password stops working as
+        // soon as a configuration exists, so an operator told "ok" needs the
+        // administrator to be in the log already.
         self.write_startup_admin().await?;
 
         Ok(Response::new(ConfigChangeResponse {
@@ -2166,12 +2061,11 @@ impl Kv for KvService {
     ) -> Result<Response<GetConfigResponse>, Status> {
         let config = self.get_config_internal().await.map_err(storage_err)?;
 
-        // Both checks are non-blocking on purpose. `is_caught_up` is the
-        // same question `await_caught_up` waits for an answer to, asked
-        // rather than waited on: a client scanning for the leader wants
-        // this node's membership either way, and a leader still applying
-        // the tail it inherited should say "not yet" now instead of
-        // holding the scan up until it is.
+        // Both checks do not block, on purpose. `is_caught_up` asks the
+        // question that `await_caught_up` waits on. A client looking for the
+        // leader wants this node's membership either way, and a leader still
+        // applying its inherited tail should say "not yet" now, not hold up
+        // the search.
         let is_leader = self
             .leader()
             .is_ok_and(|leader| leader.is_caught_up() && leader.has_read_quorum());
@@ -2204,8 +2098,8 @@ impl Kv for KvService {
         &self,
         request: Request<CreateSnapshotRequest>,
     ) -> Result<Response<CreateSnapshotResponse>, Status> {
-        // `into_parts` rather than `into_inner`: who the caller is lives
-        // in the extensions, put there by the auth layer.
+        // `into_parts`, not `into_inner`: the auth layer puts the caller's
+        // identity in the extensions.
         let (_, extensions, req) = request.into_parts();
         let result = self.create_checkpoint_inner(&extensions, req).await;
         Ok(Response::new(CreateSnapshotResponse {
@@ -2240,11 +2134,10 @@ impl Kv for KvService {
         &self,
         _request: Request<ListSnapshotsRequest>,
     ) -> Result<Response<ListSnapshotsResponse>, Status> {
-        // A local read, answerable by any node and stale on the same
-        // terms as any read outside a transaction: a snapshot created
-        // moments ago may not have reached this one yet. Not
-        // admin-gated -- knowing which snapshots exist is what a client
-        // needs in order to read at one, and the ids are its own.
+        // A local read: any node answers, stale like any read outside a
+        // transaction, so a snapshot created a moment ago may not be here yet.
+        // Not admin-only: a client must know which snapshots exist to read at
+        // one, and the ids are its own.
         let listed = self
             .store
             .run(|log| log.list_checkpoints())
@@ -2262,8 +2155,8 @@ impl Kv for KvService {
         &self,
         request: Request<CreateUserRequest>,
     ) -> Result<Response<CreateUserResponse>, Status> {
-        // `into_parts` rather than `into_inner`: who the caller is lives
-        // in the extensions, put there by the auth layer.
+        // `into_parts`, not `into_inner`: the auth layer puts the caller's
+        // identity in the extensions.
         let (_, extensions, req) = request.into_parts();
         let result = self.create_user_inner(&extensions, req).await;
         Ok(Response::new(CreateUserResponse {
@@ -2315,10 +2208,9 @@ impl Kv for KvService {
         &self,
         request: Request<RedeemInviteRequest>,
     ) -> Result<Response<RedeemInviteResponse>, Status> {
-        // `into_inner`, not `into_parts`: there is no verified identity
-        // to look at here and there is not meant to be. Whatever the
-        // caller may do comes from the invitation they present, which is
-        // in the message.
+        // `into_inner`, not `into_parts`: there is no verified identity here,
+        // by design. The caller's rights come from the invitation in the
+        // message.
         let result = self.redeem_invite_inner(request.into_inner()).await;
         Ok(Response::new(RedeemInviteResponse {
             result: Some(match result {
@@ -2522,9 +2414,9 @@ impl Kv for KvService {
 pub struct RaftPeerService {
     peer_handle: RaftPeerHandle,
     /// What `Identify` answers with: this node's identity, and the store
-    /// that says whether it has a configuration yet. `None` on a service
-    /// built without them, which then can't be added to a cluster -- only
-    /// tests that drive the Raft RPCs directly build one that way.
+    /// that says if it has a configuration yet. `None` on a service built
+    /// without them, which cannot be added to a cluster. Only tests that
+    /// drive the Raft RPCs directly build one like that.
     identity: Option<(ClusterMember, Store)>,
 }
 
@@ -2536,8 +2428,8 @@ impl RaftPeerService {
         }
     }
 
-    /// Answers `Identify` as `identity`, reporting whether `store` holds
-    /// a configuration yet.
+    /// Answer `Identify` as `identity`, and report whether `store` holds a
+    /// configuration yet.
     pub fn identify_as(mut self, identity: ClusterMember, store: Store) -> Self {
         self.identity = Some((identity, store));
         self
@@ -2547,26 +2439,27 @@ impl RaftPeerService {
 /// What `reassemble_append_entries` decided about a stream.
 #[derive(Debug)]
 enum Reassembled {
-    /// A complete request, ready for the event loop to rule on properly.
+    /// A complete request, for the event loop to rule on.
     Request(Box<AppendEntriesRequest>),
-    /// Refused here, before the event loop, and why. Still answered with
-    /// an ordinary response rather than an error -- see below.
+    /// Refused here, before the event loop, with the reason. Still answered
+    /// with a normal response, not an error: see below.
     Refused(&'static str),
 }
 
-/// Reads one `AppendEntries` stream back into the request it was split
-/// from.
+/// Read one `AppendEntries` stream back into the request it came from.
 ///
-/// A free function rather than a method for a practical reason:
-/// `tonic::Streaming` has no public constructor, so anything taking a
-/// `Request<Streaming<_>>` cannot be tested at all -- and the rules
-/// below (header first, the size ceiling, the declared-versus-actual
-/// byte count, the stale-term fast path) are exactly the part worth
-/// testing.
+/// A free function, not a method, so that it can be tested:
+/// `tonic::Streaming` has no public constructor, so code that takes a
+/// `Request<Streaming<_>>` cannot be tested. The rules here are the part
+/// worth testing:
+/// - the header comes first,
+/// - the size limit,
+/// - the declared byte count matches the actual one,
+/// - the fast path for a stale term.
 ///
 /// `current_term` is a lower bound on this node's term, used only to
-/// refuse early. Everything that gets past it is still checked on the
-/// event loop, which is where §5.1 actually lives.
+/// refuse early. The event loop checks everything that gets past it;
+/// that is where §5.1 is enforced.
 async fn reassemble_append_entries<S>(
     mut stream: S,
     current_term: u64,
@@ -2586,8 +2479,8 @@ where
         _ => return Err(Status::invalid_argument("first chunk must be a header")),
     };
 
-    // Two reasons to want nothing to do with the body. Both still read
-    // it to the end -- see `drain` below.
+    // Two reasons to ignore the body. In both cases we still read it to the
+    // end: see `drain` below.
     let refusal = if header.term < current_term {
         Some("the leader's term is behind this node's")
     } else if header.entries_bytes > MAX_APPEND_ENTRIES_BYTES as u64 {
@@ -2596,9 +2489,8 @@ where
         None
     };
 
-    // Trusting the declared size to size the buffer would make a single
-    // header an out-of-memory button, so the allocation is bounded by
-    // what this node was willing to accept in the first place.
+    // If the declared size set the buffer size, one header could exhaust
+    // memory. So the allocation is bounded by what this node accepts.
     let mut body = if refusal.is_some() {
         Vec::new()
     } else {
@@ -2613,8 +2505,7 @@ where
             ));
         };
         if refusal.is_some() {
-            // Draining, not collecting: the rest of the stream costs
-            // bandwidth but nothing else.
+            // Drain, do not collect: the rest of the stream costs bandwidth only.
             continue;
         }
         // The header's byte count is a claim; this is the fact.
@@ -2652,17 +2543,15 @@ where
 
 #[tonic::async_trait]
 impl RaftPeer for RaftPeerService {
-    /// Reassembles the stream and hands the result inward unchanged --
-    /// the term check, the log matching and the append all still happen
-    /// on the event loop, exactly as they did when this was unary.
+    /// Reassemble the stream and pass the result in unchanged. The term
+    /// check, log matching and append all happen on the event loop.
     ///
-    /// A refusal is answered with an ordinary `AppendEntriesResponse`
-    /// carrying this node's term, never a `Status`. That is load-bearing
-    /// rather than stylistic: a response is how a leader on a stale term
-    /// learns to step down (`Event::response_term`), and an error
-    /// returned while the leader is still writing its request body
-    /// surfaces to it as a transport failure, which it would retry
-    /// forever without ever seeing the term that should have stopped it.
+    /// A refusal is a normal `AppendEntriesResponse` with this node's term,
+    /// never a `Status`. This matters: the response is how a leader with a
+    /// stale term learns to step down (`Event::response_term`). An error
+    /// sent while the leader is still writing its request reaches it as a
+    /// transport failure, which it retries forever without seeing the term
+    /// that should stop it.
     async fn append_entries(
         &self,
         request: Request<tonic::Streaming<AppendEntriesChunk>>,
@@ -2680,10 +2569,8 @@ impl RaftPeer for RaftPeerService {
             Reassembled::Refused(why) => {
                 tracing::warn!("refused an append_entries stream: {why}");
                 Ok(Response::new(AppendEntriesResponse {
-                    // Read again rather than reusing `current_term`: the
-                    // event loop may have moved on while the body was
-                    // being drained, and a leader deserves the freshest
-                    // term this node can give it.
+                    // Read the term again: the event loop may have moved on while the body
+                    // drained, and the leader should get the newest term this node has.
                     term: self.peer_handle.current_term(),
                     success: false,
                     match_index: 0,
@@ -2710,9 +2597,9 @@ impl RaftPeer for RaftPeerService {
         &self,
         request: Request<GetLeaseRequest>,
     ) -> Result<Response<GetLeaseResponse>, Status> {
-        // Deliberately synchronous and infallible -- see
-        // `RaftPeerHandle::get_lease`'s doc for why this must never be
-        // able to get stuck behind, e.g., a slow in-progress AppendEntries.
+        // Synchronous and infallible on purpose: see the doc of
+        // `RaftPeerHandle::get_lease` for why this must never wait behind, for
+        // example, a slow AppendEntries.
         Ok(Response::new(
             self.peer_handle.get_lease(request.into_inner()),
         ))
@@ -2744,10 +2631,9 @@ impl RaftPeer for RaftPeerService {
     ) -> Result<Response<InstallSnapshotResponse>, Status> {
         let mut stream = request.into_inner();
 
-        // First message must be the header: Raft-protocol metadata
-        // (term/leader_id) for this RPC, distinct from the
-        // storage-level header embedded in the reassembled bytes below
-        // (which `RaftLog::install_snapshot` parses back out itself).
+        // The first message must be the header. It carries Raft metadata (term,
+        // leader_id) for this RPC, separate from the storage header inside the
+        // reassembled bytes, which `RaftLog::install_snapshot` parses itself.
         let first = stream
             .message()
             .await?
@@ -2757,15 +2643,14 @@ impl RaftPeer for RaftPeerService {
             _ => return Err(Status::invalid_argument("first chunk must be a header")),
         };
 
-        // The chunks go straight through to `install_snapshot` as they
-        // arrive, rather than being assembled first. A snapshot is the
-        // cluster's entire applied state, so "buffer it, then install
-        // it" has no size at which it stays reasonable -- what is held
-        // here is `CHUNK_BACKLOG` chunks, whatever the snapshot weighs.
+        // Chunks go to `install_snapshot` as they arrive, not after assembly. A
+        // snapshot is the cluster's whole applied state, so "buffer it, then
+        // install it" fails at some size. Only `CHUNK_BACKLOG` chunks are held
+        // here, whatever the snapshot size.
         //
-        // The install and the pump have to run at the same time: the
-        // install blocks waiting for chunks that only the pump can
-        // deliver, and the pump finishes only once the stream is done.
+        // The install and the pump must run at the same time: the install waits
+        // for chunks that only the pump delivers, and the pump finishes only
+        // when the stream ends.
         let (tx, rx) = tokio::sync::mpsc::channel(crate::store::CHUNK_BACKLOG);
         let install = self
             .peer_handle
@@ -2780,13 +2665,11 @@ impl RaftPeer for RaftPeerService {
                 if giving_up {
                     continue;
                 }
-                // A closed channel means the state machine refused this
-                // snapshot -- a stale term, most likely -- and dropped
-                // the reader. Keep reading the stream to its end anyway:
-                // answering while the sender is still writing its
-                // request body reaches it as a transport error rather
-                // than the response carrying the term that should make
-                // it stand down.
+                // A closed channel means the state machine refused this snapshot
+                // (probably a stale term) and dropped the reader. Read the stream to its
+                // end anyway: an answer sent while the sender still writes its request
+                // reaches it as a transport error, not as the response whose term should
+                // make it step down.
                 if tx.send(data.to_vec()).await.is_err() {
                     giving_up = true;
                 }

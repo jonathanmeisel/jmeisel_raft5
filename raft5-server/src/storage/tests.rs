@@ -2,8 +2,8 @@ use super::checkpoint::{checkpoint_key, encode_record};
 use super::snapshot::SNAPSHOT_MAGIC;
 use super::*;
 
-/// A budget no test here can reach, for the tests that are about
-/// something other than the budget.
+/// A budget no test here can reach, for tests about something other than
+/// the budget.
 const NO_BUDGET: usize = usize::MAX;
 
 fn open_temp() -> (RaftLog, std::path::PathBuf) {
@@ -16,12 +16,11 @@ fn open_temp() -> (RaftLog, std::path::PathBuf) {
 
 /// A unique directory suffix.
 ///
-/// A nanosecond timestamp alone isn't reliable under parallel test
-/// execution -- two tests starting at nearly the same instant can land
-/// on the same value (clock resolution, scheduling) and then collide on
-/// the same directory, which surfaces as `Db(Locked)` from whichever
-/// one opens second. A process-wide counter on top guarantees
-/// uniqueness regardless. Same reasoning, and the same fix, as
+/// A nanosecond timestamp alone is not reliable when tests run in
+/// parallel: two tests that start at nearly the same moment can get the
+/// same value and collide on one directory, which shows up as
+/// `Db(Locked)` for whichever opens second. A process-wide counter on top
+/// guarantees uniqueness. Same reasoning and fix as
 /// `raft::test_support::open_temp_log`.
 fn rand_suffix() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -51,11 +50,10 @@ fn append_assigns_gap_free_increasing_seqs() {
 
 #[test]
 fn append_does_not_touch_latest() {
-    // `append` only ever writes `log` -- `latest` must stay exactly as
-    // it was (nothing, for a brand new key) until `apply_committed`
-    // says otherwise. This is the whole point of the split: an
-    // appended-but-uncommitted write must never be visible via
-    // `get_latest`.
+    // `append` writes only `log`: `versions` must stay as it was (nothing, for
+    // a new key) until `apply_committed` says otherwise. That is the point of
+    // the split: an appended but uncommitted write must never be visible
+    // through `get_latest`.
     let (log, path) = open_temp();
     log.append(1, b"k", Some(b"v1")).unwrap();
     assert_eq!(log.get_latest(b"k").unwrap(), None);
@@ -78,8 +76,8 @@ fn apply_committed_advances_latest_to_the_newest_applied_write() {
 
 #[test]
 fn apply_committed_only_applies_up_to_the_requested_seq() {
-    // A write past `up_to_seq` must not be visible yet -- it hasn't
-    // been confirmed committed.
+    // A write past `up_to_seq` must not be visible yet: it is not confirmed
+    // committed.
     let (log, path) = open_temp();
     let seq1 = log.append(1, b"k", Some(b"v1")).unwrap();
     log.append(1, b"k", Some(b"v2")).unwrap();
@@ -100,9 +98,8 @@ fn apply_committed_removes_a_deleted_key_from_latest_entirely() {
 
     log.apply_committed(del_seq).unwrap();
 
-    // A committed delete is permanent -- there's nothing left to
-    // distinguish it from "never written" for, unlike `log` itself
-    // (which still records the tombstone as a normal entry).
+    // A committed delete reads as "never written". `log` still records the
+    // delete as a normal entry.
     assert_eq!(log.get_latest(b"k").unwrap(), None);
     let entries = log.entries_in_range(del_seq, del_seq + 1).unwrap();
     assert_eq!(entries.len(), 1);
@@ -128,7 +125,7 @@ fn apply_committed_resumes_from_the_previous_watermark_across_calls() {
     assert_eq!(seq, seq2);
     assert_eq!(val, b"v2".to_vec());
 
-    // A second call at or below the previous watermark is a no-op.
+    // A second call at or below the previous watermark does nothing.
     log.apply_committed(seq1).unwrap();
     assert_eq!(log.get_latest(b"k").unwrap().unwrap().0, seq2);
 
@@ -142,14 +139,14 @@ fn append_noop_takes_a_seq_and_round_trips_its_kind() {
     let noop = log.append_noop(2).unwrap();
     let s3 = log.append(2, b"b", Some(b"2")).unwrap();
 
-    // A no-op is a real log entry: it consumes a sequence number, so
-    // the writes around it aren't contiguous.
+    // A no-op is a real log entry: it uses a seq, so the writes around it are
+    // not contiguous.
     assert_eq!((s1, noop, s3), (1, 2, 3));
 
     let stored = log.entries_in_range(1, 4).unwrap();
     assert_eq!(stored[1].payload, EntryPayload::NoOp);
     assert_eq!(stored[1].term, 2);
-    // The neighbours still decode as ordinary writes.
+    // The neighbors still decode as normal writes.
     assert_eq!(
         stored[0].payload.writes(),
         [Mutation::new(*b"a", Some(*b"1"))]
@@ -158,8 +155,8 @@ fn append_noop_takes_a_seq_and_round_trips_its_kind() {
         stored[2].payload.writes(),
         [Mutation::new(*b"b", Some(*b"2"))]
     );
-    // And the term is still readable at the no-op's index, which is
-    // what the Figure 8 commit check consults.
+    // And the term is still readable at the no-op's index, which the Figure 8
+    // commit check uses.
     assert_eq!(log.term_at(noop).unwrap(), Some(2));
 
     cleanup(&path);
@@ -172,8 +169,8 @@ fn a_committed_noop_contributes_nothing_to_latest() {
     let noop = log.append_noop(2).unwrap();
     log.apply_committed(noop).unwrap();
 
-    // The no-op moved the applied watermark without writing a row --
-    // in particular it did not insert an empty key.
+    // The no-op moved the applied watermark without writing a row; in
+    // particular, it did not insert an empty key.
     assert_eq!(log.get_latest(b"a").unwrap(), Some((1, b"1".to_vec())));
     assert_eq!(log.get_latest(b"").unwrap(), None);
 
@@ -193,9 +190,9 @@ fn current_config_reads_the_newest_config_entry_without_waiting_for_commitment()
 
     let c1 = log.append_config(1, b"cfg-1").unwrap();
     log.append(1, b"a", Some(b"1")).unwrap();
-    // Nothing has been applied, so `latest` is still empty -- the
-    // configuration has to be visible anyway (it takes effect on
-    // append), which is exactly why it is read from `log`.
+    // Nothing is applied, so `versions` is still empty. The configuration
+    // must be visible anyway (it takes effect on append), which is why it is
+    // read from `log`.
     assert_eq!(log.get_latest(b"a").unwrap(), None);
     assert_eq!(log.current_config().unwrap(), Some(b"cfg-1".to_vec()));
 
@@ -207,8 +204,8 @@ fn current_config_reads_the_newest_config_entry_without_waiting_for_commitment()
     assert_eq!(log.config_at(c1).unwrap(), Some(b"cfg-1".to_vec()));
     assert_eq!(log.config_at(c1 - 1).unwrap(), None);
 
-    // A rolled-back config entry reverts the active configuration,
-    // which is the flip side of activating on append.
+    // A rolled-back configuration entry reverts the active configuration: the
+    // other side of taking effect on append.
     log.truncate_from(c2).unwrap();
     assert_eq!(log.current_config().unwrap(), Some(b"cfg-1".to_vec()));
 
@@ -223,13 +220,13 @@ fn a_config_entry_survives_being_compacted_away() {
     let tail = log.append(1, b"b", Some(b"2")).unwrap();
     log.apply_committed(tail).unwrap();
 
-    // Compact past the config entry entirely: it no longer exists in
-    // `log`, but a node still has to know who its peers are.
+    // Compact past the configuration entry: it no longer exists in `log`, but
+    // the node must still know its peers.
     log.compact(tail + 1).unwrap();
     assert!(log.entries_in_range(1, tail + 1).unwrap().is_empty());
     assert_eq!(log.current_config().unwrap(), Some(b"cfg-1".to_vec()));
 
-    // A newer config entry still wins over the compacted fallback.
+    // A newer configuration entry still wins over the compacted fallback.
     log.append_config(2, b"cfg-2").unwrap();
     assert_eq!(log.current_config().unwrap(), Some(b"cfg-2".to_vec()));
 
@@ -243,9 +240,9 @@ fn a_config_entry_is_not_state_machine_data() {
     let cfg = log.append_config(1, b"cfg-1").unwrap();
     log.apply_committed(cfg).unwrap();
 
-    // Applied, but it wrote no row: in particular not an empty key
-    // holding the encoded config, which would then leak into every
-    // snapshot as if it were user data.
+    // Applied, but it wrote no row. In particular, no empty key holding the
+    // encoded configuration, which would then leak into every snapshot as if
+    // it were user data.
     assert_eq!(log.get_latest(b"").unwrap(), None);
     let mut buf = Vec::new();
     assert_eq!(log.export_snapshot(&mut buf).unwrap().entry_count, 1);
@@ -263,9 +260,8 @@ fn a_snapshot_carries_the_configuration_to_its_recipient() {
     let mut buf = Vec::new();
     log.export_snapshot(&mut buf).unwrap();
 
-    // The target's own config entry is wiped along with its log, so
-    // without the header it would come out of the install with no
-    // idea who is in the cluster.
+    // The target's own configuration entry is wiped with its log, so without
+    // the header it would end the install not knowing who is in the cluster.
     let (target, target_path) = open_temp();
     target.append_config(1, b"stale-cfg").unwrap();
     target.install_snapshot(&mut buf.as_slice()).unwrap();
@@ -285,9 +281,9 @@ fn a_snapshot_excludes_a_configuration_past_its_boundary() {
     log.append_config(1, b"cfg-1").unwrap();
     let tail = log.append(1, b"a", Some(b"1")).unwrap();
     log.apply_committed(tail).unwrap();
-    // Appended after the applied watermark, so it is outside what
-    // this snapshot describes -- the leader replicates it as an
-    // ordinary entry right after the install instead.
+    // Appended after the applied watermark, so it is outside what this
+    // snapshot describes. The leader replicates it as a normal entry right
+    // after the install.
     log.append_config(1, b"cfg-2").unwrap();
 
     let mut buf = Vec::new();
@@ -301,13 +297,11 @@ fn a_snapshot_excludes_a_configuration_past_its_boundary() {
     cleanup(&target_path);
 }
 
-/// A committed delete *does* travel, as a tombstone.
+/// A committed delete does travel, as a tombstone.
 ///
-/// This inverts what it asserted before versioning: a tombstone used to
-/// be absence, and absence needs no representation. Now it is the only
-/// thing that can tell a recipient the key did not exist as of a
-/// checkpoint taken after the delete, so dropping it would be losing
-/// state rather than saving space.
+/// A tombstone is the only thing that can tell a recipient that the key
+/// did not exist as of a checkpoint taken after the delete, so dropping it
+/// would lose state, not save space.
 #[test]
 fn export_snapshot_carries_a_committed_delete_as_a_tombstone() {
     let (log, path) = open_temp();
@@ -318,7 +312,7 @@ fn export_snapshot_carries_a_committed_delete_as_a_tombstone() {
 
     let mut buf = Vec::new();
     let meta = log.export_snapshot(&mut buf).unwrap();
-    // "a"'s value, "a"'s tombstone, and "b" -- every retained row.
+    // "a"'s value, "a"'s tombstone, and "b": every kept row.
     assert_eq!(meta.entry_count, 3);
 
     let (target, target_path) = open_temp();
@@ -326,8 +320,8 @@ fn export_snapshot_carries_a_committed_delete_as_a_tombstone() {
 
     // Currently absent, as on the source.
     assert_eq!(target.get_latest(b"a").unwrap(), None);
-    // And each row came back at its *own* seq, not the boundary --
-    // which is what lets a checkpoint below the delete still see it.
+    // And each row came back at its own seq, not the boundary, which lets a
+    // checkpoint below the delete still see it.
     assert_eq!(
         target.get_as_of(b"a", first).unwrap(),
         Some((first, b"1".to_vec()))
@@ -357,13 +351,12 @@ fn compact_removes_entries_below_threshold_but_preserves_current_value() {
     assert!(log.entries_in_range(0, above).unwrap().is_empty());
     assert_eq!(log.term_at(1).unwrap(), None);
     // ...except the floor boundary itself (`below_seq - 1`), which
-    // `last_entry`/`term_at` still need an answer for even once `log`
-    // has nothing left at or below it.
+    // `last_entry` and `term_at` still answer for even when `log` has nothing
+    // at or below it.
     assert_eq!(log.term_at(s3).unwrap(), Some(1));
 
-    // ...but `get_latest` still works, since `latest` is untouched by
-    // `compact` (it was already brought up to date by `apply_committed`
-    // above).
+    // ...but `get_latest` still works, because `compact` does not touch
+    // `versions` (`apply_committed` already brought it up to date above).
     let (seq, val) = log.get_latest(b"k").unwrap().unwrap();
     assert_eq!(seq, above);
     assert_eq!(val, b"v4".to_vec());
@@ -372,23 +365,22 @@ fn compact_removes_entries_below_threshold_but_preserves_current_value() {
 
 #[test]
 fn compact_clamps_to_the_applied_watermark_rather_than_losing_data() {
-    // The key new safety invariant: `compact` must never physically
-    // remove a `log` entry that `apply_committed` hasn't copied into
-    // `latest` yet, since `log` is the only place that data exists
-    // until it has been. Asking to compact past what's been applied
-    // must silently do *less*, never lose data.
+    // The safety rule: `compact` must never remove a `log` entry that
+    // `apply_committed` has not yet copied into `versions`, because `log` is
+    // the only place that data exists until then. Asking to compact past what
+    // is applied must silently do less, never lose data.
     let (log, path) = open_temp();
     log.append(1, b"k", Some(b"v1")).unwrap();
     let s2 = log.append(1, b"k", Some(b"v2")).unwrap();
-    // Deliberately no `apply_committed` call before compacting.
+    // No `apply_committed` call before compacting, on purpose.
 
     log.compact(s2 + 1).unwrap();
 
-    // Nothing was removed -- clamped to applied_seq (0), which is
-    // `<=` the existing compact watermark (also 0), a no-op.
+    // Nothing was removed: clamped to applied_seq (0), which is `<=` the
+    // existing compact watermark (also 0), so it did nothing.
     assert_eq!(log.entries_in_range(0, s2 + 1).unwrap().len(), 2);
 
-    // Once applied, a later compact call can now proceed for real.
+    // Once applied, a later compact call goes ahead for real.
     log.apply_committed(s2).unwrap();
     log.compact(s2 + 1).unwrap();
     assert!(log.entries_in_range(0, s2 + 1).unwrap().is_empty());
@@ -399,11 +391,9 @@ fn compact_clamps_to_the_applied_watermark_rather_than_losing_data() {
 
 #[test]
 fn compact_to_the_tail_leaves_last_entry_and_term_at_answerable() {
-    // Compacting all the way through the current tail empties `log`
-    // entirely (unlike the old per-key compaction, which always left
-    // at least the newest entry behind). `last_entry`/`term_at` must
-    // still be able to answer for that boundary, the same way they do
-    // after `install_snapshot`.
+    // Compacting through the current tail empties `log` completely.
+    // `last_entry` and `term_at` must still answer for that boundary, as they
+    // do after `install_snapshot`.
     let (log, path) = open_temp();
     log.append(1, b"a", Some(b"1")).unwrap();
     log.append(1, b"a", Some(b"2")).unwrap();
@@ -415,7 +405,7 @@ fn compact_to_the_tail_leaves_last_entry_and_term_at_answerable() {
     assert_eq!(log.last_entry().unwrap(), Some((last, 2)));
     assert_eq!(log.term_at(last).unwrap(), Some(2));
 
-    // Sequencing continues correctly even though `log` is empty.
+    // Sequencing continues correctly although `log` is empty.
     let next = log.append(2, b"c", Some(b"new")).unwrap();
     assert_eq!(next, last + 1);
 
@@ -424,9 +414,8 @@ fn compact_to_the_tail_leaves_last_entry_and_term_at_answerable() {
 
 #[test]
 fn compact_resumes_from_the_previous_watermark_across_calls() {
-    // Two compaction passes should each only need to touch entries
-    // added since the last one — the second call must not need to
-    // rescan what the first one already deleted.
+    // Each compaction pass should touch only entries added since the last
+    // one: the second call must not rescan what the first already deleted.
     let (log, path) = open_temp();
     log.append(1, b"k", Some(b"v1")).unwrap();
     let s2 = log.append(1, b"k", Some(b"v2")).unwrap();
@@ -444,8 +433,8 @@ fn compact_resumes_from_the_previous_watermark_across_calls() {
     assert_eq!(seq, s4);
     assert_eq!(val, b"v4".to_vec());
 
-    // A second call with a threshold at or below the previous one is a
-    // no-op rather than an error or a rescan.
+    // A second call with a threshold at or below the previous one does
+    // nothing; it is not an error or a rescan.
     log.compact(s2 + 1).unwrap();
     assert_eq!(log.get_latest(b"k").unwrap().unwrap().0, s4);
 
@@ -454,9 +443,8 @@ fn compact_resumes_from_the_previous_watermark_across_calls() {
 
 #[test]
 fn compact_handles_many_entries_across_chunks() {
-    // Exercises the chunked-flush path in `compact` (WRITE_CHUNK is
-    // 1000) with more entries below the threshold than fit in one
-    // batch.
+    // Exercises the chunked-flush path in `compact` (WRITE_CHUNK is 1000),
+    // with more entries below the threshold than fit in one batch.
     let (log, path) = open_temp();
     let mut last_seq = 0;
     for i in 0..2500u32 {
@@ -491,11 +479,9 @@ fn truncate_from_removes_the_suffix_and_resumes_sequencing_there() {
 
 #[test]
 fn truncate_from_never_touches_latest() {
-    // `truncate_from` only ever removes *uncommitted* entries (see its
-    // doc), and `latest` only ever reflects *committed* ones -- so a
-    // truncation should never have anything to fix up there, unlike
-    // the old design where `latest` could be ahead of what's
-    // committed and truncation had to revert it.
+    // `truncate_from` only removes uncommitted entries (see its doc), and
+    // `versions` only shows committed ones, so a truncation never has anything
+    // to fix there.
     let (log, path) = open_temp();
     let keep = log.append(1, b"k", Some(b"v1")).unwrap();
     log.apply_committed(keep).unwrap();
@@ -503,8 +489,8 @@ fn truncate_from_never_touches_latest() {
 
     log.truncate_from(keep + 1).unwrap();
 
-    // The committed value is completely unaffected by truncating the
-    // uncommitted write that came after it.
+    // Truncating the uncommitted write after it does not affect the committed
+    // value at all.
     assert_eq!(log.get_latest(b"k").unwrap(), Some((keep, b"v1".to_vec())));
     cleanup(&path);
 }
@@ -564,17 +550,16 @@ fn export_snapshot_reflects_compacted_state() {
 
     let mut buf = Vec::new();
     let meta = log.export_snapshot(&mut buf).unwrap();
-    // Every *retained version*: "a" at 1, "a" at 2, "b" at 3. An export
-    // is no longer one record per live key, because a key is no longer
-    // one row -- compacting `log` says nothing about how many versions
-    // `versions` is still holding.
+    // Every kept version: "a" at 1, "a" at 2, "b" at 3. An export is one record
+    // per version, not per live key: compacting `log` says nothing about how
+    // many versions `versions` still holds.
     assert_eq!(meta.entry_count, 3);
     assert_eq!(meta.last_included_seq, last);
     assert_eq!(meta.last_included_term, 2);
     assert!(buf.starts_with(SNAPSHOT_MAGIC));
 
-    // Collecting the superseded version is what brings an export back
-    // down to one record per key.
+    // Collecting the superseded version brings an export down to one record
+    // per key.
     log.gc_versions(usize::MAX).unwrap();
     let mut buf = Vec::new();
     assert_eq!(log.export_snapshot(&mut buf).unwrap().entry_count, 2);
@@ -584,10 +569,9 @@ fn export_snapshot_reflects_compacted_state() {
 
 #[test]
 fn export_snapshot_reflects_applied_seq_not_the_raw_log_tail() {
-    // An appended-but-uncommitted entry must not be described by the
-    // snapshot's own metadata, even though it's physically the log's
-    // tail -- `latest` (what's actually being exported) doesn't
-    // reflect it yet either.
+    // An appended but uncommitted entry must not be in the snapshot's metadata,
+    // even though it is the log's physical tail: `versions` (what is exported)
+    // does not show it either.
     let (log, path) = open_temp();
     let applied = log.append(1, b"a", Some(b"1")).unwrap();
     log.apply_committed(applied).unwrap();
@@ -617,21 +601,20 @@ fn install_snapshot_replaces_state_and_continues_sequencing() {
     let meta = target.install_snapshot(&mut buf.as_slice()).unwrap();
     assert_eq!(meta.last_included_seq, last);
     assert_eq!(meta.last_included_term, 2);
-    // Three retained versions, not two live keys: "a" was written
-    // twice and nothing has collected the superseded row yet.
+    // Three kept versions, not two live keys: "a" was written twice and nothing
+    // has collected the superseded row yet.
     assert_eq!(meta.entry_count, 3);
 
-    // State came across correctly -- and "a" kept the seq it was
-    // actually written at (2), rather than being re-stamped at the
-    // snapshot boundary (3). Re-stamping would not merely lose history:
-    // a checkpoint record's seq *is* its row's seq, so it would leave
-    // every checkpoint claiming a point it was never taken at.
+    // The state arrived correctly, and "a" kept the seq it was written at (2),
+    // not re-stamped at the snapshot boundary (3). Re-stamping would not only
+    // lose history: a checkpoint record's seq is its row's seq, so every
+    // checkpoint would claim a point it was never taken at.
     let (seq, val) = target.get_latest(b"a").unwrap().unwrap();
     assert_eq!((seq, val), (2, b"2".to_vec()));
     assert_eq!(target.last_entry().unwrap(), Some((last, 2)));
 
-    // Sequencing continues from where the snapshot left off, with no
-    // gap, even though `log` has nothing before this new append.
+    // Sequencing continues from where the snapshot left off, with no gap,
+    // although `log` has nothing before this new append.
     let next = target.append(2, b"c", Some(b"new")).unwrap();
     assert_eq!(next, last + 1);
 
@@ -641,8 +624,8 @@ fn install_snapshot_replaces_state_and_continues_sequencing() {
 
 #[test]
 fn install_snapshot_wipes_prior_state_on_the_target() {
-    // The target already has its own unrelated (committed) history;
-    // installing a snapshot must fully replace it, not merge with it.
+    // The target already has its own unrelated committed history; installing
+    // a snapshot must replace it fully, not merge with it.
     let (target, target_path) = open_temp();
     let stale = target.append(1, b"stale", Some(b"old")).unwrap();
     target.apply_committed(stale).unwrap();
@@ -679,7 +662,7 @@ fn next_seq_recovers_from_watermark_with_no_log_entries() {
     target.install_snapshot(&mut buf.as_slice()).unwrap();
     drop(target);
 
-    // Reopen with no further appends: log CF is empty, so next_seq
+    // Reopen with no further appends: the log keyspace is empty, so next_seq
     // must come from the meta watermark alone.
     let reopened = RaftLog::open(&target_path).unwrap();
     assert_eq!(reopened.last_entry().unwrap(), Some((last, 2)));
@@ -735,10 +718,10 @@ fn recovers_next_seq_after_reopen() {
 
 // --- multi-key entries ------------------------------------------------
 
-/// Every payload shape has to survive a round trip through the row
-/// encoding, because a `log` row is the only record of what an entry was.
-/// Postcard writes an enum's discriminant positionally, so this is also
-/// the test that notices if `EntryPayload`'s variants are ever reordered.
+/// Every payload shape must survive a round trip through the row encoding,
+/// because a `log` row is the only record of what an entry was. Postcard
+/// writes an enum discriminant by position, so this test also notices if
+/// `EntryPayload`'s variants are ever reordered.
 #[test]
 fn every_payload_round_trips_through_a_log_row() {
     let (log, path) = open_temp();
@@ -765,11 +748,8 @@ fn every_payload_round_trips_through_a_log_row() {
     cleanup(&path);
 }
 
-/// Bounds checking used to be this module's own job, one hand-written
-/// length guard per field. It is the decoder's now, and a corrupt row has
-/// to still come back as an error rather than a panic or a wrong answer --
-/// that property is the whole reason the hand-rolled framing was safe to
-/// delete.
+/// The decoder does the bounds checking, and a corrupt row must still come
+/// back as an error, not a panic or a wrong answer.
 #[test]
 fn a_corrupt_log_row_is_refused_rather_than_half_read() {
     let good = encode_log_entry(
@@ -787,7 +767,7 @@ fn a_corrupt_log_row_is_refused_rather_than_half_read() {
         );
     }
 
-    // And a row claiming a payload variant that doesn't exist.
+    // And a row that claims a payload variant that does not exist.
     let mut unknown_variant = good.clone();
     unknown_variant[1] = 0x7f;
     assert!(decode_log_entry(&unknown_variant).is_err());
@@ -799,8 +779,8 @@ fn a_corrupt_log_row_is_refused_rather_than_half_read() {
 }
 
 /// The point of putting a transaction's writes in one entry: they reach
-/// `latest` together, at one seq, or not at all. Applying only up to the
-/// entry *before* it must show none of them.
+/// `versions` together, at one seq, or not at all. Applying only up to the
+/// entry before must show none of them.
 #[test]
 fn a_multi_key_entry_applies_all_of_its_writes_at_one_seq() {
     let (log, path) = open_temp();
@@ -817,7 +797,7 @@ fn a_multi_key_entry_applies_all_of_its_writes_at_one_seq() {
         )
         .unwrap();
 
-    // Committed only as far as the entry before it: none of it is visible.
+    // Committed only up to the entry before: none of it is visible.
     log.apply_committed(txn - 1).unwrap();
     assert_eq!(log.get_latest(b"a").unwrap(), None);
     assert_eq!(log.get_latest(b"b").unwrap(), None);
@@ -826,15 +806,15 @@ fn a_multi_key_entry_applies_all_of_its_writes_at_one_seq() {
     log.apply_committed(txn).unwrap();
     assert_eq!(log.get_latest(b"a").unwrap(), Some((txn, b"1".to_vec())));
     assert_eq!(log.get_latest(b"b").unwrap(), Some((txn, b"2".to_vec())));
-    // A delete inside the entry lands with the rest of it.
+    // A delete in the entry lands with the rest of it.
     assert_eq!(log.get_latest(b"untouched").unwrap(), None);
 
     cleanup(&path);
 }
 
-/// An entry with more mutations than `WRITE_CHUNK` is deliberately *not*
-/// split across batches -- splitting it is exactly the tear the entry
-/// exists to prevent -- so it has to apply whole anyway.
+/// An entry with more mutations than `WRITE_CHUNK` is not split across
+/// batches, on purpose (splitting is the tear the entry exists to
+/// prevent), so it must still apply whole.
 #[test]
 fn a_multi_key_entry_larger_than_a_write_chunk_still_applies_whole() {
     let (log, path) = open_temp();
@@ -857,12 +837,11 @@ fn a_multi_key_entry_larger_than_a_write_chunk_still_applies_whole() {
     cleanup(&path);
 }
 
-/// Two *separate* point reads straddling a commit see two points in
-/// time -- that is not a torn batch, and no storage-level lock could make
-/// it otherwise. Pinned here because it is the property that decides
-/// where multi-key consistency has to come from: the lock table in
-/// `grpc::KvService`, not `storage`. If this ever stops holding, the
-/// reasoning in the module doc needs revisiting.
+/// Two separate point reads across a commit see two points in time. That
+/// is not a torn batch, and no storage lock could change it. Kept because
+/// this property decides where multi-key consistency must come from: one
+/// snapshot (`read_many`) or the lock table in `grpc::KvService`. If this
+/// ever stops holding, review the reasoning in the module doc.
 #[test]
 fn two_separate_reads_can_straddle_a_commit() {
     let (log, path) = open_temp();
@@ -878,10 +857,10 @@ fn two_separate_reads_can_straddle_a_commit() {
         .unwrap();
     log.apply_committed(first).unwrap();
 
-    // A reader that reads `a`, is interrupted by a whole second entry,
-    // then reads `b`, sees the two keys at different seqs. Spelled out
-    // sequentially rather than raced, so it is a statement about the
-    // interleaving rather than a flaky one about timing.
+    // A reader that reads `a`, is interrupted by a whole second entry, then
+    // reads `b`, sees the two keys at different seqs. Written out in sequence,
+    // not raced, so it is a statement about the interleaving, not a flaky one
+    // about timing.
     let a = log.get_latest(b"a").unwrap();
 
     let second = log
@@ -903,12 +882,12 @@ fn two_separate_reads_can_straddle_a_commit() {
     cleanup(&path);
 }
 
-/// `export_snapshot` is the one thing that reads many keys of `latest` in
-/// a single operation, and `Keyspace::iter` pins a snapshot nonce so it
-/// reads them all at one instant. That is what keeps a snapshot from
-/// capturing an entry half-applied and handing its recipient a state no
-/// node ever had -- a property this module leans on rather than provides,
-/// so it is worth a test that would notice it changing.
+/// `export_snapshot` reads many keys of `versions` in one operation, and
+/// `Keyspace::iter` pins a snapshot nonce, so it reads them all at one
+/// moment. That keeps a snapshot from capturing an entry half applied and
+/// giving its recipient a state no node ever had. This module relies on
+/// that property but does not provide it, so it deserves a test that would
+/// notice it change.
 #[test]
 fn a_snapshot_never_captures_an_entry_half_applied() {
     let (log, path) = open_temp();
@@ -939,16 +918,16 @@ fn a_snapshot_never_captures_an_entry_half_applied() {
     cleanup(&dest_path);
 }
 
-/// Guards the `serde_bytes` attributes on this module's byte-string
-/// fields, which nothing else can catch: without them serde encodes a
-/// `Vec<u8>` as a sequence of `u8` and makes one serializer call per
-/// byte, which is ~50 MB/s instead of ~2 GB/s -- and produces *byte-for-
-/// byte identical output*, so no round-trip or format test notices.
+/// Guards the `serde_bytes` attributes on this module's byte-string fields,
+/// which nothing else can catch: without them, serde encodes a `Vec<u8>` as
+/// a sequence of `u8`, with one serializer call per byte (~50 MB/s instead
+/// of ~2 GB/s), and produces byte-for-byte identical output, so no
+/// round-trip or format test notices.
 ///
-/// A coarse threshold on purpose. 32 MiB inside 300ms is a floor of
-/// about 110 MB/s, which is comfortably under what the fixed code does
-/// on any machine that can run this suite (a few GB/s here, so ~20x
-/// headroom) and comfortably over what the per-byte path manages.
+/// A coarse threshold on purpose. 32 MiB within 300ms is a floor of about
+/// 110 MB/s: well below what the correct code does on any machine that can
+/// run this suite (a few GB/s here, about 20x headroom), and well above
+/// what the per-byte path manages.
 #[test]
 fn large_values_are_encoded_as_bytes_rather_than_byte_by_byte() {
     const SIZE: usize = 32 * 1024 * 1024;
@@ -976,21 +955,20 @@ fn large_values_are_encoded_as_bytes_rather_than_byte_by_byte() {
     );
 }
 
-/// A snapshot moves through a *bounded* channel, so neither end ever
-/// holds all of it.
+/// A snapshot moves through a bounded channel, so neither end ever holds
+/// all of it.
 ///
-/// This is the property, and it is the test: the channel holds
-/// `CHUNK_BACKLOG` chunks and the snapshot here is several times that.
-/// An implementation that collected the export before installing it --
-/// which is what this used to do, on both ends -- cannot get past a full
-/// channel, so it would hang here rather than fail an assertion.
+/// This test checks that property: the channel holds `CHUNK_BACKLOG`
+/// chunks, and the snapshot here is several times that. An implementation
+/// that collected the export before installing it could not get past a
+/// full channel, so it would hang here instead of failing an assertion.
 #[test]
 fn a_snapshot_streams_through_a_bounded_channel_rather_than_being_buffered() {
     use crate::store::{CHUNK_BACKLOG, ChunkReader, ChunkWriter};
     use std::io::Write;
 
     let (source, source_path) = open_temp();
-    // Comfortably more than the channel can hold at once.
+    // Well more than the channel can hold at once.
     const KEYS: usize = 64;
     const VALUE_BYTES: usize = 64 * 1024;
     for i in 0..KEYS {
@@ -1016,8 +994,8 @@ fn a_snapshot_streams_through_a_bounded_channel_rather_than_being_buffered() {
         }
     });
 
-    // Installing here, on this thread, while the export runs on that
-    // one. Neither can finish without the other making room.
+    // Install here, on this thread, while the export runs on that one.
+    // Neither can finish unless the other makes room.
     let (dest, dest_path) = open_temp();
     let installed = dest.install_snapshot(&mut ChunkReader::new(rx)).unwrap();
     let exported = exporting
@@ -1040,9 +1018,9 @@ fn a_snapshot_streams_through_a_bounded_channel_rather_than_being_buffered() {
     cleanup(&dest_path);
 }
 
-/// The producer giving up has to reach the consumer as end-of-stream,
-/// not as a silent truncation: a snapshot cut short must fail to parse
-/// rather than install as a smaller, plausible-looking one.
+/// A producer that gives up must reach the consumer as end of stream, not
+/// as a silent truncation: a snapshot cut short must fail to parse, not
+/// install as a smaller, plausible-looking one.
 #[test]
 fn a_snapshot_cut_short_is_refused_rather_than_half_installed() {
     use crate::store::ChunkReader;
@@ -1053,8 +1031,8 @@ fn a_snapshot_cut_short_is_refused_rather_than_half_installed() {
     let mut whole = Vec::new();
     source.export_snapshot(&mut whole).unwrap();
 
-    // Everything but the last few bytes: a key/value record that stops
-    // partway through.
+    // Everything except the last few bytes: a key/value record that stops
+    // partway.
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     tx.try_send(whole[..whole.len() - 3].to_vec()).unwrap();
     drop(tx);
@@ -1071,8 +1049,8 @@ fn a_snapshot_cut_short_is_refused_rather_than_half_installed() {
 
 // --- versions ---------------------------------------------------------
 
-/// A delete leaves a tombstone row rather than removing anything, and a
-/// tombstone at the head reads exactly as "never written" does.
+/// A delete leaves a tombstone row instead of removing anything, and a
+/// tombstone at the head reads exactly like "never written".
 #[test]
 fn a_committed_delete_leaves_a_tombstone_that_reads_as_absent() {
     let (log, path) = open_temp();
@@ -1083,9 +1061,8 @@ fn a_committed_delete_leaves_a_tombstone_that_reads_as_absent() {
 
     assert_eq!(log.get_latest(b"k").unwrap(), None);
     assert_eq!(log.get_version(b"k").unwrap(), None);
-    // But the rows are both still there -- that is the difference from
-    // the single-version layout, and what a checkpoint below the delete
-    // would read.
+    // But both rows are still there, which is what a checkpoint below the
+    // delete would read.
     assert_eq!(log.version_count(b"k").unwrap(), 2);
     assert_eq!(
         log.get_as_of(b"k", written).unwrap(),
@@ -1112,7 +1089,7 @@ fn every_write_to_a_key_leaves_a_readable_version() {
     assert_eq!(log.get_as_of(b"k", c).unwrap(), Some((c, b"3".to_vec())));
     assert_eq!(log.get_as_of(b"k", a - 1).unwrap(), None);
 
-    // And the seq-only path agrees with the value-carrying one.
+    // And the seq-only path agrees with the one that returns values.
     for as_of in [a, b, c, a - 1] {
         assert_eq!(
             log.version_as_of(b"k", as_of).unwrap(),
@@ -1123,8 +1100,8 @@ fn every_write_to_a_key_leaves_a_readable_version() {
     cleanup(&path);
 }
 
-/// A read as of some seq is settled: nothing written afterwards can
-/// change what it says, however much of it there is.
+/// A read as of some seq is settled: nothing written later can change what
+/// it says, however much is written.
 #[test]
 fn a_historical_read_is_unaffected_by_later_writes_and_deletes() {
     let (log, path) = open_temp();
@@ -1166,8 +1143,8 @@ fn a_boundary_sees_what_existed_at_it_and_nothing_since() {
     let made = log.append(1, b"made-later", Some(b"new")).unwrap();
     log.apply_committed(made.max(gone)).unwrap();
 
-    // As of the boundary: the first key still had its value, and the
-    // second did not exist.
+    // As of the boundary: the first key still had its value, and the second
+    // did not exist.
     assert_eq!(
         log.get_as_of(b"deleted-later", boundary).unwrap(),
         Some((before, b"v".to_vec()))
@@ -1190,8 +1167,8 @@ fn a_boundary_sees_what_existed_at_it_and_nothing_since() {
     cleanup(&path);
 }
 
-/// A scan returns each key once however many versions it has, and a
-/// tombstoned key not at all -- without either costing the caller batch
+/// A scan returns each key once, however many versions it has, and a
+/// tombstoned key not at all, without either costing the caller batch
 /// length.
 #[test]
 fn a_scan_dedups_versions_and_hides_tombstones_without_shortening_a_batch() {
@@ -1212,8 +1189,8 @@ fn a_scan_dedups_versions_and_hides_tombstones_without_shortening_a_batch() {
     let seq = log.append_writes(1, deletes).unwrap();
     log.apply_committed(seq).unwrap();
 
-    // 15 keys survive; a batch of 10 is full, not shortened by the
-    // tombstones or the superseded versions it stepped over.
+    // 15 keys survive. A batch of 10 is full, not shortened by the tombstones
+    // or the superseded versions it stepped over.
     let (batch, resume) = log.scan_latest(b"", 10, NO_BUDGET, |_| false).unwrap();
     assert_eq!(batch.len(), 10);
     assert_eq!(resume, None, "a full batch did not run out of budget");
@@ -1228,8 +1205,8 @@ fn a_scan_dedups_versions_and_hides_tombstones_without_shortening_a_batch() {
     cleanup(&path);
 }
 
-/// The prefix-collision case, end to end through the store rather than
-/// the encoding: `"a"` and `"ab"` must not see each other's versions.
+/// The prefix-collision case, end to end through the store, not only the
+/// encoding: `"a"` and `"ab"` must not see each other's versions.
 #[test]
 fn a_key_that_prefixes_another_keeps_its_own_versions() {
     let (log, path) = open_temp();
@@ -1249,16 +1226,15 @@ fn a_key_that_prefixes_another_keeps_its_own_versions() {
         log.get_as_of(b"ab", ab1).unwrap(),
         Some((ab1, b"ab1".to_vec()))
     );
-    // As of `a1`, "ab" did not exist yet -- a naive encoding would have
-    // answered with one of "ab"'s rows here.
+    // As of `a1`, "ab" did not exist yet. A naive encoding would have answered
+    // with one of "ab"'s rows here.
     assert_eq!(log.get_as_of(b"ab", a1).unwrap(), None);
 
     cleanup(&path);
 }
 
-/// One entry may contribute at most one row per key. Two mutations for
-/// one key used to collapse on their own; now a value and a tombstone at
-/// one seq would be two rows with the tombstone sorting first, so the
+/// One entry may add at most one row per key. A value and a tombstone at
+/// one seq would be two rows, with the tombstone sorting first, so the
 /// write would be buried under its own delete.
 #[test]
 fn duplicate_mutations_in_one_entry_collapse_to_the_last() {
@@ -1288,7 +1264,7 @@ fn duplicate_mutations_in_one_entry_collapse_to_the_last() {
 
 // --- version GC -------------------------------------------------------
 
-/// Write `key` once per entry, at the seqs returned.
+/// Write `key` once per entry, and return the seqs.
 fn write_each(log: &RaftLog, key: &[u8], values: &[&[u8]]) -> Vec<u64> {
     values
         .iter()
@@ -1319,14 +1295,13 @@ fn gc_keeps_only_the_newest_version_when_nothing_is_pinned() {
     cleanup(&path);
 }
 
-/// A checkpoint pins the newest version at or before its seq, and
-/// nothing else.
+/// A checkpoint pins the newest version at or before its seq, and nothing
+/// else.
 #[test]
 fn gc_retains_exactly_what_each_checkpoint_selects() {
     let (log, path) = open_temp();
-    // Two writes, then the checkpoint, then two more -- so the
-    // checkpoint genuinely falls between versions rather than after
-    // all of them.
+    // Two writes, then the checkpoint, then two more, so the checkpoint really
+    // falls between versions, not after all of them.
     let early = write_each(&log, b"k", &[b"1", b"2"]);
     let cp = log
         .append(1, &checkpoint_key(b"mid"), Some(&encode_record(0).unwrap()))
@@ -1338,8 +1313,8 @@ fn gc_retains_exactly_what_each_checkpoint_selects() {
 
     log.gc_versions(usize::MAX).unwrap();
 
-    // The checkpoint selects "2", so that survives; "1" and "3" are
-    // reachable from nothing and go.
+    // The checkpoint selects "2", so it survives; nothing reaches "1" and "3",
+    // so they go.
     assert_eq!(log.version_count(b"k").unwrap(), 2);
     assert_eq!(
         log.get_as_of(b"k", cp).unwrap(),
@@ -1353,12 +1328,12 @@ fn gc_retains_exactly_what_each_checkpoint_selects() {
     cleanup(&path);
 }
 
-/// The head-tombstone rule, both ways round. Dropping a head tombstone
-/// while something older survives would make a *current* read see a
-/// value that was deleted.
+/// The head-tombstone rule, both ways. Dropping a head tombstone while
+/// something older survives would make a current read see a deleted value.
 #[test]
 fn gc_drops_a_head_tombstone_only_when_nothing_older_survives() {
-    // Pinned: the tombstone must stay, or the current read resurrects.
+    // Pinned: the tombstone must stay, or the current read brings the value
+    // back.
     let (log, path) = open_temp();
     let written = log.append(1, b"k", Some(b"v")).unwrap();
     log.apply_committed(written).unwrap();
@@ -1383,7 +1358,7 @@ fn gc_drops_a_head_tombstone_only_when_nothing_older_survives() {
     );
     cleanup(&path);
 
-    // Unpinned: nothing below survives, so the whole run goes.
+    // Not pinned: nothing below survives, so the whole run goes.
     let (log, path) = open_temp();
     let written = log.append(1, b"k", Some(b"v")).unwrap();
     log.apply_committed(written).unwrap();
@@ -1401,7 +1376,7 @@ fn gc_drops_a_head_tombstone_only_when_nothing_older_survives() {
 }
 
 /// A removed checkpoint stops pinning, and its own record is collected
-/// along with the versions it was holding.
+/// with the versions it held.
 #[test]
 fn removing_a_checkpoint_releases_what_it_pinned() {
     let (log, path) = open_temp();
@@ -1439,8 +1414,8 @@ fn removing_a_checkpoint_releases_what_it_pinned() {
     cleanup(&path);
 }
 
-/// A budgeted pass stops at a key boundary, leaves a cursor, and the
-/// next pass carries on from there -- across a reopen.
+/// A budgeted pass stops at a key boundary and leaves a cursor, and the
+/// next pass continues from there, across a reopen.
 #[test]
 fn gc_resumes_from_its_cursor_across_passes_and_reopens() {
     let (log, path) = open_temp();
@@ -1452,7 +1427,7 @@ fn gc_resumes_from_its_cursor_across_passes_and_reopens() {
         .sum();
     assert_eq!(total, 40);
 
-    // A budget far below the work available stops early.
+    // A budget far below the available work stops early.
     let first = log.gc_versions(4).unwrap();
     assert!(!first.done, "a budgeted pass should not claim to be done");
     assert!(first.rows_removed > 0 && first.rows_removed < 20);
@@ -1475,7 +1450,7 @@ fn gc_resumes_from_its_cursor_across_passes_and_reopens() {
         .sum();
     assert_eq!(remaining, 20, "one version per key should survive");
 
-    // A completed pass clears the cursor, so the next starts over.
+    // A completed pass clears the cursor, so the next one starts over.
     let again = log.gc_versions(usize::MAX).unwrap();
     assert!(again.done);
     assert_eq!(again.rows_removed, 0, "nothing left to collect");
@@ -1483,10 +1458,10 @@ fn gc_resumes_from_its_cursor_across_passes_and_reopens() {
     cleanup(&path);
 }
 
-/// A checkpoint created while a pass is in flight is above everything
-/// that pass read, so the version it selects is each key's newest --
-/// which GC always retains. Simulated by running the pass against the
-/// live set as it was *before* the checkpoint existed.
+/// A checkpoint created during a pass is above everything that pass read,
+/// so for each key it selects the newest version, which GC always keeps.
+/// Simulated by running the pass with the live set as it was before the
+/// checkpoint existed.
 #[test]
 fn a_checkpoint_created_during_a_pass_is_still_readable_after_it() {
     let (log, path) = open_temp();
@@ -1555,8 +1530,8 @@ fn checkpoints_are_listed_with_the_seq_their_record_landed_at() {
     cleanup(&path);
 }
 
-/// A removed checkpoint stops being live immediately, before the GC has
-/// collected its rows.
+/// A removed checkpoint stops being live at once, before the GC collects
+/// its rows.
 #[test]
 fn a_removed_checkpoint_stops_being_listed() {
     let (log, path) = open_temp();
@@ -1576,9 +1551,9 @@ fn a_removed_checkpoint_stops_being_listed() {
     cleanup(&path);
 }
 
-/// Checkpoint records are ordinary rows, so they travel in a Raft
-/// snapshot with the versions they pin -- and arrive still naming the
-/// seq they were taken at.
+/// Checkpoint records are normal rows, so they travel in a Raft snapshot
+/// with the versions they pin, and still name the seq they were taken at
+/// when they arrive.
 #[test]
 fn a_checkpoint_and_what_it_pins_survive_a_raft_snapshot() {
     let (source, source_path) = open_temp();
@@ -1601,8 +1576,8 @@ fn a_checkpoint_and_what_it_pins_survive_a_raft_snapshot() {
     let (target, target_path) = open_temp();
     target.install_snapshot(&mut buf.as_slice()).unwrap();
 
-    // The checkpoint still names the seq it was taken at, not the
-    // snapshot boundary...
+    // The checkpoint still names the seq it was taken at, not the snapshot
+    // boundary...
     assert_eq!(target.checkpoint_seq(b"nightly").unwrap(), Some(cp));
     // ...and reading at it gives what it gave on the source.
     assert_eq!(
@@ -1619,8 +1594,8 @@ fn a_checkpoint_and_what_it_pins_survive_a_raft_snapshot() {
 }
 
 /// A key scan must not expose the reserved range, so a checkpoint is
-/// invisible to anything walking keys -- the caller's `skip` closure is
-/// what enforces it, exactly as it does for accounts.
+/// invisible to anything that walks keys. The caller's `skip` closure
+/// enforces this, as it does for accounts.
 #[test]
 fn checkpoint_records_sit_in_the_reserved_range() {
     let (log, path) = open_temp();
@@ -1639,12 +1614,11 @@ fn checkpoint_records_sit_in_the_reserved_range() {
     cleanup(&path);
 }
 
-/// The bound a filtered scan needs: `skip` rejecting nearly everything
+/// The bound a filtered scan needs: a `skip` that rejects nearly everything
 /// must not turn one call into a walk of the whole keyspace.
 ///
-/// The batch comes back short -- empty, here -- with a cursor, which is
-/// the case the old "append a zero byte to the last key" rule had no
-/// answer for.
+/// The batch comes back short (empty, here) with a cursor, the case the
+/// "append a zero byte to the last key" rule has no answer for.
 #[test]
 fn a_scan_that_skips_everything_stops_at_its_budget_and_says_where() {
     let (log, path) = open_temp();
@@ -1655,21 +1629,21 @@ fn a_scan_that_skips_everything_stops_at_its_budget_and_says_where() {
     let seq = log.append_writes(1, writes).unwrap();
     log.apply_committed(seq).unwrap();
 
-    // Nothing is acceptable, so the batch can never fill; the budget is
-    // the only thing that ends the walk.
+    // Nothing is acceptable, so the batch can never fill; only the budget ends
+    // the walk.
     let (keys, resume) = log.scan_latest(b"", 10, 20, |_| true).unwrap();
     assert!(keys.is_empty());
     assert_eq!(resume, Some(b"k20".to_vec()), "should resume where it stopped");
 
-    // Resuming there sees the rest, and the walk as a whole misses
-    // nothing: the cursor is a key the first pass did not decide about.
+    // Resuming there sees the rest, and the walk as a whole misses nothing:
+    // the cursor is a key the first pass did not decide.
     let (keys, resume) = log
         .scan_latest(&resume.unwrap(), 10, 20, |key| key != b"k25")
         .unwrap();
     assert_eq!(keys, vec![b"k25".to_vec()]);
     assert_eq!(resume, Some(b"k40".to_vec()));
 
-    // A budget the scan never reaches leaves no cursor behind.
+    // A budget the scan never reaches leaves no cursor.
     let (keys, resume) = log.scan_latest(b"", 10, NO_BUDGET, |_| false).unwrap();
     assert_eq!(keys.len(), 10);
     assert_eq!(resume, None);
@@ -1677,9 +1651,9 @@ fn a_scan_that_skips_everything_stops_at_its_budget_and_says_where() {
     cleanup(&path);
 }
 
-/// Skipped keys count against the budget but not against `limit` -- the
-/// two bounds are about different things, and conflating them is what
-/// would make a batch silently short for a reason the caller cannot see.
+/// Skipped keys count against the budget but not against `limit`. The two
+/// bounds measure different things, and mixing them up would make a batch
+/// silently short for a reason the caller cannot see.
 #[test]
 fn the_budget_counts_keys_examined_and_the_limit_counts_keys_kept() {
     let (log, path) = open_temp();
@@ -1690,8 +1664,8 @@ fn the_budget_counts_keys_examined_and_the_limit_counts_keys_kept() {
     let seq = log.append_writes(1, writes).unwrap();
     log.apply_committed(seq).unwrap();
 
-    // Every third key is acceptable. A budget of 30 examines them all,
-    // so the batch fills normally and the budget never bites.
+    // Every third key is acceptable. A budget of 30 examines all of them, so
+    // the batch fills normally and the budget never applies.
     let (keys, resume) = log
         .scan_latest(b"", 5, 30, |key| {
             let n: usize = std::str::from_utf8(&key[1..]).unwrap().parse().unwrap();
@@ -1718,8 +1692,8 @@ fn fetch_all(keys: &[&[u8]], fetch: Fetch) -> Vec<(Vec<u8>, Fetch)> {
     keys.iter().map(|key| (key.to_vec(), fetch)).collect()
 }
 
-/// Positional, duplicates and all, with a missing or deleted key as an
-/// empty position -- and `as_of` the applied watermark.
+/// By position, duplicates included, with a missing or deleted key as an
+/// empty position, and `as_of` equal to the applied watermark.
 #[test]
 fn read_many_answers_each_key_in_the_order_asked() {
     let (log, path) = open_temp();
@@ -1754,8 +1728,8 @@ fn read_many_answers_each_key_in_the_order_asked() {
     cleanup(&path);
 }
 
-/// A checkpoint read is as of the checkpoint, and reports its seq; an
-/// unknown or removed one is said to be missing rather than read as
+/// A checkpoint read is as of the checkpoint and reports its seq. An
+/// unknown or removed checkpoint is reported as missing, not read as
 /// empty.
 #[test]
 fn read_many_at_a_checkpoint_reads_as_of_it() {
@@ -1792,7 +1766,7 @@ fn read_many_at_a_checkpoint_reads_as_of_it() {
 }
 
 /// The budget cuts the answer to a prefix, never to nothing; a charged
-/// position counts though nothing was read for it; versions alone are
+/// position counts although nothing was read for it; versions alone are
 /// never cut.
 #[test]
 fn read_many_stops_at_the_value_budget_but_always_answers_the_first_key() {
@@ -1831,17 +1805,17 @@ fn read_many_stops_at_the_value_budget_but_always_answers_the_first_key() {
     cleanup(&path);
 }
 
-/// What `read_many` is for: keys written by one entry are never seen at
-/// two different entries, even while `apply_committed` is mid-way
-/// through a run of entries -- and `as_of` names exactly the last entry
-/// the snapshot can see.
+/// What `read_many` is for: keys written by one entry are never seen at two
+/// different entries, even while `apply_committed` is midway through a run
+/// of entries, and `as_of` names exactly the last entry the snapshot can
+/// see.
 ///
-/// Every entry here writes `x` and `y` together, plus enough filler to
-/// pass `WRITE_CHUNK`, so `apply_committed` flushes after each one. A
-/// reader racing it must find `x` and `y` at the same seq, and that seq
-/// must be `as_of`: every entry writes `x`, so `x`'s head is the last
-/// entry applied. A watermark written only with the final batch would
-/// let a mid-way snapshot see `x` past `as_of`.
+/// Every entry here writes `x` and `y` together, plus enough filler to pass
+/// `WRITE_CHUNK`, so `apply_committed` flushes after each one. A reader
+/// racing it must find `x` and `y` at the same seq, and that seq must be
+/// `as_of`: every entry writes `x`, so `x`'s head is the last entry
+/// applied. A watermark written only with the final batch would let a
+/// midway snapshot see `x` past `as_of`.
 #[test]
 fn read_many_never_sees_an_entry_or_the_watermark_half_applied() {
     let (log, path) = open_temp();

@@ -4,73 +4,68 @@ package raft5.raft;
 
 import "common.proto";
 
-// Peer-to-peer API. Served on a separate port from the client-facing Kv
-// service (client.proto) -- this one is only ever called by other cluster
-// members, so it's the natural place to require mutual TLS / cluster
-// membership auth instead of whatever auth the Kv service uses.
+// The peer API. It runs on a separate port from the client Kv service
+// (client.proto), because only other cluster members call it, so it is the
+// place to require mutual TLS between members, whatever auth the Kv
+// service uses.
 service RaftPeer {
-  // Chunked, because one log entry can be large: a transaction commits
-  // as a single entry carrying every key it wrote, and a unary request
-  // would put a hard ceiling on a transaction's size at whatever the
-  // receiver's decode limit happens to be. Chunking moves that ceiling
-  // into `raft`'s own constants, where it is a decision rather than a
+  // Chunked, because one log entry can be large: a transaction commits as
+  // one entry with every key it wrote, and a unary request would limit a
+  // transaction's size to the receiver's decode limit. Chunking moves that
+  // limit into `raft`'s own constants, where it is a decision, not a
   // default.
   //
-  // Still one request and one response per call -- the stream carries
-  // one AppendEntries, not a pipeline of them. The leader's per-peer
-  // replication task calls this and feeds the single response back into
-  // its own event loop; an inbound call is answered the same way
-  // regardless of which role this node is currently in. The reassembled
-  // request is an ordinary AppendEntriesRequest, so nothing past the
-  // gRPC boundary knows this is streamed at all.
+  // Still one request and one response per call: the stream carries one
+  // AppendEntries, not a pipeline. The leader's per-peer replication task
+  // calls this and feeds the response back to its event loop. An inbound
+  // call is answered the same way in every role. The reassembled request is
+  // a normal AppendEntriesRequest, so nothing past the gRPC boundary knows
+  // it was streamed.
   rpc AppendEntries(stream AppendEntriesChunk) returns (AppendEntriesResponse);
   rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
 
-  // Leader leasing: deliberately a separate, lightweight RPC rather than
-  // piggybacked on AppendEntries, since AppendEntries can be slow (it does
-  // real log-append work) and a lease probe needs to be fast to reliably
-  // detect quorum loss. A follower grants (and refreshes its own lease
-  // timer) only if `term` matches its current term; a leader tracks
-  // per-peer grants to decide whether it still holds a quorum of leases
-  // (gates serving reads locally without going through the log) and to
-  // avoid disrupting a peer's still-live leader with a competing
-  // election (see RequestVoteRequest.dry_run and the follower's lease
-  // check).
+  // Leader leasing: a separate, light RPC on purpose, not part of
+  // AppendEntries, because AppendEntries can be slow (it does real log
+  // work) and a lease probe must be fast to detect quorum loss reliably.
+  // A follower grants (and refreshes its own lease timer) only if `term`
+  // matches its current term. A leader tracks per-peer grants to decide
+  // whether it still holds a quorum of leases (which allows serving reads
+  // locally, without the log), and a live lease stops a competing election
+  // from disrupting a peer's leader (see RequestVoteRequest.dry_run and the
+  // follower's lease check).
   rpc GetLease(GetLeaseRequest) returns (GetLeaseResponse);
 
-  // Chunked snapshot transfer. Maps directly onto
-  // storage::export_snapshot / install_snapshot's Read/Write-based
-  // streaming: the leader reads chunks out of the exporter and sends them
-  // as they're produced; the follower feeds each chunk into
-  // install_snapshot's reader as it arrives. Neither side ever needs the
-  // whole snapshot in memory at once.
+  // Chunked snapshot transfer, matching the Read/Write streaming of
+  // storage::export_snapshot and install_snapshot: the leader sends chunks
+  // as the exporter makes them, and the follower feeds each chunk to
+  // install_snapshot's reader as it arrives. Neither side holds the whole
+  // snapshot in memory.
   rpc InstallSnapshot(stream SnapshotChunk) returns (InstallSnapshotResponse);
 
-  // Who this node is, asked by a leader about a server it is being told
-  // to add (client.proto's AddServer). Asked here rather than on the
-  // client API so that it travels over the same mTLS as the rest of the
-  // peer traffic: a leader always knows how to dial a peer, but a
-  // client API's certificate is the operator's business, not the
-  // cluster's.
+  // Who this node is. A leader asks this of a server it is told to add
+  // (client.proto's AddServer). Asked here, not on the client API, so it
+  // travels over the same mTLS as other peer traffic: a leader always knows
+  // how to dial a peer, but a client API's certificate is the operator's
+  // business, not the cluster's.
   rpc Identify(IdentifyRequest) returns (IdentifyResponse);
 }
 
 message IdentifyRequest {}
 
-// Spelled out rather than as a raft5.cluster.ClusterMember: that type
-// is generated in raft5-shared, and this file is compiled on its own.
+// Written out, not a raft5.cluster.ClusterMember: that type is generated
+// in raft5-shared, and this file is compiled separately.
 message IdentifyResponse {
   string server_id = 1;
   string address = 2;        // peer API, as this node advertises it
   string client_address = 3; // client API, likewise
-  // Whether this node already has a configuration -- in which case it
-  // belongs to some cluster already, and adding it to another would
-  // make one node a member of two.
+  // Whether this node already has a configuration. Then it already belongs
+  // to a cluster, and adding it to another would make one node a member of
+  // two.
   bool in_cluster = 4;
 }
 
 // One message of an AppendEntries stream: the header first, then the
-// entry payload in as many fragments as it takes.
+// entry payload in as many fragments as needed.
 message AppendEntriesChunk {
   oneof part {
     AppendEntriesHeader header = 1; // always the first message on the stream
@@ -78,8 +73,8 @@ message AppendEntriesChunk {
   }
 }
 
-// Everything about an AppendEntries except the entries themselves, sent
-// before them so a receiver can decide whether it wants the body at all.
+// Everything about an AppendEntries except the entries, sent first, so a
+// receiver can decide whether it wants the body at all.
 message AppendEntriesHeader {
   uint64 term = 1;
   string leader_id = 2;
@@ -87,23 +82,22 @@ message AppendEntriesHeader {
   uint64 prev_log_term = 4;
   uint64 leader_commit = 5; // seq
   uint64 compact_seq = 6;   // see AppendEntriesRequest.compact_seq
-  // How many bytes of fragments follow. Advisory -- it lets an oversized
-  // batch be refused before it is read, but it is the sender's claim
-  // rather than a fact, so a receiver counts what actually arrives and
-  // enforces its limit on that too.
+  // How many bytes of fragments follow. Advisory: it lets an oversized
+  // batch be refused before it is read, but it is the sender's claim, not
+  // a fact, so the receiver counts what arrives and enforces its limit on
+  // that too.
   uint64 entries_bytes = 7;
 }
 
-// What the fragments concatenate into. A message of its own because a
-// `repeated` field can only be decoded as part of one.
+// What the fragments join into. A separate message because a `repeated`
+// field can only be decoded as part of a message.
 message EntryBatch {
   repeated raft5.common.LogEntry entries = 1;
 }
 
-// The reassembled form of an AppendEntries stream. Never sent as a
-// single message -- it is what `grpc::RaftPeerService` hands inward once
-// the chunks are back together, and what every role's event loop still
-// sees.
+// The reassembled form of an AppendEntries stream. Never sent as one
+// message: `grpc::RaftPeerService` passes it inward once the chunks are
+// joined, and every role's event loop sees this form.
 message AppendEntriesRequest {
   uint64 term = 1;
   string leader_id = 2;
@@ -111,18 +105,18 @@ message AppendEntriesRequest {
   uint64 prev_log_term = 4;
   repeated raft5.common.LogEntry entries = 5; // empty = heartbeat
   uint64 leader_commit = 6; // seq
-  // Highest seq the leader knows is replicated to *every* peer (not just a
-  // majority) -- safe for any node, follower included, to compact its log
-  // below this, since nobody will ever need to be sent that entry again.
+  // The highest seq the leader knows is replicated to every peer (not only
+  // a majority). Any node, followers included, may compact its log below
+  // this, because nobody will ever need that entry sent again.
   uint64 compact_seq = 7; // seq
 }
 
 message AppendEntriesResponse {
   uint64 term = 1;
   bool success = 2;
-  // On success: the highest seq now matching the leader's log.
+  // On success: the highest seq that now matches the leader's log.
   // On failure: hints for the leader to back up prev_log_index faster than
-  // one-at-a-time (Raft paper §5.3 optimization) rather than a match_index.
+  // one at a time (Raft paper §5.3 optimization), not a match_index.
   uint64 match_index = 3;
   optional uint64 conflict_index = 4;
   optional uint64 conflict_term = 5;
@@ -133,13 +127,12 @@ message RequestVoteRequest {
   string candidate_id = 2;
   uint64 last_log_index = 3;
   uint64 last_log_term = 4;
-  // Pre-vote (Raft dissertation §9.6): a non-binding "would you grant
-  // this" check. The responder must answer honestly but must not alter
-  // any of its own state (current_term, voted_for, election timer) --
-  // this lets a node probe whether it could plausibly win a real election
-  // without ever bumping its term, so a partitioned node that can't reach
-  // a majority doesn't disrupt a healthy cluster by inflating its term
-  // once it reconnects.
+  // Pre-vote (Raft dissertation §9.6): a non-binding "would you grant this?"
+  // check. The responder must answer honestly but must not change its own
+  // state (current_term, voted_for, election timer). A node can learn
+  // whether it could win a real election without raising its term, so a
+  // partitioned node that cannot reach a majority does not disrupt a healthy
+  // cluster with a raised term when it reconnects.
   bool dry_run = 5;
 }
 
@@ -151,10 +144,10 @@ message RequestVoteResponse {
 message GetLeaseRequest {
   string leader_id = 1;
   uint64 term = 2;
-  // How long the leader will count this grant toward its read quorum, so
-  // the follower promises exactly that rather than its own idea of a
-  // lease -- the two can differ while a heartbeat change is replicating.
-  // 0 (a leader that predates this field) means the follower's own.
+  // How long the leader counts this grant toward its read quorum, so the
+  // follower promises exactly that, not its own lease length: the two can
+  // differ while a heartbeat change replicates. 0 means the follower uses
+  // its own lease.
   uint64 lease_millis = 3;
 }
 

@@ -2,49 +2,45 @@ syntax = "proto3";
 
 package raft5.common;
 
-// What a log entry does. Only WRITE carries key/value state machine data;
-// the rest are Raft protocol entries that occupy a sequence number (so
-// they participate in log matching and commitment like anything else) but
-// never reach the key/value state in `latest`.
+// What a log entry does. Only WRITE carries key/value data. The others
+// are Raft protocol entries that take a seq (so they take part in log
+// matching and commit) but never reach the key/value state in `versions`.
 //
-// The numbers 0 and 1 are deliberately not reused. They were PUT and
-// DELETE, and 0 is proto3's default for a missing field -- so a WRITE at 0
-// would let a stale or foreign PUT decode as a write with an empty
-// mutation list: a silent, seq-consuming no-op that still satisfies log
-// matching. Number 0 belongs to a variant that is never sent and always
+// 0 and 1 are not used for real kinds. 0 is proto3's default for a
+// missing field: if WRITE were 0, an entry with no kind would decode as a
+// write with an empty mutation list, a silent no-op that uses a seq and
+// still passes log matching. So 0 is a value that is never sent and always
 // rejected.
 enum EntryKind {
   ENTRY_KIND_UNSPECIFIED = 0; // never sent; rejected on receipt
-  reserved 1;                 // was DELETE
-  NOOP = 2;   // neither `writes` nor `config` -- see raft::leader::Leader::new
-  // `config` holds an encoded raft5.cluster.ClusterConfig. Unlike the
-  // others this takes effect on append, not on commit -- see
+  reserved 1;                 // retired; do not reuse
+  NOOP = 2;   // neither `writes` nor `config`; see raft::leader::Leader::new
+  // `config` holds an encoded raft5.cluster.ClusterConfig. Unlike the other
+  // kinds, it takes effect on append, not on commit: see
   // storage::RaftLog::current_config.
   CONFIG = 3;
   WRITE = 4;  // `writes` non-empty
 }
 
-// One key's change within a WRITE entry. `value` unset is a delete: `log`
-// records it as a tombstone, and applying it removes the key from
-// `latest` outright (see the storage module doc on why `latest` keeps no
-// tombstone of its own).
+// One key's change in a WRITE entry. An unset `value` is a delete: `log`
+// records it as a tombstone, and applying it adds a tombstone row to
+// `versions` (see the storage module doc).
 message KeyValue {
   bytes key = 1;
   optional bytes value = 2; // unset = delete
 }
 
-// Mirrors storage::LogEntry: a single entry at a given sequence number
-// and term. `kind` must survive replication -- a follower re-appends
-// these into its own log verbatim, so dropping it would flatten every
-// replicated entry into a write.
+// Mirrors storage::LogEntry: one entry at a given seq and term. `kind`
+// must survive replication: a follower re-appends these into its own log
+// exactly, so losing it would turn every replicated entry into a write.
 //
-// A WRITE carries *all* of a transaction's mutations, which is what makes
+// A WRITE carries all of a transaction's mutations, which is what makes
 // them commit and apply together: one entry, one seq, one atomic apply to
-// `latest`.
+// `versions`.
 message LogEntry {
   uint64 seq = 1;
   uint64 term = 2;
-  reserved 3, 4; // were the single `key`/`value` of a one-pair entry
+  reserved 3, 4; // retired field numbers; do not reuse
   EntryKind kind = 5;
   repeated KeyValue writes = 6; // kind == WRITE
   optional bytes config = 7;    // kind == CONFIG

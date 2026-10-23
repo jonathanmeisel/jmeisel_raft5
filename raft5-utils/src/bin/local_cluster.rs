@@ -1,18 +1,18 @@
-//! Runs a whole raft5 cluster on this machine, in one process.
+//! Run a whole raft5 cluster on this machine, in one process.
 //!
-//! Everything the cluster needs lives under one directory: each node's
+//! Everything the cluster needs lives in one directory: each node's
 //! database, the certificates, the signing secret, the administrator's
-//! password, and `cluster.json`, which records the ports. Pointed at an
-//! empty or missing directory this bootstraps a new cluster there;
-//! pointed at one it bootstrapped before, it starts that cluster again.
+//! password, and `cluster.json`, which records the ports. Given an empty or
+//! missing directory, this bootstraps a new cluster there; given one it
+//! bootstrapped before, it starts that cluster again.
 //!
-//! The ports are chosen once, at bootstrap, and reused on every restart
-//! after: each node's peer address is recorded in the cluster
-//! configuration in the Raft log, so a node that came back on a different
-//! port would be unreachable to the others.
+//! The ports are chosen once, at bootstrap, and reused on every restart:
+//! each node's peer address is recorded in the cluster configuration in the
+//! Raft log, so a node that came back on another port would be unreachable
+//! to the others.
 //!
 //! The cluster runs with mTLS between peers, TLS on the client API, and
-//! token authentication, all from material minted at bootstrap.
+//! token authentication, all from material created at bootstrap.
 
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
@@ -36,18 +36,18 @@ use raft5_shared::tls::{load_ca, load_identity};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
-/// Starts a local raft5 cluster, bootstrapping it first if need be.
+/// Start a local raft5 cluster, and bootstrap it first if needed.
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
-    /// Directory holding the cluster's databases, certificates and
-    /// secrets. A missing or empty one gets a new cluster; one this
-    /// tool bootstrapped before has that cluster started again.
+    /// The directory with the cluster's databases, certificates and secrets.
+    /// A missing or empty one gets a new cluster; one this tool bootstrapped
+    /// before has that cluster started again.
     dir: PathBuf,
-    /// Heartbeat interval for a new cluster, in milliseconds (default:
-    /// the server's, 50). Ignored when starting an existing cluster,
-    /// whose heartbeat is part of its replicated configuration --
-    /// change that one with the CLI's `heartbeat <ms>`.
+    /// The heartbeat interval for a new cluster, in milliseconds (default: the
+    /// server's, 50). Ignored when starting an existing cluster, whose
+    /// heartbeat is in its replicated configuration: change that one with the
+    /// CLI's `heartbeat <ms>`.
     #[arg(long)]
     heartbeat_ms: Option<u64>,
 }
@@ -61,11 +61,11 @@ const ADMIN_USER: &str = "admin";
 /// How long issued tokens last.
 const TOKEN_TTL: Duration = Duration::from_secs(3600);
 
-/// How long bootstrapping waits for the first node to start answering.
+/// How long bootstrap waits for the first node to start answering.
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Names the node certificate covers. Every node is on loopback, so one
-/// certificate serves them all.
+/// The names the node certificate covers. Every node is on loopback, so
+/// one certificate serves them all.
 const CERT_NAMES: &[&str] = &["localhost", "127.0.0.1"];
 
 const MANIFEST: &str = "cluster.json";
@@ -75,11 +75,11 @@ const NODE_KEY: &str = "certs/node.key";
 const JWT_SECRET: &str = "jwt_secret";
 const ADMIN_PASSWORD: &str = "admin_password";
 
-/// What has to stay the same across restarts, written to `cluster.json`.
+/// What must stay the same across restarts, written to `cluster.json`.
 ///
-/// Written only once bootstrapping has fully succeeded, so its presence
-/// is what marks a directory as holding a working cluster -- one with
-/// files in it but no manifest is a bootstrap that was interrupted.
+/// Written only after bootstrap fully succeeds, so its presence marks a
+/// directory as holding a working cluster. A directory with files but no
+/// manifest is an interrupted bootstrap.
 #[derive(Serialize, Deserialize)]
 struct Manifest {
     admin_user: String,
@@ -163,8 +163,8 @@ async fn main() -> Result<(), Error> {
     if fresh {
         let formed = tokio::select! {
             result = form_cluster(&dir, &manifest, &auth, args.heartbeat_ms) => result,
-            // A node that fails to start (a port taken in the meantime,
-            // say) would otherwise leave bootstrapping to time out.
+            // A node that fails to start (for example, a port taken meanwhile) would
+            // otherwise leave bootstrap to time out.
             Some(Ok(Err(e))) = nodes.join_next() => Err(e.into()),
         };
         if let Err(e) = formed {
@@ -180,8 +180,8 @@ async fn main() -> Result<(), Error> {
     }
     print_connection_info(&dir, &manifest);
 
-    // Ctrl-C cancels rather than kills, so each node drains and releases
-    // its database before the process exits -- see `serve_config`.
+    // Ctrl-C cancels, it does not kill, so each node drains and releases its
+    // database before the process exits: see `serve_config`.
     let mut failure = None;
     tokio::select! {
         Some(result) = nodes.join_next() => failure = node_failure(result),
@@ -227,7 +227,7 @@ fn read_manifest(dir: &Path) -> Result<Manifest, Error> {
 }
 
 /// Written to a temporary file and renamed into place, so an interrupted
-/// write can't leave a manifest that parses as something it isn't.
+/// write cannot leave a manifest that parses as something it is not.
 fn write_manifest(dir: &Path, manifest: &Manifest) -> Result<(), Error> {
     let tmp = dir.join(format!("{MANIFEST}.tmp"));
     std::fs::write(&tmp, serde_json::to_vec_pretty(manifest)?)?;
@@ -235,9 +235,9 @@ fn write_manifest(dir: &Path, manifest: &Manifest) -> Result<(), Error> {
     Ok(())
 }
 
-/// Picks the ports and mints the certificates and secrets for a new
-/// cluster in `dir`. The manifest itself is left for after the cluster
-/// has formed.
+/// Pick the ports and create the certificates and secrets for a new
+/// cluster in `dir`. The manifest is written later, after the cluster has
+/// formed.
 fn create_cluster_files(dir: &Path) -> Result<Manifest, Error> {
     std::fs::create_dir_all(dir.join("certs"))?;
 
@@ -263,12 +263,12 @@ fn create_cluster_files(dir: &Path) -> Result<Manifest, Error> {
     })
 }
 
-/// `count` distinct ports the OS considers free right now.
+/// `count` distinct ports that the OS considers free now.
 ///
-/// Every listener is held until all have been picked, so the OS can't
-/// hand the same port out twice. They are released before the nodes
-/// bind them, so something else could still take one in between -- in
-/// which case that node fails to start and bootstrapping reports it.
+/// Every listener is held until all are picked, so the OS cannot give out
+/// the same port twice. They are released before the nodes bind them, so
+/// something else could still take one in between; then that node fails
+/// to start and bootstrap reports it.
 fn free_ports(count: usize) -> Result<Vec<u16>, Error> {
     let listeners = (0..count)
         .map(|_| TcpListener::bind((Ipv4Addr::LOCALHOST, 0)))
@@ -279,11 +279,11 @@ fn free_ports(count: usize) -> Result<Vec<u16>, Error> {
         .collect::<Result<_, _>>()?)
 }
 
-/// A private CA, and one certificate it signs for every node to share:
+/// A private CA, and one certificate it signs for all nodes to share:
 /// `(ca_pem, node_cert_pem, node_key_pem)`.
 ///
-/// The node certificate is both a server and a client certificate, since
-/// a peer is both. The CA's key is thrown away once it has signed.
+/// The node certificate is both a server and a client certificate, because
+/// a peer is both. The CA's key is discarded after it signs.
 fn mint_certificates() -> Result<(String, String, String), Error> {
     let ca_key = KeyPair::generate()?;
     let mut ca_params = CertificateParams::new(Vec::<String>::new())?;
@@ -307,16 +307,16 @@ fn mint_certificates() -> Result<(String, String, String), Error> {
     Ok((ca_pem, node_cert.pem(), node_key.serialize_pem()))
 }
 
-/// 32 random bytes, as URL-safe base64: long enough for a signing
-/// secret, and pasteable as a password.
+/// 32 random bytes, as URL-safe base64: long enough for a signing secret,
+/// and easy to paste as a password.
 fn random_string() -> Result<String, Error> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).map_err(|e| format!("could not get random bytes: {e}"))?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
-/// Writes a file only its owner can read: everything here is either a
-/// secret or sits next to one.
+/// Write a file only its owner can read: everything here is a secret or
+/// sits next to one.
 fn write_private(path: &Path, contents: &[u8]) -> Result<(), Error> {
     use std::io::Write;
     let mut options = std::fs::OpenOptions::new();
@@ -337,9 +337,9 @@ fn read_trimmed(path: &Path) -> Result<String, Error> {
 
 /// The same for every node: they must all share the signing secret.
 ///
-/// The initial administrator is passed on every start, not just the
-/// first. It only matters until the cluster has a configuration, after
-/// which the account stored at bootstrap is the one that counts.
+/// The initial administrator is passed on every start, not only the first.
+/// It matters only until the cluster has a configuration; after that, the
+/// account stored at bootstrap is the one that counts.
 async fn auth_config(dir: &Path, admin_user: &str) -> Result<AuthConfig, Error> {
     let secret = read_trimmed(&dir.join(JWT_SECRET))?;
     let password = read_trimmed(&dir.join(ADMIN_PASSWORD))?;
@@ -373,8 +373,8 @@ fn client_url(node: &NodeSpec) -> String {
     format!("https://{}", node.client_addr())
 }
 
-/// Bootstraps the first node into a single-node cluster, then adds the
-/// rest to it.
+/// Bootstrap the first node into a single-node cluster, then add the
+/// others to it.
 async fn form_cluster(
     dir: &Path,
     manifest: &Manifest,
@@ -386,15 +386,14 @@ async fn form_cluster(
         [client_url(first)],
         ClientTls::new(load_ca(&dir.join(CA_CERT))?),
     )?;
-    // Signed here rather than fetched with `login`, which this process
-    // could do only slowly: against a cluster with no leader yet, the
-    // client spends its whole retry deadline looking for one before
-    // falling back to asking the node directly.
+    // Signed here, not fetched with `login`, which would be slow for this
+    // process: against a cluster with no leader yet, the client spends its
+    // whole retry deadline looking for one before it asks the node directly.
     let (token, _) = auth.issue(&manifest.admin_user)?;
     client.login_with_token(token);
 
-    // `Bootstrap` doesn't retry, and the node may not be listening yet,
-    // so keep asking until it answers.
+    // `Bootstrap` does not retry, and the node may not be listening yet, so
+    // keep asking until it answers.
     let deadline = Instant::now() + BOOTSTRAP_TIMEOUT;
     loop {
         match client.bootstrap(&first.id, heartbeat_ms).await {

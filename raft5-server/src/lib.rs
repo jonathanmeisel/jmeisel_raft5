@@ -1,19 +1,17 @@
-//! A single Raft node, runnable as a library (`run`) or as the `main`
-//! binary (see `main.rs`, which just parses flags into `run`'s
-//! arguments). Splitting it this way is what lets an integration test
-//! spin up a real node in-process instead of shelling out to the binary.
+//! A single Raft node, runnable as a library ([`serve_config`]) or as the
+//! `main` binary (see `main.rs`, which only parses flags into a
+//! [`ServerConfig`]). The split lets an integration test start a real
+//! node in-process instead of running the binary.
 //!
 //! # Shutting a node down
 //!
-//! `run` hands back a future and a `CancellationToken` rather than just a
-//! future, because a Raft node is not one task: it is two gRPC servers,
-//! a state machine, and a shifting set of per-role and per-peer
-//! background tasks underneath it. Cancelling the token is the one
-//! shutdown signal for all of them, and the future resolving is the
-//! confirmation that every last one has finished -- no detached tasks
-//! outliving the node, no `JoinHandle::abort` leaving a half-finished
-//! storage call still holding the database lock. `raft::Task` is where
-//! that discipline is actually enforced.
+//! A node takes a `CancellationToken`, because a Raft node is not one
+//! task: it is two gRPC servers, a state machine, and a changing set of
+//! per-role and per-peer background tasks. Cancelling the token is the one
+//! shutdown signal for all of them, and the node's future resolving
+//! confirms that every one has finished: no detached task outlives the
+//! node, and no `JoinHandle::abort` leaves a half-done storage call holding
+//! the database lock. `raft::Task` enforces this.
 
 pub mod auth;
 pub mod grpc;
@@ -45,134 +43,69 @@ use raft::{Common, NodeHandles};
 use storage::RaftLog;
 use store::Store;
 
-/// What a node's failure is reported as. `Send + Sync` (unlike a bare
-/// `Box<dyn Error>`) so that `run`'s future can be handed straight to
-/// `tokio::spawn`, which is how both `main` and the integration tests
-/// drive a node.
+/// How a node's failure is reported. `Send + Sync` (unlike a plain
+/// `Box<dyn Error>`), so the node's future can go straight to
+/// `tokio::spawn`, which is how `main` and the integration tests run a
+/// node.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
-
-/// Everything needed to run one Raft node: the future that *is* the node,
-/// and the token that shuts it down.
-///
-/// Nothing starts until the future is polled, and the node keeps running
-/// until either a server fails or the token is cancelled. Cancelling is
-/// the graceful path, not an abrupt one: the token is the root of a tree
-/// of child tokens covering every task the node spawns -- the gRPC
-/// servers (which stop accepting and then drain their in-flight
-/// requests), the state machine, and each of its per-role and per-peer
-/// background tasks. The future resolves only once every one of them has
-/// actually returned, which is what makes it safe to immediately restart
-/// a node on the same database directory and the same addresses: by then
-/// nothing is still holding the database lock or the sockets.
-///
-/// Dropping the future instead of cancelling the token is still abrupt,
-/// and still leaves in-flight `spawn_blocking` storage work running
-/// headless -- prefer `cancel()` then `.await`.
-///
-/// A node started against a fresh `db` directory belongs to no cluster:
-/// it answers RPCs and waits, without ever campaigning, until it is
-/// either bootstrapped into a single-node cluster (the `Bootstrap` client
-/// RPC) or added to an existing one (`AddServer` on that cluster's
-/// leader, which replicates the configuration here). Membership lives in
-/// the log, so a restart against an existing `db` rejoins whatever
-/// cluster this node was already part of -- there is no peer list to
-/// keep in sync by hand.
-///
-/// - `id`: this node's stable identity within the cluster. Must not
-///   change across restarts: it is what every other node's log calls
-///   this one.
-/// - `db`: directory holding this node's database (log, state, and
-///   membership). Created if it doesn't exist.
-/// - `client_addr`: address to serve the client API on.
-/// - `peer_addr`: address to serve the peer-to-peer Raft API on.
-/// - `advertise`: URL other nodes should dial to reach this node's peer
-///   API. Defaults to `peer_addr`, which is wrong whenever that is a
-///   wildcard bind (`0.0.0.0:...`) or behind NAT -- set it explicitly
-///   then. Recorded in the cluster configuration at bootstrap.
-/// - `advertise_client`: the same, for the client API -- what clients
-///   are handed when they ask the cluster where its members are.
-// pub fn run(
-//     id: String,
-//     db: &Path,
-//     client_addr: SocketAddr,
-//     peer_addr: SocketAddr,
-//     advertise: Option<String>,
-// ) -> (
-//     impl Future<Output = Result<(), Error>> + Send + 'static,
-//     CancellationToken,
-// ) {
-//     let cancel = CancellationToken::new();
-//     // Owned, so the returned future borrows nothing and can be spawned.
-//     let db = db.to_path_buf();
-//     let token = cancel.clone();
-//     let node = async move { serve(id, &db, client_addr, peer_addr, advertise, token).await };
-//     (node, cancel)
-// }
 
 /// How a node is configured. See [`serve_config`].
 ///
-/// A struct rather than more parameters because the list was already at
-/// the length where a caller has to count commas, and because `auth`
-/// will not be the last thing added to it.
+/// A struct, not more parameters, so callers do not have to count commas,
+/// and new settings do not change every call site.
 pub struct ServerConfig {
-    /// This node's stable identity within the cluster. Must not change
-    /// across restarts: it is what every other node's log calls this
-    /// one.
+    /// This node's stable identity in the cluster. Must not change across
+    /// restarts: every other node's log uses it for this node.
     pub id: String,
-    /// Directory holding this node's database (log, state, and
-    /// membership). Created if it doesn't exist.
+    /// The directory with this node's database (log, state and membership).
+    /// Created if it does not exist.
     pub db: PathBuf,
-    /// Address to serve the client API on.
+    /// The address to serve the client API on.
     pub client_addr: SocketAddr,
-    /// Address to serve the peer-to-peer Raft API on.
+    /// The address to serve the peer Raft API on.
     pub peer_addr: SocketAddr,
-    /// URL other nodes should dial to reach this node's peer API.
-    /// Defaults to `peer_addr`, which is wrong whenever that is a
-    /// wildcard bind (`0.0.0.0:...`) or behind NAT -- set it explicitly
-    /// then. Recorded in the cluster configuration at bootstrap.
+    /// The URL other nodes dial to reach this node's peer API. Defaults to
+    /// `peer_addr`, which is wrong for a wildcard bind (`0.0.0.0:...`) or
+    /// behind NAT: set it explicitly then. Recorded in the cluster
+    /// configuration at bootstrap.
     pub advertise: Option<String>,
-    /// The same, for the client API -- what clients are handed when they
-    /// ask the cluster where its members are.
+    /// The same, for the client API: what clients get when they ask the
+    /// cluster where its members are.
     pub advertise_client: Option<String>,
     /// How tokens are signed and checked.
     ///
-    /// `None` leaves the client API open: no request needs a token and
-    /// the account RPCs all answer `AUTH_DISABLED`, which is how this
-    /// cluster behaved before authentication existed. See
-    /// [`crate::auth`].
+    /// `None` leaves the client API open: no request needs a token, and the
+    /// account RPCs all answer `AUTH_DISABLED`. See [`crate::auth`].
     pub auth: Option<AuthConfig>,
     /// mTLS for the peer API, both as served here and as this node dials
-    /// every other member's. `None` is plaintext both ways -- and a
-    /// cluster must agree on this, since a plaintext node and a TLS one
-    /// cannot talk to each other at all.
+    /// other members. `None` is plaintext both ways. The whole cluster must
+    /// agree, because a plaintext node and a TLS node cannot talk at all.
     pub peer_tls: Option<PeerTls>,
     /// TLS for the client API, or `None` to serve it in plaintext.
     pub client_tls: Option<ClientApiTls>,
 }
 
-/// How a node proves itself to its peers, and how it decides to believe
+/// How a node proves itself to its peers, and how it decides to trust
 /// theirs.
 ///
-/// One identity plays both parts: the certificate a node serves the peer
-/// API with is the one it presents as a client when it dials another
-/// node's. So it needs both the `serverAuth` and `clientAuth` extended
-/// key usages, if it lists any.
+/// One identity does both: the certificate a node serves the peer API with
+/// is also the one it presents as a client when it dials another node. So
+/// if it lists extended key usages, it needs both `serverAuth` and
+/// `clientAuth`.
 ///
-/// Any certificate `ca` vouches for is a peer. Nothing ties a
-/// certificate to a particular `server_id` -- with one certificate
-/// shared across the whole cluster, there is no per-node identity to
-/// tie it to.
+/// Any certificate that `ca` vouches for is a peer. Nothing ties a
+/// certificate to a particular `server_id`: with one certificate shared by
+/// the whole cluster, there is no per-node identity to tie it to.
 #[derive(Clone)]
 pub struct PeerTls {
     pub identity: Identity,
-    /// What a peer's certificate must chain to. May be a self-signed
-    /// leaf trusted as its own anchor, in which case it must not be
-    /// marked `CA:TRUE` -- webpki refuses a CA certificate used as an
-    /// end entity.
+    /// What a peer's certificate must chain to. May be a self-signed leaf used
+    /// as its own anchor; then it must not be marked `CA:TRUE`, because webpki
+    /// refuses a CA certificate used as an end entity.
     pub ca: Certificate,
-    /// The name to check every peer's certificate against, instead of
-    /// the host in its address. What lets one certificate, with one
-    /// name, serve every node however they are addressed.
+    /// The name to check every peer's certificate against, instead of the host
+    /// in its address. This lets one certificate, with one name, serve every
+    /// node however it is addressed.
     pub server_name: Option<String>,
 }
 
@@ -180,20 +113,16 @@ pub struct PeerTls {
 #[derive(Clone)]
 pub struct ClientApiTls {
     pub identity: Identity,
-    /// If set, every client must present a certificate that chains to
-    /// this -- mTLS -- or the handshake fails before any RPC is seen.
-    /// That gate is all it is: who the caller *is* is still the token's
-    /// business (see [`crate::auth`]), not the certificate's.
+    /// If set, every client must present a certificate that chains to this
+    /// (mTLS), or the handshake fails before any RPC is seen. That is all it
+    /// does: the token, not the certificate, says who the caller is (see
+    /// [`crate::auth`]).
     pub client_ca: Option<Certificate>,
 }
 
-/// `run`, for a caller that already has a token to shut this node down
-/// with -- one shared with other nodes in the same process, say, or a
-/// child of some wider application-level token. `run` is this plus a
-/// freshly minted root token.
-///
-/// This is [`serve_config`] with authentication off; a node that should
-/// require tokens is started through that instead.
+/// Run a node with authentication and TLS off, until `cancel` is
+/// cancelled. [`serve_config`] with a default config; a node that needs
+/// tokens or TLS starts through that instead.
 pub async fn serve(
     id: String,
     db: &Path,
@@ -220,7 +149,28 @@ pub async fn serve(
     .await
 }
 
-/// Runs one node to completion, as `config` describes it.
+/// Run one node, as `config` describes it, until a server fails or
+/// `cancel` is cancelled.
+///
+/// Cancelling is the graceful path. `cancel` is the root of a tree of child
+/// tokens that covers every task the node starts: the gRPC servers (which
+/// stop accepting, then finish their in-flight requests), the state
+/// machine, and each per-role and per-peer background task. This returns
+/// only after all of them have returned, so it is safe to restart a node on
+/// the same database directory and addresses at once: nothing still holds
+/// the database lock or the sockets.
+///
+/// Dropping the future instead of cancelling is abrupt, and leaves
+/// in-flight `spawn_blocking` storage work running with no owner. Prefer
+/// `cancel()`, then `.await`.
+///
+/// A node started on a new `db` directory is in no cluster. It answers RPCs
+/// and waits, never campaigning, until it is bootstrapped into a
+/// single-node cluster (the `Bootstrap` client RPC) or added to an existing
+/// one (`AddServer` on that cluster's leader, which replicates the
+/// configuration here). Membership lives in the log, so a restart on an
+/// existing `db` rejoins the cluster this node was in: there is no peer
+/// list to keep in sync by hand.
 pub async fn serve_config(config: ServerConfig, cancel: CancellationToken) -> Result<(), Error> {
     let ServerConfig {
         id,
@@ -245,8 +195,8 @@ pub async fn serve_config(config: ServerConfig, cancel: CancellationToken) -> Re
         voting: true,
     };
 
-    // Checked before the node starts, not from `role_rx`: the state
-    // machine hasn't published a role yet at this point.
+    // Checked before the node starts, not from `role_rx`: the state machine
+    // has not published a role yet.
     let uninitialized = log.current_config()?.is_none();
 
     let NodeHandles {
@@ -254,17 +204,16 @@ pub async fn serve_config(config: ServerConfig, cancel: CancellationToken) -> Re
         peer_handle,
         ..
     } = Common::new(id.clone(), Arc::clone(&log), cancel.clone())?;
-    // Built before either server starts, so a certificate rustls won't
-    // accept fails the node at startup rather than at its first dial.
+    // Built before either server starts, so a certificate rustls does not
+    // accept fails the node at startup, not at its first dial.
     let mut client_builder = Server::builder();
     let mut peer_builder = Server::builder();
     let mut peer_dial = None;
     if let Some(tls) = client_tls {
         let mut config = ServerTlsConfig::new().identity(tls.identity);
         if let Some(ca) = tls.client_ca {
-            // Required, not optional: tonic's default. An optional
-            // client certificate would gate nothing, since nothing
-            // here reads who it names.
+            // Required, not optional (tonic's default). An optional client certificate
+            // would gate nothing, because nothing here reads who it names.
             config = config.client_ca_root(ca);
         }
         client_builder = client_builder.tls_config(config)?;
@@ -286,8 +235,9 @@ pub async fn serve_config(config: ServerConfig, cancel: CancellationToken) -> Re
     }
     let client_handle = common.client_handle();
 
-    // KvService's read/write path still bypasses the state machine (see
-    // its module doc); `client_handle` is what `Bootstrap` goes through.
+    // KvService appends client writes through `LeaderHandle`, not through the
+    // event loop (see its module doc). `client_handle` is what `Bootstrap`
+    // goes through.
     let mut kv_service = KvService::new(
         Store::new(Arc::clone(&log)),
         identity.clone(),
@@ -298,11 +248,10 @@ pub async fn serve_config(config: ServerConfig, cancel: CancellationToken) -> Re
         kv_service = kv_service.with_peer_tls(dial);
     }
     spawn_transaction_sweeper(kv_service.locks(), cancel.clone());
-    // A whole transaction may be a single value, so one `BufferWrite`
-    // can legitimately be as large as `MAX_TRANSACTION_BYTES`. Without
-    // this, tonic's 4MB default would refuse it -- and refuse it in the
-    // transport, where the transaction size limit has no say and no way
-    // to explain itself.
+    // A whole transaction may be one value, so one `Write` can be as large as
+    // `MAX_TRANSACTION_BYTES`. Without this, tonic's 4 MB default would refuse
+    // it in the transport, where the transaction size limit has no say and no
+    // way to explain itself.
     let kv_server =
         KvServer::new(kv_service).max_decoding_message_size(raft5_shared::MAX_KV_MESSAGE_BYTES);
     let raft_peer_server = RaftPeerServer::new(
@@ -318,23 +267,21 @@ pub async fn serve_config(config: ServerConfig, cancel: CancellationToken) -> Re
     info!("client API listening on {client_addr}");
     info!("peer API listening on {peer_addr}");
 
-    // `serve_with_shutdown` rather than `serve`: on cancellation tonic
-    // stops accepting and then lets the requests already in flight finish,
-    // instead of dropping them mid-response. They can finish -- even one
-    // parked in `LeaderHandle::append_writes` waiting on a commit that will
-    // now never come -- because `raft::run` below drops `Common` as it
-    // exits, which closes the channels those handlers are waiting on.
+    // `serve_with_shutdown`, not `serve`: on cancellation, tonic stops
+    // accepting and lets in-flight requests finish instead of dropping them
+    // mid-response. They can finish, even one waiting in
+    // `LeaderHandle::append_writes` for a commit that will never come, because
+    // `raft::run` below drops `Common` as it exits, which closes the channels
+    // those handlers wait on.
     //
-    // Each server also cancels the token on its own way out, so a bind
-    // failure on one port brings the whole node down rather than leaving
-    // a half-reachable one behind.
+    // Each server also cancels the token on its way out, so a bind failure on
+    // one port stops the whole node instead of leaving it half reachable.
     let client_server = async {
         let result = client_builder
             .layer(trace_layer())
-            // Inside the trace layer, so a request turned away for want
-            // of a token is still one of the spans this node logs --
-            // which is the only place an operator would see that
-            // happening at all.
+            // Inside the trace layer, so a request refused for lack of a token is
+            // still one of the spans this node logs, which is the only place an
+            // operator would see it.
             .layer(ValidateRequestHeaderLayer::custom(RequireToken::new(auth)))
             .add_service(kv_server)
             .serve_with_shutdown(client_addr, cancel.cancelled())
@@ -345,15 +292,13 @@ pub async fn serve_config(config: ServerConfig, cancel: CancellationToken) -> Re
     let peer_server = async {
         let result = peer_builder
             .layer(trace_layer())
-            // Matches the peer clients (see `raft::PeerConnections`):
-            // without it, h2's default 65535-byte window caps
-            // replication throughput at `window / round trip` however
-            // the batch is chunked.
+            // Matches the peer clients (see `raft::PeerConnections`): without it,
+            // h2's default 65535-byte window caps replication throughput at
+            // `window / round trip`, however the batch is chunked.
             .http2_adaptive_window(Some(true))
-            // An `AppendEntries` stream buffers up to
-            // `MAX_APPEND_ENTRIES_BYTES` here before any of it reaches
-            // the event loop, so how many may be in flight at once is
-            // the other half of that limit -- and this port is where an
+            // An `AppendEntries` stream buffers up to `MAX_APPEND_ENTRIES_BYTES` here
+            // before any of it reaches the event loop, so the number in flight at once
+            // is the other half of that limit, and this port is where an
             // unauthenticated peer would push on it.
             .max_concurrent_streams(Some(MAX_CONCURRENT_PEER_STREAMS))
             .add_service(raft_peer_server)
@@ -363,12 +308,11 @@ pub async fn serve_config(config: ServerConfig, cancel: CancellationToken) -> Re
         result
     };
 
-    // `join!`, not `select!`: all three have to be driven to completion,
-    // not just until the first one finishes. `raft::run` returns only
-    // after every task it owns has been signalled *and joined* (see
-    // `raft::Task`), and dropping it early instead would abandon exactly
-    // the work -- in-flight `spawn_blocking` storage calls holding the
-    // database lock -- that a restart right afterwards would collide with.
+    // `join!`, not `select!`: all three must run to completion, not only until
+    // the first finishes. `raft::run` returns only after every task it owns is
+    // signalled and joined (see `raft::Task`), and dropping it early would
+    // abandon exactly the work (in-flight `spawn_blocking` storage calls that
+    // hold the database lock) that an immediate restart would collide with.
     let (client_result, peer_result, ()) =
         tokio::join!(client_server, peer_server, raft::run(common));
     client_result?;
@@ -376,15 +320,14 @@ pub async fn serve_config(config: ServerConfig, cancel: CancellationToken) -> Re
     Ok(())
 }
 
-/// One span per RPC, on both the client and peer services, recording its
-/// method, latency, and outcome. Success/failure is read from the
-/// `grpc-status` trailer rather than the HTTP status (which for gRPC is
-/// almost always 200 regardless of the RPC's outcome), so an application
-/// error here is a real error, not a false "ok".
+/// One span per RPC, on both the client and peer services, with its method,
+/// latency and outcome. Success or failure comes from the `grpc-status`
+/// trailer, not the HTTP status (almost always 200 for gRPC, whatever the
+/// outcome), so an application error is logged as an error, not as "ok".
 ///
-/// Logged at `INFO` -- and failures at `WARN`, so they stand out from
-/// ordinary traffic -- to match the level the rest of this crate's
-/// logging defaults to (see `main`'s `EnvFilter`).
+/// Logged at `INFO`, and failures at `WARN` so they stand out, to match the
+/// level the rest of this crate logs at by default (see `main`'s
+/// `EnvFilter`).
 fn trace_layer()
 -> TraceLayer<tower_http::classify::SharedClassifier<tower_http::classify::GrpcErrorsAsFailures>> {
     TraceLayer::new_for_grpc()
@@ -393,34 +336,32 @@ fn trace_layer()
         .on_failure(DefaultOnFailure::new().level(Level::WARN))
 }
 
-/// How many peer RPCs may be in flight against this node at once.
+/// The most peer RPCs in flight against this node at once.
 ///
-/// Each concurrent `AppendEntries` can hold `MAX_APPEND_ENTRIES_BYTES`
-/// of reassembly buffer, so this and that constant together are the real
-/// ceiling on what inbound replication can make this node allocate.
-/// Comfortably above anything a legitimate cluster does -- a peer runs
-/// one replication stream and one lease probe against each other node --
-/// and far below "unbounded".
+/// Each concurrent `AppendEntries` can hold `MAX_APPEND_ENTRIES_BYTES` of
+/// reassembly buffer, so this and that constant together are the real limit
+/// on what inbound replication can make this node allocate. Well above
+/// what a real cluster does (a peer runs one replication stream and one
+/// lease probe against each other node), and far below unbounded.
 const MAX_CONCURRENT_PEER_STREAMS: u32 = 64;
 
-/// How often abandoned transactions are reclaimed, and how long an
-/// aborted one's record of *why* it died outlives it.
+/// How often abandoned transactions are reclaimed, and how long an aborted
+/// transaction's reason outlives it.
 ///
-/// The interval is not a latency budget. An expired transaction's locks
-/// are released by the first request that collides with them, so nothing
-/// waits on this tick to make progress -- it only reclaims transactions
-/// nobody happens to want anything from, which costs memory rather than
-/// time. The grace period is what lets a client that has been quiet come
-/// back and be told `EXPIRED` instead of `UNKNOWN`.
+/// The interval is not a latency budget. The first request that collides
+/// with an expired transaction's locks releases them, so nothing waits on
+/// this tick to make progress. It only reclaims transactions nobody
+/// collides with, which costs memory, not time. The grace period lets a
+/// client that was quiet come back and hear `EXPIRED` instead of `UNKNOWN`.
 const TRANSACTION_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const TRANSACTION_TOMBSTONE_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Reclaims transactions nobody collided with, until the node shuts down.
+/// Reclaim transactions nobody collided with, until the node shuts down.
 ///
-/// Holds the lock table outright rather than weakly: it is a map behind
-/// an `Arc`, not the service, so keeping it alive costs a few words and
-/// creates no cycle. The cancellation token is what ends this task, the
-/// same one that ends everything else here.
+/// Holds the lock table by a strong reference, not a weak one: it is a map
+/// behind an `Arc`, not the service, so keeping it alive costs a few words
+/// and makes no cycle. The cancellation token ends this task, the same
+/// token that ends everything else here.
 fn spawn_transaction_sweeper(locks: txn::Locks, cancel: CancellationToken) {
     tokio::spawn(async move {
         let mut ticks = tokio::time::interval(TRANSACTION_SWEEP_INTERVAL);

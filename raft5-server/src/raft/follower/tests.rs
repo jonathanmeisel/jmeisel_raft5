@@ -3,15 +3,13 @@ use crate::storage::Mutation;
 use crate::pb::raft5::raft::GetLeaseRequest;
 use crate::raft::test_support::*;
 
-/// Retries `req` until it's granted or this node has moved on to
-/// campaigning itself, whichever comes first -- both outcomes prove
-/// a lease-based denial isn't permanent. The two are deliberately
-/// racy against each other here: the same deadline that ends the
-/// lease also starts this node's own candidacy timer (see the module
-/// doc on why the two were merged), so on an isolated node (no real
-/// peer refreshing anything) there's no way to guarantee which one
-/// wins on any given run. Returns the granted response, or `None` if
-/// it moved on to campaigning instead.
+/// Retry `req` until it is granted or this node starts campaigning itself,
+/// whichever comes first: either outcome proves that a lease-based denial
+/// is not permanent. The two race here on purpose. The deadline that ends
+/// the lease also starts this node's candidacy timer (see the module doc
+/// for why they share one deadline), so on an isolated node (no real peer
+/// refreshing anything) nothing decides which wins on a given run. Returns
+/// the granted response, or `None` if the node started campaigning.
 async fn wait_for_vote_grant_or_role_change(
     peer_handle: &RaftPeerHandle,
     role_rx: &mut watch::Receiver<RoleHandle>,
@@ -79,9 +77,9 @@ async fn append_entries_appends_fresh_entries_to_an_empty_log() {
 
     assert!(resp.success);
     assert_eq!(resp.match_index, 2);
-    // `leader_commit` is 0 here, so nothing has committed yet --
-    // `get_latest` wouldn't reflect these entries even once applied
-    // (see storage's module doc), so check `log` directly instead.
+    // `leader_commit` is 0 here, so nothing has committed yet. `get_latest`
+    // would not show these entries even once applied (see the storage module
+    // doc), so check `log` directly.
     let stored = log.entries_in_range(1, 3).unwrap();
     assert_eq!(stored.len(), 2);
     assert_eq!(stored[0].payload.writes(), [Mutation::new(*b"a", Some(*b"1"))]);
@@ -89,10 +87,10 @@ async fn append_entries_appends_fresh_entries_to_an_empty_log() {
     cleanup(&path);
 }
 
-/// A follower re-appends replicated entries into its own log, so the
-/// entry's kind has to survive the round trip -- inferring it from
-/// `value` would turn the leader's term-opening no-op into a delete
-/// tombstone for the empty key, and the two logs would stop matching.
+/// A follower re-appends replicated entries into its own log, so an
+/// entry's kind must survive the round trip. Inferring it from `value`
+/// would turn the leader's term-opening no-op into a delete tombstone for
+/// the empty key, and the two logs would stop matching.
 #[tokio::test]
 async fn append_entries_preserves_a_replicated_noop_rather_than_flattening_it() {
     let (log, _role_rx, peer_handle, _commit_rx, _compact_rx, path) =
@@ -129,10 +127,9 @@ async fn append_entries_preserves_a_replicated_noop_rather_than_flattening_it() 
     cleanup(&path);
 }
 
-/// A configuration takes effect the moment it is *appended* (Raft
-/// §4.1), not when it commits -- so a replicated `Config` entry has
-/// to change the follower's membership immediately, with
-/// `leader_commit` still at 0.
+/// A configuration takes effect when appended (Raft §4.1), not when
+/// committed, so a replicated `Config` entry must change the follower's
+/// membership at once, with `leader_commit` still at 0.
 #[tokio::test]
 async fn a_replicated_config_entry_takes_effect_on_append_not_on_commit() {
     let before = cluster_config(&[("test-node", true), ("v1", true)]);
@@ -165,7 +162,7 @@ async fn a_replicated_config_entry_takes_effect_on_append_not_on_commit() {
     assert!(resp.success);
     assert_eq!(*commit_rx.borrow(), 0, "nothing has committed");
 
-    // Visible from storage straight away, uncommitted and unapplied.
+    // Visible from storage at once, uncommitted and unapplied.
     assert_eq!(
         ClusterConfig::from_bytes(&log.current_config().unwrap().unwrap()).unwrap(),
         after
@@ -173,9 +170,9 @@ async fn a_replicated_config_entry_takes_effect_on_append_not_on_commit() {
     cleanup(&path);
 }
 
-/// The flip side of activating on append: if the entry carrying a
-/// configuration is truncated away by a conflicting leader, the
-/// previous configuration is in force again.
+/// The other side of taking effect on append: if a conflicting leader
+/// truncates the entry with a configuration, the previous configuration is
+/// in force again.
 #[tokio::test]
 async fn a_truncated_config_entry_reverts_the_active_configuration() {
     let before = cluster_config(&[("test-node", true), ("v1", true)]);
@@ -205,8 +202,8 @@ async fn a_truncated_config_entry_reverts_the_active_configuration() {
         .await
         .unwrap();
 
-    // A leader from a later term overwrites seq 2 with something
-    // else, discarding the configuration that lived there.
+    // A leader from a later term overwrites seq 2 with something else,
+    // discarding the configuration that was there.
     let resp = peer_handle
         .append_entries(append_entries(
             2,
@@ -226,9 +223,9 @@ async fn a_truncated_config_entry_reverts_the_active_configuration() {
     cleanup(&path);
 }
 
-/// Promotion has to rebuild the election timer: `Follower::new` arms
-/// one only for a voter, so a learner that is promoted while sitting
-/// in `Follower` would otherwise never campaign again.
+/// Promotion must rebuild the election timer: `Follower::new` arms one only
+/// for a voter, so a learner promoted while in `Follower` would otherwise
+/// never campaign again.
 #[tokio::test]
 async fn a_learner_promoted_by_a_replicated_config_starts_campaigning() {
     let before = cluster_config(&[("test-node", false), ("v1", true), ("v2", true)]);
@@ -258,8 +255,8 @@ async fn a_learner_promoted_by_a_replicated_config_starts_campaigning() {
         .await
         .unwrap();
 
-    // Its peers are unreachable, so it can't win -- but it must at
-    // least start trying, which it never did as a learner.
+    // Its peers are unreachable, so it cannot win, but it must at least start
+    // trying, which it never did as a learner.
     wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Candidate)).await;
     cleanup(&path);
 }
@@ -295,10 +292,9 @@ async fn append_entries_rejects_and_hints_the_start_of_the_conflicting_term_run(
         .await
         .unwrap();
 
-    // Claims prev_log_index 3 was written at term 2, but the follower
-    // actually has term 1 there (and at 1, 2 too) -- the fast-backup
-    // hint should point at the start of that whole term-1 run, not
-    // just one index back.
+    // Claims prev_log_index 3 was written at term 2, but the follower has term
+    // 1 there (and at 1 and 2 too). The fast-backup hint should point at the
+    // start of that whole term-1 run, not just one index back.
     let resp = peer_handle
         .append_entries(append_entries(2, "leader-1", 3, 2, vec![], 0))
         .await
@@ -315,7 +311,7 @@ async fn append_entries_truncates_a_conflicting_suffix_and_applies_the_leaders_e
     let (log, _role_rx, peer_handle, _commit_rx, _compact_rx, path) =
         spawn_node_with_handles(vec![]);
 
-    // Follower picks up a stale entry at seq 2 from an old leader.
+    // The follower gets a stale entry at seq 2 from an old leader.
     let stale = vec![
         log_entry(1, 1, b"a", Some(b"1")),
         log_entry(2, 1, b"stale", Some(b"old")),
@@ -334,11 +330,10 @@ async fn append_entries_truncates_a_conflicting_suffix_and_applies_the_leaders_e
 
     assert!(resp.success);
     assert_eq!(resp.match_index, 2);
-    // `leader_commit` is 0 here, so `get_latest` wouldn't reflect any
-    // of this regardless -- check `log` directly: the stale entry at
-    // seq 2 is gone, replaced by the new leader's entry at the same
-    // seq (a keyspace can only hold one value per exact seq, so this
-    // alone proves the old one didn't survive).
+    // `leader_commit` is 0 here, so `get_latest` would not show any of this.
+    // Check `log` directly: the stale entry at seq 2 is gone, replaced by the
+    // new leader's entry at the same seq (a keyspace holds one value per exact
+    // seq, so this alone proves the old one did not survive).
     let stored = log.entries_in_range(2, 3).unwrap();
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].payload.writes()[0].key, b"fresh");
@@ -355,8 +350,8 @@ async fn append_entries_advances_commit_to_the_min_of_leader_commit_and_match_in
         log_entry(1, 1, b"a", Some(b"1")),
         log_entry(2, 1, b"b", Some(b"2")),
     ];
-    // leader_commit (1) is lower than match_index (2), so commit should
-    // land at 1, not 2.
+    // leader_commit (1) is lower than match_index (2), so commit should land
+    // at 1, not 2.
     peer_handle
         .append_entries(append_entries(1, "leader-1", 0, 0, entries, 1))
         .await
@@ -396,13 +391,12 @@ async fn request_vote_with_a_higher_term_is_granted_even_after_voting_this_term(
         .await
         .unwrap();
 
-    // Granting that vote just renewed this follower's lease (voting
-    // for a prospective leader defers our own campaign, and the two
-    // deadlines are deliberately merged into one -- see the module
-    // doc), so a second, different candidate can't get a vote until
-    // that lease naturally lapses, regardless of term. Once it does,
-    // this node's own candidacy timer -- the very same deadline --
-    // may also fire first; see `wait_for_vote_grant_or_role_change`.
+    // Granting that vote renewed this follower's lease (voting for a likely
+    // leader delays our own campaign, and the two share one deadline on
+    // purpose; see the module doc). So a second, different candidate cannot get
+    // a vote until that lease lapses, whatever its term. Then this node's own
+    // candidacy timer (the same deadline) may fire first; see
+    // `wait_for_vote_grant_or_role_change`.
     let resp = wait_for_vote_grant_or_role_change(
         &peer_handle,
         &mut role_rx,
@@ -422,16 +416,16 @@ async fn request_vote_denies_a_candidate_whose_log_ends_at_an_older_term() {
     let (_log, _role_rx, peer_handle, _commit_rx, _compact_rx, path) =
         spawn_node_with_handles(vec![]);
 
-    // Follower's log ends at term 2.
+    // The follower's log ends at term 2.
     let entries = vec![log_entry(1, 2, b"a", Some(b"1"))];
     peer_handle
         .append_entries(append_entries(2, "leader-1", 0, 0, entries, 0))
         .await
         .unwrap();
 
-    // Candidate's RPC term (3) is higher, but its own log ends at an
-    // *older* term (1) than ours (2) -- must be denied regardless of
-    // how much longer its log claims to be (index 5).
+    // The candidate's RPC term (3) is higher, but its own log ends at an older
+    // term (1) than ours (2), so it must be denied, however much longer its log
+    // claims to be (index 5).
     let resp = peer_handle
         .request_vote(RequestVoteRequest {
             term: 3,
@@ -458,14 +452,13 @@ async fn request_vote_grants_a_candidate_whose_log_is_at_least_as_up_to_date() {
         .await
         .unwrap();
 
-    // The AppendEntries above just renewed this follower's lease on
-    // leader-1, so it'll refuse any vote request until that lease
-    // naturally expires -- wait it out (or for this node's own
-    // candidacy timer, the same deadline, to fire first; see
+    // The AppendEntries above renewed this follower's lease on leader-1, so it
+    // refuses every vote request until that lease expires. Wait it out (or for
+    // this node's candidacy timer, the same deadline, to fire first; see
     // `wait_for_vote_grant_or_role_change`) before expecting a grant.
     //
-    // Same term as our last entry (2) and the same index (1) --
-    // "at least as up to date" per §5.4.1, so this should be granted.
+    // Same term as our last entry (2) and the same index (1): "at least as up
+    // to date" per §5.4.1, so this should be granted.
     let req = RequestVoteRequest {
         term: 3,
         candidate_id: "candidate-a".to_string(),
@@ -483,9 +476,9 @@ async fn request_vote_grants_a_candidate_whose_log_is_at_least_as_up_to_date() {
 
 #[tokio::test]
 async fn granting_a_vote_persists_it_to_storage() {
-    // Complements storage.rs's own round-trip test: this one checks
-    // that `Follower::handle_event` actually calls through to
-    // persistence, not just that the storage layer works in isolation.
+    // Complements storage.rs's own round-trip test: this checks that
+    // `Follower::handle_event` really calls persistence, not only that the
+    // storage layer works alone.
     let (log, path) = open_temp_log();
     let NodeHandles {
         common,
@@ -529,8 +522,8 @@ async fn dry_run_vote_grants_without_mutating_any_state() {
         .unwrap();
 
     assert!(resp.vote_granted);
-    // A dry run must not actually record anything -- current_term and
-    // voted_for stay exactly as they were before this call.
+    // A dry run must record nothing: current_term and voted_for stay as they
+    // were before this call.
     assert_eq!(log.term_state().unwrap(), (0, None));
     cleanup(&path);
 }
@@ -545,10 +538,9 @@ async fn dry_run_vote_denies_when_term_is_not_higher() {
         .await
         .unwrap();
 
-    // A dry run at the SAME term (not strictly higher) must be denied
-    // -- granting would mean "yes, you could win term 5", but this
-    // follower already recognizes term 5 as current (and possibly
-    // already voted in it for real).
+    // A dry run at the same term (not strictly higher) must be denied:
+    // granting would mean "yes, you could win term 5", but this follower
+    // already sees term 5 as current (and may have voted in it for real).
     let resp = peer_handle
         .request_vote(RequestVoteRequest {
             term: 5,
@@ -575,8 +567,8 @@ async fn dry_run_vote_denies_when_candidates_log_is_behind() {
         .await
         .unwrap();
 
-    // Term is high enough (3 > 2), but the candidate's log ends at an
-    // older term (1) than ours (2).
+    // The term is high enough (3 > 2), but the candidate's log ends at an older
+    // term (1) than ours (2).
     let resp = peer_handle
         .request_vote(RequestVoteRequest {
             term: 3,
@@ -597,10 +589,9 @@ async fn a_granted_dry_run_does_not_block_a_later_real_vote_for_someone_else() {
     let (_log, _role_rx, peer_handle, _commit_rx, _compact_rx, path) =
         spawn_node_with_handles(vec![]);
 
-    // Since a dry run never records anything, a later REAL request at
-    // the same term from a *different* candidate must still be
-    // evaluated fresh, not implicitly denied because of who the dry
-    // run was "for".
+    // A dry run records nothing, so a later real request at the same term from
+    // a different candidate must be evaluated fresh, not denied because of who
+    // the dry run was "for".
     let dry = peer_handle
         .request_vote(RequestVoteRequest {
             term: 5,
@@ -630,13 +621,12 @@ async fn a_granted_dry_run_does_not_block_a_later_real_vote_for_someone_else() {
 #[tokio::test]
 async fn get_lease_grants_when_term_matches_and_denies_otherwise() {
     let (mut role_rx, peer_handle, path) = spawn_test_node(vec![]);
-    // `get_lease` bypasses the event loop entirely (that's the whole
-    // point), so unlike append_entries/request_vote it doesn't
-    // naturally wait for the driver to actually start -- confirm the
-    // follower role is really published first.
+    // `get_lease` bypasses the event loop (that is its purpose), so unlike
+    // append_entries and request_vote it does not wait for the driver to
+    // start. Confirm the follower role is published first.
     wait_for_role(&mut role_rx, |r| matches!(r, RoleHandle::Follower(_))).await;
 
-    // Follower starts at term 0 -- a lease request for term 0 matches.
+    // The follower starts at term 0, so a lease request for term 0 matches.
     let resp = peer_handle.get_lease(GetLeaseRequest {
         leader_id: "leader-1".to_string(),
         term: 0,
@@ -644,7 +634,7 @@ async fn get_lease_grants_when_term_matches_and_denies_otherwise() {
     });
     assert!(resp.lease_granted);
 
-    // A term that doesn't match the follower's current term is denied.
+    // A term that does not match the follower's current term is denied.
     let resp = peer_handle.get_lease(GetLeaseRequest {
         leader_id: "leader-1".to_string(),
         term: 5,
@@ -655,12 +645,11 @@ async fn get_lease_grants_when_term_matches_and_denies_otherwise() {
     cleanup(&path);
 }
 
-/// A follower promises exactly the lease the leader asked for -- that
-/// is how long the leader will count it -- rather than whatever its own
-/// configuration says, which can briefly differ mid heartbeat change.
-/// Within limits: no request can silence its elections for longer than
-/// the longest heartbeat allows, and a leader that names no duration at
-/// all (one that predates the field) gets this node's own.
+/// A follower promises exactly the lease the leader asked for (how long the
+/// leader will count it), not its own configured lease, which can briefly
+/// differ during a heartbeat change. Within limits: no request can block its
+/// elections longer than the longest heartbeat allows, and a leader that
+/// names no duration gets this node's own.
 #[tokio::test]
 async fn get_lease_promises_the_requested_duration_within_limits() {
     let (mut role_rx, peer_handle, path) = spawn_test_node(vec![]);
@@ -689,7 +678,7 @@ async fn get_lease_promises_the_requested_duration_within_limits() {
     assert_promised(3_000, Duration::from_millis(3_000));
     assert_promised(0, Timing::default().lease());
     assert_promised(1, Timing::min_lease());
-    // Would overflow `Instant` unclamped.
+    // Would overflow `Instant` without the clamp.
     assert_promised(u64::MAX, Timing::max_lease());
 
     cleanup(&path);
@@ -707,9 +696,8 @@ async fn a_granted_lease_blocks_a_vote_request_for_someone_else() {
     });
     assert!(resp.lease_granted);
 
-    // A vote request arriving while the lease is still active must be
-    // refused outright -- even a real request with a higher term and
-    // a perfectly fine log.
+    // A vote request that arrives while the lease is active must be refused
+    // outright, even a real request with a higher term and a good log.
     let resp = peer_handle
         .request_vote(RequestVoteRequest {
             term: 99,
@@ -749,9 +737,9 @@ async fn a_vote_request_is_granted_normally_once_the_lease_expires() {
         lease_millis: Timing::default().lease_ms(),
     });
 
-    // Wait for the lease to naturally expire -- or, since it's the
-    // same deadline, for this node's own candidacy timer to fire
-    // first; see `wait_for_vote_grant_or_role_change`.
+    // Wait for the lease to expire, or, since it is the same deadline, for this
+    // node's own candidacy timer to fire first; see
+    // `wait_for_vote_grant_or_role_change`.
     let req = RequestVoteRequest {
         term: 1,
         candidate_id: "candidate-a".to_string(),
@@ -767,10 +755,10 @@ async fn a_vote_request_is_granted_normally_once_the_lease_expires() {
     cleanup(&path);
 }
 
-/// A follower must not transition to candidate before its lease
-/// expires -- repeated `GetLease` grants (standing in for the
-/// leader's periodic probes) should keep deferring the election
-/// timer indefinitely, well past when it would otherwise have fired.
+/// A follower must not become a candidate before its lease expires:
+/// repeated `GetLease` grants (standing in for the leader's probes) should
+/// keep delaying the election timer, well past when it would otherwise have
+/// fired.
 #[tokio::test]
 async fn periodic_lease_grants_prevent_becoming_a_candidate() {
     let (mut role_rx, peer_handle, path) = spawn_test_node(vec![]);
@@ -796,8 +784,8 @@ async fn install_snapshot_applies_state_and_advances_watermarks() {
     let (source_log, source_path) = open_temp_log();
     source_log.append(3, b"a", Some(b"1")).unwrap();
     let s2 = source_log.append(3, b"b", Some(b"2")).unwrap();
-    // `export_snapshot` only ever reflects committed state -- apply
-    // first so there's actually something for it to export.
+    // `export_snapshot` only shows committed state, so apply first, so there is
+    // something to export.
     source_log.apply_committed(s2).unwrap();
     let mut buf = Vec::new();
     let meta = source_log.export_snapshot(&mut buf).unwrap();
@@ -820,11 +808,10 @@ async fn install_snapshot_applies_state_and_advances_watermarks() {
         .unwrap();
 
     assert_eq!(resp.term, 5);
-    // `install_snapshot` repopulates `versions` with each row at the
-    // seq it was originally written at -- "a" at 1 and "b" at 2 --
-    // rather than stamping them all at `last_included_seq`. Keeping the
-    // real seqs is what lets a checkpoint survive the transfer; see
-    // `storage::snapshot::install_snapshot`.
+    // `install_snapshot` refills `versions` with each row at the seq it was
+    // written at ("a" at 1 and "b" at 2), not all stamped at
+    // `last_included_seq`. Keeping the real seqs lets a checkpoint survive the
+    // transfer; see `storage::snapshot::install_snapshot`.
     assert_eq!(log.get_latest(b"a").unwrap(), Some((1, b"1".to_vec())));
     assert_eq!(
         log.get_latest(b"b").unwrap(),
@@ -869,11 +856,11 @@ async fn install_snapshot_rejects_a_stale_term_and_does_not_touch_storage() {
     cleanup(&path);
 }
 
-/// A transaction is one entry carrying every key it wrote, so a follower
-/// that replayed it with the right seq, term and kind but *fewer
-/// mutations* would still satisfy log matching -- (seq, term) is all that
-/// compares -- and the divergence would become the cluster's truth at the
-/// next leader change. The mutations have to arrive too.
+/// A transaction is one entry with every key it wrote. A follower that
+/// replayed it with the right seq, term and kind but fewer mutations would
+/// still pass log matching (only (seq, term) is compared), and the
+/// divergence would become the cluster's truth at the next leader change.
+/// The mutations must arrive too.
 #[tokio::test]
 async fn append_entries_replays_every_mutation_of_a_multi_key_entry() {
     let (log, _role_rx, peer_handle, _commit_rx, _compact_rx, path) =
@@ -907,12 +894,10 @@ async fn append_entries_replays_every_mutation_of_a_multi_key_entry() {
     cleanup(&path);
 }
 
-/// An entry whose kind this build doesn't recognize is refused, not
-/// guessed at. Guessing used to be safe -- the unknown value defaulted to
-/// a one-key write, which was wrong but visibly so. It isn't safe now:
-/// the guess would produce a write with no mutations, an entry that
-/// consumes a seq and satisfies log matching while silently dropping
-/// every key it was carrying.
+/// An entry whose kind this build does not know is refused, not guessed.
+/// A guess would produce a write with no mutations: an entry that uses a
+/// seq and passes log matching while silently dropping every key it
+/// carried.
 #[tokio::test]
 async fn append_entries_refuses_an_entry_whose_kind_it_does_not_recognize() {
     let (log, _role_rx, peer_handle, _commit_rx, _compact_rx, path) =

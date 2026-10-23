@@ -12,8 +12,8 @@ fn txn(locks: &Locks) -> TxnId {
         .expect("a fresh transaction should open")
 }
 
-/// One key's `read_many`, values and all -- what a single-key
-/// transactional read asks of the table.
+/// One key's `read_many`, with values: what a single-key transactional
+/// read asks of the table.
 fn read(locks: &Locks, t: TxnId, key: &[u8]) -> Result<Option<Option<Vec<u8>>>, Refused> {
     locks
         .read_many(t, &[key.to_vec()], true)
@@ -27,8 +27,8 @@ fn conflict<T: std::fmt::Debug>(r: Result<T, Refused>) -> Vec<u8> {
     }
 }
 
-/// Reading is shared: any number of transactions can hold the same key,
-/// which is what lets them all proceed as long as none of them writes.
+/// Reading is shared: any number of transactions can hold the same key, so
+/// all can proceed as long as none writes.
 #[test]
 fn many_transactions_can_read_the_same_key() {
     let locks = locks();
@@ -40,9 +40,8 @@ fn many_transactions_can_read_the_same_key() {
     assert!(locks.is_locked(b"k"));
 }
 
-/// A transaction that is the *only* reader of a key may take it
-/// exclusively -- read-then-write, the commonest thing a transaction
-/// does.
+/// A transaction that is the only reader of a key may take it
+/// exclusively: read-then-write, the most common thing a transaction does.
 #[test]
 fn the_sole_reader_of_a_key_can_upgrade_to_a_write() {
     let locks = locks();
@@ -50,13 +49,13 @@ fn the_sole_reader_of_a_key_can_upgrade_to_a_write() {
 
     read(&locks, t, b"k").unwrap();
     assert_eq!(locks.buffer_write(t, b"k", Some(b"v".to_vec())), Ok(()));
-    // And the write is visible to the transaction that made it.
+    // And the transaction that made the write sees it.
     assert_eq!(read(&locks, t, b"k"), Ok(Some(Some(b"v".to_vec()))));
 }
 
-/// The regression for encoding shared holders as a set rather than a
-/// count: reading twice must not make a transaction look like two
-/// readers, or it could never upgrade a key it alone had read.
+/// Why shared holders are a set, not a count: reading twice must not make
+/// a transaction look like two readers, or it could never upgrade a key
+/// only it had read.
 #[test]
 fn reading_the_same_key_twice_still_allows_an_upgrade() {
     let locks = locks();
@@ -71,9 +70,9 @@ fn reading_the_same_key_twice_still_allows_an_upgrade() {
     );
 }
 
-/// Two readers, and the younger one wants to write: it is in the older
-/// one's way, not the other way round, so it is refused and the older
-/// one keeps what it had.
+/// Two readers, and the younger wants to write: it is in the older one's
+/// way, not the reverse, so it is refused and the older one keeps what it
+/// had.
 #[test]
 fn a_younger_transaction_cannot_take_a_key_an_older_one_is_reading() {
     let locks = locks();
@@ -91,10 +90,9 @@ fn a_younger_transaction_cannot_take_a_key_an_older_one_is_reading() {
     assert_eq!(locks.state_of(younger), Some(TxnState::Open));
 }
 
-/// Wound-wait, the reason fail-fast alone isn't enough: an older
-/// transaction takes the key rather than backing off, and the younger one
-/// finds out why on its next request instead of being told it never
-/// existed.
+/// Wound-wait, the reason fail-fast alone is not enough: an older
+/// transaction takes the key instead of backing off, and the younger one
+/// learns why on its next request instead of hearing it never existed.
 #[test]
 fn an_older_transaction_wounds_a_younger_holder_and_takes_the_key() {
     let locks = locks();
@@ -124,10 +122,9 @@ fn an_older_transaction_wounds_a_younger_holder_and_takes_the_key() {
     );
 }
 
-/// The oldest transaction is never refused by another transaction,
-/// however many of them are in its way. That is the progress property
-/// wound-wait buys, so it is worth stating as a test rather than only in
-/// a comment.
+/// The oldest transaction is never refused by another transaction, however
+/// many are in its way. That is the progress property wound-wait gives, so
+/// it is worth a test, not only a comment.
 #[test]
 fn the_oldest_transaction_wounds_everyone_in_its_way() {
     let locks = locks();
@@ -152,8 +149,8 @@ fn the_oldest_transaction_wounds_everyone_in_its_way() {
 }
 
 /// A committing transaction's writes may already be in the log, and an
-/// appended entry cannot be recalled -- so even an older transaction has
-/// to wait its turn rather than wounding it.
+/// appended entry cannot be recalled, so even an older transaction must
+/// wait its turn instead of wounding it.
 #[test]
 fn a_committing_transaction_is_not_wounded_by_an_older_one() {
     let locks = locks();
@@ -170,9 +167,9 @@ fn a_committing_transaction_is_not_wounded_by_an_older_one() {
     );
 }
 
-/// An expired transaction holds nothing, and finds out the moment it asks
-/// for anything. Released on the *conflict* path rather than by a
-/// sweeper, so the key comes free as soon as somebody wants it.
+/// An expired transaction holds nothing, and learns that the moment it asks
+/// for anything. Released on the conflict path, not by a sweeper, so the
+/// key comes free as soon as someone wants it.
 #[test]
 fn an_expired_transaction_releases_its_locks_to_the_next_request() {
     let locks = locks();
@@ -180,8 +177,8 @@ fn an_expired_transaction_releases_its_locks_to_the_next_request() {
     locks.buffer_write(doomed, b"k", Some(b"v".to_vec())).unwrap();
     assert!(locks.is_locked(b"k"));
 
-    // Younger, so it could never *wound* the holder -- only the holder's
-    // deadline can free this key.
+    // Younger, so it could never wound the holder: only the holder's deadline
+    // can free this key.
     let later = txn(&locks);
     assert_eq!(locks.buffer_write(later, b"k", Some(b"v".to_vec())), Ok(()));
 
@@ -196,9 +193,9 @@ fn an_expired_transaction_releases_its_locks_to_the_next_request() {
     );
 }
 
-/// The sweeper is the backstop for a transaction nobody collides with,
-/// and it reclaims the tombstone only after a grace period -- long enough
-/// that its owner has had a chance to be told why it died.
+/// The sweeper is the backstop for a transaction nobody collides with, and
+/// it reclaims the tombstone only after a grace period, long enough for its
+/// owner to learn why it died.
 #[test]
 fn the_sweeper_reclaims_an_expired_transaction_nobody_touched() {
     let locks = locks();
@@ -219,8 +216,8 @@ fn the_sweeper_reclaims_an_expired_transaction_nobody_touched() {
 }
 
 /// A transaction belongs to the leader that created it. A new term means
-/// its reads were validated against state that no longer applies and its
-/// commit can never happen, so it goes, and its locks go with it.
+/// its reads were checked against state that no longer applies, and its
+/// commit can never happen, so it goes, and its locks with it.
 #[test]
 fn a_change_of_leader_term_discards_every_transaction() {
     let locks = locks();
@@ -240,8 +237,8 @@ fn a_change_of_leader_term_discards_every_transaction() {
     );
 }
 
-/// Committing hands back exactly what was buffered, in key order, and
-/// dropping the guard gives the locks up however the commit turned out.
+/// Committing returns exactly what was buffered, in key order, and dropping
+/// the guard releases the locks however the commit ended.
 #[test]
 fn committing_yields_the_buffered_writes_and_the_guard_releases_them() {
     let locks = locks();
@@ -270,7 +267,7 @@ fn committing_yields_the_buffered_writes_and_the_guard_releases_them() {
 }
 
 /// Caps are refusals, not clamps: a caller told "yes" to a lifetime this
-/// server won't honour would act on a lease it doesn't have.
+/// server will not grant would act on a lease it does not have.
 #[test]
 fn an_over_long_lifetime_is_refused_rather_than_shortened() {
     let locks = locks();
@@ -281,10 +278,9 @@ fn an_over_long_lifetime_is_refused_rather_than_shortened() {
     assert_eq!(locks.open_count(), 0);
 }
 
-/// A transaction too large to replicate would never commit -- and, being
-/// already in the log and re-proposed forever, would block everything
-/// after it. The only safe place to refuse it is before it reaches the
-/// log at all.
+/// A transaction too large to replicate would never commit, and, already
+/// in the log and resent forever, would block everything after it. The only
+/// safe place to refuse it is before it reaches the log.
 #[test]
 fn a_transaction_that_buffers_too_much_is_refused_before_it_can_commit() {
     let locks = locks();
@@ -296,8 +292,8 @@ fn a_transaction_that_buffers_too_much_is_refused_before_it_can_commit() {
         Err(Refused::TooMuch(_))
     ));
 
-    // ...and the same ceiling reached a megabyte at a time, which is
-    // the shape a real transaction actually has.
+    // ...and the same limit reached a megabyte at a time, the shape a real
+    // transaction has.
     let many = txn(&locks);
     let chunk = vec![0u8; 1024 * 1024];
     let refused = (0..)
@@ -305,10 +301,10 @@ fn a_transaction_that_buffers_too_much_is_refused_before_it_can_commit() {
     assert!(matches!(refused, Some(Refused::TooMuch(_))));
 }
 
-/// There is no separate limit on key *count*, so a great many tiny keys
-/// have to be stopped by the byte cap alone -- which they only are
-/// because `entry_size` charges each key an overhead on top of its
-/// bytes. Without that, empty keys would be free and unbounded.
+/// There is no separate key-count limit, so many tiny keys must be stopped
+/// by the byte cap alone, which works only because `entry_size` charges
+/// each key an overhead on top of its bytes. Without that, empty keys would
+/// be free and unbounded.
 #[test]
 fn a_transaction_of_countless_tiny_keys_is_still_bounded() {
     let locks = locks();
@@ -323,16 +319,16 @@ fn a_transaction_of_countless_tiny_keys_is_still_bounded() {
 }
 
 /// The per-transaction cap bounds one client; this bounds the node.
-/// Without it, `MAX_OPEN_TRANSACTIONS` transactions at the per-
-/// transaction ceiling would be gigabytes, all held on the leader before
-/// anything has been proposed.
+/// Without it, `MAX_OPEN_TRANSACTIONS` transactions at the per-transaction
+/// limit would be gigabytes, all held on the leader before anything is
+/// proposed.
 #[test]
 fn the_node_wide_budget_bounds_what_every_transaction_holds_together() {
     let locks = locks();
     let chunk = vec![0u8; 1024 * 1024];
 
-    // Fill the node budget across many transactions, each well under
-    // its own limit.
+    // Fill the node budget across many transactions, each well under its own
+    // limit.
     let mut refused = None;
     'outer: for _ in 0..(MAX_BUFFERED_BYTES_NODE_WIDE / MAX_TRANSACTION_BYTES + 2) {
         let t = txn(&locks);
@@ -350,15 +346,15 @@ fn the_node_wide_budget_bounds_what_every_transaction_holds_together() {
     );
 }
 
-/// A transaction that goes away gives its budget back, or the node-wide
-/// limit would be a one-way ratchet that eventually refuses everything.
+/// A transaction that goes away returns its budget, or the node-wide limit
+/// would only ever fill up and eventually refuse everything.
 #[test]
 fn a_finished_transaction_returns_its_budget_to_the_node() {
     let locks = locks();
     let chunk = vec![0u8; 1024 * 1024];
 
-    // Do the same work repeatedly, far more times than the node-wide
-    // budget would allow if it were never released.
+    // Do the same work many more times than the node-wide budget would allow
+    // if it were never released.
     for round in 0..(MAX_BUFFERED_BYTES_NODE_WIDE / MAX_TRANSACTION_BYTES + 4) {
         let t = txn(&locks);
         for i in 0..8 {
@@ -369,19 +365,19 @@ fn a_finished_transaction_returns_its_budget_to_the_node() {
         locks.discard(t);
     }
 
-    // The same holds for a transaction that was aborted rather than
-    // dropped: it will never be written, so it stops counting at once.
+    // The same holds for a transaction that was aborted, not dropped: it will
+    // never be written, so it stops counting at once.
     let doomed = txn(&locks);
     locks.buffer_write(doomed, b"k", Some(chunk.clone())).unwrap();
     let older = locks.create(1, Duration::from_secs(1), fresh_id()).unwrap();
-    // Not actually older -- take the key by expiry instead.
+    // Not actually older: take the key by expiry instead.
     locks.discard(older);
     locks.sweep(Instant::now() + Duration::from_secs(60), Duration::ZERO);
     assert_eq!(locks.buffered_total(), 0);
 }
 
-/// Rewriting a key a transaction has already buffered replaces the value
-/// rather than counting against the caps twice.
+/// Rewriting a key the transaction already buffered replaces the value; it
+/// does not count against the caps twice.
 #[test]
 fn rewriting_a_buffered_key_replaces_it_rather_than_accumulating() {
     let locks = locks();
@@ -396,9 +392,9 @@ fn rewriting_a_buffered_key_replaces_it_rather_than_accumulating() {
     assert_eq!(writes.len(), 1);
 }
 
-/// Dropping is idempotent and silent about an id it doesn't know:
-/// commit-then-drop is the ordinary client path, and the drop shouldn't
-/// have to know whether it raced its own commit.
+/// Dropping is safe to repeat and quiet about an unknown id:
+/// commit-then-drop is the normal client path, and the drop should not need
+/// to know if it raced its own commit.
 #[test]
 fn discarding_an_unknown_transaction_is_not_an_error() {
     let locks = locks();
@@ -410,8 +406,8 @@ fn discarding_an_unknown_transaction_is_not_an_error() {
 
 // --- bulk reads and the buffer view, for key scans --------------------
 
-/// Every key a batch names ends up in the read set and held, so a
-/// many-key read's keys are as protected as a single one's.
+/// Every key a batch names joins the read set and is held, so a many-key
+/// read's keys are as protected as a single one's.
 #[test]
 fn read_many_locks_every_key_it_is_given() {
     let locks = locks();
@@ -425,8 +421,8 @@ fn read_many_locks_every_key_it_is_given() {
         assert!(locks.is_locked(key));
     }
 
-    // Held against a writer that can't displace this one: younger, so
-    // it is refused rather than wounding its way in.
+    // Held against a writer that cannot displace this one: younger, so it is
+    // refused instead of wounding its way in.
     let younger = txn(&locks);
     assert_eq!(
         conflict(locks.buffer_write(younger, b"b", Some(b"v".to_vec()))),
@@ -434,9 +430,9 @@ fn read_many_locks_every_key_it_is_given() {
     );
 }
 
-/// A refusal part-way leaves what it already took. Those locks are in
-/// the read set now and are given up when the transaction ends -- and
-/// handing one back early could not undo a wounding it took to get.
+/// A refusal partway keeps what was already taken. Those locks are in the
+/// read set and are released when the transaction ends, and giving one back
+/// early could not undo a wound it took to get it.
 #[test]
 fn read_many_keeps_the_locks_it_took_before_being_refused() {
     let locks = locks();
@@ -452,9 +448,8 @@ fn read_many_keeps_the_locks_it_took_before_being_refused() {
     assert!(!locks.is_locked(b"c"), "and it never reached the one after");
 }
 
-/// A key this transaction has already written is skipped: it holds the
-/// stronger exclusive lock, and taking a shared one on top would be a
-/// silent downgrade.
+/// A key this transaction already wrote is skipped: it holds the stronger
+/// exclusive lock, and a shared one on top would be a silent downgrade.
 #[test]
 fn read_many_leaves_a_key_this_transaction_already_wrote_alone() {
     let locks = locks();
@@ -471,9 +466,9 @@ fn read_many_leaves_a_key_this_transaction_already_wrote_alone() {
     assert_eq!(conflict(read(&locks, other, b"k")), b"k".to_vec());
 }
 
-/// Positional, with buffered values only when asked for: a read that
-/// wants versions alone gets no clone of a buffered value it would only
-/// throw away -- and still takes every lock.
+/// By position, with buffered values only when asked for: a versions-only
+/// read gets no clone of a buffered value it would throw away, and still
+/// takes every lock.
 #[test]
 fn read_many_answers_by_position_and_clones_only_when_asked() {
     let locks = locks();
@@ -490,9 +485,8 @@ fn read_many_answers_by_position_and_clones_only_when_asked() {
     assert!(locks.is_locked(b"a"));
 }
 
-/// What a scan needs to fold in its own uncommitted changes: the
-/// buffered keys from a point on, in order, each marked as a write or a
-/// delete.
+/// What a scan needs to merge its own uncommitted changes: the buffered
+/// keys from a point on, in order, each marked as a write or a delete.
 #[test]
 fn buffered_from_reports_the_buffered_keys_in_order() {
     let locks = locks();
