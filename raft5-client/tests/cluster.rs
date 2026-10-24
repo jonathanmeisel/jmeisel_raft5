@@ -437,7 +437,8 @@ async fn increment(client: &Client) -> Result<u64, Error> {
         .value
         .map(|bytes| String::from_utf8(bytes).unwrap().parse().unwrap())
         .unwrap_or(0);
-    txn.write(b"hits", Some((n + 1).to_string().as_bytes())).await?;
+    txn.write(b"hits", Some((n + 1).to_string().as_bytes()))
+        .await?;
     txn.commit().await
 }
 
@@ -477,8 +478,14 @@ async fn a_transaction_commits_every_key_at_one_seq() {
     client.write(b"bob", Some(b"10")).await.unwrap();
 
     let txn = client.transaction(Duration::from_secs(2)).await.unwrap();
-    assert_eq!(txn.read_one(b"alice").await.unwrap().value.as_deref(), Some(&b"10"[..]));
-    assert_eq!(txn.read_one(b"bob").await.unwrap().value.as_deref(), Some(&b"10"[..]));
+    assert_eq!(
+        txn.read_one(b"alice").await.unwrap().value.as_deref(),
+        Some(&b"10"[..])
+    );
+    assert_eq!(
+        txn.read_one(b"bob").await.unwrap().value.as_deref(),
+        Some(&b"10"[..])
+    );
     txn.write(b"alice", Some(b"9")).await.unwrap();
     txn.write(b"bob", Some(b"11")).await.unwrap();
     let seq = txn.commit().await.unwrap();
@@ -530,7 +537,10 @@ async fn a_transaction_reads_back_its_own_buffered_writes() {
     txn.write(b"k", Some(b"buffered")).await.unwrap();
     let read = txn.read_one(b"k").await.unwrap();
     assert_eq!(read.value.as_deref(), Some(&b"buffered"[..]));
-    assert_eq!(read.seq, committed, "seq describes committed state, not the buffer");
+    assert_eq!(
+        read.seq, committed,
+        "seq describes committed state, not the buffer"
+    );
 
     // A buffered delete reads back as absent, the same way.
     txn.write(b"k", None).await.unwrap();
@@ -567,7 +577,10 @@ async fn a_plain_write_cannot_change_a_key_a_transaction_has_read() {
         client.write(b"k", Some(b"stolen")),
     )
     .await;
-    assert!(racing.is_err(), "a plain write must not slip past a read lock");
+    assert!(
+        racing.is_err(),
+        "a plain write must not slip past a read lock"
+    );
 
     txn.abort().await.unwrap();
     // Once the lock is gone, the same write succeeds.
@@ -653,7 +666,10 @@ async fn a_read_only_transaction_commits_at_no_sequence_number() {
     client.write(b"k", Some(b"v")).await.unwrap();
 
     let txn = client.transaction(Duration::from_secs(2)).await.unwrap();
-    assert_eq!(txn.read_one(b"k").await.unwrap().value.as_deref(), Some(&b"v"[..]));
+    assert_eq!(
+        txn.read_one(b"k").await.unwrap().value.as_deref(),
+        Some(&b"v"[..])
+    );
     assert_eq!(txn.commit().await.unwrap(), 0);
 
     // Its read lock is gone with it.
@@ -700,7 +716,11 @@ async fn concurrent_transactions_keep_two_keys_consistent() {
 
     let a: i64 = number(&client, b"a").await;
     let b: i64 = number(&client, b"b").await;
-    assert_eq!(a + b, 100, "every transfer must conserve the total (a={a}, b={b})");
+    assert_eq!(
+        a + b,
+        100,
+        "every transfer must conserve the total (a={a}, b={b})"
+    );
     assert_eq!(a, 50 - TRANSFERS as i64);
 }
 
@@ -822,7 +842,10 @@ async fn a_key_iterator_walks_every_key_in_order() {
         .unwrap();
 
     let expected: Vec<Vec<u8>> = (0..25).map(|i| format!("k{i:02}").into_bytes()).collect();
-    assert_eq!(keys, expected, "paging must cover the keyspace exactly once");
+    assert_eq!(
+        keys, expected,
+        "paging must cover the keyspace exactly once"
+    );
 }
 
 /// A walk that starts mid-keyspace starts there, inclusively, and an empty
@@ -837,10 +860,18 @@ async fn a_key_iterator_starts_where_it_is_told_and_stops_at_the_end() {
         client.write(key, Some(b"v")).await.unwrap();
     }
 
-    let keys = client.key_iterator(b"banana", Consistency::Stale).collect().await.unwrap();
+    let keys = client
+        .key_iterator(b"banana", Consistency::Stale)
+        .collect()
+        .await
+        .unwrap();
     assert_eq!(keys, vec![b"banana".to_vec(), b"cherry".to_vec()]);
 
-    let past_the_end = client.key_iterator(b"z", Consistency::Stale).collect().await.unwrap();
+    let past_the_end = client
+        .key_iterator(b"z", Consistency::Stale)
+        .collect()
+        .await
+        .unwrap();
     assert!(past_the_end.is_empty());
 }
 
@@ -857,7 +888,11 @@ async fn a_key_iterator_skips_deleted_keys() {
     }
     client.write(b"b", None).await.unwrap();
 
-    let keys = client.key_iterator(b"", Consistency::Stale).collect().await.unwrap();
+    let keys = client
+        .key_iterator(b"", Consistency::Stale)
+        .collect()
+        .await
+        .unwrap();
     assert_eq!(keys, vec![b"a".to_vec(), b"c".to_vec()]);
 }
 
@@ -995,7 +1030,10 @@ async fn a_client_can_log_in_bootstrap_and_then_work() {
     // The token from before the cluster existed is still good, and the account
     // the bootstrap wrote backs it from now on.
     client.write(b"k", Some(b"v")).await.unwrap();
-    assert_eq!(client.read_one(b"k").await.unwrap().value, Some(b"v".to_vec()));
+    assert_eq!(
+        client.read_one(b"k").await.unwrap().value,
+        Some(b"v".to_vec())
+    );
 
     client
         .create_user("alice", "correct horse", false)
@@ -1004,7 +1042,10 @@ async fn a_client_can_log_in_bootstrap_and_then_work() {
 
     let alice = Client::new([n1.url()]).unwrap();
     alice.login("alice", "correct horse").await.unwrap();
-    assert_eq!(alice.read_one(b"k").await.unwrap().value, Some(b"v".to_vec()));
+    assert_eq!(
+        alice.read_one(b"k").await.unwrap().value,
+        Some(b"v".to_vec())
+    );
 }
 
 /// What matters most for how this feels: an unauthenticated call must fail
@@ -1234,10 +1275,19 @@ async fn a_linearizable_read_sees_a_write_that_has_returned() {
     let client = Client::new([n3.url()]).unwrap();
     let seq = client.write(b"k", Some(b"v")).await.unwrap();
 
-    let read = client.read_one_at(b"k", Consistency::Linearizable).await.unwrap();
+    let read = client
+        .read_one_at(b"k", Consistency::Linearizable)
+        .await
+        .unwrap();
     assert_eq!(read.seq, seq);
     assert_eq!(read.value.as_deref(), Some(&b"v"[..]));
-    assert_eq!(client.version_one_at(b"k", Consistency::Linearizable).await.unwrap(), seq);
+    assert_eq!(
+        client
+            .version_one_at(b"k", Consistency::Linearizable)
+            .await
+            .unwrap(),
+        seq
+    );
 }
 
 /// The pattern versions-only reads exist for: check the version, decide,
@@ -1338,10 +1388,21 @@ async fn a_snapshot_holds_the_store_as_it_was_taken() {
         Some(&b"here"[..]),
         "a key deleted after the snapshot is still visible through it"
     );
-    assert_eq!(client.read_one_at(b"fresh", Consistency::Snapshot(b"s1")).await.unwrap().value, None);
+    assert_eq!(
+        client
+            .read_one_at(b"fresh", Consistency::Snapshot(b"s1"))
+            .await
+            .unwrap()
+            .value,
+        None
+    );
 
     // The key set as of the snapshot, too.
-    let keys = client.key_iterator(b"", Consistency::Snapshot(b"s1")).collect().await.unwrap();
+    let keys = client
+        .key_iterator(b"", Consistency::Snapshot(b"s1"))
+        .collect()
+        .await
+        .unwrap();
     assert_eq!(keys, vec![b"doomed".to_vec(), b"kept".to_vec()]);
 
     // And it is listed, at the seq it was taken at.
@@ -1352,7 +1413,12 @@ async fn a_snapshot_holds_the_store_as_it_was_taken() {
 
     // Once released, reads at it fail instead of silently drifting.
     client.remove_snapshot(b"s1").await.unwrap();
-    assert!(client.read_one_at(b"kept", Consistency::Snapshot(b"s1")).await.is_err());
+    assert!(
+        client
+            .read_one_at(b"kept", Consistency::Snapshot(b"s1"))
+            .await
+            .is_err()
+    );
     assert!(client.list_snapshots().await.unwrap().is_empty());
 }
 
@@ -1474,9 +1540,13 @@ async fn a_read_at_a_missing_snapshot_fails_fast() {
     bootstrap(&client, "n1").await;
 
     let started = std::time::Instant::now();
-    let read = client.read_one_at(b"k", Consistency::Snapshot(b"no-such-snapshot")).await;
+    let read = client
+        .read_one_at(b"k", Consistency::Snapshot(b"no-such-snapshot"))
+        .await;
     assert!(matches!(read, Err(Error::NotFound(_))), "{read:?}");
-    let version = client.version_one_at(b"k", Consistency::Snapshot(b"no-such-snapshot")).await;
+    let version = client
+        .version_one_at(b"k", Consistency::Snapshot(b"no-such-snapshot"))
+        .await;
     assert!(matches!(version, Err(Error::NotFound(_))), "{version:?}");
     let removed = client.remove_snapshot(b"no-such-snapshot").await;
     assert!(matches!(removed, Err(Error::NotFound(_))), "{removed:?}");
@@ -1522,7 +1592,11 @@ async fn a_snapshot_walk_pages_across_batches() {
     assert_eq!(keys, expected);
 
     // While the current walk sees only what survives.
-    let now = client.key_iterator(b"", Consistency::Stale).collect().await.unwrap();
+    let now = client
+        .key_iterator(b"", Consistency::Stale)
+        .collect()
+        .await
+        .unwrap();
     assert_eq!(now.len(), 25 - 9);
 }
 
@@ -1576,7 +1650,13 @@ async fn an_acl_written_by_an_admin_is_enforced_against_another_account() {
         .write(b"app/config", Some(b"x"))
         .await
         .expect_err("nor for writing");
-    assert!(matches!(error, Error::Denied { reason: Denial::NotPermitted, .. }));
+    assert!(matches!(
+        error,
+        Error::Denied {
+            reason: Denial::NotPermitted,
+            ..
+        }
+    ));
 
     // A key the ACL does not govern is untouched.
     assert_eq!(
@@ -1607,7 +1687,10 @@ async fn a_nested_group_carries_a_grant_to_its_members() {
     bootstrap(&admin, "perm-c2").await;
     admin.write(b"app/config", Some(b"v")).await.unwrap();
     for name in ["alice", "bob"] {
-        admin.create_user(name, "correct horse", false).await.unwrap();
+        admin
+            .create_user(name, "correct horse", false)
+            .await
+            .unwrap();
     }
 
     admin
@@ -1646,12 +1729,18 @@ async fn a_nested_group_carries_a_grant_to_its_members() {
     // Read, not write.
     assert!(matches!(
         alice.write(b"app/config", Some(b"x")).await,
-        Err(Error::Denied { reason: Denial::NotPermitted, .. })
+        Err(Error::Denied {
+            reason: Denial::NotPermitted,
+            ..
+        })
     ));
     // Bob is in nothing.
     assert!(matches!(
         bob.read_one(b"app/config").await,
-        Err(Error::Denied { reason: Denial::NotPermitted, .. })
+        Err(Error::Denied {
+            reason: Denial::NotPermitted,
+            ..
+        })
     ));
 
     // Removing alice from the inner group removes her from the outer one, and
@@ -1662,7 +1751,10 @@ async fn a_nested_group_carries_a_grant_to_its_members() {
         .unwrap();
     assert!(matches!(
         alice.read_one(b"app/config").await,
-        Err(Error::Denied { reason: Denial::NotPermitted, .. })
+        Err(Error::Denied {
+            reason: Denial::NotPermitted,
+            ..
+        })
     ));
 
     // Anyone with an account can read the listings: a caller who could not
@@ -1685,14 +1777,20 @@ async fn a_role_is_granted_by_joining_its_group() {
     let admin = Client::new([n1.url()]).unwrap();
     admin.login("root", "hunter42").await.unwrap();
     bootstrap(&admin, "role-c1").await;
-    admin.create_user("alice", "correct horse", false).await.unwrap();
+    admin
+        .create_user("alice", "correct horse", false)
+        .await
+        .unwrap();
     let alice = Client::new([n1.url()]).unwrap();
     alice.login("alice", "correct horse").await.unwrap();
 
     let mut sink = Vec::new();
     assert!(matches!(
         alice.backup(None, &mut sink).await,
-        Err(Error::Denied { reason: Denial::NotAdmin, .. })
+        Err(Error::Denied {
+            reason: Denial::NotAdmin,
+            ..
+        })
     ));
     let alice_only = [Principal::user("alice")];
     admin
@@ -1704,21 +1802,30 @@ async fn a_role_is_granted_by_joining_its_group() {
     // A backup operator is not an administrator.
     assert!(matches!(
         alice.create_user("bob", "correct horse", false).await,
-        Err(Error::Denied { reason: Denial::NotAdmin, .. })
+        Err(Error::Denied {
+            reason: Denial::NotAdmin,
+            ..
+        })
     ));
 
     admin
         .update_group(ADMINS_GROUP, &alice_only, &[], &[], &[])
         .await
         .unwrap();
-    alice.create_user("bob", "correct horse", false).await.unwrap();
+    alice
+        .create_user("bob", "correct horse", false)
+        .await
+        .unwrap();
     admin
         .update_group(ADMINS_GROUP, &[], &alice_only, &[], &[])
         .await
         .unwrap();
     assert!(matches!(
         alice.create_user("carol", "correct horse", false).await,
-        Err(Error::Denied { reason: Denial::NotAdmin, .. })
+        Err(Error::Denied {
+            reason: Denial::NotAdmin,
+            ..
+        })
     ));
 }
 
@@ -1806,7 +1913,13 @@ async fn an_ordinary_account_may_make_a_group_but_not_claim_an_unowned_prefix() 
         .await
         .expect_err("the default confers no authority over the ACLs");
     assert!(
-        matches!(error, Error::Denied { reason: Denial::NotPermitted, .. }),
+        matches!(
+            error,
+            Error::Denied {
+                reason: Denial::NotPermitted,
+                ..
+            }
+        ),
         "got {error:?}"
     );
 
@@ -1822,8 +1935,13 @@ async fn an_ordinary_account_may_make_a_group_but_not_claim_an_unowned_prefix() 
     // does not reach her. Otherwise every group's administrator would silently
     // hold everything the group was ever granted.
     assert!(matches!(
-        alice.set_acl(b"app/sub/", &[(Principal::user("alice"), Right::Read)]).await,
-        Err(Error::Denied { reason: Denial::NotPermitted, .. })
+        alice
+            .set_acl(b"app/sub/", &[(Principal::user("alice"), Right::Read)])
+            .await,
+        Err(Error::Denied {
+            reason: Denial::NotPermitted,
+            ..
+        })
     ));
     alice
         .update_group("oncall", &[Principal::user("alice")], &[], &[], &[])
@@ -1835,14 +1953,22 @@ async fn an_ordinary_account_may_make_a_group_but_not_claim_an_unowned_prefix() 
         .unwrap();
     // But not a sibling nothing reaches.
     assert!(matches!(
-        alice.set_acl(b"app2/", &[(Principal::user("alice"), Right::Write)]).await,
-        Err(Error::Denied { reason: Denial::NotPermitted, .. })
+        alice
+            .set_acl(b"app2/", &[(Principal::user("alice"), Right::Write)])
+            .await,
+        Err(Error::Denied {
+            reason: Denial::NotPermitted,
+            ..
+        })
     ));
 
     // A group that does not exist is reported as such.
     assert!(matches!(
         alice.get_group("nope").await,
-        Err(Error::Denied { reason: Denial::NoSuchGroup, .. })
+        Err(Error::Denied {
+            reason: Denial::NoSuchGroup,
+            ..
+        })
     ));
 }
 
@@ -1927,7 +2053,13 @@ async fn wait_for_voters(addr: SocketAddr, tls: tonic::transport::ClientTlsConfi
     let until = Instant::now() + BOOTSTRAP_TIMEOUT;
     loop {
         if let Ok(resp) = kv.get_config(GetConfigRequest {}).await
-            && resp.into_inner().members.iter().filter(|m| m.voting).count() == n
+            && resp
+                .into_inner()
+                .members
+                .iter()
+                .filter(|m| m.voting)
+                .count()
+                == n
         {
             return;
         }
@@ -2042,7 +2174,10 @@ async fn a_many_key_read_works_at_every_consistency() {
         assert_eq!(seqs, [b, 0, a]);
     }
 
-    let at = client.read(&keys, Consistency::Snapshot(b"s1")).await.unwrap();
+    let at = client
+        .read(&keys, Consistency::Snapshot(b"s1"))
+        .await
+        .unwrap();
     assert_eq!(at.as_of, snap.seq);
     let seqs: Vec<_> = at.entries.iter().map(|e| e.seq).collect();
     assert_eq!(seqs, [0, 0, a], "b did not exist yet at the snapshot");
@@ -2051,7 +2186,10 @@ async fn a_many_key_read_works_at_every_consistency() {
     txn.write(b"a", Some(b"mine")).await.unwrap();
     let mine = txn.read(&keys).await.unwrap();
     assert_eq!(mine.entries[2].value.as_deref(), Some(&b"mine"[..]));
-    assert_eq!(mine.entries[2].seq, a, "a buffered write keeps the committed seq");
+    assert_eq!(
+        mine.entries[2].seq, a,
+        "a buffered write keeps the committed seq"
+    );
     let versions = txn.read_versions(&keys).await.unwrap();
     let seqs: Vec<_> = versions.entries.iter().map(|v| v.seq).collect();
     assert_eq!(seqs, [b, 0, a]);
@@ -2086,8 +2224,14 @@ async fn a_read_past_the_value_budget_is_returned_short_for_the_caller_to_finish
     assert_eq!(rest.entries[0].key, b"b");
     assert_eq!(rest.entries[0].value.as_deref(), Some(big.as_slice()));
 
-    let versions = client.read_versions(&keys, Consistency::Stale).await.unwrap();
-    assert!(versions.is_complete(keys.len()), "versions alone are never cut short");
+    let versions = client
+        .read_versions(&keys, Consistency::Stale)
+        .await
+        .unwrap();
+    assert!(
+        versions.is_complete(keys.len()),
+        "versions alone are never cut short"
+    );
 }
 
 /// Too many keys is refused here, before anything is sent.
@@ -2116,14 +2260,20 @@ async fn a_backup_restores_into_a_new_cluster() {
     bootstrap(&admin, "bk-src").await;
     admin.write(b"k", Some(b"before")).await.unwrap();
     admin.write(b"secret/x", Some(b"s")).await.unwrap();
-    admin.create_user("alice", "correct horse", false).await.unwrap();
+    admin
+        .create_user("alice", "correct horse", false)
+        .await
+        .unwrap();
     admin
         .set_acl(b"secret/", &[(Principal::user("root"), Right::Write)])
         .await
         .unwrap();
     admin.create_snapshot(Some(b"s1")).await.unwrap();
     admin.write(b"k", Some(b"after")).await.unwrap();
-    admin.create_invite(false, Duration::ZERO, None).await.unwrap();
+    admin
+        .create_invite(false, Duration::ZERO, None)
+        .await
+        .unwrap();
 
     let mut backup = Vec::new();
     let info = admin.backup(Some(b"s1"), &mut backup).await.unwrap();
@@ -2145,7 +2295,10 @@ async fn a_backup_restores_into_a_new_cluster() {
     let wrong = Client::new([r1.url()]).unwrap();
     assert!(matches!(
         wrong.login("root", "other").await,
-        Err(Error::Denied { reason: Denial::BadCredentials, .. })
+        Err(Error::Denied {
+            reason: Denial::BadCredentials,
+            ..
+        })
     ));
 
     // The keys as of the snapshot.
@@ -2157,7 +2310,10 @@ async fn a_backup_restores_into_a_new_cluster() {
     alice.login("alice", "correct horse").await.unwrap();
     assert!(matches!(
         alice.read_one(b"secret/x").await,
-        Err(Error::Denied { reason: Denial::NotPermitted, .. })
+        Err(Error::Denied {
+            reason: Denial::NotPermitted,
+            ..
+        })
     ));
 
     // Invitations and snapshots did not.
@@ -2170,7 +2326,11 @@ async fn a_backup_restores_into_a_new_cluster() {
     let until = Instant::now() + BOOTSTRAP_TIMEOUT;
     loop {
         let members = root.members().await.unwrap();
-        if members.members.iter().any(|m| m.server_id == "bk-r2" && m.voting) {
+        if members
+            .members
+            .iter()
+            .any(|m| m.server_id == "bk-r2" && m.voting)
+        {
             break;
         }
         assert!(Instant::now() < until, "bk-r2 never caught up: {members:?}");
