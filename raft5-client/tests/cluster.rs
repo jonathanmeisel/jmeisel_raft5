@@ -394,6 +394,166 @@ async fn concurrent_increments_do_not_lose_writes() {
     );
 }
 
+/// The same race as above, with the retrying left to `run_transaction`. It
+/// runs in spawned tasks, so this also shows that its future is `Send`.
+#[tokio::test]
+async fn run_transaction_retries_until_no_increment_is_lost() {
+    const TASKS: u64 = 4;
+    const PER_TASK: u64 = 5;
+
+    let n1 = TestNode::start("n1");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "n1").await;
+
+    let mut tasks = Vec::new();
+    for _ in 0..TASKS {
+        let client = client.clone();
+        tasks.push(tokio::spawn(async move {
+            for _ in 0..PER_TASK {
+                client
+                    .run_transaction(Duration::from_secs(2), |txn| async move {
+                        let hits = txn.read_one(b"hits").await?;
+                        let count: u64 = hits
+                            .value
+                            .map_or(0, |v| String::from_utf8(v).unwrap().parse().unwrap());
+                        txn.write(b"hits", Some((count + 1).to_string().as_bytes()))
+                            .await?;
+                        txn.commit().await
+                    })
+                    .await
+                    .expect("an increment gave up");
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.expect("an incrementing task panicked");
+    }
+
+    let total = fresh(&client, b"hits").await;
+    assert_eq!(
+        total.value.as_deref(),
+        Some((TASKS * PER_TASK).to_string().as_bytes()),
+    );
+}
+
+/// An aborted attempt leaves nothing: only what the last attempt buffered is
+/// written, and its result is what comes back.
+#[tokio::test]
+async fn run_transaction_keeps_only_the_last_attempt() {
+    let n1 = TestNode::start("n1");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "n1").await;
+
+    let mut attempts = 0;
+    let got = client
+        .run_transaction(Duration::from_secs(2), |txn| {
+            attempts += 1;
+            let attempt = attempts;
+            async move {
+                txn.write(format!("from-{attempt}").as_bytes(), Some(b"x"))
+                    .await?;
+                if attempt == 1 {
+                    return Err(Error::Aborted {
+                        reason: raft5_client::AbortReason::Wounded,
+                        key: None,
+                    });
+                }
+                txn.commit().await?;
+                Ok(attempt)
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!((got, attempts), (2, 2));
+    assert_eq!(fresh(&client, b"from-1").await.value, None);
+    assert_eq!(
+        fresh(&client, b"from-2").await.value.as_deref(),
+        Some(&b"x"[..])
+    );
+}
+
+/// An attempt can decide to write nothing: it returns without a commit, and
+/// that is not retried.
+#[tokio::test]
+async fn run_transaction_accepts_an_attempt_that_commits_nothing() {
+    let n1 = TestNode::start("n1");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "n1").await;
+
+    let mut attempts = 0;
+    let decided = client
+        .run_transaction(Duration::from_secs(2), |txn| {
+            attempts += 1;
+            async move {
+                txn.write(b"undecided", Some(b"x")).await?;
+                Ok("that name is taken")
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!((decided, attempts), ("that name is taken", 1));
+
+    // Its locks come back, so this doesn't have to wait for its deadline.
+    client.write(b"undecided", Some(b"y")).await.unwrap();
+    assert_eq!(
+        fresh(&client, b"undecided").await.value.as_deref(),
+        Some(&b"y"[..])
+    );
+}
+
+/// A commit in doubt may already have applied, so it is never replayed.
+#[tokio::test]
+async fn run_transaction_never_replays_an_in_doubt_commit() {
+    let n1 = TestNode::start("n1");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "n1").await;
+
+    let mut attempts = 0;
+    let got: Result<(), Error> = client
+        .run_transaction(Duration::from_secs(2), |_txn| {
+            attempts += 1;
+            async move { Err(Error::InDoubt { seq: 7 }) }
+        })
+        .await;
+    assert!(matches!(got, Err(Error::InDoubt { seq: 7 })));
+    assert_eq!(attempts, 1);
+}
+
+/// Work that can't finish inside its `ttl` stops soon with an error that
+/// says so, in place of retrying for the whole limit.
+#[tokio::test]
+async fn run_transaction_gives_up_on_work_that_keeps_running_out_of_time() {
+    let n1 = TestNode::start("n1");
+    let client = Client::new([n1.url()]).unwrap();
+    bootstrap(&client, "n1").await;
+
+    let start = Instant::now();
+    let mut attempts = 0;
+    let got: Result<u64, Error> = client
+        .run_transaction(Duration::from_millis(50), |txn| {
+            attempts += 1;
+            async move {
+                txn.write(b"slow", Some(b"x")).await?;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                txn.commit().await
+            }
+        })
+        .await;
+    assert!(
+        matches!(
+            got,
+            Err(Error::Aborted {
+                reason: raft5_client::AbortReason::Expired,
+                ..
+            })
+        ),
+        "{got:?}"
+    );
+    assert_eq!(attempts, 3);
+    assert!(start.elapsed() < Duration::from_secs(5));
+    assert_eq!(fresh(&client, b"slow").await.value, None);
+}
+
 /// A transaction that buffers nothing writes nothing, and commits at seq 0:
 /// there was no entry, so there is no seq.
 #[tokio::test]

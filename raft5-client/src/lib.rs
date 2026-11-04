@@ -161,9 +161,11 @@ pub enum Error {
     Unavailable(String),
     /// The transaction is over, and nothing it buffered was written.
     ///
-    /// This library does not retry it, because the retry is the whole
-    /// transaction, reads included, and only the caller knows what those
-    /// were. A replay is always safe: an aborted transaction wrote nothing.
+    /// A retry is the whole transaction, reads included, and only the caller
+    /// knows what those were. So a lone [`Transaction`](crate::Transaction)
+    /// does not retry; [`Client::run_transaction`] does, with the reads its
+    /// caller gives it. A replay is always safe: an aborted transaction wrote
+    /// nothing.
     Aborted {
         reason: AbortReason,
         /// The contended key, for [`AbortReason::LockConflict`].

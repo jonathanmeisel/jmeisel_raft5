@@ -1,13 +1,13 @@
 //! Reads, writes and key walks outside a transaction.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use raft5_shared::raft5::client::{
     GetKeysRequest, GetKeysResponse, Linearizable, ReadOk, ReadRequest, ReadResponse, WriteResponse,
     get_keys_request, get_keys_response, read_request, read_response, write_response,
 };
 
-use crate::{Client, DEADLINE, Error, RETRY_DELAY, Reply};
+use crate::{Client, DEADLINE, Error, Reply};
 use crate::routing::Kv;
 
 /// The lifetime of the transaction that [`Client::write`] opens for the
@@ -184,8 +184,9 @@ impl Client {
     ///
     /// A transaction is the cluster's only way to write, so this opens one,
     /// buffers the key, and commits: three round trips, not one.
-    /// [`transaction`] is the same mechanism with the steps left to you; use
-    /// it when more than one key is involved or the value depends on a read.
+    /// [`run_transaction`] is the same mechanism with the steps left to you;
+    /// use it when more than one key is involved or the value depends on a
+    /// read.
     ///
     /// Losing a key to another transaction is not a failure here: an aborted
     /// transaction wrote nothing, so this opens another and tries again until
@@ -196,29 +197,17 @@ impl Client {
     /// writes the same value to the same key, so the only trace is a second
     /// seq.
     ///
-    /// [`transaction`]: Client::transaction
+    /// [`run_transaction`]: Client::run_transaction
     pub async fn write(&self, key: &[u8], value: Option<&[u8]>) -> Result<u64, Error> {
-        let deadline = Instant::now() + DEADLINE;
-        loop {
-            match self.write_once(key, value).await {
-                // The value does not depend on what the key held, so a lost key just
-                // means trying again, within the same deadline as the rest of the
-                // client.
-                Err(Error::Aborted { .. }) if Instant::now() < deadline => {
-                    tokio::time::sleep(RETRY_DELAY).await;
-                }
-                other => return other,
-            }
-        }
-    }
-
-    /// One attempt at [`write`](Client::write): open a transaction, buffer the
-    /// key, commit. On any failure, `Transaction`'s `Drop` gives the locks
-    /// back instead of waiting for the deadline.
-    async fn write_once(&self, key: &[u8], value: Option<&[u8]>) -> Result<u64, Error> {
-        let txn = self.transaction(IMPLICIT_TXN_TTL).await?;
-        txn.write(key, value).await?;
-        txn.commit().await
+        // The value does not depend on what the key held, so a lost key just
+        // means trying again, within the same deadline as the rest of the
+        // client. On any failure, `Transaction`'s `Drop` gives the locks back
+        // instead of waiting for the deadline.
+        self.run_transaction_within(IMPLICIT_TXN_TTL, DEADLINE, |txn| async move {
+            txn.write(key, value).await?;
+            txn.commit().await
+        })
+        .await
     }
 
     /// Read `keys`, all as of the same moment, at `consistency`.
