@@ -104,6 +104,10 @@ impl PeerConnections {
             // the chunk size. It also keeps a large batch on the wire for less time,
             // which is what the separate lease connection protects.
             .http2_adaptive_window(true)
+            // Finds a peer that is gone during a call with no timeout of its
+            // own (see `PEER_KEEPALIVE_INTERVAL`).
+            .http2_keep_alive_interval(super::PEER_KEEPALIVE_INTERVAL)
+            .keep_alive_timeout(super::PEER_KEEPALIVE_TIMEOUT)
             .connect_lazy();
         let client = RaftPeerClient::new(channel);
         clients.insert(peer.id.clone(), client.clone());

@@ -404,10 +404,27 @@ const _: () = assert!(
      an entry is refused forever and the cluster stops committing"
 );
 
-/// The timeout for a full `InstallSnapshot` transfer. Longer than for
-/// `AppendEntries`, because it moves the whole current state, not a batch
-/// of new entries.
-const SNAPSHOT_RPC_TIMEOUT: Duration = Duration::from_secs(7200);
+/// How long an `InstallSnapshot` transfer may send no chunk before the
+/// leader stops it and tries again.
+///
+/// A transfer moves the whole current state, so it has no total limit: a
+/// large state on a slow link takes as long as it needs. A chunk goes out
+/// only when the peer's flow control has room, so a chunk that goes out
+/// means the peer is still taking them. After the last chunk, the peer
+/// installs the state, and only the connection's keepalive limits that
+/// (see `PEER_KEEPALIVE_INTERVAL`).
+const SNAPSHOT_STALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How often a peer connection sends an HTTP/2 ping, and how long the
+/// answer may take. A peer that does not answer in time is gone (crashed,
+/// or cut off with no reset), and every call on the connection fails.
+///
+/// This is the only limit on an RPC that has no timeout of its own: an
+/// `InstallSnapshot` after its last chunk, while the peer installs it. The
+/// peer's HTTP/2 layer answers pings while the install runs, so a long
+/// install is not cut short.
+const PEER_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const PEER_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How much of an encoded entry batch goes into each
 /// `AppendEntriesChunk`.

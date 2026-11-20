@@ -1,7 +1,7 @@
 use super::*;
 // Only the tests use the replication step builder directly; the leader
 // itself only sees it from inside a replication task.
-use super::replication::{ReplicationStep, build_replication_step_sync};
+use super::replication::{ReplicationStep, build_replication_step_sync, watch_progress};
 use crate::raft::test_support::*;
 
 /// A cluster with no peers reaches a majority on its self-vote alone (see
@@ -1281,4 +1281,59 @@ async fn replication_is_woken_by_new_entries_rather_than_polled() {
 
     cleanup(&path_a);
     cleanup(&path_b);
+}
+
+/// How long the `watch_progress` tests let a stream go quiet. Short, so
+/// the tests are quick, and far above scheduling noise.
+const STALL: Duration = Duration::from_millis(200);
+
+/// A snapshot body that the receiver stops taking (its flow control is
+/// full, or it hangs) stops the transfer once `STALL` passes.
+#[tokio::test]
+async fn a_transfer_stalls_when_the_receiver_stops_taking_chunks() {
+    let (tx, rx) = mpsc::channel::<u32>(4);
+    let (body, stalled) = watch_progress(tokio_stream::wrappers::ReceiverStream::new(rx), STALL);
+    tx.send(1).await.unwrap();
+    tx.send(2).await.unwrap();
+    // The receiver takes one chunk, then nothing more.
+    let mut body = Box::pin(body);
+    assert_eq!(tokio_stream::StreamExt::next(&mut body).await, Some(1));
+    let started = tokio::time::Instant::now();
+    tokio::time::timeout(STALL * 5, stalled)
+        .await
+        .expect("a transfer that stops moving should stall");
+    assert!(started.elapsed() >= STALL / 2);
+}
+
+/// A slow transfer that keeps moving runs for longer than `STALL`, and a
+/// finished one never stalls, however long the receiver then works.
+#[tokio::test]
+async fn a_slow_transfer_runs_on_and_a_finished_one_never_stalls() {
+    let (tx, rx) = mpsc::channel::<u32>(1);
+    let (body, stalled) = watch_progress(tokio_stream::wrappers::ReceiverStream::new(rx), STALL);
+    let receiver = tokio::spawn(async move {
+        let mut body = Box::pin(body);
+        let mut got = 0;
+        while tokio_stream::StreamExt::next(&mut body).await.is_some() {
+            got += 1;
+        }
+        got
+    });
+    let sender = tokio::spawn(async move {
+        for i in 0..12 {
+            tokio::time::sleep(STALL / 4).await;
+            tx.send(i).await.unwrap();
+        }
+    });
+    let mut stalled = Box::pin(stalled);
+    // Three times `STALL` of chunks, then the end of the stream.
+    tokio::select! {
+        () = &mut stalled => panic!("a transfer that keeps moving must not stall"),
+        sent = sender => sent.unwrap(),
+    }
+    assert_eq!(receiver.await.unwrap(), 12);
+    assert!(
+        tokio::time::timeout(STALL * 3, stalled).await.is_err(),
+        "a transfer whose body ended must not stall"
+    );
 }

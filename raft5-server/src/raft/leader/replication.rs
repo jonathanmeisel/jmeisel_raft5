@@ -13,6 +13,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 
 use std::io::Write;
+use std::pin::Pin;
 
 use crate::store::ChunkWriter;
 
@@ -265,8 +266,10 @@ async fn append_entries_to_peer(
 ///
 /// The export runs on the blocking pool (fjall's export is synchronous,
 /// as with every storage call) and feeds the stream through a
-/// `store::ChunkWriter`. Bounded by the generous `SNAPSHOT_RPC_TIMEOUT`,
-/// because this can be far larger than an `AppendEntries` batch. `None` on
+/// `store::ChunkWriter`. It has no total time limit, because the state can
+/// be far larger than an `AppendEntries` batch: it stops only when no chunk
+/// goes out for `SNAPSHOT_STALL_TIMEOUT`, or when the connection's
+/// keepalive finds the peer gone. `None` on
 /// an RPC failure (the caller tries again next tick, as everywhere here),
 /// but a storage read failure panics, as in `build_replication_step_sync`.
 async fn send_snapshot_to_peer(
@@ -322,10 +325,23 @@ async fn send_snapshot_to_peer(
     let stream = tokio_stream::iter(std::iter::once(header)).chain(body);
 
     let mut client = conns.client(peer)?;
+    let (stream, stalled) = watch_progress(stream, SNAPSHOT_STALL_TIMEOUT);
     let attempt = client.install_snapshot(stream);
-    // `SNAPSHOT_RPC_TIMEOUT` bounds the transfer, at two hours: far too long
-    // for a shutting-down node to wait, so cancellation cuts it short.
-    let answered = until_cancelled(cancel, tokio::time::timeout(SNAPSHOT_RPC_TIMEOUT, attempt)).await;
+    // A transfer that stops moving ends after `SNAPSHOT_STALL_TIMEOUT`, and
+    // cancellation cuts any transfer short for a node that is shutting down.
+    let answered = until_cancelled(cancel, async {
+        tokio::select! {
+            answer = attempt => Some(answer),
+            () = stalled => None,
+        }
+    })
+    .await;
+    if matches!(answered, Some(None)) {
+        warn!(
+            "install_snapshot to {} sent nothing for {:?}; stopping it",
+            peer.id, SNAPSHOT_STALL_TIMEOUT
+        );
+    }
 
     // Join the exporter either way: on success, to surface a storage failure
     // that the response alone would hide; on failure, so the blocking task is
@@ -340,12 +356,78 @@ async fn send_snapshot_to_peer(
     }
 
     match answered {
-        Some(Ok(Ok(resp))) => Some((resp.into_inner(), last_included_seq)),
+        Some(Some(Ok(resp))) => Some((resp.into_inner(), last_included_seq)),
         _ => {
             warn!("install_snapshot to {} did not complete; retrying", peer.id);
             None
         }
     }
+}
+
+/// When a watched stream last gave an item, and whether it has ended.
+#[derive(Clone, Copy)]
+struct Progress {
+    last: tokio::time::Instant,
+    ended: bool,
+}
+
+/// A stream that records in `progress` each item it gives, and its end.
+pub(super) struct Watched<S> {
+    body: Pin<Box<S>>,
+    progress: Arc<std::sync::Mutex<Progress>>,
+}
+
+impl<S: Stream> Stream for Watched<S> {
+    type Item = S::Item;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<S::Item>> {
+        let polled = self.body.as_mut().poll_next(cx);
+        if let std::task::Poll::Ready(item) = &polled {
+            let mut progress = self.progress.lock().unwrap();
+            match item {
+                Some(_) => progress.last = tokio::time::Instant::now(),
+                None => progress.ended = true,
+            }
+        }
+        polled
+    }
+}
+
+/// Wraps `body` for an RPC that sends it, and returns a future that
+/// finishes if the RPC takes no item from `body` for `stall`.
+///
+/// - The time starts now, so a connect that hangs counts as a stall.
+/// - After `body` ends, the future never finishes. The receiver may still
+///   be working on what it got, and a stall says nothing about that.
+pub(super) fn watch_progress<S: Stream>(
+    body: S,
+    stall: Duration,
+) -> (Watched<S>, impl Future<Output = ()>) {
+    let progress = Arc::new(std::sync::Mutex::new(Progress {
+        last: tokio::time::Instant::now(),
+        ended: false,
+    }));
+    let watched = Watched {
+        body: Box::pin(body),
+        progress: Arc::clone(&progress),
+    };
+    let stalled = async move {
+        loop {
+            let now = *progress.lock().unwrap();
+            if now.ended {
+                return std::future::pending().await;
+            }
+            let deadline = now.last + stall;
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep_until(deadline).await;
+        }
+    };
+    (watched, stalled)
 }
 
 /// Send `AppendEntries` to `peer` whenever there is something to tell it,
